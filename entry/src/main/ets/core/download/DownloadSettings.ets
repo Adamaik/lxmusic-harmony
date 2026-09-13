@@ -19,9 +19,9 @@ const SETTINGS_VERSION: number = 1;
  * 存法与播放设置一致：一份 JSON 落在沙箱（filesDir/download_settings.json），
  * 同时把每个值写进 AppStorage，界面用 @StorageLink 订阅即可实时响应。
  *
- * 「手动选择」保存的是系统文件选择器返回的目录 uri（file://docs/...）。要让它在
- * 应用重启后依然可写，选完目录还得调 fileShare.persistPermission 申请长期授权
- * （见 DownloadManager.pickSaveDir）。
+ * 「手动选择」保存的是系统文件选择器返回的目录 uri（file://docs/...）。它只用来把
+ * 系统保存对话框定位到那儿（见 DownloadManager.openTarget）——往用户目录新建文件
+ * 只有系统保存对话框这一条官方通路，所以手动模式下每首会确认一次。
  */
 
 /** 文件名格式（顺序与界面一致） */
@@ -31,13 +31,13 @@ export const NAME_FORMAT_LABELS: string[] = ['歌曲名', '艺术家-标题', '�
 /**
  * 保存位置
  *
- *   manual ：自己选一个目录，长期往里面写（选一次就行）
- *   app    ：系统的 Download/<应用> 目录，不用选、开箱可用
+ *   manual ：自己选一个目录，下载时把系统保存对话框定位到它
+ *   app    ：系统的 Download/<应用> 目录，不用选、全程不弹对话框
  *
  * 「手动选择」用的是文件选择器的**文件夹模式**（SystemCapability.FileManagement
- * .UserFileService.FolderSelection，手机/平板/PC 都在支持列表里）+ fileShare 的
- * 持久化授权：选完 persistPermission 记住授权，重启后再 activatePermission 启回来，
- * 之后每首歌直接往这个目录里写，不再询问。
+ * .UserFileService.FolderSelection，手机/平板/PC 都在支持列表里），只记住目录本身。
+ * 不做「持久化授权」：那需要受限 ACL 权限 FILE_ACCESS_PERSIST（要 Profile 声明），
+ * 而且真正写文件的系统保存对话框并不需要它。
  */
 export const SAVE_MODES: string[] = ['manual', 'app'];
 export const SAVE_MODE_LABELS: string[] = ['手动选择', 'Download目录'];

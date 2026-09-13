@@ -47,9 +47,8 @@ export struct DownloadSettingsView {
   /**
    * 切换保存位置
    *
-   * 手动选择：真的去选一个目录（文件选择器的文件夹模式），选完把授权持久化，
-   * 之后每首歌直接往这个目录写、不再询问。任何一步失败都如实报出来（带系统错误码），
-   * 不切模式、也不偷偷换地方写。
+   * 手动选择：真的去选一个目录（文件选择器的文件夹模式），选完记住它，
+   * 之后每首下载的系统保存对话框都会定位到这个目录。
    */
   private async pickMode(mode: string): Promise<void> {
     if (mode === 'app') {
@@ -67,11 +66,8 @@ export struct DownloadSettingsView {
       this.pickDetail = result.detail;
       if (result.cancel) {
         this.toast('没有选择目录，保存位置保持不变');
-      } else if (result.usable) {
-        this.toast(`下载目录已设为「${result.label}」，之后每首会定位到这个目录保存`);
       } else {
-        // 目录记下了但写不进去：把每一步的结果摊开，便于定位是授权还是写入的问题
-        this.toast(`已选「${result.label}」，但写不进去：${result.detail}`);
+        this.toast(`下载目录已设为「${result.label}」`);
       }
     } catch (e) {
       this.toast(`选择目录失败：${(e as BusinessError).message}`);
@@ -85,12 +81,10 @@ export struct DownloadSettingsView {
       const label: string = DownloadSettings.getInstance().getSaveDirLabel();
       if (label.length === 0) {
         return '还没选目录：点「手动选择」挑一个目录（系统文件选择器）。'
-          + '选完记住它，之后每首下载都会定位到这个目录。';
+          + '之后每首下载都会定位到这个目录。';
       }
-      const persistent: boolean = DownloadManager.getInstance().isManualDirPersistent();
       return `当前目录：${label}。手机系统不允许应用直接往用户目录里新建文件，`
         + '所以每首下载会弹一次系统保存对话框（已定位到这个目录、文件名已填好），确认即可。'
-        + (persistent ? '该目录已记住长期授权，重启后不用重选。' : '该目录只有本次会话的授权，重启后需要重选。')
         + '想完全不询问，请用「Download目录」。';
     }
     return 'Download目录：保存到系统的 Download/应用名/ 目录，全程不弹对话框，'

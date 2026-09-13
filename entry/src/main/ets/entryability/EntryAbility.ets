@@ -32,8 +32,6 @@ export default class EntryAbility extends UIAbility {
     // 建出来之前恢复好，否则列表第一帧是空的
     DownloadSettings.getInstance().init(this.context);
     DownloadManager.getInstance().init(this.context);
-    // 上次选的下载目录：新进程里要把长期授权 activate 回来才能接着写
-    DownloadManager.getInstance().initManualDir(this.context);
   }
 
   onDestroy(): void {

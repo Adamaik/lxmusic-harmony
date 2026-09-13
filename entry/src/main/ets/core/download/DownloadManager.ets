@@ -1,5 +1,5 @@
 import { common } from '@kit.AbilityKit';
-import { fileIo as fs, fileShare, picker } from '@kit.CoreFileKit';
+import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { http } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -76,9 +76,7 @@ export interface PickDirResult {
   cancel: boolean;
   /** 目录短名 */
   label: string;
-  /** 现在能不能往这个目录写 */
-  usable: boolean;
-  /** 诊断细节：哪一步成功/失败（失败时带系统错误码） */
+  /** 说明这次选择意味着什么（为什么每首还要确认一次） */
   detail: string;
 }
 
@@ -384,63 +382,6 @@ export class DownloadManager {
 
   // ---------------------------------------------------------------- 保存位置
 
-  /**
-   * 手动目录的授权策略
-   *
-   * 关键点：OperationMode 是按位分开的 —— READ / WRITE / **CREATE** / DELETE / RENAME。
-   * 只申请 READ|WRITE 的话，改已有文件可以，**在目录里新建文件不行**（探针就是在建文件，
-   * 所以之前必然失败）。下载要新建文件、失败时还要删掉半截文件，四个位都申请。
-   */
-  private manualPolicy(uri: string): fileShare.PolicyInfo {
-    return {
-      uri: uri,
-      operationMode: fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE
-        | fileShare.OperationMode.CREATE_MODE | fileShare.OperationMode.DELETE_MODE,
-    };
-  }
-
-  /** 手动选择的目录当前能不能写（启动时验证一次；失败会让设置页提示重选） */
-  private manualDirUsable: boolean = false;
-  /** 这个目录的授权是不是「长期」的（false = 只有本次会话有效，重启要重选） */
-  private manualDirPersistent: boolean = false;
-
-  /**
-   * 启动时把「上次选的目录」的长期授权启回来
-   *
-   * persistPermission 记住的是授权本身，新进程里要 activatePermission 才能真正生效；
-   * 再用探针确认真的可写，写在内存里给设置页和下载用。
-   */
-  initManualDir(context: common.Context): void {
-    const settings = DownloadSettings.getInstance();
-    const uri: string = settings.getSaveDirUri();
-    if (uri.length === 0) {
-      this.manualDirUsable = false;
-      return;
-    }
-    this.context = context;
-    const policy: fileShare.PolicyInfo = this.manualPolicy(uri);
-    fileShare.activatePermission([policy]).then(() => {
-      this.manualDirUsable = this.probeWritable(uri).length === 0;
-      this.manualDirPersistent = this.manualDirUsable;
-      if (!this.manualDirUsable) {
-        hilog.warn(DOMAIN, TAG, 'manual dir not writable after activate: %{public}s', uri);
-      }
-    }).catch((err: BusinessError) => {
-      this.manualDirUsable = false;
-      hilog.warn(DOMAIN, TAG, 'activatePermission failed: %{public}s', JSON.stringify(err));
-    });
-  }
-
-  /** 手动选的目录是否可用（设置页据此提示） */
-  isManualDirUsable(): boolean {
-    return this.manualDirUsable;
-  }
-
-  /** 这个目录的授权是否长期有效（false 表示只有本次会话有效） */
-  isManualDirPersistent(): boolean {
-    return this.manualDirPersistent;
-  }
-
   /** 切回系统的 Download 目录（选过的目录 uri 留着，方便再切回手动） */
   useAppDir(): void {
     DownloadSettings.getInstance().setSaveMode('app');
@@ -448,65 +389,41 @@ export class DownloadManager {
   }
 
   /**
-   * 让用户选一个「长期下载目录」
+   * 让用户选一个「下载目录」，记住它
    *
-   * 依次做：picker 选文件夹 -> persistPermission 持久化 -> checkPersistentPermission 确认
-   * -> activatePermission 启用 -> 探针建文件。每一步的结果都记进 detail：
-   * 真机上没法看 hilog，失败时只能靠提示语定位，所以宁可比一句话详细。
-   *
-   * 探针失败**不当成致命错误**：目录照样记下（用户能看到选的是哪儿），
-   * 但标记为不可写，下载时自动改为弹系统保存对话框（见 openTarget），设置页也会如实说明。
+   * 这里只做一件事：把用户选的目录（uri + 短名）记下来，之后每首下载的保存对话框
+   * 都定位到那儿。**不做授权持久化**，原因有两条：
+   *   1. persistPermission / activatePermission 需要 ohos.permission.FILE_ACCESS_PERSIST，
+   *      而它是「受限 ACL 权限」，必须在签名 Profile 的 allowed-acls 里声明才生效；
+   *      声明在自己工程里没用（还会卡住 AGC 上传的 ACL 一致性校验）。
+   *   2. 就算拿到了这个权限也用不上：往用户目录**新建文件**不能用 openSync + CREATE
+   *      （报 13900002），官方唯一通路是系统保存对话框（见 openTarget），
+   *      而那条路不需要任何权限。
+   * 所以「长期授权」这件事在手机上本来就做不到，如实告诉用户每首会确认一次。
    */
   async pickSaveDir(context: common.Context): Promise<PickDirResult> {
     if (!canIUse('SystemCapability.FileManagement.UserFileService.FolderSelection')) {
-      return { cancel: false, label: '', usable: false, detail: '这台设备不支持选择文件夹' };
+      return { cancel: false, label: '', detail: '这台设备不支持选择文件夹' };
     }
     const options = new picker.DocumentSelectOptions();
     options.maxSelectNumber = 1;
     options.selectMode = picker.DocumentSelectMode.FOLDER;
     const uris: string[] = await new picker.DocumentViewPicker(context).select(options);
     if (uris.length === 0) {
-      return { cancel: true, label: '', usable: false, detail: '' };
+      return { cancel: true, label: '', detail: '' };
     }
     const uri: string = uris[0];
-    const policy: fileShare.PolicyInfo = this.manualPolicy(uri);
-    const steps: string[] = [];
-
-    let persistent: boolean = false;
-    try {
-      await fileShare.persistPermission([policy]);
-      steps.push('授权持久化：成功');
-    } catch (err) {
-      steps.push(`授权持久化失败（${(err as BusinessError).code} ${(err as BusinessError).message}）`);
-      hilog.warn(DOMAIN, TAG, 'persistPermission failed: %{public}s', JSON.stringify(err));
-    }
-    try {
-      const checked: boolean[] = await fileShare.checkPersistentPermission([policy]);
-      persistent = checked.length > 0 && checked[0];
-      steps.push(`系统确认长期权限：${persistent ? '有' : '没有'}`);
-    } catch (err) {
-      steps.push(`查长期权限失败（${(err as BusinessError).code}）`);
-    }
-    try {
-      await fileShare.activatePermission([policy]);
-      steps.push('启用授权：成功');
-    } catch (err) {
-      steps.push(`启用授权失败（${(err as BusinessError).code} ${(err as BusinessError).message}）`);
-    }
-
-    // 探针只在「直接往目录里写」这条路上有意义；手机上本来就是走系统保存对话框，
-    // 所以探针结果只作诊断记录，不当作能否使用的判据。
-    const probeError: string = this.probeWritable(uri);
-    steps.push(probeError.length === 0 ? '直接写入探针：成功' : `直接写入探针：不支持（${probeError}）`);
-
     const label: string = this.labelOf(uri);
     this.context = context;
-    this.manualDirUsable = true;
-    this.manualDirPersistent = persistent;
     DownloadSettings.getInstance().setSaveDir(uri, label);
     this.bump();
     hilog.info(DOMAIN, TAG, 'manual download dir set: %{public}s', uri);
-    return { cancel: false, label: label, usable: true, detail: steps.join('；') };
+    return {
+      cancel: false,
+      label: label,
+      detail: `当前目录：${label}。手机系统不允许应用直接往用户目录新建文件，`
+        + '每首下载会弹一次系统保存对话框（已定位到这个目录、文件名已填好），确认即可',
+    };
   }
 
   private labelOf(uri: string): string {
@@ -517,24 +434,6 @@ export class DownloadManager {
       return decoded.length > 0 ? decoded : uri;
     } catch (e) {
       return raw;
-    }
-  }
-
-  /**
-   * 往目标目录写一个探针文件再删掉，确认可写
-   * @returns 空串表示可写；否则是失败原因（带系统错误码，方便定位）
-   */
-  private probeWritable(uri: string): string {
-    const probe: string = `${uri}/lx_download_probe.tmp`;
-    try {
-      const handle = fs.openSync(probe, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.closeSync(handle);
-      this.unlinkQuietly(probe);
-      return '';
-    } catch (e) {
-      const err = e as BusinessError;
-      hilog.warn(DOMAIN, TAG, 'probe dir failed: %{public}s', JSON.stringify(e));
-      return `${err.code} ${err.message}`;
     }
   }
 

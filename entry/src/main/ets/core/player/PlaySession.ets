@@ -979,13 +979,24 @@ export class PlaySession {
       // 0) 用户主动下载到本地的：优先放它。
       // 下载是明确的用户意图、文件是长期保留的，比 LRU 播放缓存更该被优先使用：
       // 离线能放、也不看音源脸色（音源失效时下载过的歌照样能听）。
+      //
+      // 打不开就往下走（联网重放）：下载到用户目录（Download/、或手选的目录）的文件，
+      // 系统给的是「会话级」访问授权，重启后可能已经读不到（要长期授权得申请受限 ACL
+      // 权限 FILE_ACCESS_PERSIST，见 module.json5 里的说明）。这种情况不该让整首歌
+      // 直接失败，能联网就照常放。
       const downloaded: string = downloadedFile(cacheKey.length > 0 ? cacheKey : item.id);
       if (downloaded.length > 0) {
-        audioCache.setPlayingPath('');
-        this.currentLocalPath = downloaded;
-        this.setStatus('loading', '正在读取已下载文件…');
-        await LxPlayer.getInstance().playLocal(downloaded);
-        return;
+        try {
+          audioCache.setPlayingPath('');
+          this.currentLocalPath = downloaded;
+          this.setStatus('loading', '正在读取已下载文件…');
+          await LxPlayer.getInstance().playLocal(downloaded);
+          return;
+        } catch (e) {
+          this.currentLocalPath = '';
+          hilog.warn(DOMAIN, TAG, 'play downloaded file failed, fallback to online: %{public}s',
+            (e as Error).message);
+        }
       }
 
       // 1) 本地音频缓存命中：直接读沙箱文件，不联网、也不看源脚本的脸色

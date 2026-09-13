@@ -24,12 +24,12 @@
       {
         // 后台播放：退到后台/息屏后进程要能继续跑，否则 AVPlayer 会被冻结停住
         "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
-      },
-      {
-        // 下载：用户选了「长期下载目录」后，要靠这个权限把该目录的读写授权持久化
-        // （system_grant：声明即自动授予，不需要弹窗申请）
-        "name": "ohos.permission.FILE_ACCESS_PERSIST"
       }
+      // 这里原本还声明了 ohos.permission.FILE_ACCESS_PERSIST（持久化目录授权），已去掉：
+      // 它属于「受限 ACL 权限」，必须在签名 Profile 的 allowed-acls 里声明才能生效
+      // （自动生成的调试 Profile 里没有，声明了也只是摆设，还会卡住 AGC 上传时的
+      // 「ACL 权限声明一致性」校验）。而下载真正写文件走的是系统保存对话框
+      // （DocumentViewPicker.save），那条路本来就不需要这个权限，见 openTarget。
     ],
     "abilities": [
       {
