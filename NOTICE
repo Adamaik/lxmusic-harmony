@@ -1,0 +1,21 @@
+lxmusic-harmony
+Copyright 2026 Adamaik
+
+本作品是 lx-music-mobile 的移植与改作（Apache License 2.0，第 4 条要求的声明）。
+
+上游项目
+  lx-music-mobile
+  Copyright (c) lyswhut
+  Apache License 2.0
+  https://github.com/lyswhut/lx-music-mobile
+
+主要改动
+  - 界面层与播放链路用 ArkTS / ArkUI 全部重写（上游为 React Native）
+  - 音源脚本引擎改为在 HarmonyOS 的 Web 容器中执行洛雪音源脚本，
+    网络请求经宿主代理转发（上游用 Node/QuickJS 侧的实现）
+  - 洛雪同步协议的握手、加密、压缩与列表动作，以及各平台的搜索 / 歌词接口实现，
+    参考了上游同名逻辑（部分函数按上游行为等价改写，字段顺序保持一致以便互通）
+  - 新增 HarmonyOS 侧能力：AVSession 播控中心、桌面歌词、投播（投递至）、
+    系统分享、沙箱音频缓存、文档目录下载等
+
+本项目不包含、也不提供任何音频内容；播放地址由使用者自行导入的音源脚本解析。
