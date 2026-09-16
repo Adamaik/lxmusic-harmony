@@ -17,6 +17,10 @@
 - **同步**：洛雪同步协议（握手 / 加密 / 压缩 / 列表动作），可与洛雪桌面端互通
 - **设置**：播放设置 / 下载设置 / 缓存管理 / 音源管理 / 同步设置
 
+## 如何使用
+1. 自行构建签名安装
+2. 通过链接加入测试群组：https://appgallery.huawei.com/link/invite-test-wap?taskId=b4a29d53aca2244132b9a2b9b5c3bc74&invitationCode=9eHG2pO3r9g
+
 ## 构建
 
 需要 DevEco Studio（`compatibleSdkVersion` = 6.1.0(23)，`targetSdkVersion` = 26.0.0）。
