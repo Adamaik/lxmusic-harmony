@@ -232,7 +232,7 @@ await LxPlayer.getInstance().playUrl(url);
    在「当前源声明的平台 ∩ 内置搜索支持的平台」上按 `歌名 + 歌手` 搜一次，取最像的
    一条（先全等，再去掉空格/括号后包含匹配），转成带 musicInfo 的 `SongItem` 替换
    队列里这一条。以前这里直接走「演示模式」只推进度条，就是「点了播放没声音」的根因。
-2. **音质要和源协商。** 搜索页选的音质源不一定支持，`negotiateQuality()` 在
+2. **音质要和源协商。** 设置里选的播放音质源不一定支持，`negotiateQuality()` 在
    「`supported[platform].qualitys`」∩「该曲目的 `_types`」里按 flac24bit → 128k
    从高到低挑一个。`pickQuality()`（`MusicSearch.ets`）只从 320k 往下找，曲目缺
    128k 时会返回源并不支持的 128k，所以播放链路用自己这版更宽松的协商。

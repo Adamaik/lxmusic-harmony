@@ -2,7 +2,8 @@ import { C_BG, C_CARD, C_RED, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SegPills, SettingLabel, TOGGLE_LABELS, ToggleSetting } from '../ui/SettingWidgets';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
-import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_DESKTOP_LYRIC, K_EXTEND_QUALITY, K_EXTEND_QUALITY_TYPE,
+import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_DESKTOP_LYRIC, K_EXTEND_QUALITY,
+  K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
   K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
   PlaySettings } from '../core/settings/PlaySettings';
@@ -114,6 +115,8 @@ export struct PlaySettingsView {
   @StorageLink(K_LYRIC_FONT_SIZE) fontSize: number = 19;
   @StorageLink(K_LYRIC_KEEP_SCREEN) keepScreen: boolean = true;
   @StorageLink(K_DESKTOP_LYRIC) desktopLyric: boolean = true;
+  /** 本地音乐自动匹配歌词（要联网搜一次，所以给了开关） */
+  @StorageLink(K_AUTO_MATCH_LYRIC) autoMatchLyric: boolean = true;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
@@ -252,10 +255,22 @@ export struct PlaySettingsView {
               },
             })
             HintText({ text: this.desktopLyricHint() })
+            ToggleSetting({
+              label: '本地音乐自动匹配歌词',
+              value: this.autoMatchLyric,
+              onPick: (next: boolean) => {
+                PlaySettings.getInstance().setAutoMatchLyric(next);
+              },
+            })
+            HintText({
+              text: '本地歌没有平台身份，只能拿歌名与歌手去平台上搜一首对应的歌再取词（要联网，'
+                + '每首歌只搜一次）。匹配没把握时宁可不显示 —— 配错的歌词比没有歌词更糟；'
+                + '这时可以在播放页的「更多 - 匹配歌词」里自己搜一次、选正确的那条。'
+                + '同目录下的同名 .lrc 会随导入一起拷进来，优先用它，不联网也不会配错。',
+            })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })
-          .borderRadius(R_CARD)
+          .padding({ left: 16, right: 16, top: 17, bottom: 17 })          .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
           HintText({

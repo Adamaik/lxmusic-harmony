@@ -1,4 +1,4 @@
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
+import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
   R_CARD } from '../ui/Theme';
 import { I_CACHE, IconGlyph } from '../ui/Icons';
 import { AudioCache, K_CACHE_VERSION } from '../core/music/AudioCache';
@@ -294,6 +294,14 @@ export struct CacheSettingsView {
           this.audioCard()
           Text('边听边把整首下到应用沙箱，下次播放直接读本地：不联网、不受源脚本影响。'
             + '上限设 0 即关闭缓存。')
+            .fontSize(11.5)
+            .fontColor(C_TEXT_WEAK)
+            .width('100%')
+            .padding({ left: 4, right: 4 })
+            .textAlign(TextAlign.Start)
+          Text('下载永远给播放让路：正在听的那首缓冲不够时缓存会停下来等（网络就那么多，'
+            + '先把声音喂饱），够用了再接着下；断在半路的会留着，下次接着下，不从头重来。'
+            + '上一首还在播时也会提前取下下一首，切歌时直接读本地文件。')
             .fontSize(11.5)
             .fontColor(C_TEXT_WEAK)
             .width('100%')

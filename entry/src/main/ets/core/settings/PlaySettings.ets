@@ -58,6 +58,14 @@ export const K_LYRIC_FONT_SIZE: string = 'cfg_lyric_font_size';
 export const K_LYRIC_KEEP_SCREEN: string = 'cfg_lyric_keep_screen';
 /** 桌面歌词（系统歌词悬浮窗）开关 */
 export const K_DESKTOP_LYRIC: string = 'cfg_desktop_lyric';
+/**
+ * 本地音乐自动匹配歌词
+ *
+ * 本地歌没有平台身份，只能拿「歌名 + 歌手 + 时长」去平台搜一首对应的在线歌再取词，
+ * 也就是要联网。默认开着（大多数人希望本地歌也有滚动歌词），但它会发网络请求，
+ * 所以给一个开关；关掉之后仍然可以在播放页手动匹配。
+ */
+export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
 
 /** 落盘结构（字段全部可选：老文件里可能缺字段，缺的用默认值） */
 interface PlaySettingsData {
@@ -72,6 +80,7 @@ interface PlaySettingsData {
   lyricFontSize?: number;
   lyricKeepScreenOn?: boolean;
   desktopLyric?: boolean;
+  autoMatchLyric?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -121,6 +130,8 @@ export class PlaySettings {
    * 以前这个能力一接上就是「有词就显示」，没有开关；现在用户能关掉。
    */
   private desktopLyric: boolean = true;
+  /** 本地歌自动匹配歌词默认开，见 K_AUTO_MATCH_LYRIC 的说明 */
+  private autoMatchLyric: boolean = true;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -171,6 +182,7 @@ export class PlaySettings {
       lyricFontSize: this.lyricFontSize,
       lyricKeepScreenOn: this.lyricKeepScreenOn,
       desktopLyric: this.desktopLyric,
+      autoMatchLyric: this.autoMatchLyric,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -217,6 +229,9 @@ export class PlaySettings {
     if (data.desktopLyric !== undefined) {
       this.desktopLyric = data.desktopLyric;
     }
+    if (data.autoMatchLyric !== undefined) {
+      this.autoMatchLyric = data.autoMatchLyric;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -236,6 +251,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_LYRIC_FONT_SIZE, this.lyricFontSize);
       AppStorage.setOrCreate(K_LYRIC_KEEP_SCREEN, this.lyricKeepScreenOn);
       AppStorage.setOrCreate(K_DESKTOP_LYRIC, this.desktopLyric);
+      AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -409,6 +425,20 @@ export class PlaySettings {
     }
     this.desktopLyric = value;
     AppStorage.setOrCreate(K_DESKTOP_LYRIC, value);
+    this.write();
+  }
+
+  /** 本地音乐自动匹配歌词（要联网搜一次，所以给了开关） */
+  getAutoMatchLyric(): boolean {
+    return this.autoMatchLyric;
+  }
+
+  setAutoMatchLyric(value: boolean): void {
+    if (value === this.autoMatchLyric) {
+      return;
+    }
+    this.autoMatchLyric = value;
+    AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, value);
     this.write();
   }
 }

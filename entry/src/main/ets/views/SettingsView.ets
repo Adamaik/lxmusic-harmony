@@ -1,8 +1,6 @@
 import { C_BG, C_CARD, C_DIVIDER, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_GEAR, I_PERSON, I_REFRESH, I_THUMB_UP,
   I_VOLUME, IconGlyph } from '../ui/Icons';
-import { hdsEffectSupported, hdsMaterialType } from '../ui/Hds';
-import { isGlassMaterialSupported } from '../ui/Glass';
 import { PageTitle } from '../ui/Widgets';
 
 /** 设置项 */
@@ -27,7 +25,7 @@ const GROUP_PLAY: SettingRowDef[] = [
 ];
 
 const GROUP_THEME: SettingRowDef[] = [
-  { icon: I_BRUSH, title: '主题', action: 'theme' },
+  { icon: I_BRUSH, title: '外观', action: 'appearance' },
 ];
 
 const GROUP_OTHER: SettingRowDef[] = [
@@ -110,15 +108,6 @@ export struct SettingsView {
   onNavigate: (action: string) => void = () => {
   };
   @State keyword: string = '';
-  @State hdsText: string = '';
-
-  aboutToAppear(): void {
-    // HDS 视效在模拟器上不可用，这里把实际生效情况摊开，免得效果对不上时无从判断
-    const effect: string = hdsEffectSupported() ? '已启用' : '当前设备不支持（模拟器）';
-    // 玻璃（沉浸式材质）与视效是两个独立能力位
-    const glass: string = isGlassMaterialSupported() ? '系统材质可用' : '毛玻璃兜底';
-    this.hdsText = `HDS 沉浸视效：${effect}　沉浸光感材质：${hdsMaterialType()}（玻璃：${glass}）`;
-  }
 
   /** 按搜索词过滤一组设置项 */
   private filter(rows: SettingRowDef[]): SettingRowDef[] {
@@ -237,9 +226,10 @@ export struct SettingsView {
           // ------------------------------------------------ 播放 / 下载
           this.cardGroup(GROUP_PLAY)
 
-          // ------------------------------------------------ 主题
+          // ------------------------------------------------ 外观
           this.cardGroup(GROUP_THEME)
-          this.hint(this.hdsText)
+          this.hint('玻璃材质档位、首页流光、封面取色、深浅模式都在这一页；'
+            + '标题栏与底部页签栏用的是同一档材质')
 
           // ------------------------------------------------ 其它 / 关于
           this.cardGroup(GROUP_OTHER)

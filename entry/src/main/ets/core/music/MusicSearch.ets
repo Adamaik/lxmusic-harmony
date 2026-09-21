@@ -458,9 +458,11 @@ async function searchKg(str: string, page: number, limit: number): Promise<LxMus
   const url: string =
     `https://songsearch.kugou.com/song_search_v2?keyword=${encodeURIComponent(str)}&page=${page}&pagesize=${limit}` +
     '&userid=0&clientver=&platform=WebFilter&filter=2&iscorrection=1&privilege_filter=0&area_code=1';
+  let lastError: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const body: Record<string, Object> = await httpGetJson(url);
-    if (asNumber(body['error_code']) !== 0) {
+    lastError = asNumber(body['error_code']);
+    if (lastError !== 0) {
       continue;
     }
     const data: Record<string, Object> = asRecord(body['data']);
@@ -468,6 +470,10 @@ async function searchKg(str: string, page: number, limit: number): Promise<LxMus
     if (list.length > 0) {
       return list;
     }
+  }
+  // 接口报错不能当成「没搜到」：聚合搜索要按平台说清楚谁没通
+  if (lastError !== 0) {
+    throw new Error(`酷狗接口返回 error_code ${lastError}`);
   }
   return [];
 }
@@ -723,8 +729,11 @@ function httpGetJson(
 /**
  * 搜索音乐，返回可直接交给源规则解析播放链接的 musicInfo 列表。
  *
+ * 返回空数组 = 这个平台确实没搜到；接口不通（非 200 / error_code / code != 0）
+ * 一律抛错，不再返回空数组 —— 否则界面会把「接口挂了」显示成「没有搜索结果」。
+ *
  * @param keyword 关键词
- * @param source  平台：kw / kg / mg
+ * @param source  平台：kw / kg / mg / tx / wy
  * @param page    页码，从 1 开始
  * @param limit   每页数量
  */
@@ -755,6 +764,97 @@ export async function searchMusic(
   }
   // xm（喜马拉雅）在洛雪里整块是注释掉的死代码，没有可移植的实现
   throw new Error(`${source} 暂无内置搜索实现（当前支持：${SEARCH_PLATFORMS.join(' / ')}）`);
+}
+
+// ------------------------------------------------------------------ 聚合搜索
+
+/** 单个平台的搜索结果（失败也占一条，界面好把「哪个平台没通」说清楚） */
+export interface LxPlatformSearch {
+  source: string;
+  items: LxMusicInfo[];
+  /** 空串 = 这个平台搜成功 */
+  error: string;
+}
+
+/** 聚合搜索结果：逐平台一份（界面自己决定要不要交错合并） */
+export interface LxAggSearchResult {
+  keyword: string;
+  platforms: LxPlatformSearch[];
+}
+
+/**
+ * 把多份列表交错合并成一份：每个平台轮流取一条。
+ *
+ * 聚合搜索结果直接拼接是「30 条酷我 + 30 条酷狗」，用户在列表里要滚过一整个
+ * 平台才能看到另一个；交错后前几行就能横向比较同一首歌在各平台的结果 ——
+ * 这才是「聚合搜索」真正有用的地方。
+ *
+ * 放在这里而不是界面里：交错规则是搜索语义的一部分（和谁在前、取多少条有关），
+ * 哪天要改成按相关度排，也应该只改这一处。
+ */
+export function interleave<T>(lists: T[][]): T[] {
+  const merged: T[] = [];
+  let depth: number = 0;
+  let more: boolean = true;
+  while (more) {
+    more = false;
+    for (let i = 0; i < lists.length; i++) {
+      if (depth < lists[i].length) {
+        merged.push(lists[i][depth]);
+        more = true;
+      }
+    }
+    depth++;
+  }
+  return merged;
+}
+
+/** 单平台搜索，失败也返回（不抛），供聚合用 */
+export async function searchPlatform(
+  keyword: string,
+  source: string,
+  page: number = 1,
+  limit: number = 30,
+): Promise<LxPlatformSearch> {
+  try {
+    const items: LxMusicInfo[] = await searchMusic(keyword, source, page, limit);
+    return { source: source, items: items, error: '' };
+  } catch (e) {
+    return { source: source, items: [], error: (e as Error).message };
+  }
+}
+
+/**
+ * 聚合搜索：一次问所有平台。
+ *
+ * 单个平台失败（超时、接口改了、歌没版权…）不该让整次搜索失败，
+ * 所以逐平台各自 try 一遍，失败的把原因带回来给界面显示。
+ */
+export async function searchMusicAll(
+  keyword: string,
+  sources: string[] = SEARCH_PLATFORMS,
+  page: number = 1,
+  limit: number = 30,
+): Promise<LxAggSearchResult> {
+  const str: string = keyword.trim();
+  if (str.length === 0) {
+    throw new Error('请输入搜索关键词');
+  }
+  const tasks: Promise<LxPlatformSearch>[] = [];
+  for (let i = 0; i < sources.length; i++) {
+    tasks.push(searchPlatform(str, sources[i], page, limit));
+  }
+  const settled: PromiseSettledResult<LxPlatformSearch>[] = await Promise.allSettled(tasks);
+  const platforms: LxPlatformSearch[] = [];
+  for (let i = 0; i < settled.length; i++) {
+    const r: PromiseSettledResult<LxPlatformSearch> = settled[i];
+    if (r.status === 'fulfilled') {
+      platforms.push(r.value);
+    } else {
+      platforms.push({ source: sources[i], items: [], error: '搜索失败' });
+    }
+  }
+  return { keyword: str, platforms: platforms };
 }
 
 // ------------------------------------------------------------------ QQ 音乐 tx
@@ -927,6 +1027,7 @@ function addTxQuality(
 }
 
 async function searchTx(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+  let lastCode: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const body: string = createTxRequestBody(str, page, limit);
     const sign: string = createZzcSign(body);
@@ -935,7 +1036,8 @@ async function searchTx(str: string, page: number, limit: number): Promise<LxMus
     const resp: Record<string, Object> = await httpPostJson(url, body, headers);
     const service: Record<string, Object> = asRecord(resp['music.search.SearchCgiService']);
     const req: Record<string, Object> = service['code'] !== undefined ? service : asRecord(resp['req']);
-    if (asNumber(resp['code']) !== 0 || asNumber(req['code']) !== 0) {
+    lastCode = asNumber(resp['code']) !== 0 ? asNumber(resp['code']) : asNumber(req['code']);
+    if (lastCode !== 0) {
       continue;
     }
     const data: Record<string, Object> = asRecord(req['data']);
@@ -945,6 +1047,10 @@ async function searchTx(str: string, page: number, limit: number): Promise<LxMus
     if (list.length > 0) {
       return list;
     }
+  }
+  // 同上：接口报错如实抛，别伪装成「没搜到」
+  if (lastCode !== 0) {
+    throw new Error(`QQ 音乐接口返回 code ${lastCode}`);
   }
   return [];
 }
@@ -1067,6 +1173,7 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
     'total': page === 1,
     'limit': limit,
   };
+  let lastCode: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const dataJson: string = JSON.stringify(params);
     const form: Record<string, string> = { 'params': createEapiParams(path, dataJson) };
@@ -1075,7 +1182,8 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
       'origin': 'https://music.163.com',
     };
     const body: Record<string, Object> = await httpPostForm('http://interface.music.163.com/eapi/batch', form, headers);
-    if (asNumber(body['code']) !== 200) {
+    lastCode = asNumber(body['code']);
+    if (lastCode !== 200) {
       continue;
     }
     const data: Record<string, Object> = asRecord(body['data']);
@@ -1083,6 +1191,12 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
     if (list.length > 0) {
       return list;
     }
+  }
+  // 接口返非 200 时以前也是返回空数组，界面上就成了「没有搜索结果（网易）」
+  // —— 接口不通被伪装成「没搜到」（见 docs/DEFECTS.md D-001）。聚合搜索要按平台
+  // 报「谁没通」，所以这里把接口错误如实抛出去；code 200 但确实没资源才返回空。
+  if (lastCode !== 200) {
+    throw new Error(`网易接口返回 code ${lastCode}（该接口当前不可用）`);
   }
   return [];
 }

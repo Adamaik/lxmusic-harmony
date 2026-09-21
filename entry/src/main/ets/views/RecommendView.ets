@@ -1,7 +1,10 @@
 import { LIST_PLATFORMS, LxBoardItem, LxPlaylistItem, LxSortItem, OnlineRoute, getBoards, getRecommendPlaylists, platformName, sortListOf } from '../core/music/MusicList';
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
-import { I_CHEVRON_RIGHT, I_DISC, I_MIC, I_PLAY, I_SEARCH, IconGlyph } from '../ui/Icons';
+import { C_BG, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_MIC, I_PLAY, I_SEARCH, IconGlyph } from '../ui/Icons';
 import { CoverArt, PageTitle, RoundIconButton, SectionTitle } from '../ui/Widgets';
+import { HdsFlowLightBackground } from '../ui/Hds';
+import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { K_FLOW_LIGHT, K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 
 /** 在线排行榜卡片 */
 @Component
@@ -171,12 +174,14 @@ export struct RecommendView {
   @Prop bottomInset: number = 0;
   onOpenSearch: () => void = () => {
   };
-  onOpenSource: () => void = () => {
-  };
   onOpenOnline: (route: OnlineRoute) => void = () => {
   };
   /** 当前推荐来源，切走再回来保持上次选的平台 */
   @StorageLink(K_RECOMMEND_SOURCE) platform: string = 'kw';
+  /** 首页是否挂 HDS 背景流光（外观设置里可关，关掉就不挂这一层） */
+  @StorageLink(K_FLOW_LIGHT) flowLight: boolean = true;
+  /** 玻璃厚度档位（外观设置）：两个下拉框的玻璃跟着它变 */
+  @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   @State sorts: LxSortItem[] = sortListOf('kw');
   @State sortIndex: number = 0;
   @State boards: LxBoardItem[] = [];
@@ -201,6 +206,14 @@ export struct RecommendView {
   private currentSortId(): string {
     if (this.sortIndex >= 0 && this.sortIndex < this.sorts.length) {
       return this.sorts[this.sortIndex].id;
+    }
+    return '';
+  }
+
+  /** 当前排序的名字（下拉框上显示的就是它） */
+  private currentSortName(): string {
+    if (this.sortIndex >= 0 && this.sortIndex < this.sorts.length) {
+      return this.sorts[this.sortIndex].name;
     }
     return '';
   }
@@ -313,35 +326,37 @@ export struct RecommendView {
 
   // ------------------------------------------------------------ 构建
 
+  /**
+   * 来源下拉菜单
+   *
+   * 用系统的 Menu + MenuItem（和歌单页的「更多」菜单同一套），而不是 Select 自带的菜单：
+   * 这样胶囊与菜单都由这里控制，也不会出现组件内外两套尺寸打架的问题。
+   */
   @Builder
-  sourcePill(id: string) {
-    Text(platformName(id))
-      .fontSize(13.5)
-      .fontWeight(this.platform === id ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.platform === id ? Color.White : '#3A3A3C')
-      .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-      .borderRadius(16)
-      .backgroundColor(this.platform === id ? C_RED : C_CARD)
-      .animation({ duration: 180, curve: Curve.EaseInOut })
-      .onClick(() => {
-        this.switchPlatform(id);
-      })
+  sourceMenu() {
+    Menu() {
+      ForEach(LIST_PLATFORMS, (id: string) => {
+        MenuItem({ content: platformName(id) })
+          .onClick(() => {
+            this.switchPlatform(id);
+          })
+      }, (id: string) => id)
+    }
   }
 
+  /** 排序下拉菜单（各平台给的排序项不一样，有几个列几个） */
   @Builder
-  sortPill(item: LxSortItem, index: number) {
-    Text(item.name)
-      .fontSize(13.5)
-      .fontWeight(this.sortIndex === index ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.sortIndex === index ? C_RED : '#3A3A3C')
-      .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-      .borderRadius(16)
-      .backgroundColor(this.sortIndex === index ? '#FBE9E9' : C_CARD)
-      .animation({ duration: 180, curve: Curve.EaseInOut })
-      .onClick(() => {
-        this.switchSort(index);
-      })
+  sortMenu() {
+    Menu() {
+      ForEach(this.sorts, (item: LxSortItem, index: number) => {
+        MenuItem({ content: item.name })
+          .onClick(() => {
+            this.switchSort(index);
+          })
+      }, (item: LxSortItem, index: number) => `${index}_${item.id}`)
+    }
   }
+
 
   @Builder
   playlistRow(item: LxPlaylistItem) {
@@ -365,7 +380,9 @@ export struct RecommendView {
         if (this.playlistMeta(item).length > 0) {
           Text(this.playlistMeta(item))
             .fontSize(F_SUB)
-            .fontColor(C_TEXT_WEAK)
+            // 作者 / 播放量这一行要用深一点的灰：底色本来就是浅灰，
+            // 原来那档（C_TEXT_WEAK）压在上面几乎看不见
+            .fontColor(C_TEXT_SUB)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
@@ -421,46 +438,51 @@ export struct RecommendView {
   }
 
   build() {
-    Column() {
+    /**
+     * 首页底色之上、内容之下铺一层 HDS 背景流光（着色器，10 秒一圈无限循环）。
+     *
+     * 底色必须留在这层 Stack 上：如果把不透明底色写在内容那一层，流光会被整片盖住，
+     * 看上去就是「加了没效果」——这一点是这套光效唯一容易踩的坑。
+     * 流光层本身铺满、不拦触摸，不影响原有布局与交互。
+     */
+    Stack({ alignContent: Alignment.TopStart }) {
+      if (this.flowLight) {
+        HdsFlowLightBackground()
+      }
+
+      Column() {
       // ---------------------------------------------------- 顶栏
       Row({ space: 10 }) {
         PageTitle({ text: '推荐' })
         Blank()
-        RoundIconButton({ icon: I_DISC, boxSize: 40, iconSize: 21, onTap: this.onOpenSource })
-        RoundIconButton({ icon: I_SEARCH, boxSize: 40, iconSize: 21, onTap: this.onOpenSearch })
+        /**
+         * 推荐来源（酷我 / 酷狗 / 咪咕 / QQ / 网易云）
+         *
+         * 自己画胶囊 + 系统的下拉菜单（bindMenu），不再用系统 `Select` 外面再套一层自绘框：
+         * Select 自带一套内边距与高度（≥40vp），塞进 38vp 的框里就会出现「框一种尺寸、
+         * 文字按另一种尺寸排」的错位。现在框高、文字基线、箭头间距全由这里定，必然对得上。
+         *
+         * 位置仍是原来那颗「音源设置」圆钮的位置（音源设置在「设置」页有入口）。
+         */
+        Row({ space: 3 }) {
+          Text(platformName(this.platform))
+            .fontSize(14.5)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(C_TEXT)
+            .maxLines(1)
+          IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 14, color: C_TEXT_SUB })
+        }
+        .height(36)
+        .padding({ left: 14, right: 10 })
+        .attributeModifier(thinGlass(18, false, '', this.materialLevel))
+        .systemMaterial(immersiveMaterialFor(this.materialLevel))
+        .bindMenu(this.sourceMenu())
+        .accessibilityText(`推荐来源：${platformName(this.platform)}，点按切换`)
+        .accessibilityLevel('yes')
+        RoundIconButton({ icon: I_SEARCH, boxSize: 40, iconSize: 21, label: '搜索', onTap: this.onOpenSearch })
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 6 })
-
-      // ---------------------------------------------------- 推荐来源
-      Scroll() {
-        Row({ space: 8 }) {
-          ForEach(LIST_PLATFORMS, (id: string) => {
-            this.sourcePill(id)
-          }, (id: string) => id)
-        }
-        .padding({ left: 16, right: 16 })
-      }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
-      .height(44)
-
-      // ---------------------------------------------------- 排序页签（有的平台只有一个，就不占位）
-      if (this.sorts.length > 1) {
-        Scroll() {
-          Row({ space: 8 }) {
-            ForEach(this.sorts, (item: LxSortItem, index: number) => {
-              this.sortPill(item, index)
-            }, (item: LxSortItem, index: number) => `${index}_${item.tid}`)
-          }
-          .padding({ left: 16, right: 16 })
-        }
-        .scrollable(ScrollDirection.Horizontal)
-        .scrollBar(BarState.Off)
-        .width('100%')
-        .height(42)
-      }
 
       // ---------------------------------------------------- 内容
       Refresh({ refreshing: $$this.refreshing }) {
@@ -519,6 +541,30 @@ export struct RecommendView {
                   .fontSize(12)
                   .fontColor(C_TEXT_WEAK)
               }
+              /**
+               * 排序（推荐 / 最热 / 最新 / 收藏 / 攀升…）
+               *
+               * 原来是标题下面另一排横滑胶囊，现在并到这一栏、靠右做成下拉框：
+               * 它管的就是这一栏的内容，和标题挨在一起比单独占一行更好理解。
+               * 各平台给了几个就用几个，只有一个时不显示（没什么可选的）。
+               */
+              if (this.sorts.length > 1) {
+                Row({ space: 3 }) {
+                  Text(this.currentSortName())
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(C_RED)
+                    .maxLines(1)
+                  IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 13, color: C_RED })
+                }
+                .height(30)
+                .padding({ left: 12, right: 8 })
+                .attributeModifier(thinGlass(15, false, '', this.materialLevel))
+                .systemMaterial(immersiveMaterialFor(this.materialLevel))
+                .bindMenu(this.sortMenu())
+                .accessibilityText(`排序：${this.currentSortName()}，点按切换`)
+                .accessibilityLevel('yes')
+              }
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: this.boards.length > 0 ? 22 : 4, bottom: 10 })
@@ -531,14 +577,9 @@ export struct RecommendView {
           } else {
             LazyForEach(this.playlistSource, (item: LxPlaylistItem) => {
               ListItem() {
-                Column() {
-                  this.playlistRow(item)
-                  Divider()
-                    .strokeWidth(0.6)
-                    .color(C_DIVIDER)
-                    .margin({ left: 86 })
-                }
-                .width('100%')
+                // 行与行之间不画分隔线：封面 + 两行字自己就能分开，多一条浅色横线
+                // 在浅灰底上反而像一条白缝
+                this.playlistRow(item)
               }
             }, (item: LxPlaylistItem) => `${item.id}_${item.name}`)
 
@@ -584,14 +625,18 @@ export struct RecommendView {
           void this.loadMore();
         })
       }
-      .layoutWeight(1)
+        .layoutWeight(1)
+        .width('100%')
+        .onRefreshing(() => {
+          void this.reload();
+        })
+      }
       .width('100%')
-      .onRefreshing(() => {
-        void this.reload();
-      })
+      .height('100%')
     }
     .width('100%')
     .height('100%')
+    // 底色挂在外层 Stack（流光层之上、内容之下），别挪回内容那一层
     .backgroundColor(C_BG)
   }
 }

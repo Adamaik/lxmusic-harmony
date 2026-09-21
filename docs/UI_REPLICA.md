@@ -7,12 +7,13 @@
 
 ```
 pages/Index.ets                 壳层：四个页签 + 底部玻璃层 + 全屏播放器 + 播放列表半模态 + 音源沙箱
-views/RecommendView.ets         推荐：排行榜横滑卡片、筛选胶囊、精选推荐列表
+views/RecommendView.ets         推荐：顶栏来源下拉框 + 排行榜横滑卡片 + 推荐歌单（栏内排序下拉框）
 views/PlaylistView.ets          歌单：列表 + SongListPane（与「我的」共用）
+views/ImportPlaylistSheet.ets   导入歌单：粘贴分享链接 → 解析预览 → 落成本地歌单
 views/MineView.ets              我的：播放历史/收藏/平台音乐/下载管理 分段胶囊
 views/SettingsView.ets          设置：搜索框、登录卡、音源/播放/下载/主题/其它 分组
 views/SourceSettingsView.ets    音源设置（真功能：导入在线音源、加载、删除、日志、离线自检）
-views/SearchView.ets            搜索页（真功能：kw/kg/mg/tx/wy 五平台 + 音质选择）
+views/SearchView.ets            搜索页（真功能：一次聚合搜五平台 + 结果按平台筛选下拉框）
 views/PlayerView.ets            全屏播放器：封面页/歌词页横滑双页（歌词随进度自动滚动）
 views/PlayQueueSheet.ets        播放列表内容（外面的半模态是系统 bindSheet）
 views/MiniBar.ets               HdsTabs 迷你栏内容：折叠=唱片圆钮，展开=迷你播放器
@@ -22,6 +23,7 @@ core/music/CoverStore.ets       封面懒解析 + 缓存（列表陆续出图）
 core/music/Lyric.ets            LRC 解析与当前行定位
 core/music/PlatformLyric.ets    内置平台歌词（kw/kg/tx/mg）
 core/music/Inflate.ets          纯 ArkTS zlib/deflate 解压（酷我歌词用）
+core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短链跟随 + lxmusic 深链，见 docs/LIST_IMPORT.md）
 ```
 
 ## 图标：官方符号图标库
@@ -43,28 +45,170 @@ core/music/Inflate.ets          纯 ArkTS zlib/deflate 解压（酷我歌词用�
 - 全应用不再有自绘路径图标：播放页那颗播放钮也从自绘「水滴」改成了圆形底 +
   官方 `play_fill` / `pause_fill`（原来那条 `PLAY_BLOB` 路径和 `scalePath()` 已删除）。
 
-## 华为玻璃动效 + HDS 沉浸视效
+## 华为玻璃动效 + HDS 光效
 
 三层叠加：
 
 1. **沉浸式系统材质**（`uiMaterial.ImmersiveMaterial`，API 26）：系统在材质层做滤镜，
    `interactive: true` 是按压形变反馈，`lightEffect` 是光感交互反馈。
    封装在 `ui/Glass.ets`，每个玻璃层同时设置材质与 `backgroundBlurStyle` 兜底。
-2. **HDS 沉浸视效**（UI Design Kit `@kit.UIDesignKit`，见 `ui/Hds.ets`）：
-   `HdsVisualComponent` + `HdsSceneController`，场景
-   `HdsSceneType.DUAL_EDGE_FLOW_LIGHT_WITH_BACKGROUND_MASK`（双边边缘流光 +
-   背景叠加色），`setSceneParams({backgroundMaskColors, firstEdgeFlowLight,
-   secondEdgeFlowLight})` 配置两条光带（起止位置按周长比例 + 颜色），
-   用 `start/pause/resume/stop` 控制。原先用在自绘的底部导航胶囊上；
-   底栏换成 HDS 悬浮页签后，这块暂时没有落点了（保留待用）。
+2. **HDS 光效**（UI Design Kit `@kit.UIDesignKit`，见 `ui/Hds.ets`）：走 `hdsEffect` 的
+   **着色器**路径 —— `HdsEffectBuilder().shaderEffect({...}).buildEffect()` 产出一个
+   `VisualEffect`（`uiEffect.VisualEffect`，API 12 起的通用属性），挂在任意组件的
+   `.visualEffect()` 上，**不需要现成控件当载体**：
+   - `HdsFlowLightBackground`：`EffectType.UV_BACKGROUND_FLOW_LIGHT`，整片背景流光。
+     挂在首页（`views/RecommendView.ets`）内容 Stack 的首个子节点，10 秒一圈、无限循环、
+     透明度 0.5；页面底色要上移到那层 Stack —— 底色留在内容层会把流光整片盖住。
+   - `HdsEdgeFlowLight`：`EffectType.DUAL_EDGE_FLOW_LIGHT`，轮廓流光。
+     挂在播放页的播放钮下面（白色主光带 + 一点品牌红副光带）。
+   - 两者都铺满父容器、`HitTestMode.Transparent`，不影响布局与交互；
+     首页流光可在「设置 - 外观」里关掉。
 3. **HDS 玻璃材质色**：描边取 `$r('sys.color.glass_material_outline_primary')`，
    亮暗模式与系统一致；取不到时退回自绘高光边。
 
+### 悬浮控件的玻璃：照着派音抄（这才是「为什么它好看」的答案）
+
+把派音的源码逐行读完之后，结论和我之前做的是**反的**：
+
+- **它的顶栏圆钮根本不用玻璃、不用材质、不用光效**（`HomeTopBar.ets`）：就三个属性 ——
+  `backgroundColor('#1AFFFFFF')`（10% 白）+ `borderWidth(1)` + `borderColor('#FFFFFF')`
+  （纯白 1px 描边），`40×40 / borderRadius 20`。暗色下换成 `#19FFFFFF` / `#66FFFFFF`。
+  **全项目没有一处 `shadow()`。**
+- **它的左右筛选栏用的是系统组件** `CapsuleSegmentButtonV2`
+  （`@ohos.arkui.advanced.SegmentButtonV2`，见它的 `CapsuleSegmentedSelector.ets`）：
+  底是页面同色系的浅灰、选中项是强调色药丸 + 反白字。
+- 玻璃只出现在**大面**上（迷你栏、hero 上的按钮）：`backgroundBlurStyle(BACKGROUND_THICK)`
+  + `#26ffffff` 描边，就这些。
+- 它好看的根本原因不只是"配方"，而是**平台组件用得多**：HDS 的标题栏 / 悬浮页签栏 / 半模态、
+  系统 `CapsuleSegmentButtonV2` / `Chip` / `bindSheet` / 菜单 —— 圆角、间距、动效都是平台定的。
+
+所以 listen 这边改成：
+
+| 控件 | 现在的做法 |
+| --- | --- |
+| 我的页分段筛选 | 系统 `CapsuleSegmentButtonV2`（`ui/CapsuleSegment.ets`，V2 组件）——与派音同一个组件 |
+| 顶栏圆钮（搜索 / 导入 / 新建 / 清空…）| 派音那颗钮的配方：10% 白底 + 纯白 1vp 描边，**去掉阴影、去掉轮廓光效** |
+| 两个下拉框 | **自己画胶囊 + 系统下拉菜单**（`bindMenu` + `Menu`/`MenuItem`），不是系统 `Select`：Select 自带一套内边距与高度（≥40vp），外面再套自绘框会出现「框一种尺寸、文字按另一种尺寸排」的错位。自绘后框高（36 / 30）、圆角（18 / 15）、内边距、箭头间距全可控 |
+| 标题栏 / 底部页签栏 / 半模态 | HDS 的系统材质（平台认可的表面，材质真能渲染） |
+
+之前的「粗糙」有两层原因：一是给悬浮控件**加了阴影和自发光**，那会把它变成"实心白牌子"；
+二是我一直在手画本该交给平台的组件。
+
+### 系统材质（`.systemMaterial`）在内容区不生效这件事
+
+`uiMaterial` / `.systemMaterial()` 是 **API 26** 的接口，而 HDS 里接受 `SystemMaterialParams` 的
+只有两处：标题栏（`TitleBarStyleOptions.systemMaterialEffect`）和 `HdsTabs` 的浮动页签栏
+（`HdsTabsFloatingStyle.systemMaterialEffect`），加上半模态 —— 底部导航栏之所以有材质，
+是因为它是"底部页签栏"这个平台认可的表面。内容区里的普通按钮拿不到。
+
+代码里仍然保留这条路（`immersiveMaterialFor()` + `.systemMaterial()`，能力位不支持时返回
+`undefined`），能生效就生效，不生效就落在上面那层自绘玻璃上 —— 但**不要指望它**，
+界面的观感是照着派音那套调的。
+
+### 悬浮控件的玻璃：走系统材质，和底部导航栏同一套
+
+底部导航栏那种「流光溢彩」是**系统沉浸材质**画的（折射、随底下内容提亮、按压形变、
+光感反馈都在材质滤镜里）。`systemMaterial` 是 API 26 起的**通用属性**
+（`uiMaterial.ImmersiveMaterial`），任何组件都能挂 —— 不是只能用在标题栏 / 底部 TabBar /
+弹窗上，那是早先版本的限制，之前照那条限制自己手画磨砂，所以看着「粗糙」。
+
+`ui/Glass.ets` 的 `GlassModifier` 现在分三层，一层层降级：
+
+1. **系统材质**（首选，能力位在就挂）：
+   `ImmersiveMaterial({ style, interactive: true, lightEffect: { color: 主题色 }, applyShadow: true })`
+   - `style` 跟随外观设置的档位（`immersiveStyleOf`，跟随系统时问 `getGlobalMaterialLevel()`）；
+   - `interactive` = 按压形变反馈；`lightEffect` = 光感交互反馈（动感光效的来源）。
+2. **轮廓点光**（可选，`withPointLight()`）：HDS 的 `pointLight` 着色器（`SOFT` 柔光 +
+   `BORDER` 只照亮轮廓），给悬浮控件边沿加一圈光，让它们「立」起来。
+   圆钮、两个下拉框、我的页分段栏都开了。
+3. **自绘兜底**：毛玻璃模糊 + **上亮下暗的轻渐变**（纯色底太死）+ 1vp 系统玻璃描边 +
+   轻阴影。只有在设备没有材质能力位、或材质构造失败时才是唯一的一层；
+   支持时它仍然先画上去 —— 材质生效会接管底色 / 描边 / 阴影，
+   万一某个机型上材质在内容区不渲染，控件也不会变成一片透明。
+
+走这一套的控件（改档位时一起变厚变薄）：顶栏圆钮（搜索 / 导入 / 新建 / 清空…）、
+**两个下拉框**（首页来源、「推荐歌单」栏的排序）、**我的页分段筛选**（做成左右留边、
+大圆角的浮动玻璃条，与底部导航栏同一个观感）、搜索框、页内悬浮迷你播放条、提示条。
+
+### 材质档位（标题栏 / 页签栏 / 半模态 + 全部自绘玻璃层）
+
+`ui/Hds.ets` 的 `buildTitleMaterial(level)` 把「跟随系统 / 弱 / 均衡 / 强」映射成
+`hdsMaterial` 的 `SMOOTH / GENTLE / EXQUISITE / ADAPTIVE`，三处都调它：
+
+| 位置 | 字段 |
+| --- | --- |
+| 子页面标题栏 | `titleBar()` 的 `style.systemMaterialEffect`（见 `Index.titleBarOptions`） |
+| 底部悬浮页签栏 | `barFloatingStyle.systemMaterialEffect` |
+| 半模态（播放列表 / 同步方式）| `bindSheet` 的 `systemMaterial` |
+
+档位存在 `core/settings/AppearanceSettings.ets`（沙箱 JSON + AppStorage），
+在「设置 - 外观」里改，改完一起变：
+
+| 档位 | 系统材质（标题栏 / 页签栏 / 半模态） | 自绘玻璃层（`buildGlassBlur`） |
+| --- | --- | --- |
+| 跟随系统 | `ADAPTIVE` | `COMPONENT_THICK`（自绘层没有系统档位可跟，按均衡偏厚） |
+| 弱 | `SMOOTH` | `COMPONENT_THIN` |
+| 均衡 | `GENTLE` | `COMPONENT_REGULAR` |
+| 强 | `EXQUISITE` | `COMPONENT_ULTRA_THICK` |
+
+自绘层的档位是响应式的：宿主组件用 `@StorageLink(K_MATERIAL_LEVEL)` 订阅，在 build 里按当前值
+取玻璃 —— 与派音「一个 `AmbientState` 驱动全应用玻璃厚度」是同一个做法。
+
+### 子页面标题栏
+
+`Index.titleBarOptions(title, scroller?)` 一个函数管全部 9 个子页面：
+
+- `blurStrategy: ENABLE` + `systemMaterialEffect`：标题栏是磨砂玻璃，而不是一条死白；
+- 标题与图标色取 `$r('sys.color.font_primary')`（跟随系统深浅模式）；
+- 传了 `scroller` 才开 `IMMERSIVE_GRADIENT_BLUR`：在线歌单 / 歌单详情两页的封面会滚到
+  标题栏底下，靠 `HdsNavDestination.bindToScrollable([scroller])` 拿滚动偏移，
+  返回键从浮在封面上渐变成浮在磨砂上；白底设置页不绑滚动，直接上材质更稳。
+
 > **模拟器不支持 HDS 沉浸视效**（官方文档明确列出：点光源效果、按压阴影、
 > 双边边缘流光、背景流光、自带背景的双边流光、沉浸光感材质）。
-> 所以 `ui/Hds.ets` 里用 `canIUse('SystemCapability.UIDesign.HDSComponent.Core')`
-> 加模拟器检测做了自动跳过（模拟器上 `const.product.model` 是 `emulator`），
-> 真机自动生效。设置页底部会把实际生效情况写出来，方便对不上时定位。
+> 但代码**不因为模拟器就把能力关掉**：`hdsEffectSupported()` 只看能力位
+> （`canIUse('SystemCapability.UIDesign.HDSComponent.Core')`），能不能画出来交给平台 ——
+> 早先那版额外做了「模拟器就整层跳过」，结果是哪里都没有效果，设置页还把原因写成
+> 「当前设备不支持」，对不上问题。现在「设置 - 外观」底部会把能力位 / 材质类型 /
+> 是否模拟器如实写出来，方便对不上时定位。
+
+## 外观设置（设置 - 外观）
+
+`views/AppearanceSettingsView.ets` + `core/settings/AppearanceSettings.ets`
+（沙箱 `appearance_settings.json`，改完立即落盘）：
+
+| 项 | 作用范围 |
+| --- | --- |
+| 玻璃材质档位 | 标题栏 / 底部页签栏 / 半模态 |
+| 首页流光 | 首页 HDS 背景流光（关掉就不挂这一层，省一份着色器） |
+| 播放页封面圆角 | 播放页大封面（0 直角 ~ 40 接近圆形，默认 12） |
+
+**深浅模式故意没放进来**：自绘界面的颜色还在 `ui/Theme.ets` 的常量里，只切系统的
+`setColorMode` 会出现「浅色界面 + 深色系统栏」的四不像。要开放这一项，得先把全部颜色
+迁到资源（`resources/base` 与 `resources/dark` 下的同名 token，含现在散在视图里的
+内联色值），再读设置里的档位去 `setColorMode`。
+
+## 动效与无障碍（照着派音那套补齐的）
+
+- **封面弹簧**：播放 / 暂停时封面弹一下（`views/PlayerView.ets`，stiffness 220 /
+  damping 13，16ms 一帧做数值积分，约 12% 过冲后收住）。Curve 里没有带过冲的弹簧，
+  所以自己积。
+- **符号替换动效**：`ui/Icons.ets` 的 `IconGlyph` 加了 `replaceEffect`，播放 <-> 暂停、
+  收藏 <-> 取消收藏是「长成另一个形状」，不是硬切（默认关，列表里成百上千个图标不该
+  各自带动效）。
+- **首页筛选收进顶栏**：来源（酷我 / 酷狗 / 咪咕 / QQ / 网易云）与排序（推荐 / 最热 / 最新…）
+  原来是标题下面两排横滑胶囊，总共占掉 86vp 的高度。现在来源做成顶栏右侧的下拉框
+  （系统 `Select`，位置就是原来那颗「音源设置」圆钮的位置），排序并进「推荐歌单」那一栏靠右，
+  内容因此上移一屏。两个下拉框都只放真正可选项 —— `Select` 的选中态由组件自己维护，
+  混进「跳页入口」这类不是选项的条目，选完会停在那一条上改不回来。
+- **歌单行不再画分隔线**：封面 + 两行字自己就能分开，浅灰底上那条 `C_DIVIDER` 看着像一条白缝；
+  行里的作者 / 播放量从 `C_TEXT_WEAK` 换成 `C_TEXT_SUB`（原来的灰压在同色系底上几乎看不见）。
+- **空状态**：`ui/Widgets.ets` 的 `EmptyState`（官方符号 + 主文案 + 怎么才有内容的副文案），
+  歌单 / 歌单详情 / 播放列表等处不再各写一段灰字。
+- **无障碍**：图标钮与列表行都给了 `accessibilityText` / `accessibilityGroup`
+  （之前全应用 0 处）：圆钮、歌曲行、迷你栏、播放页控制区；
+  纯装饰的图标（封面上的音量指示、行尾箭头、未接功能的铃铛）标 `accessibilityLevel('no')`，
+  读屏不会报出一个点不动的按钮。
 
 ## HDS 增强组件
 
@@ -282,6 +426,27 @@ HdsListItemCard({
    铺满整屏，再按 `getWindowAvoidArea` 读到的避让高度做留白；读到 0 说明系统已经
    避让过，此时要按 0 处理，否则会双重留白（标题被推得很低）。
 
+## 搜索页：聚合搜索 + 平台筛选
+
+搜索页不再先让人选一个平台再搜，而是**一次问五个平台**（`searchMusicAll()`，
+`Promise.allSettled` 并发，单个平台超时/接口变了不让整次搜索失败）：
+
+- 结果按「每个平台轮流取一条」交错合并（`interleave()`）。直接拼接是「30 条酷我 +
+  30 条酷狗」，要滚过一整个平台才看得到另一个；交错后前几行就能横向比较同一首歌
+  在各平台的结果——同一首歌常常只有一两个平台能拿到播放链接，这才是聚合的用处。
+- 结果栏右端一个**平台筛选下拉框**（和推荐页两个下拉框同款：自己画的胶囊 +
+  `bindMenu` 系统菜单）。菜单项带着各平台这次搜到几首（搜到 0 首或失败也照实写），
+  切换只换现成的列表，不重新联网。不筛 = 全部平台的聚合结果。
+  筛选会记住（换关键词也还在那个平台）；但筛的平台这次一条都没有（多半没通）时
+  自动退回「全部」，免得人对着空列表看不出别的平台有结果。
+- 结果行上带**平台标签**（品牌色小胶囊，`platformColor/platformTint`）：
+  聚合结果里同一首歌有好几条，不标出来分不清哪条是哪个站。
+- **音质选择从搜索页撤掉了**：它和「设置 - 播放设置 - 播放音质」写的是同一个值
+  （两边各写一趟，还各自有个默认值），留在搜索页只是多一个入口；现在搜索页只负责
+  搜索，音质统一听设置的。
+- 状态行与空态会说清楚「哪个平台没通」（`本次 酷我 30 · 酷狗 失败 · …`），
+  失败的平台可以单独切过去看，而不是笼统地报一句「搜索失败」。
+
 ## 数据与功能边界
 
 - 演示数据（播放历史、歌单、精选推荐、播放队列、排行榜卡片）在
@@ -291,7 +456,7 @@ HdsListItemCard({
   `PlaySession.ensurePlayable()` 会先按「歌名 + 歌手」在当前音源声明且内置搜索支持的
   平台上搜一次，拿到真实 musicInfo 后再交给源规则解析播放链接，并把队列里这条替换成
   真实条目（封面、时长跟着变真实）。解析结果按歌名缓存在 `resolveCache` 里，不会每次重搜。
-- **音质按源声明协商**：搜索页选的音质不一定被音源支持，`negotiateQuality()` 会在
+- **音质按源声明协商**：设置里选的音质不一定被音源支持，`negotiateQuality()` 会在
   「源声明的 qualitys」∩「这首歌提供的 `_types`」里从高到低挑一个；直接把用户选的音质
   丢给源，遇到不支持该音质的源就会解析失败（表现出来就是点了没反应）。
 - **进度 / 时长 / 播放态全部来自 AVPlayer**：`LxPlayer` 把 `timeUpdate` / `durationUpdate` /

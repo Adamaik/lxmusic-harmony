@@ -1,94 +1,38 @@
 import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
-import { common } from '@kit.AbilityKit';
-import { BusinessError } from '@kit.BasicServicesKit';
-import { HintText, OptionSetting, SegPills, SettingLabel, ToggleSetting } from '../ui/SettingWidgets';
-import { DownloadManager, PickDirResult } from '../core/download/DownloadManager';
-import { DownloadSettings, K_DOWNLOAD_MARK_QUALITY, K_DOWNLOAD_NAME_FORMAT, K_DOWNLOAD_SAVE_MODE,
-  NAME_FORMAT_LABELS, NAME_FORMATS, SAVE_MODE_LABELS, SAVE_MODES } from '../core/download/DownloadSettings';
-
-const SAVE_MODE_INDEX: Record<string, number> = { 'manual': 0, 'app': 1 };
+import { HintText, OptionSetting, SettingLabel, ToggleSetting } from '../ui/SettingWidgets';
+import { DownloadManager } from '../core/download/DownloadManager';
+import { DownloadSettings, K_DOWNLOAD_DIR_URI, K_DOWNLOAD_MARK_QUALITY, K_DOWNLOAD_NAME_FORMAT,
+  NAME_FORMAT_LABELS, NAME_FORMATS } from '../core/download/DownloadSettings';
 
 /**
  * 下载设置
  *
- * 参考图上的三项：
+ * 三项：
  *   文件名称格式（歌曲名 / 艺术家-标题 / 标题-艺术家）
  *   下载文件标注音质（开/关）
- *   保存位置（手动选择 / Download目录）
+ *   下载目录（**只展示，不可改也不提供跳转**）
  *
- * 「手动选择」调系统文件选择器挑目录，选完申请长期授权（不然重启后写不进去），
- * 并用探针文件确认可写；「Download目录」是应用内 files/Download，不需要任何权限。
- * 两者都写进 DownloadSettings（沙箱 JSON + AppStorage），重启不丢。
+ * 保存位置固定为应用自己的下载目录（系统 Download/<应用名>/，全程不弹对话框），
+ * 所以这里不再让用户选，也不放「打开文件夹」按钮 —— 系统没有「跳到文件管理某个目录」
+ * 的能力（依据见 docs/DEFECTS.md D-004），按钮只能把文件管理拉到首页，反而误导。
+ * 把目录名字显示出来，用户自己去「文件管理」里找即可。
  */
 @Component
 export struct DownloadSettingsView {
   @Prop bottomInset: number = 0;
   @StorageLink(K_DOWNLOAD_NAME_FORMAT) nameFormat: string = 'song';
   @StorageLink(K_DOWNLOAD_MARK_QUALITY) markQuality: boolean = true;
-  @StorageLink(K_DOWNLOAD_SAVE_MODE) saveMode: string = 'app';
-  @State picking: boolean = false;
-  /** 最近一次选目录的逐步结果（写不进去时显示在页面上） */
-  @State pickDetail: string = '';
-
-  private toast(message: string): void {
-    this.getUIContext().getPromptAction().showToast({ message: message });
-  }
+  /** 公共下载目录 uri：写进去过一次才有值（下载成功后订阅它刷新） */
+  @StorageLink(K_DOWNLOAD_DIR_URI) dirUri: string = '';
 
   private formatIndex(): number {
     const index: number = NAME_FORMATS.indexOf(this.nameFormat);
     return index < 0 ? 0 : index;
   }
 
-  private saveModeIndex(): number {
-    const index: number = SAVE_MODE_INDEX[this.saveMode];
-    return index === undefined ? 1 : index;
-  }
-
-  /**
-   * 切换保存位置
-   *
-   * 手动选择：真的去选一个目录（文件选择器的文件夹模式），选完记住它，
-   * 之后每首下载的系统保存对话框都会定位到这个目录。
-   */
-  private async pickMode(mode: string): Promise<void> {
-    if (mode === 'app') {
-      DownloadManager.getInstance().useAppDir();
-      this.toast('已改为保存到系统的 Download 目录');
-      return;
-    }
-    if (this.picking) {
-      return;
-    }
-    this.picking = true;
-    try {
-      const context: common.Context = this.getUIContext().getHostContext() as common.Context;
-      const result: PickDirResult = await DownloadManager.getInstance().pickSaveDir(context);
-      this.pickDetail = result.detail;
-      if (result.cancel) {
-        this.toast('没有选择目录，保存位置保持不变');
-      } else {
-        this.toast(`下载目录已设为「${result.label}」`);
-      }
-    } catch (e) {
-      this.toast(`选择目录失败：${(e as BusinessError).message}`);
-    } finally {
-      this.picking = false;
-    }
-  }
-
-  private hintText(): string {
-    if (this.saveMode === 'manual') {
-      const label: string = DownloadSettings.getInstance().getSaveDirLabel();
-      if (label.length === 0) {
-        return '还没选目录：点「手动选择」挑一个目录（系统文件选择器）。'
-          + '之后每首下载都会定位到这个目录。';
-      }
-      return `当前目录：${label}。手机系统不允许应用直接往用户目录里新建文件，`
-        + '所以每首下载会弹一次系统保存对话框（已定位到这个目录、文件名已填好），确认即可。'
-        + '想完全不询问，请用「Download目录」。';
-    }
-    return 'Download目录：保存到系统的 Download/应用名/ 目录，全程不弹对话框，'
-      + '在「文件管理」里能直接看到；系统不支持时会退回应用内的 Download 目录。';
+  /** 下载目录的展示名（`下载/<应用名>`；还没下载过时说明文件在应用内目录） */
+  private folderLabel(): string {
+    return DownloadManager.getInstance().folderLabel();
   }
 
   build() {
@@ -113,17 +57,8 @@ export struct DownloadSettingsView {
               },
             })
 
-            Column({ space: 9 }) {
-              SettingLabel({ label: '保存位置' })
-              SegPills({
-                labels: SAVE_MODE_LABELS,
-                activeIndex: this.saveModeIndex(),
-                onPick: (index: number) => {
-                  void this.pickMode(SAVE_MODES[index]);
-                },
-              })
-            }
-            .width('100%')
+            // 下载目录：只读展示（不可改、不给跳转入口），与上面两项同一个「标题 + 当前值」样式
+            SettingLabel({ label: '下载目录', value: this.folderLabel() })
           }
           .width('100%')
           .padding({ left: 16, right: 16, top: 17, bottom: 17 })
@@ -133,7 +68,6 @@ export struct DownloadSettingsView {
           HintText({ text: this.hintText() })
           HintText({
             text: '文件名示例：「' + this.sampleName() + '」。'
-              + '（应用内目录下载中的文件先写成 .part，下完才改名，中途失败不留半截歌。）'
               + '同时最多下 2 首，其余排队。',
           })
         }
@@ -147,6 +81,16 @@ export struct DownloadSettingsView {
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)
+  }
+
+  private hintText(): string {
+    if (this.dirUri.length === 0) {
+      return '歌曲统一保存在应用自己的下载目录里，全程不弹对话框。'
+        + '下载一首之后，这里会显示它在「文件管理」里的位置。';
+    }
+    return `歌曲统一保存在「${this.folderLabel()}」，全程不弹对话框。`
+      + '这是应用自己的目录，位置固定、不能改；文件管理里打开「下载」就能看到它，'
+      + '也可以在那儿复制或分享下载好的文件。';
   }
 
   /** 按当前设置拼一个示例文件名，省得用户猜「标注音质」是什么效果 */

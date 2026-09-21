@@ -35,6 +35,8 @@ export const I_TRASH: Resource = $r('sys.symbol.trash');
 export const I_VOLUME: Resource = $r('sys.symbol.speaker_wave_3');
 /** 下载 */
 export const I_DOWNLOAD: Resource = $r('sys.symbol.download');
+/** 导入（歌单导入：往托盘里落的那支箭头） */
+export const I_IMPORT: Resource = $r('sys.symbol.square_and_arrow_down');
 /** 缓存 */
 export const I_CACHE: Resource = $r('sys.symbol.externaldrive');
 /** 主题 */
@@ -101,6 +103,13 @@ export struct IconGlyph {
   @Prop iconSize: number = 22;
   @Prop color: ResourceColor = '#1A1A1A';
   @Prop weight: FontWeight = FontWeight.Medium;
+  /**
+   * 换图时走系统的符号替换动效（播放 <-> 暂停、收藏 <-> 取消收藏这类成对图标）。
+   *
+   * 默认关：列表里成百上千个图标不应该各自带着动效。开着的时候图标是「长成」
+   * 另一个形状，而不是硬切一张图。
+   */
+  @Prop replaceEffect: boolean = false;
 
   build() {
     SymbolGlyph(this.symbol)
@@ -108,5 +117,6 @@ export struct IconGlyph {
       .fontColor([this.color])
       .fontWeight(this.weight)
       .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+      .symbolEffect(new ReplaceSymbolEffect(EffectScope.LAYER), this.replaceEffect)
   }
 }

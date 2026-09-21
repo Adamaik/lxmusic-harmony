@@ -16,6 +16,7 @@ import {
   formatSingerName,
   sizeFormate,
 } from './MusicSearch';
+import { musicIdOf } from './MusicId';
 
 /**
  * 内置「歌单广场 / 排行榜」（宿主侧）
@@ -144,6 +145,58 @@ function asRecord(v: Object | undefined): Record<string, Object> {
     return v as Record<string, Object>;
   }
   return {};
+}
+
+/**
+ * 歌单简介的展示文本
+ *
+ * 各平台回的简介都是 HTML 片段：酷我直接用 `<br><br>` 分段，酷狗整段带标签，
+ * QQ 是 `<br>`，网易偶尔夹实体。直接塞给 Text 会把 `<br>` 当文字画出来，
+ * 所以统一在这里洗成纯文本：换行标签还原成真换行、其余标签去掉、实体解码、
+ * 连续空行压成一行、行内空白压成单个空格。
+ *
+ * 顺序是「先剥标签、后解实体」：反过来的话原文里写着的 `&lt;br&gt;`（本意是字面量）
+ * 会被解码成 `<br>` 再当成换行，而且解码出的 `<` 与后面的 `>` 会被当成一个标签整段吃掉。
+ */
+export function descText(raw: string): string {
+  if (raw.length === 0) {
+    return '';
+  }
+  // 换行标签先还原成真的换行：<br> / <br/> / <br /> 三种写法，外加块级结束标签
+  let text: string = raw.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<\/(p|div|li|h[1-6])>/gi, '\n');
+  // 剩下的标签整段丢掉，只留标签之间的文字
+  let stripped: string = '';
+  let depth: number = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch: string = text.charAt(i);
+    if (ch === '<') {
+      depth++;
+      continue;
+    }
+    if (ch === '>') {
+      if (depth > 0) {
+        depth--;
+      }
+      continue;
+    }
+    if (depth === 0) {
+      stripped += ch;
+    }
+  }
+  const kept: string[] = [];
+  for (const line of decodeName(stripped).split('\n')) {
+    const trimmed: string = line.replace(/\s+/g, ' ').trim();
+    // 连续空行只保留一行
+    if (trimmed.length === 0 && (kept.length === 0 || kept[kept.length - 1].length === 0)) {
+      continue;
+    }
+    kept.push(trimmed);
+  }
+  while (kept.length > 0 && kept[kept.length - 1].length === 0) {
+    kept.pop();
+  }
+  return kept.join('\n');
 }
 
 /** 洛雪的 formatPlayCount：播放量 -> 「1.2万 / 3.4亿」 */
@@ -416,9 +469,72 @@ export async function getPlaylistDetail(source: string, id: string, page: number
   throw new Error(`暂不支持该平台的歌单：${source}`);
 }
 
+/** 拉全量歌单时的进度（导入面板用来显示「正在获取 x/y」） */
+export interface PlaylistDetailProgress {
+  page: number;
+  loaded: number;
+  total: number;
+}
+
+/** 翻页上限：咪咕一页 30 首，40 页 ≈ 1200 首，够覆盖常见歌单又不会无限翻 */
+const MAX_DETAIL_PAGES: number = 40;
+
+/**
+ * 歌单的全部歌曲（对应洛雪的 getListDetailAll）
+ *
+ * 各平台一页给多少差别很大：酷我一次 1000 首、网易一次最多 1000 首、酷狗与 QQ
+ * 不分页（一次给全），只有咪咕是一页 30 首。所以这里统一翻页，并且以
+ * 「这一页没带来新歌」作为终止条件 —— 不分页的平台第二页会原样再给一份，
+ * 靠这个判断停住，不会空转。
+ */
+export async function getPlaylistDetailAll(source: string, id: string,
+  onProgress?: (progress: PlaylistDetailProgress) => void): Promise<LxListDetail> {
+  const merged: LxMusicInfo[] = [];
+  const seen: Set<string> = new Set<string>();
+  let info: LxListInfo = emptyListInfo('');
+  let total: number = 0;
+  let page: number = 1;
+  while (page <= MAX_DETAIL_PAGES) {
+    const detail: LxListDetail = await getPlaylistDetail(source, id, page);
+    if (detail.info.name.length > 0 && info.name.length === 0) {
+      info = detail.info;
+    } else if (info.name.length > 0 && info.img.length === 0 && detail.info.img.length > 0) {
+      // 咪咕的歌曲列表接口不带封面，歌单信息接口才带；第一页没补上就在这里补
+      info = detail.info;
+    }
+    if (detail.total > total) {
+      total = detail.total;
+    }
+    let added: number = 0;
+    for (const song of detail.list) {
+      const key: string = musicIdOf(song);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(song);
+      added++;
+    }
+    if (onProgress !== undefined) {
+      onProgress({ page: page, loaded: merged.length, total: total });
+    }
+    if (added === 0 || detail.list.length === 0) {
+      break;
+    }
+    if (total > 0 && merged.length >= total) {
+      break;
+    }
+    page++;
+  }
+  return {
+    list: merged,
+    total: total > merged.length ? total : merged.length,
+    info: info,
+  };
+}
+
 /** 排行榜列表 */
-export function getBoards(source: string): LxBoardItem[] {
-  if (source === 'kw') {
+export function getBoards(source: string): LxBoardItem[] {  if (source === 'kw') {
     return KW_BOARDS;
   }
   if (source === 'kg') {
@@ -487,7 +603,7 @@ function kwFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
       name: asString(item['name']),
       author: asString(item['uname']),
       img: asString(item['img']),
-      desc: asString(item['desc']),
+      desc: descText(asString(item['desc'])),
       playCount: formatPlayCount(asNumber(item['listencnt'])),
       total: asNumber(item['total']),
       time: '',
@@ -523,7 +639,7 @@ async function kwPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   const info: LxListInfo = {
     name: asString(body['title']),
     img: asString(body['pic']),
-    desc: asString(body['info']),
+    desc: descText(asString(body['info'])),
     author: asString(body['uname']),
     playCount: formatPlayCount(asNumber(body['playnum'])),
   };
@@ -651,7 +767,7 @@ async function kwBoardSongs(bangid: string, page: number, name: string): Promise
   const info: LxListInfo = {
     name: apiName.length > 0 ? apiName : name,
     img: asString(data['pic']),
-    desc: asString(data['info']),
+    desc: descText(asString(data['info'])),
     author: '',
     playCount: '',
   };
@@ -703,7 +819,7 @@ function kgFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
       name: asString(item['specialname']),
       author: asString(item['nickname']),
       img: img,
-      desc: asString(item['intro']),
+      desc: descText(asString(item['intro'])),
       playCount: totalPlay.length > 0 ? totalPlay : formatPlayCount(asNumber(item['play_count'])),
       total: asNumber(item['song_count']),
       time: time,
@@ -733,33 +849,11 @@ async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   const info: LxListInfo = {
     name: infoMatch !== null ? infoMatch[1] : '',
     img: infoMatch !== null ? infoMatch[2] : '',
-    desc: descMatch !== null ? kgStripTags(descMatch[1]) : '',
+    desc: descMatch !== null ? descText(descMatch[1]) : '',
     author: '',
     playCount: '',
   };
   return { list: songs, total: songs.length, info: info };
-}
-
-function kgStripTags(html: string): string {
-  let out: string = '';
-  let depth: number = 0;
-  for (let i = 0; i < html.length; i++) {
-    const ch: string = html.charAt(i);
-    if (ch === '<') {
-      depth++;
-      continue;
-    }
-    if (ch === '>') {
-      if (depth > 0) {
-        depth--;
-      }
-      continue;
-    }
-    if (depth === 0) {
-      out += ch;
-    }
-  }
-  return decodeName(out.split('\r').join(' ').split('\n').join(' ').trim());
 }
 
 /** 用 hash 批量换歌曲信息：gateway 一次最多 100 条 */
@@ -994,7 +1088,7 @@ function mgFilterPlaylistsByContents(rawList: Object[]): LxPlaylistItem[] {
       name: asString(item['txt']),
       author: '',
       img: asString(item['img']),
-      desc: asString(item['txt2']),
+      desc: descText(asString(item['txt2'])),
       playCount: '',
       total: 0,
       time: '',
@@ -1044,7 +1138,7 @@ async function mgPlaylistDetail(id: string, page: number): Promise<LxListDetail>
     info = {
       name: asString(infoData['title']),
       img: asString(asRecord(infoData['imgItem'])['img']),
-      desc: asString(infoData['summary']),
+      desc: descText(asString(infoData['summary'])),
       author: asString(infoData['ownerName']),
       playCount: formatPlayCount(asNumber(asRecord(infoData['opNumItem'])['playNum'])),
     };
@@ -1201,6 +1295,44 @@ const TX_SORTS: LxSortItem[] = [
 const TX_MUSICU: string = 'https://u.y.qq.com/cgi-bin/musicu.fcg' +
   '?loginUin=0&hostUin=0&format=json&inCharset=utf-8&outCharset=utf-8&notice=0' +
   '&platform=wk_v15.json&needNewCode=0';
+/** POST 用的 musicu 端点：新版歌单详情把参数放在请求体里，query 那些参数不需要 */
+const TX_MUSICU_BARE: string = 'https://u.y.qq.com/cgi-bin/musicu.fcg';
+/** 新版歌单详情一次取多少首（洛雪 getListDetail2 的 song_num） */
+const TX_DISS_SONG_NUM: number = 1000;
+
+/** 新版歌单详情（musicu）的请求体，字段照抄洛雪 tx/songList.js 的 getListDetail2 */
+interface TxDissInfoParam {
+  disstid: number;
+  userinfo: number;
+  tag: number;
+  orderlist: number;
+  song_begin: number;
+  song_num: number;
+  onlysonglist: number;
+  enc_host_uin: string;
+}
+
+interface TxDissInfoModule {
+  module: string;
+  method: string;
+  param: TxDissInfoParam;
+}
+
+interface TxDissInfoComm {
+  cv: number;
+  ct: number;
+  format: string;
+  inCharset: string;
+  outCharset: string;
+  platform: string;
+  needNewCode: number;
+  uin: number;
+}
+
+interface TxDissInfoPayload {
+  comm: TxDissInfoComm;
+  req_1: TxDissInfoModule;
+}
 /** 榜单页里每一行的原始片段（只用来切分） */
 const TX_PERIOD_LIST = /data-listname="(.+?)" data-tid=".*?\/(.+?)" data-date="(.+?)" .+?<\/i>/g;
 /** 从单行里取出「榜单 id -> 周期」；不能带 g，需要分组 */
@@ -1290,7 +1422,7 @@ function txFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
       name: asString(item['title']),
       author: asString(asRecord(item['creator_info'])['nick']),
       img: asString(item['cover_url_medium']),
-      desc: txCleanDesc(asString(item['desc'])),
+      desc: descText(asString(item['desc'])),
       playCount: formatPlayCount(asNumber(item['access_num'])),
       total: ids.length,
       time: modify > 0 ? dateFormat(modify * 1000) : '',
@@ -1301,11 +1433,79 @@ function txFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
   return list;
 }
 
-function txCleanDesc(desc: string): string {
-  return decodeName(desc).split('<br>').join('\n');
+/**
+ * QQ 歌单详情
+ *
+ * 两条路都留着，但顺序与洛雪相反：洛雪先打老的 fcg_ucc_getcdinfo_byids_cp、
+ * 失败再走新版 musicu；实测老接口已经下线（code=-1，见 tools/live_list_probe.js），
+ * 所以这里新版优先、老接口兜底。两条路的 songlist 是同一套字段，共用 txFilterSongs。
+ */
+async function txPlaylistDetail(id: string): Promise<LxListDetail> {
+  try {
+    return await txPlaylistDetailMusicu(id);
+  } catch (e) {
+    return await txPlaylistDetailLegacy(id);
+  }
 }
 
-async function txPlaylistDetail(id: string): Promise<LxListDetail> {
+/** 新版：music.srfDissInfo.aiDissInfo / uniform_get_Dissinfo（洛雪 tx/songList.js 的 getListDetail2） */
+async function txPlaylistDetailMusicu(id: string): Promise<LxListDetail> {
+  const param: TxDissInfoParam = {
+    disstid: asNumber(id),
+    userinfo: 1,
+    tag: 1,
+    orderlist: 1,
+    song_begin: 0,
+    song_num: TX_DISS_SONG_NUM,
+    onlysonglist: 0,
+    enc_host_uin: '',
+  };
+  const module: TxDissInfoModule = {
+    module: 'music.srfDissInfo.aiDissInfo',
+    method: 'uniform_get_Dissinfo',
+    param: param,
+  };
+  const comm: TxDissInfoComm = {
+    cv: 4747474,
+    ct: 24,
+    format: 'json',
+    inCharset: 'utf-8',
+    outCharset: 'utf-8',
+    platform: 'yqq.json',
+    needNewCode: 1,
+    uin: 0,
+  };
+  const payload: TxDissInfoPayload = { comm: comm, req_1: module };
+  const headers: Record<string, string> = {
+    'Origin': 'https://y.qq.com',
+    'Referer': `https://y.qq.com/n/yqq/playsquare/${id}.html`,
+  };
+  const body: Record<string, Object> =
+    await fetchRecord(TX_MUSICU_BARE, { method: 'post', headers: headers, body: payload },
+      'QQ 歌单详情');
+  if (asNumber(body['code']) !== 0) {
+    throw new Error(`QQ 歌单详情接口返回异常（code=${asString(body['code'])}）`);
+  }
+  const req: Record<string, Object> = asRecord(body['req_1']);
+  const data: Record<string, Object> = asRecord(req['data']);
+  const songs: Object[] = asObjectArray(data['songlist']);
+  if (asNumber(req['code']) !== 0 || songs.length === 0) {
+    throw new Error('QQ 歌单详情接口没取到歌曲');
+  }
+  const dir: Record<string, Object> = asRecord(data['dirinfo']);
+  const total: number = asNumber(data['total_song_num']);
+  const info: LxListInfo = {
+    name: asString(dir['title']),
+    img: asString(dir['picurl']),
+    desc: descText(asString(dir['desc'])),
+    author: asString(dir['host_nick']),
+    playCount: formatPlayCount(asNumber(dir['listennum'])),
+  };
+  return { list: txFilterSongs(songs), total: total > 0 ? total : songs.length, info: info };
+}
+
+/** 老接口（cdlist）：QQ 已下线，只作为兜底留着 */
+async function txPlaylistDetailLegacy(id: string): Promise<LxListDetail> {
   const url: string = 'https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg' +
     `?type=1&json=1&utf8=1&onlysong=0&new_format=1&disstid=${encodeURIComponent(id)}` +
     '&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&notice=0' +
@@ -1324,7 +1524,7 @@ async function txPlaylistDetail(id: string): Promise<LxListDetail> {
   const info: LxListInfo = {
     name: asString(cd['dissname']),
     img: asString(cd['logo']),
-    desc: txCleanDesc(asString(cd['desc'])),
+    desc: descText(asString(cd['desc'])),
     author: asString(cd['nickname']),
     playCount: formatPlayCount(asNumber(cd['visitnum'])),
   };
@@ -1482,7 +1682,7 @@ function wyFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
       name: asString(item['name']),
       author: asString(asRecord(item['creator'])['nickname']),
       img: asString(item['coverImgUrl']),
-      desc: asString(item['description']),
+      desc: descText(asString(item['description'])),
       playCount: formatPlayCount(asNumber(item['playCount'])),
       total: asNumber(item['trackCount']),
       time: createTime > 0 ? dateFormat(createTime) : '',
@@ -1515,7 +1715,7 @@ async function wyPlaylistDetail(id: string, page: number, name: string): Promise
   const info: LxListInfo = {
     name: infoName,
     img: asString(playlist['coverImgUrl']),
-    desc: asString(playlist['description']),
+    desc: descText(asString(playlist['description'])),
     author: asString(asRecord(playlist['creator'])['nickname']),
     playCount: formatPlayCount(asNumber(playlist['playCount'])),
   };

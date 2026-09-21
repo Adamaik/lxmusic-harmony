@@ -1,8 +1,9 @@
 import { C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
   R_COVER } from './Theme';
-import { GlassModifier, thinGlass } from './Glass';
-import { I_CHEVRON_RIGHT, I_HEART, I_HEART_FILLED, I_MORE, I_TRASH, I_VOLUME, IconGlyph } from './Icons';
+import { immersiveMaterialFor, thinGlass } from './Glass';
+import { I_CHEVRON_RIGHT, I_DOC, I_HEART, I_HEART_FILLED, I_MORE, I_TRASH, I_VOLUME, IconGlyph } from './Icons';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
+import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 
 /**
  * 通用小组件：封面、圆形图标按钮、歌曲行
@@ -141,6 +142,43 @@ export struct CoverArt {
   }
 }
 
+/**
+ * 空状态
+ *
+ * 之前每个列表各写一段灰字（字号、颜色、上下留白各不相同，有的还没图标），
+ * 这里合成一处：官方符号图标 + 主文案 + 可选副文案，居中。
+ * 用官方符号而不是自绘插图，与全应用「图标一律 sys.symbol」保持一致。
+ */
+@Component
+export struct EmptyState {
+  @Prop icon: Resource = I_DOC;
+  @Prop text: string = '';
+  /** 副文案：告诉用户「怎么才会有内容」，比单说「没有数据」有用 */
+  @Prop hint: string = '';
+  @Prop topPadding: number = 64;
+
+  build() {
+    Column({ space: 10 }) {
+      IconGlyph({ symbol: this.icon, iconSize: 42, color: C_TEXT_WEAK })
+        .accessibilityLevel('no')
+      Text(this.text)
+        .fontSize(F_ITEM)
+        .fontColor(C_TEXT_SUB)
+        .textAlign(TextAlign.Center)
+      if (this.hint.length > 0) {
+        Text(this.hint)
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .textAlign(TextAlign.Center)
+          .padding({ left: 32, right: 32 })
+      }
+    }
+    .width('100%')
+    .padding({ top: this.topPadding, bottom: 24 })
+    .alignItems(HorizontalAlign.Center)
+  }
+}
+
 /** 顶栏右侧那种白色玻璃圆钮 */
 @Component
 export struct RoundIconButton {
@@ -149,16 +187,16 @@ export struct RoundIconButton {
   @Prop iconSize: number = 20;
   @Prop color: ResourceColor = C_ICON;
   @Prop filled: boolean = true;
+  /** 读屏用的说明（这个钮里只有图形，读屏读不出「搜索」「音源」这类含义） */
+  @Prop label: string = '';
   onTap: () => void = () => {
   };
-  private glass: GlassModifier = thinGlass(20);
-
-  aboutToAppear(): void {
-    this.glass = thinGlass(this.boxSize / 2);
-  }
+  /** 玻璃厚度档位（外观设置）：订阅它，改档位时全部悬浮圆钮一起变厚变薄 */
+  @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
 
   build() {
-    // 用官方的圆形 Button 承载（带系统按压/焦点态），玻璃底与沉浸光感材质仍由 GlassModifier 给
+    // 用官方的圆形 Button 承载（带系统按压/焦点态），玻璃底（毛玻璃 + 半透明白 + 1vp 亮边）
+    // 由 GlassModifier 给；内容区的普通组件吃不到系统材质，见 ui/Glass.ets 开头的限制说明
     Button({ type: ButtonType.Circle, stateEffect: true }) {
       IconGlyph({
               symbol: this.icon,
@@ -168,10 +206,20 @@ export struct RoundIconButton {
     }
     .width(this.boxSize)
     .height(this.boxSize)
-    .attributeModifier(this.glass)
+    // 玻璃三层：系统沉浸材质（与底部导航栏同一套引擎）+ 按压形变 + 光感反馈，
+    // 外加轮廓点光；材质不可用时退化成自绘磨砂
+    // 派音那颗悬浮圆钮的配方：极淡的白底 + 纯白 1vp 描边，没有阴影、没有光效。
+    // 玻璃感来自「透出背后的内容」这一件事，而不是加阴影或者描边发亮。
+    .attributeModifier(thinGlass(this.boxSize / 2, false, '', this.materialLevel))
+    // 系统沉浸材质（和底部导航栏同一族的观感）。挂在组件上而不是 AttributeModifier 里：
+    // 属性修改器里能调哪些接口有讲究，直接挂更稳。设备没有能力位时这里是 undefined，
+    // 等于不设材质，界面就落在上面那层自绘玻璃上。
+    .systemMaterial(immersiveMaterialFor(this.materialLevel))
     .onClick(() => {
       this.onTap();
     })
+    .accessibilityText(this.label)
+    .accessibilityLevel(this.label.length > 0 ? 'yes' : 'auto')
   }
 }
 
@@ -193,11 +241,6 @@ export struct SongRow {
   };
   onDelete: () => void = () => {
   };
-  private glass: GlassModifier = thinGlass(16);
-
-  aboutToAppear(): void {
-    this.glass = thinGlass(this.coverSize / 2);
-  }
 
   build() {
     Row({ space: 11 }) {
@@ -236,6 +279,8 @@ export struct SongRow {
               iconSize: 19,
               color: C_RED,
             })
+          // 纯装饰（含义已经由歌名变红表达），读屏跳过它
+          .accessibilityLevel('no')
       }
       if (this.showDelete) {
         IconGlyph({
@@ -246,6 +291,8 @@ export struct SongRow {
           .onClick(() => {
             this.onDelete();
           })
+          .accessibilityText(`从歌单移除 ${this.name}`)
+          .accessibilityLevel('yes')
       }
       if (this.showMore) {
         IconGlyph({
@@ -256,6 +303,8 @@ export struct SongRow {
           .onClick(() => {
             this.onMore();
           })
+          .accessibilityText(`${this.name} 的更多操作`)
+          .accessibilityLevel('yes')
       }
       if (this.showChevron) {
         IconGlyph({
@@ -263,6 +312,7 @@ export struct SongRow {
               iconSize: 18,
               color: C_TEXT_WEAK,
             })
+          .accessibilityLevel('no')
       }
     }
     .width('100%')
@@ -271,6 +321,10 @@ export struct SongRow {
     .onClick(() => {
       this.onTap();
     })
+    // 整行当成一个节点：读屏读「歌名，歌手」，而不是把封面、文字、图标逐个念一遍
+    .accessibilityGroup(true)
+    .accessibilityText(this.singer.length > 0 ? `${this.name}，${this.singer}` : this.name)
+    .accessibilityLevel('yes')
   }
 }
 
@@ -310,6 +364,8 @@ export struct FavoriteHeart {
         symbol: this.isLiked() ? I_HEART_FILLED : I_HEART,
         iconSize: this.iconSize,
         color: this.isLiked() ? this.colorOn : this.colorOff,
+        // 收藏 <-> 取消收藏是同一颗心的两种状态，用符号替换动效过渡，不是硬切
+        replaceEffect: true,
       })
     }
     // 图标本身太窄，撑出足够大的点击区；子组件的点击会吃掉整行的点击（不会误触播放）
@@ -317,41 +373,8 @@ export struct FavoriteHeart {
     .onClick(() => {
       this.onToggle();
     })
-  }
-}
-
-/** 分段胶囊（我的页：播放历史 / 收藏 / 平台音乐 / 下载管理） */
-@Component
-export struct SegmentedTabs {
-  @Prop labels: string[] = [];
-  @Link activeIndex: number;
-  onChanged: (index: number) => void = () => {
-  };
-  // 色调必须半透明：不透明底色会遮挡沉浸式材质的滤镜
-  private glass: GlassModifier = thinGlass(20, false, 'rgba(230, 230, 234, 0.78)');
-
-  build() {
-    Row() {
-      ForEach(this.labels, (label: string, i: number) => {
-        Text(label)
-          .fontSize(14.5)
-          .fontWeight(this.activeIndex === i ? FontWeight.Bold : FontWeight.Medium)
-          .fontColor(this.activeIndex === i ? Color.White : '#3A3A3C')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(38)
-          .borderRadius(19)
-          .backgroundColor(this.activeIndex === i ? C_RED : Color.Transparent)
-          .animation({ duration: 220, curve: Curve.EaseInOut })
-          .onClick(() => {
-            this.activeIndex = i;
-            this.onChanged(i);
-          })
-      }, (label: string, i: number) => `${i}_${label}`)
-    }
-    .width('100%')
-    .padding(3)
-    .attributeModifier(this.glass)
+    .accessibilityText(this.isLiked() ? '取消收藏' : '收藏')
+    .accessibilityLevel('yes')
   }
 }
 

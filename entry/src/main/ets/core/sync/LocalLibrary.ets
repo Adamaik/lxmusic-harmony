@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { K_LIBRARY_VERSION, PlaySession, LibrarySink, PlaylistSummary, SongItem } from '../player/PlaySession';
 import { fromLxMusicInfo, isSyncable, toLxMusicInfo } from './SyncConvert';
 import { defaultListData, SyncStore } from './SyncStore';
+import { LocalMusic, LOCAL_SOURCE } from '../local/LocalMusic';
 import { ADD_MUSIC_TOP, DISLIKE_NAME_ALIAS, DISLIKE_NAME_SEP, LIST_ID_LOVE, LOVE_LIST_NAME,
   LxDislikeMusicInfo, LxListCreateData,
   LxListData, LxListMusicAddData, LxListMusicMoveData, LxListMusicOverwriteData, LxListMusicRemoveData,
@@ -51,6 +52,16 @@ export class LocalLibrary implements LibrarySink {
   }
 
   private store: SyncStore = new SyncStore();
+  /**
+   * 本地音乐库（设备里导入进来的音频）
+   *
+   * 它和这份同步数据是两个存储：本地歌不属于洛雪同步协议的范畴（官方客户端也只同步在线歌），
+   * 但用户明确要求「本地歌也能加进歌单和收藏」，所以这里做一层非同步侧表：
+   *   - 歌单 / 收藏里**属于本地歌**的那部分 key 存在 LocalMusic 里（见它的 lists）；
+   *   - 读取时合并（本地歌排在前面），写入时各写各的；
+   *   - 同步上行只看到 LxMusicInfoNew 那一半，协议与 md5 都不受影响。
+   */
+  private local: LocalMusic = LocalMusic.getInstance();
   private data: LxListData = defaultListData();
   private dislike: string = '';
   /** 本地是否已经有一份库（没有则说明是首次安装，界面上的演示数据先留着） */
@@ -117,7 +128,8 @@ export class LocalLibrary implements LibrarySink {
 
   summary(): LibrarySummary {
     const playlists: number = this.data.userList.length;
-    const songs: number = this.data.defaultList.length + this.data.loveList.length;
+    const songs: number = this.data.defaultList.length + this.data.loveList.length
+      + this.local.count();
     return { playlists: playlists, songs: songs };
   }
 
@@ -131,16 +143,16 @@ export class LocalLibrary implements LibrarySink {
       queue.push(fromLxMusicInfo(info));
     }
     const favorites: SongItem[] = [];
+    // 收藏里的本地歌排在前面（它们在同步数据里不存在，只能这么合）
+    for (const song of this.local.songsByKeys(this.local.listKeys(LIST_ID_LOVE))) {
+      favorites.push(song);
+    }
     for (const info of this.data.loveList) {
       favorites.push(fromLxMusicInfo(info));
     }
-    const playlists: PlaylistSummary[] = [];
-    for (const item of this.data.userList) {
-      playlists.push({ id: item.id, name: item.name, count: item.list.length });
-    }
     this.applying = true;
     try {
-      session.adoptLibraryState(queue, favorites, playlists);
+      session.adoptLibraryState(queue, favorites, this.playlistSummaries());
     } finally {
       this.applying = false;
     }
@@ -152,6 +164,9 @@ export class LocalLibrary implements LibrarySink {
       return;
     }
     const session = PlaySession.getInstance();
+    // 收藏里的本地歌先落盘：它们不上行（同步只送在线歌），但必须存住，
+    // 否则重启后收藏里那几首本地歌就没了。这一步与下面「要不要上行」无关。
+    this.syncLocalFavorites(session.favorites);
     const nextDefault: LxMusicInfoNew[] = musicsOf(session.queue);
     const nextLove: LxMusicInfoNew[] = musicsOf(session.favorites);
 
@@ -198,6 +213,32 @@ export class LocalLibrary implements LibrarySink {
     AppStorage.setOrCreate(K_LIBRARY_VERSION, version + 1);
   }
 
+  /**
+   * 只改了「属于本地歌的那部分」（本地歌进出歌单 / 收藏）
+   *
+   * 这里**不能**用 mirrorToSession()：它会把界面队列整体换成同步过的队列，
+   * 而正在播的本地队列在同步数据里是不存在的 —— 结果是「往歌单里加一首本地歌，
+   * 播放队列里的本地歌全没了」。同步那份数据本来也没变，只需要让列表页重读计数。
+   */
+  private bumpLocalChange(): void {
+    this.bumpLibraryVersion();
+  }
+
+  /** 把界面收藏名单里属于本地歌的那部分同步到侧表 */
+  private syncLocalFavorites(favorites: SongItem[]): void {
+    const keys: string[] = [];
+    for (const item of favorites) {
+      if (item.source !== LOCAL_SOURCE) {
+        continue;
+      }
+      const key: string = this.local.keyOfId(item.id);
+      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
+        keys.push(key);
+      }
+    }
+    this.local.setListKeys(LIST_ID_LOVE, keys);
+  }
+
   private emitOverwrite(listId: string, musicInfos: LxMusicInfoNew[]): void {
     const data: LxListMusicOverwriteData = { listId: listId, musicInfos: musicInfos };
     this.emit({ action: 'list_music_overwrite', data: data }, 'list');
@@ -208,7 +249,12 @@ export class LocalLibrary implements LibrarySink {
   playlistSummaries(): PlaylistSummary[] {
     const out: PlaylistSummary[] = [];
     for (const item of this.data.userList) {
-      out.push({ id: item.id, name: item.name, count: item.list.length });
+      out.push({
+        id: item.id,
+        name: item.name,
+        // 曲目数要把侧表里的本地歌算上，否则「歌单里有 3 首本地歌」外面显示 0 首
+        count: item.list.length + this.local.listCount(item.id),
+      });
     }
     return out;
   }
@@ -220,6 +266,11 @@ export class LocalLibrary implements LibrarySink {
       return [];
     }
     const out: SongItem[] = [];
+    // 本地歌排在前面：它们不在同步数据里，没有「和在线歌交错」的顺序可言；
+    // 排在前面与「新加的歌排最前」的既有规则一致。
+    for (const song of this.local.songsByKeys(this.local.listKeys(id))) {
+      out.push(song);
+    }
     for (const info of musics) {
       out.push(fromLxMusicInfo(info));
     }
@@ -233,7 +284,11 @@ export class LocalLibrary implements LibrarySink {
    * 协议上仍然是 loveList，与官方客户端的「我的收藏」互通。
    */
   favoritePlaylistSummary(): PlaylistSummary {
-    return { id: LIST_ID_LOVE, name: LOVE_LIST_NAME, count: this.data.loveList.length };
+    return {
+      id: LIST_ID_LOVE,
+      name: LOVE_LIST_NAME,
+      count: this.data.loveList.length + this.local.listCount(LIST_ID_LOVE),
+    };
   }
 
   /** 是不是那个不可删除 / 不可改名的内置歌单 */
@@ -271,8 +326,75 @@ export class LocalLibrary implements LibrarySink {
     return id;
   }
 
-  renamePlaylist(id: string, name: string): void {
-    if (this.isBuiltinPlaylist(id)) {
+  /**
+   * 按线上歌单标识找已经导入过的本地歌单
+   *
+   * 导入面板拿它判断这次是「新建」还是「更新已有歌单」。sourceListId 存的是洛雪的
+   * 列表标识 `${source}__${歌单id}`（与 core/music/PlaylistLink 解析出来的一致）。
+   */
+  playlistBySourceListId(sourceListId: string): PlaylistSummary | null {
+    if (sourceListId.length === 0) {
+      return null;
+    }
+    for (const item of this.data.userList) {
+      if (item.sourceListId === sourceListId) {
+        return { id: item.id, name: item.name, count: item.list.length + this.local.listCount(item.id) };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 导入在线歌单（对应洛雪的 addSongListDetail）
+   *
+   * 与「新建歌单」的两点不同：
+   *   1. id 由「平台 + md5(平台__歌单id)」决定，所以同一个线上歌单反复导入都是同一个
+   *      本地歌单，不会冒出一堆同名列表（洛雪也是这么算 id 的）；
+   *   2. 一起落 source / sourceListId，服务端与官方客户端认这两个字段，以后还能
+   *      按它判断「这个歌单来自哪个平台」。
+   * @returns 导入后的歌单；没有任何可导入的歌时返回 null
+   */
+  importPlaylist(name: string, source: string, sourceListId: string,
+    items: SongItem[]): PlaylistSummary | null {
+    const musics: LxMusicInfoNew[] = musicsOf(items);
+    if (musics.length === 0) {
+      return null;
+    }
+    const id: string = `${source}_${toMD5(sourceListId)}`;
+    const existing = this.findPlaylist(id);
+    if (existing !== null) {
+      // 同一个线上歌单再导一次：原地更新（名字与歌曲都换成线上最新的）
+      existing.name = name;
+      existing.source = source;
+      existing.sourceListId = sourceListId;
+      existing.locationUpdateTime = Date.now();
+      existing.list = musics;
+      this.persist();
+      this.mirrorToSession();
+      this.emitOverwrite(id, musics);
+      this.emit({ action: 'list_update', data: [buildUserListInfo(existing)] }, 'list');
+      return { id: id, name: name, count: musics.length + this.local.listCount(id) };
+    }
+    const item: LxUserListInfoFull = {
+      id: id,
+      name: name,
+      source: source,
+      sourceListId: sourceListId,
+      locationUpdateTime: Date.now(),
+      list: musics,
+    };
+    this.data.userList.push(item);
+    this.persist();
+    this.mirrorToSession();
+    const data: LxListCreateData = {
+      position: this.data.userList.length - 1,
+      listInfos: [buildUserListInfo(item)],
+    };
+    this.emit({ action: 'list_create', data: data }, 'list');
+    return { id: id, name: name, count: musics.length };
+  }
+
+  renamePlaylist(id: string, name: string): void {    if (this.isBuiltinPlaylist(id)) {
       // 内置收藏歌单不允许改名
       return;
     }
@@ -309,6 +431,8 @@ export class LocalLibrary implements LibrarySink {
       return;
     }
     this.data.userList = remains;
+    // 歌单没了，它在侧表里的本地歌引用也一起清掉（留着就是永远读不到的垃圾）
+    this.local.dropLists(removable);
     this.persist();
     this.mirrorToSession();
     this.emit({ action: 'list_remove', data: removable }, 'list');
@@ -326,9 +450,16 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return 0;
     }
+    // 本地歌走侧表（它们不属于同步结构，musicsOf 会把它们丢掉）
+    const localKeys: string[] = this.localKeysIn(items);
+    const localAdded: number = this.local.addToList(id, localKeys);
     const musics: LxMusicInfoNew[] = musicsOf(items);
     if (musics.length === 0) {
-      return 0;
+      // 整批都是本地歌：同步那份数据一个字都没变，只需让列表页重读计数
+      if (localAdded > 0) {
+        this.bumpLocalChange();
+      }
+      return localAdded;
     }
     const existed: Set<string> = new Set<string>();
     for (const info of target.list) {
@@ -343,7 +474,10 @@ export class LocalLibrary implements LibrarySink {
       added.push(info);
     }
     if (added.length === 0) {
-      return 0;
+      if (localAdded > 0) {
+        this.bumpLocalChange();
+      }
+      return localAdded;
     }
     target.list = added.concat(target.list);
     this.persist();
@@ -354,7 +488,22 @@ export class LocalLibrary implements LibrarySink {
       addMusicLocationType: ADD_MUSIC_TOP,
     };
     this.emit({ action: 'list_music_add', data: data }, 'list');
-    return added.length;
+    return added.length + localAdded;
+  }
+
+  /** 一批条目里属于本地歌、且确实还在库里的 key（去重、保持顺序） */
+  private localKeysIn(items: SongItem[]): string[] {
+    const keys: string[] = [];
+    for (const item of items) {
+      if (item.source !== LOCAL_SOURCE) {
+        continue;
+      }
+      const key: string = this.local.keyOfId(item.id);
+      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
+        keys.push(key);
+      }
+    }
+    return keys;
   }
 
   /**
@@ -375,24 +524,35 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return;
     }
+    // 本地歌从侧表里摘（同步那份数据里本来就没有它们）
+    const localRemoved: number = this.local.removeFromList(id, this.localKeysOfIds(songIds));
     const remains: LxMusicInfoNew[] = [];
+    const removedIds: string[] = [];
     for (const info of target.list) {
-      if (!songIds.includes(info.id)) {
-        remains.push(info);
+      if (songIds.includes(info.id)) {
+        removedIds.push(info.id);
+        continue;
       }
+      remains.push(info);
     }
     if (remains.length === target.list.length) {
+      // 只删掉了本地歌：同步那份数据一个字没变，上行也没必要
+      if (localRemoved > 0) {
+        this.bumpLocalChange();
+      }
       return;
     }
     target.list = remains;
     this.persist();
     this.mirrorToSession();
-    const data: LxListMusicRemoveData = { listId: id, ids: songIds };
+    // 只报真正在同步数据里被删掉的那些 id（本地歌的 id 服务端并不认识）
+    const data: LxListMusicRemoveData = { listId: id, ids: removedIds };
     this.emit({ action: 'list_music_remove', data: data }, 'list');
   }
 
   /** 从内置收藏里移除一批歌（协议上是整份 love 列表覆盖，与官方一致） */
   private removeMusicFromLove(songIds: string[]): void {
+    const localRemoved: number = this.local.removeFromList(LIST_ID_LOVE, this.localKeysOfIds(songIds));
     const remains: LxMusicInfoNew[] = [];
     for (const info of this.data.loveList) {
       if (!songIds.includes(info.id)) {
@@ -400,6 +560,9 @@ export class LocalLibrary implements LibrarySink {
       }
     }
     if (remains.length === this.data.loveList.length) {
+      if (localRemoved > 0) {
+        this.bumpLocalChange();
+      }
       return;
     }
     this.data.loveList = remains;
@@ -414,11 +577,25 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return;
     }
+    // 本地歌那半边一起换掉（换成新列表里的本地歌）
+    this.local.setListKeys(id, this.localKeysIn(items));
     const musics: LxMusicInfoNew[] = musicsOf(items);
     target.list = musics;
     this.persist();
     this.mirrorToSession();
     this.emitOverwrite(id, musics);
+  }
+
+  /** 一批条目 id 里属于本地歌的 key（去重、保持顺序） */
+  private localKeysOfIds(ids: string[]): string[] {
+    const keys: string[] = [];
+    for (const id of ids) {
+      const key: string = this.local.keyOfId(id);
+      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
+        keys.push(key);
+      }
+    }
+    return keys;
   }
 
   private findPlaylist(id: string): LxUserListInfoFull | null {

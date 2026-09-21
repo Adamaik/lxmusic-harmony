@@ -56,3 +56,27 @@ export const C_ICON_PURPLE: string = '#8257F5';
 export const C_ICON_GREEN: string = '#2FBE5B';
 export const C_ICON_ORANGE: string = '#F4A11E';
 export const C_ICON_CORAL: string = '#F4634B';
+
+/**
+ * 平台品牌色（聚合搜索结果行上的来源小标签）
+ *
+ * 聚合结果里同一首歌会来自好几个平台，光有文字标签不好扫，用平台自己的品牌色
+ * 区分（和派音同一套色值）。取不到的平台退回次要文字色。
+ */
+const PLATFORM_COLORS: Record<string, string> = {
+  'kw': '#FF6B35',
+  'kg': '#4A90D9',
+  'mg': '#FF4081',
+  'tx': '#31C27C',
+  'wy': '#C62F2F',
+};
+
+export function platformColor(source: string): string {
+  const color: string = PLATFORM_COLORS[source];
+  return color !== undefined ? color : C_TEXT_SUB;
+}
+
+/** 品牌色的淡底（`#1F` = 12% 不透明度），给标签做胶囊底 */
+export function platformTint(source: string): string {
+  return `#1F${platformColor(source).slice(1)}`;
+}

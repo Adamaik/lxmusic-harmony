@@ -1,6 +1,6 @@
 import { PlaySession, SongItem } from '../core/player/PlaySession';
-import { K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME, K_CURRENT_QUALITY, K_CURRENT_SINGER,
-  K_DURATION, K_LYRIC_LINES, K_LYRIC_STATUS, K_PLAYER_STATUS,
+import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME,
+  K_CURRENT_QUALITY, K_CURRENT_SINGER, K_DURATION, K_LYRIC_LINES, K_LYRIC_STATUS, K_PLAYER_STATUS,
   K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
@@ -14,6 +14,12 @@ import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
+import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
+import { LxMusicInfo } from '../core/music/MusicSearch';
+import { C_BG } from '../ui/Theme';
+import { HdsEdgeFlowLight } from '../ui/Hds';
+import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
+import { LyricMatchSheet } from './LyricMatchSheet';
 
 function formatTime(seconds: number): string {
   const total: number = Math.max(0, Math.floor(seconds));
@@ -21,6 +27,25 @@ function formatTime(seconds: number): string {
   const s: number = total % 60;
   return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
 }
+
+/** 值 / 总长 -> 百分比（0~100），总长还不知道（0）时给 0 */
+function percentOf(value: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  const percent: number = (value / total) * 100;
+  if (percent < 0) {
+    return 0;
+  }
+  return percent > 100 ? 100 : percent;
+}
+
+/** 进度条几何：自绘的缓冲条要让出半个滑块，才能和 Slider 的轨道对齐 */
+const TRACK_THICKNESS: number = 3;
+const BLOCK_SIZE: number = 9;
+const TRACK_INSET: number = BLOCK_SIZE / 2;
+/** 进度条宽度变化的过渡时长：缓冲是分块长出来的，加个短过渡看着才像连续走 */
+const TRACK_ANIM_MS: number = 260;
 
 /**
  * 全屏播放器
@@ -55,7 +80,13 @@ export struct PlayerView {
   @StorageLink(K_CURRENT_COVER) cover: string = '';
   @StorageLink(K_CURRENT_ART) art: boolean = false;
   @StorageLink(K_CURRENT_QUALITY) quality: string = '128k';
-  @StorageLink(K_PLAYER_STATUS) status: string = 'idle';
+  @StorageLink(K_PLAYER_STATUS) @Watch('onStatusChanged') status: string = 'idle';
+  /** 播放页封面圆角（外观设置里可调，默认 12） */
+  @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
+  /** 弱网下播放器在等数据：状态仍是 playing，但播放钮要显示成转圈 */
+  @StorageLink(K_BUFFERING) buffering: boolean = false;
+  /** 已缓冲到哪个位置（秒）：进度条上比已播更长的那一段（见 bufferTrack） */
+  @StorageLink(K_BUFFERED_SECONDS) buffered: number = 0;
   @StorageLink(K_PROGRESS) @Watch('onProgressChanged') progress: number = 0;
   @StorageLink(K_DURATION) duration: number = 0;
   @StorageLink(K_LYRIC_LINES) @Watch('onLyricChanged') lyricLines: LyricLine[] = [];
@@ -64,20 +95,80 @@ export struct PlayerView {
   @State pageIndex: number = 0;
   /** 右下角「更多」的底部面板是否展开 */
   @State moreOpen: boolean = false;
+  /** 「匹配歌词」面板是否展开（本地歌专用） */
+  @State matchOpen: boolean = false;
   /** 当前唱到的歌词行；-1 = 没有时间轴/还没开始 */
   @State activeLine: number = -1;
+  /**
+   * 封面的弹簧缩放（播放 1.05 / 暂停 0.95）
+   *
+   * 系统没有「带过冲的弹簧」这个曲线（Curve 里最接近的也是单向缓动），
+   * 所以这里按 16ms 一帧做数值积分：阻尼弹簧，约 12% 过冲、0.5 秒收住。
+   * 播放/暂停时封面「弹」一下，是这类播放器最容易被记住的一处细节。
+   */
+  @State coverSpringScale: number = 1;
   private controller: SwiperController = new SwiperController();
   private lyricScroller: Scroller = new Scroller();
+  /** 弹簧的目标值与速度（速度不参与渲染，不需要 @State） */
+  private coverSpringTarget: number = 1;
+  private coverSpringVelocity: number = 0;
+  private coverSpringTimer: number = 0;
+  private coverSpringLastMs: number = 0;
 
   aboutToAppear(): void {
     // 打开播放器时可能已经唱到一半了，先把当前行对上，别等下一秒 timeUpdate
     this.activeLine = activeLyricIndex(this.lyricLines, this.progress);
     this.syncKeepScreenOn();
+    // 进来时正在播就直接是放大的样子，不要从 1 弹一下（那是给「切播放状态」用的）
+    this.coverSpringTarget = this.playing() ? 1.05 : 0.95;
+    this.coverSpringScale = this.coverSpringTarget;
   }
 
   aboutToDisappear(): void {
     // 播放器收起就把常亮还回去，别让这个窗口一直钉在亮屏上
     this.onKeepScreenOn(false);
+    this.stopCoverSpring();
+  }
+
+  /** 播放状态变了：让封面弹到对应的目标尺寸（弹簧过程由 startCoverSpring 推进） */
+  onStatusChanged(): void {
+    this.coverSpringTarget = this.playing() ? 1.05 : 0.95;
+    this.startCoverSpring();
+  }
+
+  /**
+   * 推进封面的阻尼弹簧（stiffness 220 / damping 13）
+   *
+   * 每 16ms 积一帧：加速度 = 位移差 * 刚度 - 速度 * 阻尼；位移与速度都足够小
+   * （肉眼看不出、也快过一帧的像素）时直接吸附到目标值并停表，避免定时器常驻。
+   */
+  private startCoverSpring(): void {
+    if (this.coverSpringTimer !== 0) {
+      return;
+    }
+    this.coverSpringLastMs = Date.now();
+    this.coverSpringTimer = setInterval(() => {
+      const now: number = Date.now();
+      // 卡顿掉帧时限制单帧步长，否则数值积分会发散（画面直接跳飞）
+      const dt: number = Math.min(32, now - this.coverSpringLastMs) / 1000;
+      this.coverSpringLastMs = now;
+      const acc: number = (this.coverSpringTarget - this.coverSpringScale) * 220 - this.coverSpringVelocity * 13;
+      this.coverSpringVelocity += acc * dt;
+      this.coverSpringScale += this.coverSpringVelocity * dt;
+      if (Math.abs(this.coverSpringTarget - this.coverSpringScale) < 0.0005
+        && Math.abs(this.coverSpringVelocity) < 0.0005) {
+        this.coverSpringScale = this.coverSpringTarget;
+        this.coverSpringVelocity = 0;
+        this.stopCoverSpring();
+      }
+    }, 16);
+  }
+
+  private stopCoverSpring(): void {
+    if (this.coverSpringTimer !== 0) {
+      clearInterval(this.coverSpringTimer);
+      this.coverSpringTimer = 0;
+    }
   }
 
   /**
@@ -152,12 +243,47 @@ export struct PlayerView {
     }
   }
 
+  /** 音质标签：本地歌没有音质档，显示「本地」而不是内部的 'local' 标记 */
+  private qualityLabel(): string {
+    return this.quality === 'local' ? '本地' : this.quality;
+  }
+
+  /** 当前这首是不是本地音乐（决定要不要给「匹配歌词」入口） */
+  private isCurrentLocal(): boolean {
+    return LocalMusic.getInstance().hasId(this.currentId);
+  }
+
+  /** 本地歌的时长（毫秒，0 = 未知）：给匹配结果排序用 */
+  private currentLocalDurationMs(): number {
+    const music = LocalMusic.getInstance();
+    return music.durationMsOf(music.keyOfId(this.currentId));
+  }
+
+  /** 用户在手动的匹配面板里选中了一条：记住它并重新取词 */
+  private applyLyricMatch(info: LxMusicInfo, source: string): void {
+    const music = LocalMusic.getInstance();
+    const key: string = music.keyOfId(this.currentId);
+    if (key.length === 0) {
+      this.matchOpen = false;
+      return;
+    }
+    music.saveMatch(key, source, JSON.stringify(info));
+    this.matchOpen = false;
+    this.toast(`已匹配到「${info.name} - ${info.singer}」，正在取词`);
+    PlaySession.getInstance().refreshLyric();
+  }
+
   /** 下载当前这首歌（设置里的文件名格式 / 保存位置都生效） */
   private downloadCurrent(): void {
     const session = PlaySession.getInstance();
     const item: SongItem | null = session.current;
     if (item === null) {
       this.toast('还没有正在播放的歌');
+      return;
+    }
+    // 本地歌已经在本机了，没什么可下的
+    if (isLocalSong(item)) {
+      this.toast(`「${item.name}」已经在本机了`);
       return;
     }
     const manager = DownloadManager.getInstance();
@@ -254,6 +380,14 @@ export struct PlayerView {
         this.addCurrentToQueue(true);
       })
 
+      // 本地歌才有：自动匹配没把握（或没匹配上）时，让用户自己搜一次、选正确的那条
+      if (this.isCurrentLocal()) {
+        this.moreItem('匹配歌词', () => {
+          this.moreOpen = false;
+          this.matchOpen = true;
+        })
+      }
+
       Divider()
         .strokeWidth(0.5)
         .color('#26FFFFFF')
@@ -293,6 +427,44 @@ export struct PlayerView {
     .backgroundColor('#8A000000')
   }
 
+  /**
+   * 「匹配歌词」面板
+   *
+   * 同样自绘、不用 bindSheet：播放器本身就是系统的半模态（见本文件开头那段说明），
+   * 再叠一个系统弹层容易和它打架。
+   */
+  @Builder
+  matchOverlay() {
+    Column() {
+      Column()
+        .width('100%')
+        .layoutWeight(1)
+        .onClick(() => {
+          this.matchOpen = false;
+        })
+      Column() {
+        LyricMatchSheet({
+          songName: this.name,
+          singer: this.singer,
+          durationMs: this.currentLocalDurationMs(),
+          bottomInset: this.bottomInset,
+          onPick: (info: LxMusicInfo, source: string) => {
+            this.applyLyricMatch(info, source);
+          },
+        })
+      }
+      .width('100%')
+      .height('62%')
+      .borderRadius({ topLeft: 20, topRight: 20 })
+      // 面板内容用的是浅色主题的配色（与「添加到歌单」那个系统半模态一致）
+      .backgroundColor(C_BG)
+      .clip(true)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#8A000000')
+  }
+
   /** 播放模式按钮的图标：列表循环 / 顺序播放 / 单曲循环 / 随机播放 */
   private playModeIcon(): Resource {
     if (this.playMode === 'order') {
@@ -316,6 +488,20 @@ export struct PlayerView {
 
   private playing(): boolean {
     return this.status === 'playing';
+  }
+
+  /** 播放模式的中文名（读屏要读出来；文案与 PlaySession.playModeLabel 一致） */
+  private playModeLabel(): string {
+    if (this.playMode === 'order') {
+      return '顺序播放';
+    }
+    if (this.playMode === 'single') {
+      return '单曲循环';
+    }
+    if (this.playMode === 'shuffle') {
+      return '随机播放';
+    }
+    return '列表循环';
   }
 
   private loading(): boolean {
@@ -444,15 +630,23 @@ export struct PlayerView {
           name: this.name,
           art: this.art,
           boxSize: 252,
-          radius: 12,
+          // 圆角来自外观设置（默认 12）
+          radius: this.coverRadius,
           // 还在解析/缓冲时封面可能没到：先给深色底，别闪一张默认封面
           pending: this.status === 'loading',
         })
       }
       .width(252)
       .height(252)
-      .borderRadius(12)
+      .borderRadius(this.coverRadius)
       .shadow({ radius: 40, color: '#66000000', offsetX: 0, offsetY: 18 })
+      // 播放/暂停时的弹簧缩放（缩放中心放在封面正中，别从左上角放大）
+      .scale({
+        x: this.coverSpringScale,
+        y: this.coverSpringScale,
+        centerX: '50%',
+        centerY: '50%',
+      })
 
       Row({ space: 12 }) {
         Column({ space: 7 }) {
@@ -585,6 +779,14 @@ export struct PlayerView {
   @Builder
   playButton() {
     Stack({ alignContent: Alignment.Center }) {
+      // 轮廓流光垫在最底下：白色主光带 + 一点品牌红副光带，低透明度，
+      // 只在播放钮外缘走一圈（HDS 着色器，不吃触摸，不影响点击）
+      HdsEdgeFlowLight({
+        radius: 36,
+        colorA: '#66FFFFFF',
+        colorB: '#33FF6B6B',
+        lightOpacity: 0.5,
+      })
       // 圆底用带圆角的容器 + 系统阴影，不要用 Circle().shadow()：
       // Shape 的阴影是按「组件矩形减去图形」算的，会画出一个方块状的底，很难看
       Column()
@@ -593,8 +795,8 @@ export struct PlayerView {
         .borderRadius(36)
         .backgroundColor('#F4F4F6')
         .shadow({ radius: 26, color: '#66FFFFFF', offsetX: 0, offsetY: 0 })
-      if (this.loading()) {
-        // 解析播放链接 / 缓冲期间转圈：这时还没出声，不能显示成「播放中」
+      if (this.loading() || this.buffering) {
+        // 解析播放链接 / 弱网等数据期间转圈：这时没在出声，不能显示成「播放中」
         LoadingProgress()
           .width(30)
           .height(30)
@@ -604,6 +806,8 @@ export struct PlayerView {
               symbol: this.playing() ? I_PAUSE : I_PLAY,
               iconSize: 26,
               color: '#17171A',
+              // 播放 <-> 暂停换图时走系统的符号替换动效（图标自己形变，不是硬切）
+              replaceEffect: true,
             })
           .offset({ x: this.playing() ? 0 : 2 })
       }
@@ -613,40 +817,99 @@ export struct PlayerView {
     .onClick(() => {
       PlaySession.getInstance().toggle();
     })
+    .accessibilityText(this.playing() ? '暂停' : '播放')
+    .accessibilityLevel('yes')
+  }
+
+  /**
+   * 进度条底下的「缓冲条」
+   *
+   * 惯例（浏览器 / 各家播放器都这么做）：进度条上除了已播的那一段，还有一条更长的浅色段，
+   * 表示「已经缓冲到哪儿了」—— 网络断了还能靠它撑到那一段，用户一眼就知道要不要等。
+   * 系统的 Slider 只有一条轨道，画不出三段，所以这里自绘一条垫在 Slider 底下，
+   * 把 Slider 自己的轨道设成透明：交互（拖动 seek）仍然归 Slider。
+   *
+   * 左右各让出半个滑块，才能和 Slider 的轨道两端对齐（滑块是沿轨道中心走的）。
+   */
+  @Builder
+  bufferTrack() {
+    Stack({ alignContent: Alignment.Start }) {
+      // 整条底（没缓冲到的部分）
+      Column()
+        .width('100%')
+        .height(TRACK_THICKNESS)
+        .borderRadius(TRACK_THICKNESS / 2)
+        .backgroundColor('#33FFFFFF')
+      // 已缓冲（可以播到这里）：按块往前长，加个短动画让它看起来是连续走而不是一格一格跳
+      Column()
+        .width(`${this.bufferPercent()}%`)
+        .height(TRACK_THICKNESS)
+        .borderRadius(TRACK_THICKNESS / 2)
+        .backgroundColor('#80FFFFFF')
+        .animation({ duration: TRACK_ANIM_MS, curve: Curve.Linear })
+      // 已播
+      Column()
+        .width(`${this.progressPercent()}%`)
+        .height(TRACK_THICKNESS)
+        .borderRadius(TRACK_THICKNESS / 2)
+        .backgroundColor('#FFFFFF')
+        .animation({ duration: TRACK_ANIM_MS, curve: Curve.Linear })
+    }
+    .width('100%')
+    .height(TRACK_THICKNESS)
+    .padding({ left: TRACK_INSET, right: TRACK_INSET })
+  }
+
+  /** 已播进度占总长的百分比 */
+  private progressPercent(): number {
+    return percentOf(this.progress, this.duration);
+  }
+
+  /** 已缓冲进度占总长的百分比（本地播放整首都在本地，直接画满） */
+  private bufferPercent(): number {
+    return percentOf(this.buffered, this.duration);
   }
 
   @Builder
   controlBar() {
     Column({ space: 0 }) {
-      Slider({
-        value: this.progress,
-        min: 0,
-        max: this.duration > 0 ? this.duration : 1,
-        style: SliderStyle.OutSet,
-      })
-        .trackThickness(1.5)
-        .blockSize({ width: 9, height: 9 })
-        .blockColor('#FFFFFF')
-        .selectedColor('#FFFFFF')
-        .trackColor('#40FFFFFF')
-        .width('100%')
-        .padding({ left: 0, right: 0 })
-        // 还没真正出声（loading）时进度条不可拖，避免拖了却没反应
-        .enabled(this.status === 'playing' || this.status === 'paused')
-        .onChange((value: number, mode: SliderChangeMode) => {
-          if (mode === SliderChangeMode.Begin) {
-            return;
-          }
-          // 真正 seek 到播放器；进度条随后由 AVPlayer 的 timeUpdate 回写
-          PlaySession.getInstance().seek(value);
+      // 进度条 = 自己画的缓冲条（底） + 系统 Slider（交互）
+      Stack() {
+        this.bufferTrack()
+
+        Slider({
+          value: this.progress,
+          min: 0,
+          max: this.duration > 0 ? this.duration : 1,
+          style: SliderStyle.OutSet,
         })
+          .trackThickness(TRACK_THICKNESS)
+          .blockSize({ width: BLOCK_SIZE, height: BLOCK_SIZE })
+          .blockColor('#FFFFFF')
+          // 轨道交给下面自绘的那条（要画三段：整条底 / 缓冲段 / 已播段），
+          // Slider 只留滑块和拖动交互
+          .selectedColor(Color.Transparent)
+          .trackColor(Color.Transparent)
+          .width('100%')
+          .padding({ left: 0, right: 0 })
+          // 还没真正出声（loading）时进度条不可拖，避免拖了却没反应
+          .enabled(this.status === 'playing' || this.status === 'paused')
+          .onChange((value: number, mode: SliderChangeMode) => {
+            if (mode === SliderChangeMode.Begin) {
+              return;
+            }
+            // 真正 seek 到播放器；进度条随后由 AVPlayer 的 timeUpdate 回写
+            PlaySession.getInstance().seek(value);
+          })
+      }
+      .width('100%')
 
       Row() {
         Text(formatTime(this.progress))
           .fontSize(11.5)
           .fontColor('#A6FFFFFF')
         Blank()
-        Text(this.quality)
+        Text(this.qualityLabel())
           .fontSize(11.5)
           .fontColor('#CCFFFFFF')
           .padding({ left: 10, right: 10, top: 3, bottom: 3 })
@@ -676,6 +939,8 @@ export struct PlayerView {
         .onClick(() => {
           this.switchPlayMode();
         })
+        .accessibilityText(`播放模式：${this.playModeLabel()}，点按切换`)
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({
@@ -689,6 +954,8 @@ export struct PlayerView {
         .onClick(() => {
           PlaySession.getInstance().prev();
         })
+        .accessibilityText('上一首')
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           this.playButton()
@@ -708,6 +975,8 @@ export struct PlayerView {
         .onClick(() => {
           PlaySession.getInstance().next();
         })
+        .accessibilityText('下一首')
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({
@@ -721,6 +990,8 @@ export struct PlayerView {
         .onClick(() => {
           this.onOpenQueue();
         })
+        .accessibilityText('播放列表')
+        .accessibilityLevel('yes')
       }
       .width('100%')
 
@@ -751,12 +1022,16 @@ export struct PlayerView {
         }
         .layoutWeight(1)
         .height(44)
+        .accessibilityText('投播至')
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({ symbol: I_BELL, iconSize: 22, color: '#8CFFFFFF' })
         }
         .layoutWeight(1)
         .height(44)
+        // 这个入口还没接功能，读屏就不要报出一个点不动的按钮
+        .accessibilityLevel('no')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({ symbol: I_DOWNLOAD, iconSize: 22, color: '#8CFFFFFF' })
@@ -766,6 +1041,8 @@ export struct PlayerView {
         .onClick(() => {
           this.downloadCurrent();
         })
+        .accessibilityText('下载这首歌')
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({ symbol: I_MORE_CIRCLE, iconSize: 22, color: '#8CFFFFFF' })
@@ -775,6 +1052,8 @@ export struct PlayerView {
         .onClick(() => {
           this.moreOpen = true;
         })
+        .accessibilityText('更多')
+        .accessibilityLevel('yes')
       }
       .width('100%')
       .padding({ top: 8, bottom: 6 })
@@ -865,6 +1144,11 @@ export struct PlayerView {
       // 右下角「更多」：盖在播放器内容之上的自绘底部面板
       if (this.moreOpen) {
         this.moreOverlay()
+      }
+
+      // 「匹配歌词」：同样是自绘面板（播放器本身是系统半模态，不再叠系统弹层）
+      if (this.matchOpen) {
+        this.matchOverlay()
       }
     }
     .width('100%')

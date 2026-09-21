@@ -1,5 +1,5 @@
 import { common } from '@kit.AbilityKit';
-import { fileIo as fs, picker } from '@kit.CoreFileKit';
+import { fileIo as fs, fileUri, picker } from '@kit.CoreFileKit';
 import { http } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -10,6 +10,7 @@ import { SourceEngine } from '../source/SourceEngine';
 import { LxQuality } from '../source/LxTypes';
 import { DownloadSettings } from './DownloadSettings';
 import { clearDownloadedFiles, removeDownloadedFile, setDownloadedFile } from './DownloadIndex';
+import { isLocalSong } from '../local/LocalMusic';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'DownloadManager';
@@ -17,8 +18,10 @@ const TAG: string = 'DownloadManager';
 /** 下载列表 / 进度变化时递增，界面订阅它刷新 */
 export const K_DOWNLOAD_VERSION: string = 'download_version';
 
-/** 应用内的下载目录（不需要任何权限，卸载应用才会删） */
+/** 应用内的下载目录（系统的公共目录拿不到时的兜底；卸载应用才会删） */
 const DIR_NAME: string = 'Download';
+/** 公共目录 uri 的前缀：据此把「文件管理里能看到的文件」与沙箱兜底文件区分开 */
+const PUBLIC_URI_PREFIX: string = 'file://docs';
 const INDEX_FILE: string = 'downloads.json';
 const PART_SUFFIX: string = '.part';
 /** 同时下载数：跟着洛雪的 download.maxDownloadNum 取 2，少占带宽也少被平台限流 */
@@ -65,19 +68,17 @@ export interface DownloadItem {
   status: DownloadStatus;
   /** 失败原因（status = error 时有值） */
   error: string;
-  /** 非致命提示（例如自定义目录写不了、已改存到应用目录） */
+  /** 非致命提示（例如系统下载目录不可用、已改存到应用内目录），列表里跟在状态后面显示 */
   note: string;
   createdAt: number;
 }
 
-/** 选下载目录的结果 */
-export interface PickDirResult {
-  /** 用户取消了选择 */
-  cancel: boolean;
-  /** 目录短名 */
-  label: string;
-  /** 说明这次选择意味着什么（为什么每首还要确认一次） */
-  detail: string;
+/** 第 2 条写路径（系统保存对话框）的结果 */
+interface PickerAttempt {
+  /** 成功时的写目标 */
+  target: WriteTarget | null;
+  /** 失败原因（target 为空时有值，会展示给用户） */
+  reason: string;
 }
 
 /** 一次下载要写的位置 */
@@ -87,6 +88,10 @@ interface WriteTarget {
   /** 边下边写的临时文件；空串表示直接写 path（系统保存给的 uri） */
   part: string;
   handle: fs.File;
+  /** 没写进系统公共下载目录（写进了应用内目录）：列表里要如实说明，不然用户找不到文件 */
+  fallback: boolean;
+  /** 退回应用内目录的原因（fallback 为真时给用户看） */
+  reason: string;
 }
 
 /** 落盘结构（字段可选：老文件可能缺） */
@@ -252,6 +257,11 @@ export class DownloadManager {
     if (!this.inited) {
       return null;
     }
+    // 本地歌（从设备导入进来的音频）已经在本机了，没有下载的意义：
+    // 在这里拦一道，任何入口都不会把它排进下载队列
+    if (isLocalSong(song)) {
+      return null;
+    }
     const key: string = downloadKeyOf(song);
     if (key.length === 0) {
       return null;
@@ -382,132 +392,201 @@ export class DownloadManager {
 
   // ---------------------------------------------------------------- 保存位置
 
-  /** 切回系统的 Download 目录（选过的目录 uri 留着，方便再切回手动） */
-  useAppDir(): void {
-    DownloadSettings.getInstance().setSaveMode('app');
-    this.bump();
+  /**
+   * 下载目录的展示名（设置页 / 下载管理里显示 / 提示用户去哪找）
+   *
+   * 目录是系统给的，这里把它裁成用户认得的写法：
+   *   `file://docs/storage/Users/currentUser/Download/com.example.listen` -> `下载/聆听`
+   * 两处「翻译」的理由：
+   *   1. 路径里的 `Download` 显示成「下载」——「文件管理」中文界面里那一条就叫「下载」，
+   *      显示英文名用户会以为不是一个地方；
+   *   2. DOWNLOAD 模式建的目录用的是**包名**（官方文档：自动创建在 `Download/包名/` 目录），
+   *      而「文件管理」界面里把它显示成应用名（「聆听」）—— 用户看到的是后者，
+   *      所以末段等于自己的包名时换成应用名（见 displayDirName）。
+   * 一次都没写进公共目录（保存对话框失败、全落在应用内目录）时如实说明。
+   */
+  folderLabel(): string {
+    const uri: string = this.publicDirUri();
+    if (uri.length === 0) {
+      return '应用内目录（文件管理里看不到）';
+    }
+    let decoded: string = uri;
+    try {
+      decoded = decodeURIComponent(uri);
+    } catch (e) {
+      // uri 里的 % 解不开就按原文显示
+    }
+    const at: number = decoded.lastIndexOf('/Download/');
+    if (at >= 0) {
+      const tail: string = decoded.substring(at + '/Download/'.length);
+      return `下载/${this.displayDirName(tail)}`;
+    }
+    const cut: number = decoded.lastIndexOf('/');
+    const tail: string = cut >= 0 ? decoded.substring(cut + 1) : decoded;
+    return tail.length > 0 ? this.displayDirName(tail) : decoded;
   }
 
   /**
-   * 让用户选一个「下载目录」，记住它
+   * 目录末段换成用户认得的名字
    *
-   * 这里只做一件事：把用户选的目录（uri + 短名）记下来，之后每首下载的保存对话框
-   * 都定位到那儿。**不做授权持久化**，原因有两条：
-   *   1. persistPermission / activatePermission 需要 ohos.permission.FILE_ACCESS_PERSIST，
-   *      而它是「受限 ACL 权限」，必须在签名 Profile 的 allowed-acls 里声明才生效；
-   *      声明在自己工程里没用（还会卡住 AGC 上传的 ACL 一致性校验）。
-   *   2. 就算拿到了这个权限也用不上：往用户目录**新建文件**不能用 openSync + CREATE
-   *      （报 13900002），官方唯一通路是系统保存对话框（见 openTarget），
-   *      而那条路不需要任何权限。
-   * 所以「长期授权」这件事在手机上本来就做不到，如实告诉用户每首会确认一次。
+   * 末段等于自己的包名（`com.example.listen`）时换成应用名（`聆听`）：物理目录用的是包名，
+   * 但用户在「文件管理」里看到的是应用名，显示 `下载/com.example.listen` 会让人以为
+   * 跟文件管理里那个「聆听」不是一个地方。不是包名（别的机型/版本可能直接用应用名建目录）
+   * 就原样返回 —— 这里不猜、也不写死任何名字。
    */
-  async pickSaveDir(context: common.Context): Promise<PickDirResult> {
-    if (!canIUse('SystemCapability.FileManagement.UserFileService.FolderSelection')) {
-      return { cancel: false, label: '', detail: '这台设备不支持选择文件夹' };
+  private displayDirName(name: string): string {
+    const context = this.context;
+    if (context === null) {
+      return name;
     }
-    const options = new picker.DocumentSelectOptions();
-    options.maxSelectNumber = 1;
-    options.selectMode = picker.DocumentSelectMode.FOLDER;
-    const uris: string[] = await new picker.DocumentViewPicker(context).select(options);
-    if (uris.length === 0) {
-      return { cancel: true, label: '', detail: '' };
+    let bundle: string = '';
+    try {
+      bundle = context.applicationInfo.name;
+    } catch (e) {
+      return name;
     }
-    const uri: string = uris[0];
-    const label: string = this.labelOf(uri);
-    this.context = context;
-    DownloadSettings.getInstance().setSaveDir(uri, label);
-    this.bump();
-    hilog.info(DOMAIN, TAG, 'manual download dir set: %{public}s', uri);
-    return {
-      cancel: false,
-      label: label,
-      detail: `当前目录：${label}。手机系统不允许应用直接往用户目录新建文件，`
-        + '每首下载会弹一次系统保存对话框（已定位到这个目录、文件名已填好），确认即可',
-    };
+    if (name !== bundle) {
+      return name;
+    }
+    const label: string = this.appLabel();
+    return label.length > 0 ? label : name;
   }
 
-  private labelOf(uri: string): string {
-    const cut: number = uri.lastIndexOf('/');
-    const raw: string = cut >= 0 ? uri.substring(cut + 1) : uri;
-    try {
-      const decoded: string = decodeURIComponent(raw);
-      return decoded.length > 0 ? decoded : uri;
-    } catch (e) {
-      return raw;
+  /**
+   * 应用名（`app_name` 资源，与「文件管理」里显示的一致）
+   *
+   * 三条路依次试，哪条先拿到用哪条 —— 这里取不到就得把包名亮给用户看，所以宁可多试：
+   *   1. `applicationInfo.labelId`（app.json5 里 label 指向的那个字符串资源，编译器算好的 id）；
+   *   2. 按资源名找 `app_name`（工程里这个 key 就是应用名，不依赖 id 怎么生成）；
+   *   3. 按 `$r('app.string.app_name')` 的 id 找（老写法，兜底）。
+   * `applicationInfo.label` 不用：它可能是 `$string:xxx` 这样的描述符原文，显示出来更糟。
+   */
+  private appLabel(): string {
+    const context = this.context;
+    if (context === null) {
+      return '';
     }
+    try {
+      const labelId: number = context.applicationInfo.labelId;
+      if (labelId > 0) {
+        const byLabelId: string = context.resourceManager.getStringSync(labelId);
+        if (byLabelId.length > 0) {
+          return byLabelId;
+        }
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'app label by labelId failed: %{public}s', JSON.stringify(e));
+    }
+    try {
+      const byName: string = context.resourceManager.getStringByNameSync('app_name');
+      if (byName.length > 0) {
+        return byName;
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'app label by name failed: %{public}s', JSON.stringify(e));
+    }
+    try {
+      return context.resourceManager.getStringSync($r('app.string.app_name').id);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'app label by resource id failed: %{public}s', JSON.stringify(e));
+      return '';
+    }
+  }
+
+  /**
+   * 下载目录的 uri（公共目录）
+   *
+   * 首选设置里记下的（保存成功过一次就有）；没有就从下载记录里挑一条公共目录的文件
+   * uri 现算。都没有说明还没写进过公共目录 —— 返回空串，不去猜一个目录名字出来：
+   * 猜错了会把用户指到一个不存在的地方。
+   */
+  private publicDirUri(): string {
+    const learned: string = DownloadSettings.getInstance().getDownloadDirUri();
+    if (learned.length > 0) {
+      return learned;
+    }
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const uri: string = this.items[i].uri;
+      if (!uri.startsWith(PUBLIC_URI_PREFIX)) {
+        continue;
+      }
+      const cut: number = uri.lastIndexOf('/');
+      if (cut > PUBLIC_URI_PREFIX.length) {
+        return uri.substring(0, cut);
+      }
+    }
+    return '';
   }
 
   /**
    * 打开这次下载要写的位置
    *
-   * 关键限制（踩过一次）：`file://docs/...` 这类用户目录 uri **不能**用 openSync + CREATE
-   * 直接新建文件（报 13900002 No such file or directory），所以往用户目录写只有一条
-   * 官方通路 —— 系统保存对话框（DocumentViewPicker.save），由系统创建文件并返回可写 uri。
+   * 目标固定是**应用自己的下载目录**（用户不再选保存位置），按两条路试：
    *
-   *   Download目录 -> save(pickerMode = DOWNLOAD)：不弹界面，系统直接建在
-   *                   Download/<应用名>/ 下并返回可写 uri
-   *   手动选择     -> save(defaultFilePathUri = 用户选的目录)：对话框已定位到那个目录、
-   *                   文件名也填好了，确认一下就写进去
+   *   1. 系统保存对话框的 DOWNLOAD 模式（`save(pickerMode = DOWNLOAD)`）：不弹界面，
+   *      系统返回 Download/<包名>/ 这个**目录** uri（带持久化权限），我们拼上文件名
+   *      自己建文件。这是手机上把文件写进「文件管理」能看到的目录的**唯一**官方通路 ——
+   *      `Environment.getUserDownloadDir()` 那条路依赖 syscap
+   *      `File.Environment.FolderObtain`，手机不具备（编译器直接报 28005）。
+   *   2. 应用内 files/Download。第 1 条失败时的兜底：歌下得来、也能播，
+   *      但在「文件管理」里看不到，所以把失败原因写进 note，列表里如实显示。
    *
-   * 两条都拿不到（设备不支持 / 没有 context）时退回应用内 files/Download。
-   * 返回 null 表示用户在对话框里取消了（当作取消，不算失败）。
+   * 返回 null 表示这次下载没法开始（拿不到可写句柄）。
    */
   private async openTarget(fileName: string): Promise<WriteTarget | null> {
-    const settings = DownloadSettings.getInstance();
-    const manualDir: string = settings.getSaveDirUri();
-    const manual: boolean = settings.getSaveMode() === 'manual' && manualDir.length > 0;
-    const context = this.context;
-    if (context !== null) {
-      try {
-        const options = new picker.DocumentSaveOptions();
-        options.newFileNames = [fileName];
-        if (manual) {
-          // 定位到用户选的那个目录：对话框打开时就在那儿，文件名已填好
-          options.defaultFilePathUri = manualDir;
-        } else {
-          // 直接落到系统的 Download/<应用名>/，跳过选择界面
-          options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
-        }
-        const uris: string[] = await new picker.DocumentViewPicker(context).save(options);
-        if (uris.length === 0) {
-          return null;
-        }
-        const uri: string = uris[0];
-        // 文件是系统建好的，这里只负责打开（不带 CREATE：uri 上不支持创建）
-        const handle: fs.File = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-        return { path: uri, part: '', handle: handle };
-      } catch (e) {
-        hilog.warn(DOMAIN, TAG, 'open save target failed: %{public}s', JSON.stringify(e));
-        if (manual) {
-          // 手动模式失败就如实报错，别偷偷换个地方存
-          throw e as Error;
-        }
-      }
+    const attempt: PickerAttempt = await this.openViaPicker(fileName);
+    if (attempt.target !== null) {
+      return attempt.target;
     }
-    if (manual) {
-      throw new Error('保存对话框不可用，请在「下载设置」里重新选一次目录');
-    }
-    // Download目录模式拿不到系统目录：退回应用内目录，别让这次下载白跑
     const target: string = this.uniquePath(this.dir, fileName);
     const handle: fs.File | null = this.openPart(target);
     if (handle === null) {
       return null;
     }
-    return { path: target, part: `${target}${PART_SUFFIX}`, handle: handle };
+    return {
+      path: target,
+      part: `${target}${PART_SUFFIX}`,
+      handle: handle,
+      fallback: true,
+      reason: attempt.reason,
+    };
   }
 
-  /** 目标目录里同名文件已存在就加 (1)(2)…（uri 场景没有目录列举能力，用存在性判断） */
-  private uniqueUriPath(dir: string, fileName: string): string {
-    const dot: number = fileName.lastIndexOf('.');
-    const stem: string = dot > 0 ? fileName.substring(0, dot) : fileName;
-    const ext: string = dot > 0 ? fileName.substring(dot) : '';
-    let candidate: string = `${dir}/${fileName}`;
-    let index: number = 1;
-    while (this.exists(candidate) && index < 100) {
-      candidate = `${dir}/${stem} (${index})${ext}`;
-      index++;
+  /** 记下这条路的目录 uri（设置页「下载目录」显示的就是它） */
+  private learnDirOf(dirUri: string): void {
+    DownloadSettings.getInstance().learnDownloadDir(dirUri);
+  }
+
+  /** 第 2 条路（系统保存对话框）的结果：target 非空=成功，否则 reason 是失败原因 */
+  private async openViaPicker(fileName: string): Promise<PickerAttempt> {
+    const context = this.context;
+    if (context === null) {
+      return { target: null, reason: '应用上下文还没准备好' };
     }
-    return candidate;
+    try {
+      const options = new picker.DocumentSaveOptions();
+      // DOWNLOAD 模式下只认 pickerMode，别的选项（含 newFileNames）都不生效，
+      // 所以文件名不在这里给：拿到目录之后自己拼。
+      options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
+      const uris: string[] = await new picker.DocumentViewPicker(context).save(options);
+      if (uris.length === 0) {
+        return { target: null, reason: '系统保存对话框没有返回可用地址' };
+      }
+      // 返回的是**目录** uri（Download/包名/），不是文件 uri —— 官方 save-user-file 的
+      // DOWNLOAD 模式示例就是这么用的：拼上文件名 -> 转成路径 -> CREATE 建文件。
+      // 之前把它当文件 uri 打开、还带 TRUNC（目录打不开），这条路径其实一直是失败的，
+      // 只是失败被静默吞掉、直接落到了应用内目录。
+      const dirUri: string = uris[0];
+      const path: string = new fileUri.FileUri(`${dirUri}/${fileName}`).path;
+      const handle: fs.File = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE);
+      this.learnDirOf(dirUri);
+      return { target: { path: path, part: '', handle: handle, fallback: false, reason: '' },
+        reason: '' };
+    } catch (e) {
+      const error = e as BusinessError;
+      hilog.warn(DOMAIN, TAG, 'save dialog failed: %{public}s', JSON.stringify(e));
+      return { target: null, reason: `系统保存目录没能用上（${error.code} ${error.message}）` };
+    }
   }
 
   // ---------------------------------------------------------------- 队列
@@ -574,7 +653,7 @@ export class DownloadManager {
       return;
     }
 
-    // 2) 打开保存位置（Download目录走系统 Download，手动选择弹保存对话框）
+    // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）
     const fileName: string = this.buildFileName(item, url);
     item.fileName = fileName;
     let write: WriteTarget | null = null;
@@ -588,6 +667,9 @@ export class DownloadManager {
       this.fail(item, '已取消（没有选择保存位置）');
       return;
     }
+    item.note = write.fallback
+      ? `已存到应用内目录（「文件管理」看不到）：${write.reason}`
+      : '';
     if (item.status !== 'downloading') {
       this.closeQuietly(write.handle);
       return;
@@ -627,11 +709,11 @@ export class DownloadManager {
       this.requests.delete(item.key);
       if (item.status !== 'downloading') {
         // 期间被取消：丢掉半截文件
-        this.cleanupFailed(item, part, target);
+        this.cleanupFailed(part, target);
         return;
       }
       if (code !== 200 || item.received === 0) {
-        this.cleanupFailed(item, part, target);
+        this.cleanupFailed(part, target);
         this.fail(item, `下载失败（HTTP ${code}）`);
         return;
       }
@@ -646,12 +728,12 @@ export class DownloadManager {
         setDownloadedFile(item.key, target);
         hilog.info(DOMAIN, TAG, 'download done: %{public}s -> %{public}s', item.name, item.fileName);
       } catch (e) {
-        this.cleanupFailed(item, part, target);
+        this.cleanupFailed(part, target);
         this.fail(item, `写入文件失败：${(e as BusinessError).message}`);
       }
     } catch (e) {
       this.closeQuietly(file);
-      this.cleanupFailed(item, part, target);
+      this.cleanupFailed(part, target);
       this.requests.delete(item.key);
       if (item.status === 'downloading') {
         this.fail(item, (e as BusinessError).message);
@@ -772,7 +854,7 @@ export class DownloadManager {
   }
 
   /** 失败 / 取消时清掉半截文件（uri 场景删掉那个空文件） */
-  private cleanupFailed(item: DownloadItem, part: string, target: string): void {
+  private cleanupFailed(part: string, target: string): void {
     if (part.length > 0) {
       this.unlinkQuietly(part);
       return;

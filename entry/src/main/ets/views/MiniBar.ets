@@ -1,6 +1,6 @@
 import { PlaySession } from '../core/player/PlaySession';
-import { K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME, K_CURRENT_SINGER, K_MINI_EXPANDED,
-  K_PLAYER_STATUS } from '../core/player/PlaySession';
+import { K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME, K_CURRENT_SINGER,
+  K_MINI_EXPANDED, K_PLAYER_STATUS } from '../core/player/PlaySession';
 import { C_TEXT, C_TEXT_SUB } from '../ui/Theme';
 import { I_NEXT, I_PAUSE_CIRCLE, I_PLAY_CIRCLE, I_QUEUE, IconGlyph } from '../ui/Icons';
 import { CoverArt } from '../ui/Widgets';
@@ -37,6 +37,8 @@ export struct MiniBarView {
   @StorageLink(K_CURRENT_COVER) cover: string = '';
   @StorageLink(K_CURRENT_ART) art: boolean = false;
   @StorageLink(K_PLAYER_STATUS) status: string = 'idle';
+  /** 弱网下播放器在等数据：状态仍是 playing，但要显示成转圈（见 PlaySession.onPlayerBuffer） */
+  @StorageLink(K_BUFFERING) buffering: boolean = false;
 
   build() {
     if (this.expanded || this.forceExpanded) {
@@ -73,9 +75,12 @@ export struct MiniBarView {
         .onClick(() => {
           this.onOpenPlayer();
         })
+        .accessibilityGroup(true)
+        .accessibilityText(this.singer.length > 0 ? `${this.name}，${this.singer}，打开播放页` : `${this.name}，打开播放页`)
+        .accessibilityLevel('yes')
 
-        if (this.status === 'loading') {
-          // 切歌/缓冲期间转圈，不出声就不显示成播放中
+        if (this.status === 'loading' || this.buffering) {
+          // 切歌 / 等数据期间转圈，不出声就不显示成播放中
           LoadingProgress()
             .width(22)
             .height(22)
@@ -83,24 +88,33 @@ export struct MiniBarView {
             .onClick(() => {
               PlaySession.getInstance().toggle();
             })
+            .accessibilityText('暂停')
+            .accessibilityLevel('yes')
         } else {
           IconGlyph({
             symbol: this.status === 'playing' ? I_PAUSE_CIRCLE : I_PLAY_CIRCLE,
             iconSize: 28,
             color: '#17171A',
+            replaceEffect: true,
           })
             .onClick(() => {
               PlaySession.getInstance().toggle();
             })
+            .accessibilityText(this.status === 'playing' ? '暂停' : '播放')
+            .accessibilityLevel('yes')
         }
         IconGlyph({ symbol: I_NEXT, iconSize: 25, color: C_TEXT })
           .onClick(() => {
             PlaySession.getInstance().next();
           })
+          .accessibilityText('下一首')
+          .accessibilityLevel('yes')
         IconGlyph({ symbol: I_QUEUE, iconSize: 23, color: C_TEXT })
           .onClick(() => {
             this.onOpenQueue();
           })
+          .accessibilityText('播放列表')
+          .accessibilityLevel('yes')
       }
       .width('100%')
       .height('100%')
@@ -118,6 +132,9 @@ export struct MiniBarView {
       .width('100%')
       .height('100%')
       .clip(true)
+      .accessibilityGroup(true)
+      .accessibilityText('展开迷你播放器')
+      .accessibilityLevel('yes')
     }
   }
 }

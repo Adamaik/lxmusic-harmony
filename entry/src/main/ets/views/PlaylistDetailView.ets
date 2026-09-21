@@ -5,14 +5,16 @@ import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 import { LOVE_LIST_NAME } from '../core/sync/SyncTypes';
 import { C_BG, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_DOWNLOAD, I_HEART, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
-import { CoverArt, FavoriteHeart } from '../ui/Widgets';
+import { CoverArt, EmptyState, FavoriteHeart } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
-import { thinGlass } from '../ui/Glass';
+import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
+import { isLocalSong } from '../core/local/LocalMusic';
 
 /**
  * 歌单详情（点歌单进来的那一页）
@@ -30,6 +32,10 @@ export struct PlaylistDetailView {
   @Prop playlistId: string = '';
   @Prop playlistName: string = '';
   @Prop bottomInset: number = 0;
+  /** 页面主滚动容器，由壳层传进来（HDS 标题栏的滚动渐变要绑它，见 Index.titleBarOptions） */
+  scroller: Scroller = new Scroller();
+  /** 玻璃厚度档位（外观设置）：页内那层悬浮迷你播放条的毛玻璃跟着它变 */
+  @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   onOpenPlayer: () => void = () => {
   };
   onOpenQueue: () => void = () => {
@@ -102,6 +108,11 @@ export struct PlaylistDetailView {
 
   /** 下载：交给下载管理排队（设置里的文件名格式 / 保存位置都生效） */
   private download(item: SongItem): void {
+    // 本地歌已经在本机了（菜单里也不显示这一项，这里只作兜底）
+    if (isLocalSong(item)) {
+      this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
     const manager = DownloadManager.getInstance();
     if (!manager.isReady()) {
       this.toast('下载管理没准备好，稍后再试');
@@ -216,10 +227,13 @@ export struct PlaylistDetailView {
         .onClick(() => {
           this.playSong(item);
         })
-      MenuItem({ content: '下载' })
-        .onClick(() => {
-          this.download(item);
-        })
+      // 本地歌已经在本机了，下载这一项对它没有意义
+      if (!isLocalSong(item)) {
+        MenuItem({ content: '下载' })
+          .onClick(() => {
+            this.download(item);
+          })
+      }
       MenuItem({ content: '添加到歌单' })
         .onClick(() => {
           this.openPlaylistPicker(item);
@@ -353,12 +367,27 @@ export struct PlaylistDetailView {
       this.toast('歌单里还没有歌曲');
       return;
     }
-    const added: number = DownloadManager.getInstance().enqueueMany(this.songs);
+    // 本地歌跳过（已经在本机了）：只把在线歌排进下载队列
+    const online: SongItem[] = [];
+    let localCount: number = 0;
+    for (const item of this.songs) {
+      if (isLocalSong(item)) {
+        localCount++;
+      } else {
+        online.push(item);
+      }
+    }
+    if (online.length === 0) {
+      this.toast('这个歌单里都是本地歌，不需要下载');
+      return;
+    }
+    const added: number = DownloadManager.getInstance().enqueueMany(online);
     if (added === 0) {
       this.toast('这些歌都已经在下载列表里了');
       return;
     }
-    this.toast(`已加入下载 ${added} 首，可在「我的 - 下载管理」查看进度`);
+    const skipped: string = localCount > 0 ? `（跳过 ${localCount} 首本地歌）` : '';
+    this.toast(`已加入下载 ${added} 首${skipped}，可在「我的 - 下载管理」查看进度`);
   }
 
   private collectAll(): void {
@@ -443,7 +472,7 @@ export struct PlaylistDetailView {
     // 迷你播放条浮在列表之上（不是另占一行）：滚动的歌曲从它下面透过，
     // 毛玻璃才有东西可模糊——HDS 那条悬浮栏也是压在内容上的观感。
     Stack({ alignContent: Alignment.Bottom }) {
-      List() {
+      List({ scroller: this.scroller }) {
         ListItem() {
           this.header()
         }
@@ -454,17 +483,11 @@ export struct PlaylistDetailView {
 
         if (this.songs.length === 0) {
           ListItem() {
-            Column({ space: 8 }) {
-              Text('这个歌单还没有歌曲')
-                .fontSize(15)
-                .fontColor(C_TEXT_SUB)
-              Text('可以在洛雪桌面端 / 移动端把歌加进来，同步后就会出现')
-                .fontSize(12.5)
-                .fontColor(C_TEXT_WEAK)
-                .textAlign(TextAlign.Center)
-            }
-            .width('100%')
-            .padding({ left: 32, right: 32, top: 60 })
+            EmptyState({
+              text: '这个歌单还没有歌曲',
+              hint: '可以在洛雪桌面端 / 移动端把歌加进来，同步后就会出现',
+              topPadding: 56,
+            })
           }
         } else {
           // 懒加载：歌单动辄几百首，一次性建完所有行既卡又占内存
@@ -517,7 +540,8 @@ export struct PlaylistDetailView {
         }
         .width('100%')
         .height(HDS_BAR_HEIGHT)
-        .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2))
+        .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2, false, '', this.materialLevel))
+        .systemMaterial(immersiveMaterialFor(this.materialLevel))
         .clip(true)
       }
       .width('100%')

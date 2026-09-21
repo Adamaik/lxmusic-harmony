@@ -30,6 +30,12 @@ export interface LxRequestOptions {
   binary?: boolean;
   /** 为 true 时不做 JSON 解析，body 始终返回原始文本（用于下载源脚本） */
   rawText?: boolean;
+  /**
+   * 最大重定向次数。0 = 由调用方自己处理 3xx（从响应的 Location 头里读下一跳），
+   * 用于把短链（163cn.tv / c.migu.cn / t1.kugou.com 这类）解析成最终地址。
+   * 不传时保持系统默认（30 次自动跟随），与源脚本的请求语义一致。
+   */
+  maxRedirects?: number;
 }
 
 export interface LxResponse {
@@ -191,6 +197,9 @@ export function lxRequest(
   };
   if (bodyText !== undefined && method !== 'GET' && method !== 'HEAD') {
     requestOptions.extraData = bodyText;
+  }
+  if (options.maxRedirects !== undefined) {
+    requestOptions.maxRedirects = options.maxRedirects;
   }
 
   httpRequest.request(url, requestOptions)

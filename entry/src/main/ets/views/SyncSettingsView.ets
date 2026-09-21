@@ -266,7 +266,7 @@ export struct SyncSettingsView {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
 
-        RoundIconButton({ icon: I_REFRESH, boxSize: 36, iconSize: 18, onTap: () => {
+        RoundIconButton({ icon: I_REFRESH, boxSize: 36, iconSize: 18, label: '刷新同步状态', onTap: () => {
           void this.reconnect();
         } })
       }
@@ -457,6 +457,14 @@ export struct SyncSettingsView {
           Column({ space: 6 }) {
             this.sectionCard('同步内容', this.summaryText)
             Text('试听列表 = 本机的播放队列；收藏与歌单会与同一服务端的其它设备（洛雪桌面端 / 移动端）互通。')
+              .fontSize(F_SUB)
+              .fontColor(C_TEXT_SUB)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+            Text('注意：本地歌曲无法同步 —— 同步协议只传在线歌曲，本地音乐（从设备导入的音频）'
+              + '在同步时会被直接抛弃：不会上传到服务端，也不会从其它设备同步过来'
+              + '（歌单 / 收藏里的本地歌曲只留在本机，详见 docs/LOCAL_MUSIC.md）。')
               .fontSize(F_SUB)
               .fontColor(C_TEXT_SUB)
               .width('100%')

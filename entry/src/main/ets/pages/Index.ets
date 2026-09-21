@@ -1,18 +1,21 @@
 import { common } from '@kit.AbilityKit';
 import { SymbolGlyphModifier, window } from '@kit.ArkUI';
-import { HdsBarLayoutMode, HdsBarStyle, HdsNavigation, HdsNavDestination, HdsTabs,
-  HdsTabsBarChangeMode, HdsTabsController, hdsMaterial } from '@kit.UIDesignKit';
+import { BlurStrategy, HdsBarLayoutMode, HdsBarStyle, HdsNavigation, HdsNavigationTitleBarOptions,
+  HdsNavDestination, HdsTabs, HdsTabsBarChangeMode, HdsTabsController, HdsTitleBarContentStyle,
+  ScrollEffectType, TitleBarStyleOptions, TitleSize } from '@kit.UIDesignKit';
 import { K_CURRENT_ID, K_MINI_EXPANDED, K_QUEUE_COUNT, K_STATUS_TEXT, PlaySession } from '../core/player/PlaySession';
 import { SourceEngine } from '../core/source/SourceEngine';
 import { SourceInfo, SourceLog } from '../core/source/LxTypes';
 import { OnlineRoute } from '../core/music/MusicList';
 import { C_BG, C_ICON, C_RED, C_TEXT, F_SUB } from '../ui/Theme';
-import { GlassModifier, thinGlass } from '../ui/Glass';
+import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { DustLayer } from '../ui/Dust';
 import { SourceSandboxHost } from '../components/SourceSandboxHost';
 import { SyncManager, K_SYNC_STATUS } from '../core/sync/SyncManager';
 import { describeStatus, shouldNotifySyncMessage } from '../core/sync/SyncStatusText';
-import { HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
+import { buildTitleMaterial, HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
+import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
 import { I_GEAR, I_GEAR_FILL, I_HOME, I_HOME_FILL, I_PERSON, I_PERSON_FILL, I_PLAYLIST,
   I_PLAYLIST_FILL } from '../ui/Icons';
 import { MiniBarView } from '../views/MiniBar';
@@ -44,6 +47,8 @@ const PAGE_CACHE: string = 'cache';
 const PAGE_PLAY: string = 'play';
 /** 下载设置 */
 const PAGE_DOWNLOAD: string = 'download';
+/** 外观设置（材质档位 / 光效 / 深浅模式） */
+const PAGE_APPEARANCE: string = 'appearance';
 /** 在线歌单 / 在线榜单详情 */
 const PAGE_ONLINE: string = 'online';
 
@@ -101,6 +106,18 @@ struct Index {
   @StorageLink(K_QUEUE_COUNT) queueCount: number = 0;
   /** HDS 的页签控制器：悬浮页签 + 迷你栏都由它统管 */
   private tabsController: HdsTabsController = new HdsTabsController();
+  /** 材质档位（外观设置）：标题栏 / 底部页签栏 / 半模态共用，改一处三处一起变 */
+  @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
+  /**
+   * 详情页的主滚动容器。
+   *
+   * HDS 标题栏的渐变模糊（IMMERSIVE_GRADIENT_BLUR）是「滚动多少、磨砂多厚」，
+   * 它必须绑到页面真正的滚动容器上才知道滚了多少（见 titleBarOptions + bindToScrollable）。
+   * 只有封面会滚到标题栏底下、返回键浮在封面上的两个详情页需要；
+   * 其余子页面是白底设置页，标题栏直接给系统材质就够，不必绑。
+   */
+  private onlineScroller: Scroller = new Scroller();
+  private playlistScroller: Scroller = new Scroller();
   /** HDS 路由栈：搜索页 / 音源设置都作为 HdsNavDestination 压栈，标题栏与返回键由 HDS 提供 */
   private pathStack: NavPathStack = new NavPathStack();
   private mainWindow: window.Window | null = null;
@@ -108,9 +125,6 @@ struct Index {
   /** 播放会话的提示（缺音源 / 解析失败 / 播放错误），统一走 HDS 提示条 */
   private noticeListener: ((text: string) => void) | null = null;
   private toastTimer: number = 0;
-  // 提示条要保证文字可读，色调给得比其它玻璃层实一点；但必须带透明度，
-  // 不透明底色会挡住沉浸式材质的滤镜（玻璃动效就没了）
-  private toastGlass: GlassModifier = thinGlass(18, false, 'rgba(255, 255, 255, 0.82)');
 
   aboutToAppear(): void {
     PlaySession.getInstance().seed();
@@ -450,7 +464,53 @@ struct Index {
       this.showToast('洛雪音乐 HarmonyOS 复刻版 · 界面演示');
       return;
     }
+    if (action === 'appearance') {
+      this.go(PAGE_APPEARANCE);
+      return;
+    }
     this.showToast('该功能暂未接入');
+  }
+
+  /**
+   * 子页面标题栏（HDS）
+   *
+   * 配方与系统应用的标题栏一致：
+   *   - 系统材质：档位取外观设置（标题栏 / 底部页签栏 / 半模态三处同一档，见 buildTitleMaterial）；
+   *   - 毛玻璃：blurStrategy ENABLE，标题栏后面的内容透上来，而不是一条死白；
+   *   - 标题与图标颜色：系统主文字色，深浅模式切换后自动跟着换（不用自己判断）。
+   *
+   * 传了 `scroller` 才开渐变模糊：那是「一开始透明、滚起来才变磨砂」的过程，
+   * 只有封面会滚到标题栏底下的详情页需要；白底设置页直接给材质更稳
+   * （渐变模糊要绑滚动容器才算得出滚了多少，见各 destination 的 bindToScrollable）。
+   *
+   * title 传空字符串时只留返回键：在线歌单 / 歌单详情页的名字已经写在封面下面，
+   * 标题栏再写一遍就是同一行字出现两次。
+   */
+  private titleBarOptions(title: string = '', scroller?: Scroller): HdsNavigationTitleBarOptions {
+    const contentStyle: HdsTitleBarContentStyle = {
+      titleStyle: { mainTitleColor: $r('sys.color.font_primary') },
+      menuStyle: { iconColor: $r('sys.color.font_primary') },
+    };
+    const style: TitleBarStyleOptions = {
+      blurStrategy: BlurStrategy.ENABLE,
+      systemMaterialEffect: buildTitleMaterial(this.materialLevel),
+      originalStyle: { contentStyle: contentStyle },
+    };
+    if (scroller !== undefined) {
+      style.scrollEffectOpts = { scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR };
+      style.scrollEffectStyle = {
+        backgroundStyle: { blurRadius: 40 },
+        contentStyle: contentStyle,
+      };
+    }
+    const options: HdsNavigationTitleBarOptions = {
+      avoidLayoutSafeArea: true,
+      style: style,
+    };
+    if (title.length > 0) {
+      options.content = { title: { mainTitle: title, mainTitleSize: TitleSize.TITLE_ML } };
+    }
+    return options;
   }
 
   /**
@@ -472,7 +532,7 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '搜索' } } })
+      .titleBar(this.titleBarOptions('搜索'))
     } else if (name === PAGE_SOURCE) {
       HdsNavDestination() {
         Column() {
@@ -482,7 +542,7 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '音源设置' } } })
+      .titleBar(this.titleBarOptions('音源设置'))
       .onHidden(() => {
         this.refreshSourceSummary();
       })
@@ -495,7 +555,7 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '同步设置' } } })
+      .titleBar(this.titleBarOptions('同步设置'))
     } else if (name === PAGE_CACHE) {
       HdsNavDestination() {
         Column() {
@@ -505,7 +565,7 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '缓存' } } })
+      .titleBar(this.titleBarOptions('缓存'))
     } else if (name === PAGE_PLAY) {
       HdsNavDestination() {
         Column() {
@@ -515,7 +575,7 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '播放设置' } } })
+      .titleBar(this.titleBarOptions('播放设置'))
     } else if (name === PAGE_DOWNLOAD) {
       HdsNavDestination() {
         Column() {
@@ -525,7 +585,17 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({ avoidLayoutSafeArea: true, content: { title: { mainTitle: '下载设置' } } })
+      .titleBar(this.titleBarOptions('下载设置'))
+    } else if (name === PAGE_APPEARANCE) {
+      HdsNavDestination() {
+        Column() {
+          AppearanceSettingsView({ bottomInset: this.bottomInset })
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
+      }
+      .titleBar(this.titleBarOptions('外观'))
     } else if (name === PAGE_ONLINE) {
       HdsNavDestination() {
         Column() {
@@ -536,6 +606,7 @@ struct Index {
             listName: this.routeOnlineName,
             listCover: this.routeOnlineCover,
             bottomInset: this.bottomInset,
+            scroller: this.onlineScroller,
             onOpenPlayer: () => {
               this.openPlayer();
             },
@@ -548,10 +619,11 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({
-        avoidLayoutSafeArea: true,
-        content: { title: { mainTitle: this.routeOnlineName } },
-      })
+      // 顶栏不给标题：歌单名在封面下方已经有了，导航栏再重复一遍就是同一行字出现两次。
+      // 这一页的封面会滚到标题栏底下，所以绑上滚动容器开渐变模糊：
+      // 开始时返回键浮在封面上（底色透明），滚起来标题栏才变成磨砂。
+      .titleBar(this.titleBarOptions('', this.onlineScroller))
+      .bindToScrollable([this.onlineScroller])
     } else if (name === PAGE_PLAYLIST) {
       HdsNavDestination() {
         Column() {
@@ -559,6 +631,7 @@ struct Index {
             playlistId: this.routePlaylistId,
             playlistName: this.routePlaylistName,
             bottomInset: this.bottomInset,
+            scroller: this.playlistScroller,
             onOpenPlayer: () => {
               this.openPlayer();
             },
@@ -571,10 +644,9 @@ struct Index {
         .height('100%')
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
-      .titleBar({
-        avoidLayoutSafeArea: true,
-        content: { title: { mainTitle: this.routePlaylistName } },
-      })
+      // 同上：本地歌单的名字写在封面右边，顶栏不再重复；封面滚上去时标题栏才起磨砂
+      .titleBar(this.titleBarOptions('', this.playlistScroller))
+      .bindToScrollable([this.playlistScroller])
     }
   }
 
@@ -590,9 +662,6 @@ struct Index {
               onOpenSearch: () => {
                 this.go(PAGE_SEARCH);
               },
-              onOpenSource: () => {
-                this.go(PAGE_SOURCE);
-              },
               onOpenOnline: (route: OnlineRoute) => {
                 this.openOnline(route);
               },
@@ -604,9 +673,6 @@ struct Index {
             PlaylistView({
               topInset: this.topInset,
               bottomInset: this.bottomInset + 96,
-              onOpenSort: () => {
-                this.showToast('歌单排序暂未接入');
-              },
               onOpenPlaylist: (playlist: PlaylistSummary) => {
                 this.openPlaylist(playlist);
               },
@@ -649,10 +715,8 @@ struct Index {
           barBottomMargin: this.bottomInset + 10,
           // 内容从页签栏底下淡出，官方推荐的悬浮页签观感
           gradientMask: { maskColor: '#66F1F1F2', maskHeight: 104 },
-          systemMaterialEffect: {
-            materialType: hdsMaterial.MaterialType.IMMERSIVE,
-            materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
-          },
+          // 与标题栏、半模态共用同一个材质档位（外观设置里改一处，三处一起变）
+          systemMaterialEffect: buildTitleMaterial(this.materialLevel),
           // 迷你栏：折叠态就是右边那颗唱片圆钮，展开态是迷你播放器
           miniBar: {
             miniBarBuilder: () => this.miniBarBuilder(),
@@ -716,7 +780,10 @@ struct Index {
         }
         .constraintSize({ maxWidth: '86%' })
         .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-        .attributeModifier(this.toastGlass)
+        // 提示条要保证文字可读，色调给得比其它玻璃层实一点；但必须带透明度，
+        // 不透明底色会把毛玻璃的模糊盖掉（玻璃感就没了）。厚度跟外观设置的档位走。
+        .attributeModifier(thinGlass(18, false, 'rgba(255, 255, 255, 0.82)', this.materialLevel))
+        .systemMaterial(immersiveMaterialFor(this.materialLevel))
         // 压在底部迷你栏 / 页签栏之上：顶部在子页面里是标题栏与返回键的位置，别挡着
         .align(Alignment.Bottom)
         .margin({ left: 16, right: 16, bottom: this.bottomInset + 92 })
@@ -748,6 +815,7 @@ struct Index {
           detentSelection: SheetSize.MEDIUM,
           dragBar: true,
           showClose: true,
+          systemMaterial: buildTitleMaterial(this.materialLevel),
           title: { title: '同步方式' },
           onDisappear: () => {
             // 用户下滑关掉也算「取消同步」；已选过的话 answerMode 是空操作
@@ -774,10 +842,8 @@ struct Index {
       dragBar: true,
       showClose: true,
       blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
-      systemMaterial: {
-        materialType: hdsMaterial.MaterialType.IMMERSIVE,
-        materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
-      },
+      // 与标题栏、底部页签栏同一档材质（blurStyle 是材质不可用时的兜底）
+      systemMaterial: buildTitleMaterial(this.materialLevel),
       title: { title: '播放列表', subtitle: `共 ${this.queueCount} 首` },
     })
   }

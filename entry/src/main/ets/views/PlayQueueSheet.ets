@@ -3,11 +3,12 @@ import { K_CURRENT_ID, K_QUEUE_COUNT } from '../core/player/PlaySession';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
 import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_SUB } from '../ui/Theme';
-import { I_TRASH, I_VOLUME, IconGlyph } from '../ui/Icons';
-import { CoverArt } from '../ui/Widgets';
+import { I_QUEUE, I_TRASH, I_VOLUME, IconGlyph } from '../ui/Icons';
+import { CoverArt, EmptyState } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
+import { isLocalSong } from '../core/local/LocalMusic';
 
 /**
  * 播放列表的内容
@@ -76,6 +77,11 @@ export struct PlayQueueContent {
 
   /** 下载：交给下载管理排队 */
   private download(item: SongItem): void {
+    // 本地歌已经在本机了（菜单里也不显示这一项，这里只作兜底）
+    if (isLocalSong(item)) {
+      this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
     const manager = DownloadManager.getInstance();
     const state: DownloadItem | null = manager.stateOf(downloadKeyOf(item));
     if (state !== null && state.status === 'done') {
@@ -107,10 +113,13 @@ export struct PlayQueueContent {
         .onClick(() => {
           this.toggleFavorite(item);
         })
-      MenuItem({ content: '下载' })
-        .onClick(() => {
-          this.download(item);
-        })
+      // 本地歌已经在本机了，下载这一项对它没有意义
+      if (!isLocalSong(item)) {
+        MenuItem({ content: '下载' })
+          .onClick(() => {
+            this.download(item);
+          })
+      }
       MenuItem({ content: '不喜欢的歌曲' })
         .onClick(() => {
           this.dislike(item);
@@ -192,9 +201,11 @@ export struct PlayQueueContent {
     Column() {
       if (this.items.length === 0) {
         Column() {
-          Text('播放列表是空的')
-            .fontSize(14)
-            .fontColor(C_TEXT_WEAK)
+          EmptyState({
+            icon: I_QUEUE,
+            text: '播放列表是空的',
+            hint: '在歌单或搜索结果里点一首歌，就会进到这里',
+          })
         }
         .layoutWeight(1)
         .width('100%')

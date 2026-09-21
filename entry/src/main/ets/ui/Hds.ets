@@ -1,24 +1,31 @@
 import { deviceInfo } from '@kit.BasicServicesKit';
-import { hdsMaterial, HdsSceneController, HdsSceneType, HdsVisualComponent } from '@kit.UIDesignKit';
+import { hdsEffect, hdsMaterial, SystemMaterialParams } from '@kit.UIDesignKit';
 
 /**
  * HDS（HarmonyOS Design System，UI Design Kit）能力接入
  *
- * 1) 沉浸视效：HdsVisualComponent + HdsSceneController。
- *    当前 HDS 开放的场景是 DUAL_EDGE_FLOW_LIGHT_WITH_BACKGROUND_MASK
- *    （双边边缘流光 + 背景叠加色），用 HdsSceneController 的
- *    start/pause/resume/stop 控制动画，setSceneParams 配置两条光带的
- *    起止位置（按周长比例）与颜色。
+ * 1) 光效：hdsEffect 的着色器（`ShaderEffectController` + `EffectType`）。
+ *    这是**通用属性**路径：`HdsEffectBuilder().shaderEffect({...}).buildEffect()`
+ *    产出一个 `VisualEffect`（即 `uiEffect.VisualEffect`，API 12 起的通用属性），
+ *    挂在任意组件的 `.visualEffect()` 上即可，不需要任何现成控件当载体。
+ *      - `UV_BACKGROUND_FLOW_LIGHT`：整片背景流光，挂在全屏 Stack 上就是「首页流光」；
+ *      - `DUAL_EDGE_FLOW_LIGHT`：轮廓流光，挂在一块圆角容器上。
+ *    之前这里走的是 `HdsVisualComponent` + `HdsSceneType` 那一套（场景组件），
+ *    它必须有个现成控件可挂，底栏换成 HDS 悬浮页签后就没有落点了 —— 那条路已删掉。
  *
- * 2) 沉浸光感材质：hdsMaterial.getSystemMaterialTypes() 返回本机支持的材质类型
- *    （NONE / ADAPTIVE / IMMERSIVE），玻璃层据此决定用系统材质还是自绘兜底。
+ * 2) 材质档位：`buildTitleMaterial(level)` 把「跟随系统 / 弱 / 均衡 / 强」映射成
+ *    HDS 的系统材质参数。标题栏、底部页签栏、半模态三处共用同一个档位，
+ *    全应用的玻璃厚度才是同一套。档位由外观设置页写入（见 core/settings/AppearanceSettings.ets）。
  *
- * 3) 材质色板：直接取系统的 HDS 玻璃材质色（$r('sys.color.glass_material_*')），
- *    而不是自己拍一个半透明白，这样亮暗色模式下都与系统一致。
+ * 3) 材质与色板：`hdsMaterial.getSystemMaterialTypes()` 返回本机支持的材质类型；
+ *    玻璃层取系统的 HDS 玻璃材质色（`$r('sys.color.glass_material_*')`），
+ *    亮暗色模式下与系统一致，而不是自己拍一个半透明白。
  *
- * 注意：官方文档明确「模拟器不支持 HDS 沉浸视效（点光源、按压阴影、双边边缘流光、
- * 背景流光、沉浸光感材质）」，所以这里在模拟器上自动跳过视效层，
- * 避免画出不该有的背景遮罩；真机上会自动生效。
+ * 关于模拟器：官方文档写明「模拟器不支持 HDS 沉浸视效（点光源、按压阴影、
+ * 双边边缘流光、背景流光、沉浸光感材质）」，模拟器上渲不出来是平台侧的事。
+ * 但**代码不因此把能力关掉**：能力位在就挂上去，能不能画出来交给平台 ——
+ * 之前这里额外做了「模拟器就整层跳过」，结果是哪里都没有效果，
+ * 设置页还把原因写成「当前设备不支持」，对不上问题。现在只在能力位缺失时才不挂。
  */
 
 const SCENE: string = 'SystemCapability.UIDesign.HDSComponent.Core';
@@ -43,10 +50,11 @@ export const HDS_BAR_HEIGHT: number = 56;
 
 /**
  * 是否为模拟器。
+ * 只用于设置页把「为什么看不到视效」说清楚，不再用来关能力。
  * 模拟器上的 const.product.model / name / hardwareversion 都是 "emulator"，
  * 这里把几个可能命中的字段都查一遍，任一命中即认为是模拟器。
  */
-function isEmulator(): boolean {
+export function isEmulatorDevice(): boolean {
   const probes: string[] = [];
   try {
     probes.push(deviceInfo.productModel);
@@ -67,7 +75,7 @@ function isEmulator(): boolean {
 
 let supportedCache: boolean | undefined = undefined;
 
-/** 当前设备是否具备 HDS 视效能力（能力位存在，且不是模拟器） */
+/** 当前设备是否具备 HDS 能力（只看能力位；能不能渲染由平台决定） */
 export function hdsEffectSupported(): boolean {
   if (supportedCache !== undefined) {
     return supportedCache;
@@ -78,8 +86,67 @@ export function hdsEffectSupported(): boolean {
   } catch (e) {
     capability = false;
   }
-  supportedCache = capability && !isEmulator();
+  supportedCache = capability;
   return supportedCache;
+}
+
+// ------------------------------------------------------------------ 材质档位
+
+/** 外观设置里的档位顺序：0 跟随系统 / 1 弱 / 2 均衡 / 3 强 */
+export const MATERIAL_LEVEL_LABELS: string[] = ['跟随系统', '弱', '均衡', '强'];
+/** 档位上限（界面与校验用） */
+export const MATERIAL_LEVEL_MAX: number = MATERIAL_LEVEL_LABELS.length - 1;
+
+/** 档位收敛到 [0, MATERIAL_LEVEL_MAX]，越界按「跟随系统」处理 */
+export function clampMaterialLevel(level: number): number {
+  if (Number.isNaN(level) || level < 0 || level > MATERIAL_LEVEL_MAX) {
+    return 0;
+  }
+  return Math.round(level);
+}
+
+/**
+ * 档位 -> HDS 系统材质参数
+ *
+ * 标题栏（TitleBarStyleOptions.systemMaterialEffect）、底部页签栏
+ * （barFloatingStyle.systemMaterialEffect）、半模态（bindSheet 的 systemMaterial）
+ * 都走这一个函数，改一处档位三处一起变。
+ */
+export function buildTitleMaterial(level: number): SystemMaterialParams {
+  switch (clampMaterialLevel(level)) {
+    case 1:
+      return { materialType: hdsMaterial.MaterialType.IMMERSIVE, materialLevel: hdsMaterial.MaterialLevel.SMOOTH };
+    case 2:
+      return { materialType: hdsMaterial.MaterialType.IMMERSIVE, materialLevel: hdsMaterial.MaterialLevel.GENTLE };
+    case 3:
+      return { materialType: hdsMaterial.MaterialType.IMMERSIVE, materialLevel: hdsMaterial.MaterialLevel.EXQUISITE };
+    default:
+      return { materialType: hdsMaterial.MaterialType.IMMERSIVE, materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE };
+  }
+}
+
+/**
+ * 档位 -> 自绘玻璃层的模糊厚度
+ *
+ * 内容区里的普通组件吃不到系统材质（见 ui/Glass.ets 开头的平台限制），只能自己画磨砂，
+ * 所以「档位」在这里落成 backgroundBlurStyle 的厚度。映射与派音一致
+ * （它的 PlaylistFloatingMiniBar / PlaylistsPage 也是按 level 选 Thin/Regular/Thick）：
+ *   1 弱   -> COMPONENT_THIN            能透出更多背后的内容
+ *   2 均衡 -> COMPONENT_REGULAR
+ *   3 强   -> COMPONENT_ULTRA_THICK     最厚，背后几乎糊成一片
+ *   0 跟随系统 -> COMPONENT_ULTRA_THICK 自绘层没有「系统的档位」可跟，直接给最厚 ——
+ *                                      底部悬浮页签栏就是最厚那一档的观感，默认要对齐它
+ *   （3 强 与 0 都落在最厚一档，因为 ULTRA_THICK 已经是最厚，再往上没有了）
+ */
+export function buildGlassBlur(level: number): BlurStyle {
+  switch (clampMaterialLevel(level)) {
+    case 1:
+      return BlurStyle.COMPONENT_THIN;
+    case 2:
+      return BlurStyle.COMPONENT_REGULAR;
+    default:
+      return BlurStyle.COMPONENT_ULTRA_THICK;
+  }
 }
 
 let materialCache: string | undefined = undefined;
@@ -104,76 +171,100 @@ export function hdsMaterialType(): string {
   return text;
 }
 
-/** HDS 玻璃材质底色（系统色，跟随亮暗模式） */
-export function hdsGlassMask(): Resource {
-  return $r('sys.color.glass_material_mask_primary');
-}
+// ------------------------------------------------------------------ 光效
 
-/** HDS 玻璃材质描边（系统色） */
-export function hdsGlassOutline(): Resource {
-  return $r('sys.color.glass_material_outline_primary');
-}
+/** 流光完整循环一圈的时长（ms）：10 秒一圈是系统首页流光的默认观感，慢到不抢内容 */
+export const FLOW_LIGHT_DURATION_MS: number = 10000;
+/** 流光层不透明度：压在页面底色之上、内容之下，避免喧宾夺主 */
+export const FLOW_LIGHT_OPACITY: number = 0.5;
 
 /**
- * HDS 沉浸视效层：双边边缘流光
+ * 背景流光层
  *
- * 铺满父容器，作为最底层或覆盖层使用（本身不接收点击）。
+ * 用法：
+ *   Stack({ alignContent: Alignment.TopStart }) {
+ *     HdsFlowLightBackground()        // 首个子节点：画在底色之上、内容之下
+ *     Column() { ...页面内容... }
+ *   }
+ *   .backgroundColor(页面底色)         // 底色必须挂在这一层 Stack 上
+ *
+ * 底色一定要给外层 Stack：如果把不透明底色留在内容那一层，流光会被整片盖掉，
+ * 看上去就是「加了没效果」。
+ *
+ * 布局与交互都不受影响：铺满父容器、不拦触摸（HitTestMode.Transparent）、
+ * 本身没有子节点，不参与测量。
  */
 @Component
-export struct HdsFlowLight {
-  @Prop radius: number = 30;
-  /** 第一条光带的颜色（从主题色推导，默认跟随强调色） */
-  @Prop colorA: ResourceColor = '#59FF6B6B';
-  @Prop colorB: ResourceColor = '#40FF9F43';
-  private controller: HdsSceneController = new HdsSceneController();
-  private configured: boolean = false;
-
-  aboutToAppear(): void {
-    if (!hdsEffectSupported()) {
-      return;
-    }
-    try {
-      this.controller.setSceneParams({
-        // 背景叠加色用全透明：只叠加流光，不盖住下层玻璃
-        backgroundMaskColors: ['#00000000', '#00000000'],
-        firstEdgeFlowLight: { startPos: 0, endPos: 0.3, color: this.colorA },
-        secondEdgeFlowLight: { startPos: 0.5, endPos: 0.8, color: this.colorB },
-      });
-      this.configured = true;
-    } catch (e) {
-      this.configured = false;
-    }
-  }
-
-  aboutToDisappear(): void {
-    if (!this.configured) {
-      return;
-    }
-    try {
-      this.controller.stop();
-    } catch (e) {
-      // 忽略：视效层被销毁时停止动画失败没有影响
-    }
-  }
+export struct HdsFlowLightBackground {
+  @Prop lightOpacity: number = FLOW_LIGHT_OPACITY;
+  @Prop durationMs: number = FLOW_LIGHT_DURATION_MS;
+  private controller: hdsEffect.ShaderEffectController = new hdsEffect.ShaderEffectController();
 
   build() {
     if (hdsEffectSupported()) {
-      HdsVisualComponent()
-        .scene(HdsSceneType.DUAL_EDGE_FLOW_LIGHT_WITH_BACKGROUND_MASK, this.controller)
+      Stack()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
+        .opacity(this.lightOpacity)
+        .visualEffect(new hdsEffect.HdsEffectBuilder()
+          .shaderEffect({
+            effectType: hdsEffect.EffectType.UV_BACKGROUND_FLOW_LIGHT,
+            animation: {
+              duration: this.durationMs,
+              // -1 = 无限循环
+              iterations: -1,
+              autoPlay: true
+            },
+            controller: this.controller
+          })
+          .buildEffect())
+    }
+  }
+}
+
+/**
+ * 轮廓流光（双边边缘流光）
+ *
+ * 需要「一块有圆角的容器自己在发光」时用：垫在内容下面当光底（圆钮、播放胶囊），
+ * 或者盖在封面这类整块图片上。铺满父容器，不拦触摸。
+ *
+ * 与背景流光的区别：`UV_BACKGROUND_FLOW_LIGHT` 是整片背景流光，这个是沿轮廓走的
+ * 两条光带，观感更「贴边」，两者不要叠在同一层上。
+ */
+@Component
+export struct HdsEdgeFlowLight {
+  @Prop radius: number = 30;
+  @Prop colorA: ResourceColor = '#59FF6B6B';
+  @Prop colorB: ResourceColor = '#40FF9F43';
+  @Prop lightOpacity: number = 0.8;
+  @Prop durationMs: number = FLOW_LIGHT_DURATION_MS;
+  private controller: hdsEffect.ShaderEffectController = new hdsEffect.ShaderEffectController();
+
+  build() {
+    if (hdsEffectSupported()) {
+      Stack()
         .width('100%')
         .height('100%')
         .borderRadius(this.radius)
         .clip(true)
-        .hitTestBehavior(HitTestMode.None)
-        .onAppear(() => {
-          if (this.configured) {
-            try {
-              this.controller.start();
-            } catch (e) {
-              // 忽略：不支持时系统会静默忽略
-            }
-          }
-        })
+        .hitTestBehavior(HitTestMode.Transparent)
+        .opacity(this.lightOpacity)
+        .visualEffect(new hdsEffect.HdsEffectBuilder()
+          .shaderEffect({
+            effectType: hdsEffect.EffectType.DUAL_EDGE_FLOW_LIGHT,
+            params: {
+              firstEdgeFlowLight: { startPos: 0, endPos: 0.3, color: this.colorA },
+              secondEdgeFlowLight: { startPos: 0.5, endPos: 0.8, color: this.colorB }
+            },
+            animation: {
+              duration: this.durationMs,
+              iterations: -1,
+              autoPlay: true
+            },
+            controller: this.controller
+          })
+          .buildEffect())
     }
   }
 }

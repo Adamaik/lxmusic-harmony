@@ -4,13 +4,15 @@ import { LxListDetail, LxListInfo, getBoardSongs, getPlaylistDetail, platformNam
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
 import { C_BG, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
-import { I_DOWNLOAD, I_HEART, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
+import { I_CHEVRON_DOWN, I_DOWNLOAD, I_HEART, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { CoverArt, FavoriteHeart } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
-import { thinGlass } from '../ui/Glass';
+import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
+import { ImportPlaylistSheet } from './ImportPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 
 /** 一次最多往队列里放多少首（在线榜单动辄几百首，全塞进队列既慢也没意义） */
@@ -20,7 +22,8 @@ const MAX_SONGS: number = 500;
  * 在线歌单 / 在线榜单详情
  *
  * 从推荐页点进来的那一页：顶部是在线歌单（或榜单）的封面与信息，
- * 下面「播放全部 / 全部收藏」，再下面是歌曲列表，点某一首就从这一首开始播。
+ * 下面「播放全部 / 收藏」，再下面是歌曲列表，点某一首就从这一首开始播。
+ * 名字只出现在封面下方那一处（导航栏不再重复一遍歌单名）。
  *
  * 数据来自宿主内置的平台接口（core/music/MusicList.ets），与音源无关：
  * 拿到 musicInfo 之后，播放链接照旧交给导入的源规则解析。
@@ -39,6 +42,16 @@ export struct OnlineListView {
   /** 进入时已知的封面（歌单有；榜单为空） */
   @Prop listCover: string = '';
   @Prop bottomInset: number = 0;
+  /**
+   * 页面主滚动容器，由壳层（pages/Index.ets）传进来。
+   *
+   * HDS 标题栏的渐变模糊要知道「滚了多少」，靠的是 HdsNavDestination.bindToScrollable
+   * 绑这个 Scroller：封面滚到标题栏底下时，返回键从浮在封面上变成浮在磨砂上。
+   * 不传也能跑，只是标题栏不会有滚动渐变。
+   */
+  scroller: Scroller = new Scroller();
+  /** 玻璃厚度档位（外观设置）：页内那层悬浮迷你播放条的毛玻璃跟着它变 */
+  @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   onOpenPlayer: () => void = () => {
   };
   onOpenQueue: () => void = () => {
@@ -57,6 +70,8 @@ export struct OnlineListView {
   @State pickerOpen: boolean = false;
   @State pending: SongItem | null = null;
   @State candidates: PlaylistSummary[] = [];
+  /** 「导入到我的歌单」面板（把这个在线歌单存成自己的歌单） */
+  @State importOpen: boolean = false;
   /** 懒加载数据源：在线榜单可能上千首，一次性建完所有行会卡 */
   private listSource: SongListSource = new SongListSource();
 
@@ -386,19 +401,20 @@ export struct OnlineListView {
         this.playFrom(0);
       })
 
+      // 收藏：一个按钮两个去处（「收藏到收藏」/「收藏到歌单」），点开再选。
+      // 原先「全部收藏」和「导入到我的歌单」并排摆着，用户得先猜哪个是哪个。
       Row({ space: 6 }) {
         IconGlyph({ symbol: I_HEART, iconSize: 20, color: C_RED })
-        Text('全部收藏')
+        Text('收藏')
           .fontSize(15)
           .fontColor(C_RED)
+        IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 14, color: C_RED })
       }
       .height(46)
-      .padding({ left: 16, right: 16 })
+      .padding({ left: 16, right: 12 })
       .borderRadius(23)
       .backgroundColor('#14E33B3B')
-      .onClick(() => {
-        this.collectAll();
-      })
+      .bindMenu(this.collectMenu())
 
       // 下载全部：列表里有几十上百首，一个个点太费事
       Row() {
@@ -415,6 +431,53 @@ export struct OnlineListView {
     }
     .width('100%')
     .padding({ left: 16, right: 16, bottom: 8 })
+  }
+
+  /**
+   * 「收藏」按钮的菜单
+   *
+   * 两个去处：
+   *   - 收藏到收藏：把列表里的歌全部加进收藏（原来那个「全部收藏」）；
+   *   - 收藏到歌单：把这张在线歌单整个存进「我的歌单」（原来的「导入到我的歌单」，
+   *     同一个线上歌单再存一次是原地更新，不会重复建列表）。
+   * 榜单没有「收藏到歌单」：榜单的 bangid 与歌单 id 不是一回事，存下来以后没法再更新。
+   */
+  @Builder
+  collectMenu() {
+    Menu() {
+      MenuItem({ content: `收藏到收藏（${this.songs.length} 首）` })
+        .onClick(() => {
+          this.collectAll();
+        })
+      if (this.kind === 'playlist') {
+        MenuItem({ content: '收藏到歌单' })
+          .onClick(() => {
+            this.importOpen = true;
+          })
+      }
+    }
+    .font({ size: 16 })
+    .menuItemDivider({
+      strokeWidth: LengthMetrics.vp(0.5),
+      color: C_DIVIDER,
+      startMargin: LengthMetrics.vp(14),
+      endMargin: LengthMetrics.vp(14),
+    })
+  }
+
+  /** 「导入到我的歌单」面板：平台与歌单 id 已经知道，直接带进去 */
+  @Builder
+  importSheet() {
+    ImportPlaylistSheet({
+      bottomInset: this.bottomInset,
+      presetSource: this.source,
+      presetId: this.listId,
+      presetName: this.listName,
+      onDone: (message: string) => {
+        this.importOpen = false;
+        this.toast(message);
+      },
+    })
   }
 
   @Builder
@@ -509,7 +572,7 @@ export struct OnlineListView {
   build() {
     // 迷你播放条浮在列表之上（与歌单详情同一套观感）
     Stack({ alignContent: Alignment.Bottom }) {
-      List() {
+      List({ scroller: this.scroller }) {
         ListItem() {
           this.header()
         }
@@ -602,11 +665,25 @@ export struct OnlineListView {
         }
         .width('100%')
         .height(HDS_BAR_HEIGHT)
-        .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2))
+        .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2, false, '', this.materialLevel))
+        .systemMaterial(immersiveMaterialFor(this.materialLevel))
         .clip(true)
       }
       .width('100%')
       .padding({ left: 12, right: 12, bottom: this.bottomInset + 10 })
+
+      // 导入面板：挂在单独的 1x1 节点上（根节点已经被「添加到歌单」面板占了）
+      Column()
+        .width(1)
+        .height(1)
+        .bindSheet($$this.importOpen, this.importSheet(), {
+          preferType: SheetType.BOTTOM,
+          detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+          detentSelection: SheetSize.LARGE,
+          dragBar: true,
+          showClose: true,
+          title: { title: '导入歌单' },
+        })
     }
     .width('100%')
     .height('100%')

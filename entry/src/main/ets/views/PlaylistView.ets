@@ -3,13 +3,18 @@ import { K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../co
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 import { LOVE_LIST_NAME } from '../core/sync/SyncTypes';
-import { C_BG, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
-import { I_CHEVRON_RIGHT, I_HEART_FILLED, I_MORE, I_MORE_CIRCLE, I_PLUS, I_SORT, IconGlyph } from '../ui/Icons';
-import { CoverArt, FavoriteHeart, PageTitle, RoundIconButton } from '../ui/Widgets';
+import { C_BG, C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SUB, platformColor,
+  platformTint } from '../ui/Theme';
+import { platformName } from '../core/music/MusicList';
+import { I_CHEVRON_RIGHT, I_HEART_FILLED, I_IMPORT, I_MORE, I_MORE_CIRCLE, I_PLUS,
+  IconGlyph } from '../ui/Icons';
+import { CoverArt, EmptyState, FavoriteHeart, PageTitle, RoundIconButton } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
+import { ImportPlaylistSheet } from './ImportPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
+import { isLocalSong } from '../core/local/LocalMusic';
 
 /**
  * 歌单页
@@ -26,8 +31,6 @@ export struct PlaylistView {
   @Prop bottomInset: number = 0;
   onOpenPlaylist: (playlist: PlaylistSummary) => void = () => {
   };
-  onOpenSort: () => void = () => {
-  };
   @State playlists: PlaylistSummary[] = [];
   /** 最近一次触摸点：删除歌单时在这里撒一把粒子（普通字段，不引起重绘） */
   private dustX: number = 0;
@@ -36,6 +39,8 @@ export struct PlaylistView {
   @State editOpen: boolean = false;
   @State editingId: string = '';
   @State editName: string = '';
+  /** 「导入歌单」面板（粘贴第三方歌单分享链接） */
+  @State importOpen: boolean = false;
   /** 同步模块或本地库改动后重新读一次歌单 */
   @StorageLink(K_LIBRARY_VERSION) @Watch('refresh') libraryVersion: number = 0;
   @StorageLink(K_SYNC_DATA_VERSION) @Watch('refresh') syncVersion: number = 0;
@@ -201,104 +206,133 @@ export struct PlaylistView {
     .padding({ left: 16, right: 16, top: 16, bottom: 8 })
   }
 
+  @Builder
+  importSheet() {
+    ImportPlaylistSheet({
+      bottomInset: this.bottomInset,
+      onDone: (message: string) => {
+        this.importOpen = false;
+        this.toast(message);
+      },
+    })
+  }
+
   build() {
-    Column() {
-      Row({ space: 10 }) {
-        PageTitle({ text: '歌单' })
-        Blank()
-        RoundIconButton({ icon: I_SORT, boxSize: 40, iconSize: 21, onTap: this.onOpenSort })
-        RoundIconButton({ icon: I_PLUS, boxSize: 40, iconSize: 22, onTap: () => {
-          this.openCreate();
-        } })
-      }
-      .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 10 })
-
-      // 系统列表：ListItemGroup(CARD) 给整块白卡，行内分隔线由 group 的 divider 统一画
-      List() {
-        ListItemGroup({ style: ListItemGroupStyle.CARD }) {
-          ForEach(this.playlists, (item: PlaylistSummary) => {
-            ListItem() {
-              Row({ space: 10 }) {
-                // 内置收藏歌单前面挂一颗心，跟普通歌单区分开
-                if (this.isBuiltin(item)) {
-                  IconGlyph({ symbol: I_HEART_FILLED, iconSize: 18, color: C_RED })
-                }
-
-                Column({ space: 5 }) {
-                  Text(item.name)
-                    .fontSize(F_ITEM)
-                    .fontColor(C_TEXT)
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .width('100%')
-                    .textAlign(TextAlign.Start)
-                  Text(this.isBuiltin(item) ? `${item.count} 首 · 默认收藏歌单` : `${item.count} 首`)
-                    .fontSize(F_SUB)
-                    .fontColor(C_TEXT_WEAK)
-                    .width('100%')
-                    .textAlign(TextAlign.Start)
-                }
-                .layoutWeight(1)
-                .alignItems(HorizontalAlign.Start)
-
-                // 内置歌单不给「更多」入口：它不能改名、也不能删除
-                if (!this.isBuiltin(item)) {
-                  IconGlyph({ symbol: I_MORE, iconSize: 20, color: C_TEXT_WEAK })
-                }
-                IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_TEXT_WEAK })
-              }
-              .width('100%')
-              .height(76)
-              .padding({ left: 16, right: 14 })
-              .onClick(() => {
-                this.onOpenPlaylist(item);
-              })
-              .onTouch((event: TouchEvent) => {
-                this.rememberTouch(event);
-              })
-              .bindContextMenu(this.rowMenu(item), ResponseType.LongPress)
-            }
-          }, (item: PlaylistSummary) => `${item.id}_${item.count}_${item.name}`)
+    // 两个半模态各自挂在一个节点上：同一个节点叠两个 bindSheet 会互相干扰
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        Row({ space: 10 }) {
+          PageTitle({ text: '歌单' })
+          Blank()
+          // 歌单页只留「导入」「新建」两个悬浮钮：原来中间那颗「排序」点下去只弹一句
+          // 「暂未接入」，摆在那里是误导，直接去掉（排序在「推荐」页是按来源走的，
+          // 本地歌单的排序还没有真实需求）
+          RoundIconButton({ icon: I_IMPORT, boxSize: 40, iconSize: 20, label: '导入歌单', onTap: () => {
+            this.importOpen = true;
+          } })
+          RoundIconButton({ icon: I_PLUS, boxSize: 40, iconSize: 22, label: '新建歌单', onTap: () => {
+            this.openCreate();
+          } })
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 8 })
-        .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 16 })
+        .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 10 })
 
-        if (this.playlists.length === 0) {
-          ListItem() {
-            Column({ space: 8 }) {
-              Text('还没有歌单')
-                .fontSize(15)
-                .fontColor(C_TEXT_SUB)
-              Text('点右上角「+」新建一个歌单')
-                .fontSize(12.5)
-                .fontColor(C_TEXT_WEAK)
+        // 系统列表：ListItemGroup(CARD) 给整块白卡，行内分隔线由 group 的 divider 统一画
+        List() {
+          ListItemGroup({ style: ListItemGroupStyle.CARD }) {
+            ForEach(this.playlists, (item: PlaylistSummary) => {
+              ListItem() {
+                Row({ space: 10 }) {
+                  // 内置收藏歌单前面挂一颗心，跟普通歌单区分开
+                  if (this.isBuiltin(item)) {
+                    IconGlyph({ symbol: I_HEART_FILLED, iconSize: 18, color: C_RED })
+                  }
+
+                  Column({ space: 5 }) {
+                    Text(item.name)
+                      .fontSize(F_ITEM)
+                      .fontColor(C_TEXT)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+                      .textAlign(TextAlign.Start)
+                    Text(this.isBuiltin(item) ? `${item.count} 首 · 默认收藏歌单` : `${item.count} 首`)
+                      .fontSize(F_SUB)
+                      .fontColor(C_TEXT_WEAK)
+                      .width('100%')
+                      .textAlign(TextAlign.Start)
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.Start)
+
+                  // 内置歌单不给「更多」入口：它不能改名、也不能删除
+                  if (!this.isBuiltin(item)) {
+                    IconGlyph({ symbol: I_MORE, iconSize: 20, color: C_TEXT_WEAK })
+                  }
+                  IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_TEXT_WEAK })
+                }
+                .width('100%')
+                .height(76)
+                .padding({ left: 16, right: 14 })
+                .onClick(() => {
+                  this.onOpenPlaylist(item);
+                })
+                .onTouch((event: TouchEvent) => {
+                  this.rememberTouch(event);
+                })
+                .bindContextMenu(this.rowMenu(item), ResponseType.LongPress)
+              }
+            }, (item: PlaylistSummary) => `${item.id}_${item.count}_${item.name}`)
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 8 })
+          .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 16 })
+
+          if (this.playlists.length === 0) {
+            ListItem() {
+              EmptyState({
+                text: '还没有歌单',
+                hint: '点右上角「+」新建一个歌单，或者从「导入歌单」粘贴分享链接',
+                topPadding: 72,
+              })
             }
-            .width('100%')
-            .padding({ top: 80 })
+          }
+
+          ListItem() {
+            Column().height(this.bottomInset + 12).width('100%')
           }
         }
-
-        ListItem() {
-          Column().height(this.bottomInset + 12).width('100%')
-        }
+        .scrollBar(BarState.Off)
+        .layoutWeight(1)
+        .width('100%')
       }
-      .scrollBar(BarState.Off)
-      .layoutWeight(1)
       .width('100%')
+      .height('100%')
+      .bindSheet($$this.editOpen, this.editSheet(), {
+        preferType: SheetType.BOTTOM,
+        detents: [SheetSize.MEDIUM],
+        detentSelection: SheetSize.MEDIUM,
+        dragBar: true,
+        showClose: false,
+        title: { title: this.editingId.length === 0 ? '新建歌单' : '重命名' },
+      })
+
+      // 导入面板：挂在另一个 1x1 节点上（上面那个节点已经占了新建面板）
+      Column()
+        .width(1)
+        .height(1)
+        .bindSheet($$this.importOpen, this.importSheet(), {
+          preferType: SheetType.BOTTOM,
+          detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+          detentSelection: SheetSize.LARGE,
+          dragBar: true,
+          showClose: true,
+          title: { title: '导入歌单' },
+        })
     }
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)
-    .bindSheet($$this.editOpen, this.editSheet(), {
-      preferType: SheetType.BOTTOM,
-      detents: [SheetSize.MEDIUM],
-      detentSelection: SheetSize.MEDIUM,
-      dragBar: true,
-      showClose: false,
-      title: { title: this.editingId.length === 0 ? '新建歌单' : '重命名' },
-    })
   }
 }
 
@@ -314,10 +348,19 @@ export struct SongListPane {
   @Prop @Watch('onItemsChanged') items: SongItem[] = [];
   @Prop currentId: string = '';
   @Prop emptyText: string = '这里是空的';
+  /** 行上是否标出来源平台（聚合搜索结果才需要，普通歌单里所有歌都是一个平台） */
+  @Prop showSource: boolean = false;
   @Prop coverSize: number = 52;
   /** 列表底部要留出的空间（悬浮页签栏 / 手势条），由调用方给 */
   @Prop bottomInset: number = 0;
   onPick: (index: number) => void = () => {
+  };
+  /**
+   * 「从本地音乐移除」的回调（只有 source='local' 的条目会用到）
+   *
+   * 不传就表示这个列表里不会出现本地歌（比如在线排行榜），菜单里也就不显示这一项。
+   */
+  onRemoveLocal: (item: SongItem) => void = () => {
   };
   /** 「添加到歌单」选歌单面板 */
   @State pickerOpen: boolean = false;
@@ -351,6 +394,11 @@ export struct SongListPane {
 
   /** 下载：交给下载管理排队 */
   private download(item: SongItem): void {
+    // 本地歌没什么可下的（菜单里也不显示这一项，这里只作兜底）
+    if (isLocalSong(item)) {
+      this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
     const manager = DownloadManager.getInstance();
     const state: DownloadItem | null = manager.stateOf(downloadKeyOf(item));
     if (state !== null && state.status === 'done') {
@@ -455,10 +503,13 @@ export struct SongListPane {
             this.onPick(index);
           }
         })
-      MenuItem({ content: '下载' })
-        .onClick(() => {
-          this.download(item);
-        })
+      // 本地歌已经在本地了，下载这一项对它没有意义
+      if (!isLocalSong(item)) {
+        MenuItem({ content: '下载' })
+          .onClick(() => {
+            this.download(item);
+          })
+      }
       MenuItem({ content: '添加到歌单' })
         .onClick(() => {
           this.openPlaylistPicker(item);
@@ -471,6 +522,12 @@ export struct SongListPane {
         .onClick(() => {
           this.addToNext(item);
         })
+      if (isLocalSong(item)) {
+        MenuItem({ content: '从本地音乐移除' })
+          .onClick(() => {
+            this.onRemoveLocal(item);
+          })
+      }
     }
     .font({ size: 16 })
     .menuItemDivider({
@@ -484,13 +541,7 @@ export struct SongListPane {
   build() {
     Column() {
       if (this.items.length === 0) {
-        Column() {
-          Text(this.emptyText)
-            .fontSize(15)
-            .fontColor(C_TEXT_SUB)
-        }
-        .width('100%')
-        .padding({ top: 90 })
+        EmptyState({ text: this.emptyText, topPadding: 82 })
       } else {
         List() {
           LazyForEach(this.source, (item: SongItem, index: number) => {
@@ -512,14 +563,30 @@ export struct SongListPane {
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                       .width('100%')
                       .textAlign(TextAlign.Start)
-                    if (item.singer.length > 0) {
-                      Text(item.singer)
-                        .fontSize(F_SUB)
-                        .fontColor(C_TEXT_WEAK)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .width('100%')
-                        .textAlign(TextAlign.Start)
+                    if (item.singer.length > 0 || this.showSource) {
+                      Row({ space: 6 }) {
+                        if (item.singer.length > 0) {
+                          Text(item.singer)
+                            .fontSize(F_SUB)
+                            .fontColor(C_TEXT_WEAK)
+                            .maxLines(1)
+                            .textOverflow({ overflow: TextOverflow.Ellipsis })
+                            .layoutWeight(1)
+                            .textAlign(TextAlign.Start)
+                        }
+                        if (this.showSource) {
+                          // 来源标签：同一首歌在五个平台都有，扫列表时得一眼看出哪条是哪个站
+                          Text(platformName(item.source))
+                            .fontSize(10.5)
+                            .fontColor(platformColor(item.source))
+                            .padding({ left: 5, right: 5, top: 1, bottom: 1 })
+                            .borderRadius(6)
+                            .backgroundColor(platformTint(item.source))
+                            .flexShrink(0)
+                        }
+                      }
+                      .width('100%')
+                      .alignItems(VerticalAlign.Center)
                     }
                   }
                   .layoutWeight(1)

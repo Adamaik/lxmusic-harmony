@@ -1,5 +1,5 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { I_MORE_CIRCLE, I_PLAY_CIRCLE, IconGlyph } from '../ui/Icons';
 import { CoverArt } from '../ui/Widgets';
 import { CoverStore } from '../core/music/CoverStore';
@@ -27,6 +27,7 @@ function sizeText(bytes: number): string {
  * 显示每条下载的封面、歌名歌手、状态（排队中 / 进度 / 已完成体积 / 失败原因），
  * 点一行：已完成的直接播本地文件（离线可放），没下完的先提醒。
  * 右侧「更多」里可以重新下载 / 删除记录（删记录会连文件一起删）。
+ * 下载目录本身在「设置 - 下载设置」里展示（系统没有跳到指定目录的能力，所以不在此放跳转入口）。
  */
 @Component
 export struct DownloadListPane {
@@ -157,6 +158,16 @@ export struct DownloadListPane {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
           .textAlign(TextAlign.Start)
+        // 落盘位置没拿到系统目录时如实说明一句，不然用户去文件管理里找不到这个文件
+        if (item.note.length > 0) {
+          Text(item.note)
+            .fontSize(11)
+            .fontColor(C_RED)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
@@ -188,51 +199,59 @@ export struct DownloadListPane {
   }
 
   build() {
-    if (this.items.length === 0) {
-      Column() {
-        Text('还没有下载任何歌曲')
-          .fontSize(15)
-          .fontColor(C_TEXT_SUB)
-        Text('在歌单、在线列表或播放器里点「下载」就会出现在这里')
+    Column() {
+      // 顶部一行：正在下载的条数（下载目录在「设置 - 下载设置」里展示，这里不放跳转按钮）
+      if (DownloadManager.getInstance().activeCount() > 0) {
+        Text(`正在下载 ${DownloadManager.getInstance().activeCount()} 首`)
           .fontSize(F_SUB)
-          .fontColor(C_TEXT_WEAK)
-          .margin({ top: 8 })
+          .fontColor(C_TEXT_SUB)
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 8 })
+          .textAlign(TextAlign.Start)
       }
-      .width('100%')
-      .padding({ top: 90 })
-    } else {
-      Column() {
-        if (DownloadManager.getInstance().activeCount() > 0) {
-          Text(`正在下载 ${DownloadManager.getInstance().activeCount()} 首`)
-            .fontSize(F_SUB)
+
+      if (this.items.length === 0) {
+        Column() {
+          Text('还没有下载任何歌曲')
+            .fontSize(15)
             .fontColor(C_TEXT_SUB)
-            .width('100%')
-            .padding({ left: 4, right: 4, bottom: 8 })
-            .textAlign(TextAlign.Start)
-        }
-        List() {
-          ForEach(this.items, (item: DownloadItem) => {
-            ListItem() {
-              this.row(item)
-            }
-          }, (item: DownloadItem) => `${item.key}_${item.status}_${item.received}`)
+          Text('在歌单、在线列表或播放器里点「下载」就会出现在这里')
+            .fontSize(F_SUB)
+            .fontColor(C_TEXT_WEAK)
+            .margin({ top: 8 })
         }
         .width('100%')
         .layoutWeight(1)
-        .borderRadius(R_CARD)
-        .backgroundColor(C_CARD)
-        .divider({
-          strokeWidth: 0.6,
-          color: C_DIVIDER,
-          startMargin: 72,
-          endMargin: 0,
-        })
-        .scrollBar(BarState.Off)
-        .padding({ bottom: this.bottomInset })
+        .padding({ top: 60 })
+      } else {
+        Column() {
+          List() {
+            ForEach(this.items, (item: DownloadItem) => {
+              ListItem() {
+                this.row(item)
+              }
+            }, (item: DownloadItem) => `${item.key}_${item.status}_${item.received}`)
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .borderRadius(R_CARD)
+          .backgroundColor(C_CARD)
+          .divider({
+            strokeWidth: 0.6,
+            color: C_DIVIDER,
+            startMargin: 72,
+            endMargin: 0,
+          })
+          .scrollBar(BarState.Off)
+          .padding({ bottom: this.bottomInset })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 16, right: 16 })
       }
-      .width('100%')
-      .layoutWeight(1)
-      .padding({ left: 16, right: 16 })
     }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(C_BG)
   }
 }
