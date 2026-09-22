@@ -14,6 +14,7 @@ import {
   decodeName,
   formatPlayTime,
   formatSingerName,
+  mgImageUrl,
   sizeFormate,
 } from './MusicSearch';
 import { musicIdOf } from './MusicId';
@@ -1205,8 +1206,9 @@ function mgFilterSongsV5(rawList: Object[]): LxMusicInfo[] {
       }
       addType(types, map, quality, mgSizeOf(format), '');
     }
-    const img: string = asString(item['img3']).length > 0 ? asString(item['img3'])
-      : (asString(item['img2']).length > 0 ? asString(item['img2']) : asString(item['img1']));
+    // img1/img2/img3 是相对路径（/data/oss/...），要补上宿主才能当封面用
+    const img: string = mgImageUrl(asString(item['img3']).length > 0 ? asString(item['img3'])
+      : (asString(item['img2']).length > 0 ? asString(item['img2']) : asString(item['img1'])));
     const seed: SongSeed = {
       singer: formatSingerName(item['singerList']),
       name: asString(item['songName']),
@@ -1251,7 +1253,8 @@ function mgFilterSongs(rawList: Object[]): LxMusicInfo[] {
     const length: string = asString(item['length']);
     const lengthMatch: RegExpMatchArray | null = length.match(/(\d\d:\d\d)$/);
     const albums: Object[] = asObjectArray(item['albumImgs']);
-    const img: string = albums.length > 0 ? asString(asRecord(albums[0])['img']) : '';
+    // 同 V5：榜单给的也是相对路径，补上宿主
+    const img: string = mgImageUrl(albums.length > 0 ? asString(asRecord(albums[0])['img']) : '');
     const seed: SongSeed = {
       singer: formatSingerName(item['artists']),
       name: asString(item['songName']),

@@ -1,14 +1,20 @@
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
+import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SourceEngine } from '../core/source/SourceEngine';
+import { MAX_SCRIPT_SIZE } from '../core/source/LxMetadata';
 import { ImportResolveTestResult, SourceInfo, SourceLog } from '../core/source/LxTypes';
 import { DEFAULT_MUSIC_INFO_JSON, formatTestResult, runOfflineSelfTest } from '../core/source/SourceTest';
 import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '@kit.UIDesignKit';
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
+import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB,
   R_CARD } from '../ui/Theme';
+
+const DOMAIN: number = 0x0001;
+const TAG: string = 'SourceSettingsView';
 
 const PLATFORM_NAMES: Record<string, string> = {
   'kw': '酷我',
@@ -22,9 +28,11 @@ const PLATFORM_NAMES: Record<string, string> = {
 /**
  * 音源设置
  *
- * 洛雪的「设置 - 音源设置」就是这一页：导入在线音源、启用/删除已导入的音源、
+ * 洛雪的「设置 - 音源设置」就是这一页：导入音源、启用/删除已导入的音源、
  * 查看音源声明的平台能力。这里把原先调试页的能力完整保留下来：
  * 导入 -> 加载 -> 声明平台 -> 沙箱环境兼容模式 -> 引擎日志 -> 离线自检。
+ *
+ * 导入有两条入口：粘贴链接/正文（在线拉取），或从文件导入本地脚本（见 pickSourceFile）。
  */
 @Component
 export struct SourceSettingsView {
@@ -196,7 +204,7 @@ export struct SourceSettingsView {
             .padding({ left: 4 })
 
           // ------------------------------------------------ 导入音源
-          this.sectionCard('导入在线音源')
+          this.sectionCard('导入音源')
           Column({ space: 10 }) {
             TextArea({
               text: this.sourceInput,
@@ -220,14 +228,15 @@ export struct SourceSettingsView {
                 .onClick(() => {
                   this.importAndLoad();
                 })
-              Button('载入内置示例源')
+              Button('导入音源文件')
                 .fontSize(14)
                 .height(40)
                 .layoutWeight(1)
                 .backgroundColor('#EDEDF0')
                 .fontColor(C_TEXT)
+                .enabled(!this.busy)
                 .onClick(() => {
-                  this.loadDemoScript();
+                  this.pickSourceFile();
                 })
             }
             .width('100%')
@@ -399,19 +408,108 @@ export struct SourceSettingsView {
     .padding({ top: 3, bottom: 3 })
   }
 
-  private loadDemoScript(): void {
+  // ------------------------------------------------------------ 从文件导入
+
+  /**
+   * 从文件导入音源：拉起文件管理选一个脚本文件，读成文本后走和「粘贴正文」同一条路
+   *
+   * 选文件用 DocumentViewPicker（与「导入音乐」选音频文件是同一套做法）；后缀过滤给 .js，
+   * 洛雪的源就是 js 脚本。用户在文件管理里取消不会进 then，这里也不报错 —— 取消不是失败。
+   */
+  private pickSourceFile(): void {
+    if (this.busy) {
+      return;
+    }
     try {
-      const decoder = util.TextDecoder.create('utf-8');
-      const text: string =
-        decoder.decodeToString(this.getContext().resourceManager.getRawFileContentSync('demo_source.js'));
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      options.fileSuffixFilters = ['音源脚本 (.js)|.js'];
+      const documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(this.getContext());
+      documentPicker.select(options)
+        .then((uris: string[]) => {
+          if (uris.length === 0) {
+            return;
+          }
+          void this.importSourceFile(uris[0]);
+        })
+        .catch((err: BusinessError) => {
+          // 用户取消也走这里（错误码里带 cancel），不当成失败提示
+          hilog.info(DOMAIN, TAG, 'pick source file ended: %{public}s', err.message);
+        });
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'open document picker failed: %{public}s', JSON.stringify(e));
+      this.status = '打不开文件选择器，当前环境可能不支持选择文件';
+    }
+  }
+
+  private async importSourceFile(uri: string): Promise<void> {
+    const name: string = fileNameOf(uri);
+    this.busy = true;
+    this.status = `正在读取「${name}」…`;
+    try {
+      const text: string = readScriptFile(uri);
       if (text.trim().length === 0) {
-        this.status = '内置示例源读取为空：当前环境 rawfile 不可用，请在模拟器/真机上运行';
+        this.status = `「${name}」是空文件，没有可导入的脚本`;
         return;
       }
-      this.sourceInput = text;
-      this.status = '已载入内置示例源（离线，仅用于验证链路）';
+      const info: SourceInfo = SourceEngine.getInstance().importSource(text);
+      this.status = `已导入「${info.name}」，正在初始化沙箱…`;
+      this.refreshSources();
+      // 加载这一步自己管 busy 与状态文案，与「导入并加载」共用
+      await this.loadSource(info.id);
     } catch (e) {
-      this.status = `读取示例源失败: ${(e as BusinessError).message}`;
+      hilog.error(DOMAIN, TAG, 'import source file failed (%{public}s): %{public}s', name, JSON.stringify(e));
+      this.status = `导入文件「${name}」失败: ${(e as Error).message}`;
+    } finally {
+      this.busy = false;
     }
+  }
+}
+
+/**
+ * 读出用户选中的音源脚本
+ *
+ * picker 给的是文件管理那边的 uri（`file://docs/...`），用 fs.openSync 直接打开即可
+ * （与「导入音乐」读音频文件是同一套做法），再按 UTF-8 解成文本。
+ *
+ * 大小上限跟引擎用同一个常量：引擎本来就以「源脚本过大」拒收超过 MAX_SCRIPT_SIZE 的正文，
+ * 这里提前按文件大小拦下来，选错一个大文件时不会先把整个文件读进内存。
+ */
+function readScriptFile(uri: string): string {
+  let file: fs.File | null = null;
+  try {
+    file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    const size: number = fs.statSync(file.fd).size;
+    if (size <= 0) {
+      return '';
+    }
+    if (size > MAX_SCRIPT_SIZE) {
+      throw new Error(`文件太大（${Math.round(size / 1024)} KB），音源脚本不会这么大`);
+    }
+    const buffer: ArrayBuffer = new ArrayBuffer(size);
+    const read: number = fs.readSync(file.fd, buffer);
+    const decoder = util.TextDecoder.create('utf-8');
+    const text: string = decoder.decodeToString(new Uint8Array(buffer, 0, read));
+    // 带 BOM 的脚本会把一个不可见字符顶在正文最前面，交给引擎前先摘掉
+    return text.charCodeAt(0) === 0xFEFF ? text.substring(1) : text;
+  } finally {
+    if (file !== null) {
+      try {
+        fs.closeSync(file);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'close source file failed: %{public}s', JSON.stringify(e));
+      }
+    }
+  }
+}
+
+/** uri 上的文件名（只用于提示；取不到就显示整条 uri） */
+function fileNameOf(uri: string): string {
+  const cut: number = uri.lastIndexOf('/');
+  const raw: string = cut >= 0 ? uri.substring(cut + 1) : uri;
+  try {
+    return decodeURIComponent(raw);
+  } catch (e) {
+    return raw;
   }
 }

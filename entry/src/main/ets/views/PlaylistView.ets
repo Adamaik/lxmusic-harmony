@@ -6,8 +6,8 @@ import { LOVE_LIST_NAME } from '../core/sync/SyncTypes';
 import { C_BG, C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SUB, platformColor,
   platformTint } from '../ui/Theme';
 import { platformName } from '../core/music/MusicList';
-import { I_CHEVRON_RIGHT, I_HEART_FILLED, I_IMPORT, I_MORE, I_MORE_CIRCLE, I_PLUS,
-  IconGlyph } from '../ui/Icons';
+import { I_CHECK_CIRCLE, I_CHEVRON_RIGHT, I_CIRCLE, I_HEART_FILLED, I_IMPORT, I_MORE, I_MORE_CIRCLE,
+  I_PLUS, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, FavoriteHeart, PageTitle, RoundIconButton } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
@@ -15,6 +15,7 @@ import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { ImportPlaylistSheet } from './ImportPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
+import { isWebDavSong } from '../core/webdav/WebDavLibrary';
 
 /**
  * 歌单页
@@ -350,6 +351,16 @@ export struct SongListPane {
   @Prop emptyText: string = '这里是空的';
   /** 行上是否标出来源平台（聚合搜索结果才需要，普通歌单里所有歌都是一个平台） */
   @Prop showSource: boolean = false;
+  /**
+   * 多选模式（本地音乐的批量移除用）
+   *
+   * 打开后行尾的心/更多换成勾选圈，点行 = 勾选/取消，不再播歌。
+   * 默认关，其余列表（歌单、搜索、播放历史…）的行为一点不变。
+   */
+  @Prop selecting: boolean = false;
+  @Prop selectedIds: string[] = [];
+  onToggleSelect: (item: SongItem) => void = () => {
+  };
   @Prop coverSize: number = 52;
   /** 列表底部要留出的空间（悬浮页签栏 / 手势条），由调用方给 */
   @Prop bottomInset: number = 0;
@@ -383,13 +394,9 @@ export struct SongListPane {
     this.getUIContext().getPromptAction().showToast({ message: message });
   }
 
-  private indexOf(item: SongItem): number {
-    for (let i = 0; i < this.items.length; i++) {
-      if (this.items[i].id === item.id) {
-        return i;
-      }
-    }
-    return -1;
+  /** 这一条是否被勾选（多选模式） */
+  private isSelected(id: string): boolean {
+    return this.selectedIds.indexOf(id) >= 0;
   }
 
   /** 下载：交给下载管理排队 */
@@ -397,6 +404,11 @@ export struct SongListPane {
     // 本地歌没什么可下的（菜单里也不显示这一项，这里只作兜底）
     if (isLocalSong(item)) {
       this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
+    // 云端歌的「下载」由播放缓存的边听边下负责（DownloadManager 那条路要问音源要链接）
+    if (isWebDavSong(item)) {
+      this.toast(`「${item.name}」是云端音乐，播放时会自动缓存`);
       return;
     }
     const manager = DownloadManager.getInstance();
@@ -503,8 +515,8 @@ export struct SongListPane {
             this.onPick(index);
           }
         })
-      // 本地歌已经在本地了，下载这一项对它没有意义
-      if (!isLocalSong(item)) {
+      // 本地歌已经在本地了、云端歌由播放缓存负责，下载这一项对它们都没有意义
+      if (!isLocalSong(item) && !isWebDavSong(item)) {
         MenuItem({ content: '下载' })
           .onClick(() => {
             this.download(item);
@@ -592,20 +604,34 @@ export struct SongListPane {
                   .layoutWeight(1)
                   .alignItems(HorizontalAlign.Start)
 
-                  // 爱心 + 两点：与排行榜的行尾一致（子组件的点击会吃掉整行的点击）
-                  FavoriteHeart({
-                    songId: item.id,
-                    onToggle: () => {
-                      this.toggleFavorite(item);
-                    },
-                  })
-                  IconGlyph({ symbol: I_MORE_CIRCLE, iconSize: 22, color: C_TEXT_WEAK })
-                    .bindMenu(this.rowMenu(item, index))
+                  if (this.selecting) {
+                    // 多选模式：行尾只留一个勾选圈（爱心/更多这时没意义，点了还会误触）
+                    IconGlyph({
+                      symbol: this.isSelected(item.id) ? I_CHECK_CIRCLE : I_CIRCLE,
+                      iconSize: 22,
+                      color: this.isSelected(item.id) ? C_RED : C_TEXT_WEAK,
+                    })
+                      .accessibilityLevel('no')
+                  } else {
+                    // 爱心 + 两点：与排行榜的行尾一致（子组件的点击会吃掉整行的点击）
+                    FavoriteHeart({
+                      songId: item.id,
+                      onToggle: () => {
+                        this.toggleFavorite(item);
+                      },
+                    })
+                    IconGlyph({ symbol: I_MORE_CIRCLE, iconSize: 22, color: C_TEXT_WEAK })
+                      .bindMenu(this.rowMenu(item, index))
+                  }
                 }
                 .width('100%')
                 .height(this.coverSize + 22)
                 .padding({ left: 16, right: 14 })
                 .onClick(() => {
+                  if (this.selecting) {
+                    this.onToggleSelect(item);
+                    return;
+                  }
                   this.onPick(index);
                 })
                 .bindContextMenu(this.rowMenu(item, index), ResponseType.LongPress)

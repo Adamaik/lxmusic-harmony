@@ -3,7 +3,9 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { K_LIBRARY_VERSION, PlaySession, LibrarySink, PlaylistSummary, SongItem } from '../player/PlaySession';
 import { fromLxMusicInfo, isSyncable, toLxMusicInfo } from './SyncConvert';
 import { defaultListData, SyncStore } from './SyncStore';
-import { LocalMusic, LOCAL_SOURCE } from '../local/LocalMusic';
+import { LocalMusic } from '../local/LocalMusic';
+import { SongSideTable } from '../local/SideTable';
+import { WebDavLibrary } from '../webdav/WebDavLibrary';
 import { ADD_MUSIC_TOP, DISLIKE_NAME_ALIAS, DISLIKE_NAME_SEP, LIST_ID_LOVE, LOVE_LIST_NAME,
   LxDislikeMusicInfo, LxListCreateData,
   LxListData, LxListMusicAddData, LxListMusicMoveData, LxListMusicOverwriteData, LxListMusicRemoveData,
@@ -62,6 +64,14 @@ export class LocalLibrary implements LibrarySink {
    *   - 同步上行只看到 LxMusicInfoNew 那一半，协议与 md5 都不受影响。
    */
   private local: LocalMusic = LocalMusic.getInstance();
+  /**
+   * 云端音乐库（自己 WebDAV 服务器上的音频）
+   *
+   * 与本地音乐完全并列的第二种「非同步来源」，同样有自己的侧表。两张侧表的接口一致
+   * （都实现 SongSideTable），所以下面所有涉及侧表的地方都按 `sideTables()` 数组统一处理，
+   * 不再出现「本地歌一套、云端歌又一套」的重复代码。
+   */
+  private webdav: WebDavLibrary = WebDavLibrary.getInstance();
   private data: LxListData = defaultListData();
   private dislike: string = '';
   /** 本地是否已经有一份库（没有则说明是首次安装，界面上的演示数据先留着） */
@@ -129,8 +139,109 @@ export class LocalLibrary implements LibrarySink {
   summary(): LibrarySummary {
     const playlists: number = this.data.userList.length;
     const songs: number = this.data.defaultList.length + this.data.loveList.length
-      + this.local.count();
+      + this.sideTotal();
     return { playlists: playlists, songs: songs };
+  }
+
+  // ------------------------------------------------------------ 非同步侧表（本地 / 云端）
+
+  /**
+   * 所有非同步侧表
+   *
+   * 数组顺序就是列表里的展示顺序（本地在前、云端在后），与「新加的歌排最前」的既有规则
+   * 不冲突：这些条目在同步数据里根本不存在，没有「和在线歌交错」的顺序可言。
+   * 以后再加第三种来源（比如 SMB / Jellyfin），在这里加一项就够了。
+   */
+  private sideTables(): SongSideTable[] {
+    return [this.local, this.webdav];
+  }
+
+  /** 某个列表里属于侧表的歌（顺序与 sideTables 一致） */
+  private sideSongsOf(listId: string): SongItem[] {
+    const out: SongItem[] = [];
+    for (const table of this.sideTables()) {
+      for (const song of table.songsByKeys(table.listKeys(listId))) {
+        out.push(song);
+      }
+    }
+    return out;
+  }
+
+  /** 某个列表里侧表条目的数量（歌单外显示的「N 首」要把这部分算进去） */
+  private sideCountOf(listId: string): number {
+    let sum: number = 0;
+    for (const table of this.sideTables()) {
+      sum += table.listCount(listId);
+    }
+    return sum;
+  }
+
+  /** 侧表条目总数（音乐库规模统计用） */
+  private sideTotal(): number {
+    let sum: number = 0;
+    for (const table of this.sideTables()) {
+      sum += table.count();
+    }
+    return sum;
+  }
+
+  /** 一批条目里属于某张侧表、且确实还在库里的 key（去重、保持顺序） */
+  private sideKeysIn(table: SongSideTable, items: SongItem[]): string[] {
+    const keys: string[] = [];
+    for (const item of items) {
+      if (item.source !== table.source) {
+        continue;
+      }
+      const key: string = table.keyOfId(item.id);
+      if (key.length > 0 && table.hasKey(key) && !keys.includes(key)) {
+        keys.push(key);
+      }
+    }
+    return keys;
+  }
+
+  /** 一批条目 id 里属于某张侧表、且还在库里的 key（去重、保持顺序） */
+  private sideKeysOfIds(table: SongSideTable, ids: string[]): string[] {
+    const keys: string[] = [];
+    for (const id of ids) {
+      const key: string = table.keyOfId(id);
+      if (key.length > 0 && table.hasKey(key) && !keys.includes(key)) {
+        keys.push(key);
+      }
+    }
+    return keys;
+  }
+
+  /** 往各张侧表里加；@returns 真正加进去的总数 */
+  private addToSideTables(listId: string, items: SongItem[]): number {
+    let added: number = 0;
+    for (const table of this.sideTables()) {
+      added += table.addToList(listId, this.sideKeysIn(table, items));
+    }
+    return added;
+  }
+
+  /** 从各张侧表里摘；@returns 真正被摘掉的总数 */
+  private removeFromSideTables(listId: string, ids: string[]): number {
+    let removed: number = 0;
+    for (const table of this.sideTables()) {
+      removed += table.removeFromList(listId, this.sideKeysOfIds(table, ids));
+    }
+    return removed;
+  }
+
+  /** 用一批条目整体覆盖各张侧表的成员 */
+  private setSideTableKeys(listId: string, items: SongItem[]): void {
+    for (const table of this.sideTables()) {
+      table.setListKeys(listId, this.sideKeysIn(table, items));
+    }
+  }
+
+  /** 歌单被删掉了：各张侧表里的引用一起清 */
+  private dropSideLists(listIds: string[]): void {
+    for (const table of this.sideTables()) {
+      table.dropLists(listIds);
+    }
   }
 
   // ------------------------------------------------------------ 界面镜像
@@ -143,8 +254,8 @@ export class LocalLibrary implements LibrarySink {
       queue.push(fromLxMusicInfo(info));
     }
     const favorites: SongItem[] = [];
-    // 收藏里的本地歌排在前面（它们在同步数据里不存在，只能这么合）
-    for (const song of this.local.songsByKeys(this.local.listKeys(LIST_ID_LOVE))) {
+    // 收藏里的本地歌 / 云端歌排在前面（它们在同步数据里不存在，只能这么合）
+    for (const song of this.sideSongsOf(LIST_ID_LOVE)) {
       favorites.push(song);
     }
     for (const info of this.data.loveList) {
@@ -164,9 +275,9 @@ export class LocalLibrary implements LibrarySink {
       return;
     }
     const session = PlaySession.getInstance();
-    // 收藏里的本地歌先落盘：它们不上行（同步只送在线歌），但必须存住，
-    // 否则重启后收藏里那几首本地歌就没了。这一步与下面「要不要上行」无关。
-    this.syncLocalFavorites(session.favorites);
+    // 收藏里的本地歌 / 云端歌先落盘：它们不上行（同步只送在线歌），但必须存住，
+    // 否则重启后收藏里那几首就没了。这一步与下面「要不要上行」无关。
+    this.syncSideFavorites(session.favorites);
     const nextDefault: LxMusicInfoNew[] = musicsOf(session.queue);
     const nextLove: LxMusicInfoNew[] = musicsOf(session.favorites);
 
@@ -224,19 +335,11 @@ export class LocalLibrary implements LibrarySink {
     this.bumpLibraryVersion();
   }
 
-  /** 把界面收藏名单里属于本地歌的那部分同步到侧表 */
-  private syncLocalFavorites(favorites: SongItem[]): void {
-    const keys: string[] = [];
-    for (const item of favorites) {
-      if (item.source !== LOCAL_SOURCE) {
-        continue;
-      }
-      const key: string = this.local.keyOfId(item.id);
-      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
-        keys.push(key);
-      }
+  /** 把界面收藏名单里属于各张侧表的那部分同步到各自的侧表 */
+  private syncSideFavorites(favorites: SongItem[]): void {
+    for (const table of this.sideTables()) {
+      table.setListKeys(LIST_ID_LOVE, this.sideKeysIn(table, favorites));
     }
-    this.local.setListKeys(LIST_ID_LOVE, keys);
   }
 
   private emitOverwrite(listId: string, musicInfos: LxMusicInfoNew[]): void {
@@ -252,8 +355,8 @@ export class LocalLibrary implements LibrarySink {
       out.push({
         id: item.id,
         name: item.name,
-        // 曲目数要把侧表里的本地歌算上，否则「歌单里有 3 首本地歌」外面显示 0 首
-        count: item.list.length + this.local.listCount(item.id),
+        // 曲目数要把侧表里的本地歌 / 云端歌算上，否则「歌单里有 3 首本地歌」外面显示 0 首
+        count: item.list.length + this.sideCountOf(item.id),
       });
     }
     return out;
@@ -266,9 +369,9 @@ export class LocalLibrary implements LibrarySink {
       return [];
     }
     const out: SongItem[] = [];
-    // 本地歌排在前面：它们不在同步数据里，没有「和在线歌交错」的顺序可言；
-    // 排在前面与「新加的歌排最前」的既有规则一致。
-    for (const song of this.local.songsByKeys(this.local.listKeys(id))) {
+    // 侧表里的歌（本地 / 云端）排在前面：它们不在同步数据里，没有「和在线歌交错」
+    // 的顺序可言；排在前面与「新加的歌排最前」的既有规则一致。
+    for (const song of this.sideSongsOf(id)) {
       out.push(song);
     }
     for (const info of musics) {
@@ -287,7 +390,7 @@ export class LocalLibrary implements LibrarySink {
     return {
       id: LIST_ID_LOVE,
       name: LOVE_LIST_NAME,
-      count: this.data.loveList.length + this.local.listCount(LIST_ID_LOVE),
+      count: this.data.loveList.length + this.sideCountOf(LIST_ID_LOVE),
     };
   }
 
@@ -338,7 +441,7 @@ export class LocalLibrary implements LibrarySink {
     }
     for (const item of this.data.userList) {
       if (item.sourceListId === sourceListId) {
-        return { id: item.id, name: item.name, count: item.list.length + this.local.listCount(item.id) };
+        return { id: item.id, name: item.name, count: item.list.length + this.sideCountOf(item.id) };
       }
     }
     return null;
@@ -373,7 +476,7 @@ export class LocalLibrary implements LibrarySink {
       this.mirrorToSession();
       this.emitOverwrite(id, musics);
       this.emit({ action: 'list_update', data: [buildUserListInfo(existing)] }, 'list');
-      return { id: id, name: name, count: musics.length + this.local.listCount(id) };
+      return { id: id, name: name, count: musics.length + this.sideCountOf(id) };
     }
     const item: LxUserListInfoFull = {
       id: id,
@@ -431,8 +534,8 @@ export class LocalLibrary implements LibrarySink {
       return;
     }
     this.data.userList = remains;
-    // 歌单没了，它在侧表里的本地歌引用也一起清掉（留着就是永远读不到的垃圾）
-    this.local.dropLists(removable);
+    // 歌单没了，它在各张侧表里的引用也一起清掉（留着就是永远读不到的垃圾）
+    this.dropSideLists(removable);
     this.persist();
     this.mirrorToSession();
     this.emit({ action: 'list_remove', data: removable }, 'list');
@@ -450,12 +553,11 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return 0;
     }
-    // 本地歌走侧表（它们不属于同步结构，musicsOf 会把它们丢掉）
-    const localKeys: string[] = this.localKeysIn(items);
-    const localAdded: number = this.local.addToList(id, localKeys);
+    // 本地歌 / 云端歌走侧表（它们不属于同步结构，musicsOf 会把它们丢掉）
+    const localAdded: number = this.addToSideTables(id, items);
     const musics: LxMusicInfoNew[] = musicsOf(items);
     if (musics.length === 0) {
-      // 整批都是本地歌：同步那份数据一个字都没变，只需让列表页重读计数
+      // 整批都是侧表里的歌：同步那份数据一个字都没变，只需让列表页重读计数
       if (localAdded > 0) {
         this.bumpLocalChange();
       }
@@ -491,21 +593,6 @@ export class LocalLibrary implements LibrarySink {
     return added.length + localAdded;
   }
 
-  /** 一批条目里属于本地歌、且确实还在库里的 key（去重、保持顺序） */
-  private localKeysIn(items: SongItem[]): string[] {
-    const keys: string[] = [];
-    for (const item of items) {
-      if (item.source !== LOCAL_SOURCE) {
-        continue;
-      }
-      const key: string = this.local.keyOfId(item.id);
-      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
-        keys.push(key);
-      }
-    }
-    return keys;
-  }
-
   /**
    * 从歌单里删歌
    *
@@ -524,8 +611,8 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return;
     }
-    // 本地歌从侧表里摘（同步那份数据里本来就没有它们）
-    const localRemoved: number = this.local.removeFromList(id, this.localKeysOfIds(songIds));
+    // 侧表里的歌从侧表摘（同步那份数据里本来就没有它们）
+    const localRemoved: number = this.removeFromSideTables(id, songIds);
     const remains: LxMusicInfoNew[] = [];
     const removedIds: string[] = [];
     for (const info of target.list) {
@@ -552,7 +639,7 @@ export class LocalLibrary implements LibrarySink {
 
   /** 从内置收藏里移除一批歌（协议上是整份 love 列表覆盖，与官方一致） */
   private removeMusicFromLove(songIds: string[]): void {
-    const localRemoved: number = this.local.removeFromList(LIST_ID_LOVE, this.localKeysOfIds(songIds));
+    const localRemoved: number = this.removeFromSideTables(LIST_ID_LOVE, songIds);
     const remains: LxMusicInfoNew[] = [];
     for (const info of this.data.loveList) {
       if (!songIds.includes(info.id)) {
@@ -577,25 +664,13 @@ export class LocalLibrary implements LibrarySink {
     if (target === null) {
       return;
     }
-    // 本地歌那半边一起换掉（换成新列表里的本地歌）
-    this.local.setListKeys(id, this.localKeysIn(items));
+    // 侧表那半边一起换掉（换成新列表里属于各张侧表的条目）
+    this.setSideTableKeys(id, items);
     const musics: LxMusicInfoNew[] = musicsOf(items);
     target.list = musics;
     this.persist();
     this.mirrorToSession();
     this.emitOverwrite(id, musics);
-  }
-
-  /** 一批条目 id 里属于本地歌的 key（去重、保持顺序） */
-  private localKeysOfIds(ids: string[]): string[] {
-    const keys: string[] = [];
-    for (const id of ids) {
-      const key: string = this.local.keyOfId(id);
-      if (key.length > 0 && this.local.hasKey(key) && !keys.includes(key)) {
-        keys.push(key);
-      }
-    }
-    return keys;
   }
 
   private findPlaylist(id: string): LxUserListInfoFull | null {

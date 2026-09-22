@@ -394,6 +394,37 @@ export class LxPlayer {
   }
 
   /**
+   * 播放一个**需要请求头**的网络音频地址（WebDAV 这类要 Basic 认证的源）
+   *
+   * 为什么不用 `player.url`：url 是裸字符串，没有任何地方能挂 `Authorization`，
+   * 而 WebDAV 服务器一定要求认证。官方给的带请求头的形态是
+   * `media.createMediaSourceWithUrl(url, headers)` + `setMediaSource(src, strategy)`，
+   * 而且它允许**设源的同时把播放策略一起给**（缓冲水位那两项），所以我们不必再走
+   * 「initialized 态里补 setPlaybackStrategy」那一步（见 prepareWithStrategy）。
+   *
+   * 失败时不阻断：退回不带头的 `player.url`（匿名可读的服务器照样能放），
+   * 真的放不出来由播放器的错误回调报上去。
+   */
+  async playUrlWithHeaders(url: string, headers: Record<string, string>): Promise<void> {
+    const player: media.AVPlayer = await this.preparePlayer();
+    try {
+      const source: media.MediaSource = media.createMediaSourceWithUrl(url, headers);
+      await player.setMediaSource(source, this.playbackStrategy());
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'setMediaSource with headers failed, fallback to url: %{public}s',
+        JSON.stringify(err));
+      if (this.avPlayer !== player) {
+        return;
+      }
+      try {
+        player.url = url;
+      } catch (e) {
+        this.update('error', `播放失败：${(e as BusinessError).message}`);
+      }
+    }
+  }
+
+  /**
    * 播放本地缓存文件（AudioCache 下好的整首）
    *
    * 用 fdSrc 而不是 file:// 路径：沙箱文件的绝对路径在不同版本上对 AVPlayer 的
@@ -515,6 +546,20 @@ export class LxPlayer {
   }
 
   /**
+   * 播放策略（缓冲水位）
+   *
+   * 抽出来是因为有两个设置点：走 `player.url` 时只能在 initialized 态用
+   * `setPlaybackStrategy` 补（见 prepareWithStrategy），走 `setMediaSource` 时
+   * 可以随源一起给（见 playUrlWithHeaders）。两处的值必须一致，所以只有这一份。
+   */
+  private playbackStrategy(): media.PlaybackStrategy {
+    return {
+      preferredBufferDuration: BUFFER_SECONDS,
+      preferredBufferDurationForPlaying: RESUME_WATERLINE_SECONDS,
+    };
+  }
+
+  /**
    * 设好播放策略再 prepare
    *
    * `setPlaybackStrategy` 只能在 initialized 态调用，而 prepare 会把它推离这个状态，
@@ -523,10 +568,7 @@ export class LxPlayer {
    * 设策略失败不阻断播放：个别设备/版本不支持时退回系统默认，别让用户直接听不成。
    */
   private async prepareWithStrategy(player: media.AVPlayer): Promise<void> {
-    const strategy: media.PlaybackStrategy = {
-      preferredBufferDuration: BUFFER_SECONDS,
-      preferredBufferDurationForPlaying: RESUME_WATERLINE_SECONDS,
-    };
+    const strategy: media.PlaybackStrategy = this.playbackStrategy();
     try {
       await player.setPlaybackStrategy(strategy);
     } catch (err) {

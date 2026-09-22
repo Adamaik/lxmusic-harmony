@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { UIContext } from '@kit.ArkUI';
-import { fileIo as fs, picker } from '@kit.CoreFileKit';
+import { picker } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SongItem, PlaySession } from '../core/player/PlaySession';
@@ -12,9 +12,6 @@ import { SongListPane } from './PlaylistView';
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LocalMusicPane';
 
-/** 单次导入的上限（Picker 在 API 20 及以前也是 500） */
-const MAX_PICK: number = 500;
-
 /**
  * 本地音乐面板（我的 -> 本地音乐）
  *
@@ -22,6 +19,9 @@ const MAX_PICK: number = 500;
  * （ohos.permission.READ_AUDIO 是受限权限，只批克隆/备份/同步场景；也没有枚举
  * 音频媒体的 API），官方给的正路是让用户用 Picker 选。选中的 URI 只有临时权限，
  * 退到后台就失效，所以选中后立刻拷一份进沙箱 —— 从此不看系统脸色。
+ *
+ * 导入按钮直接拉起**文件管理的音频聚合视图**（`mergeMode = AUDIO`）：一屏列出
+ * 设备上所有音频，全选一次导完。不再提供别的入口，理由见 `scanDeviceAudio()`。
  * 详细调研见 docs/LOCAL_MUSIC.md。
  */
 @Component
@@ -33,6 +33,9 @@ export struct LocalMusicPane {
   @State items: SongItem[] = [];
   /** 导入进行中（进度文案在 AppStorage 里，切走再回来还能看到） */
   @State importing: boolean = false;
+  /** 多选模式（批量移除用）：打开后点行是勾选，行尾换成勾选圈 */
+  @State selecting: boolean = false;
+  @State selectedIds: string[] = [];
   @StorageLink(K_LOCAL_VERSION) @Watch('onLibraryChanged') libraryVersion: number = 0;
   @StorageLink(K_LOCAL_PROGRESS) progressText: string = '';
 
@@ -46,6 +49,89 @@ export struct LocalMusicPane {
 
   private refresh(): void {
     this.items = LocalMusic.getInstance().songsForUi();
+    // 库变了（导入/移除）就把已经不存在的条目从勾选里摘掉，
+    // 否则「移除 N」会带着幽灵条目算数
+    if (this.selectedIds.length > 0) {
+      const alive: string[] = [];
+      for (const id of this.selectedIds) {
+        for (const item of this.items) {
+          if (item.id === id) {
+            alive.push(id);
+            break;
+          }
+        }
+      }
+      this.selectedIds = alive;
+    }
+  }
+
+  // ------------------------------------------------------------ 多选
+
+  private enterSelecting(): void {
+    this.selecting = true;
+    this.selectedIds = [];
+  }
+
+  private exitSelecting(): void {
+    this.selecting = false;
+    this.selectedIds = [];
+  }
+
+  private toggleSelect(item: SongItem): void {
+    const next: string[] = [];
+    let hit: boolean = false;
+    for (const id of this.selectedIds) {
+      if (id === item.id) {
+        hit = true;
+      } else {
+        next.push(id);
+      }
+    }
+    if (!hit) {
+      next.push(item.id);
+    }
+    this.selectedIds = next;
+  }
+
+  private allSelected(): boolean {
+    return this.items.length > 0 && this.selectedIds.length === this.items.length;
+  }
+
+  /** 全选 / 取消全选（一个按钮来回切，列表大了才有意义） */
+  private toggleSelectAll(): void {
+    if (this.allSelected()) {
+      this.selectedIds = [];
+      return;
+    }
+    const ids: string[] = [];
+    for (const item of this.items) {
+      ids.push(item.id);
+    }
+    this.selectedIds = ids;
+  }
+
+  private selectedItems(): SongItem[] {
+    const out: SongItem[] = [];
+    for (const item of this.items) {
+      if (this.selectedIds.indexOf(item.id) >= 0) {
+        out.push(item);
+      }
+    }
+    return out;
+  }
+
+  /** 批量移除（走共用那句确认框，删的是应用内副本，设备里的原文件不动） */
+  private removeSelected(): void {
+    const targets: SongItem[] = this.selectedItems();
+    if (targets.length === 0) {
+      this.toast('先勾选要移除的歌');
+      return;
+    }
+    confirmRemoveLocalSongs(this.getUIContext(), targets, (removed: number) => {
+      this.exitSelecting();
+      this.refresh();
+      this.toast(`已移除 ${removed} 首`);
+    });
   }
 
   private toast(message: string): void {
@@ -65,97 +151,49 @@ export struct LocalMusicPane {
     return context === undefined ? null : context as common.UIAbilityContext;
   }
 
-  @Builder
-  importMenu() {
-    Menu() {
-      MenuItem({ content: '选择音乐文件' })
-        .onClick(() => {
-          this.pickFiles();
-        })
-      MenuItem({ content: '选择音乐文件夹' })
-        .onClick(() => {
-          this.pickFolder();
-        })
-    }
-    .font({ size: 16 })
-  }
-
-  /** 选文件：AudioViewPicker（音频专用，可多选） */
-  private pickFiles(): void {
+  /**
+   * 导入入口（唯一的）：DocumentViewPicker + mergeMode = AUDIO
+   *
+   * 这个模式拉起的是**文件管理应用自己的聚合视图（音频分类页）**：一屏列出设备上
+   * 所有音频文件，多选/全选由文件管理界面提供。官方指南明写这个参数
+   * 「在 Phone 设备中可正常使用，在其他设备中无效果」—— 这是三方应用在手机上
+   * 能做的最接近「扫描本机音乐」的事（自己扫全盘是不允许的：
+   * READ_AUDIO / READ_MEDIA 都是受限权限，只批克隆/备份/同步场景）。
+   *
+   * 注意：mergeMode 置为非 DEFAULT 后，其它参数基本不生效（官方文档：
+   * 「API 版本 26.0.0 及之后的版本当该参数置为非 DEFAULT 时，仅 fileSuffixFilters
+   * 参数生效」），所以这里不再配 maxSelectNumber / fileSuffixFilters —— 聚合视图
+   * 本身就只有音频，数量上限由文件管理界面自己管。
+   *
+   * 曾经的两条路（都撤了，记在这免得以后重复踩）：
+   *   - `selectMode = FOLDER` 选文件夹：手机在 API 26 之前不支持这个参数
+   *     （官方指南：「从 API 版本 26.0.0 开始，当文件类型是 FOLDER 时，Phone 设备
+   *     支持该参数」），而且目录 URI 也不是 `fs.listFileSync` 能接受的参数
+   *     （它只吃应用沙箱路径），两者叠加的结果是「选了文件夹却报目录里没文件」；
+   *   - `AudioViewPicker`：也能用，但只是逐个多选，批量导入不如聚合视图。
+   */
+  private scanDeviceAudio(): void {
     const context: common.UIAbilityContext | null = this.hostContext();
     if (context === null) {
       this.toast('当前环境不支持选择文件');
       return;
     }
     try {
-      const options: picker.AudioSelectOptions = new picker.AudioSelectOptions();
-      options.maxSelectNumber = MAX_PICK;
-      const audioPicker: picker.AudioViewPicker = new picker.AudioViewPicker(context);
-      audioPicker.select(options)
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.mergeMode = picker.MergeTypeMode.AUDIO;
+      const documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(context);
+      documentPicker.select(options)
         .then((uris: string[]) => {
           void this.runImport(uris);
         })
         .catch((err: BusinessError) => {
           // 用户取消也会走到这里（错误码里带 cancel），不当成失败提示
-          hilog.info(DOMAIN, TAG, 'pick files ended: %{public}s', err.message);
+          hilog.info(DOMAIN, TAG, 'scan audio ended: %{public}s', err.message);
         });
     } catch (e) {
-      hilog.error(DOMAIN, TAG, 'pick files failed: %{public}s', JSON.stringify(e));
-      this.toast('打开文件选择器失败');
+      hilog.error(DOMAIN, TAG, 'scan audio failed: %{public}s', JSON.stringify(e));
+      this.toast('打不开文件管理的音频视图');
     }
-  }
-
-  /**
-   * 选文件夹：DocumentViewPicker 的 FOLDER 模式，再把目录里的文件列出来
-   *
-   * 手机端一次只能选一个目录（allowsMulFolderSelection 在 Phone 上无效）。
-   * 目录 URI 能不能用 fs.listFileSync 枚举，官方文档没有明说 —— 失败时明确告诉
-   * 用户改用「选择音乐文件」，不要静默什么都不发生（真机验证项，见 docs/LOCAL_MUSIC.md）。
-   */
-  private pickFolder(): void {
-    const context: common.UIAbilityContext | null = this.hostContext();
-    if (context === null) {
-      this.toast('当前环境不支持选择文件夹');
-      return;
-    }
-    try {
-      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
-      options.selectMode = picker.DocumentSelectMode.FOLDER;
-      const documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(context);
-      documentPicker.select(options)
-        .then((results: string[]) => {
-          if (results.length === 0) {
-            return;
-          }
-          const uris: string[] = this.listFolder(results[0]);
-          if (uris.length === 0) {
-            this.toast('这个目录里没有找到文件，请改用「选择音乐文件」');
-            return;
-          }
-          void this.runImport(uris);
-        })
-        .catch((err: BusinessError) => {
-          hilog.info(DOMAIN, TAG, 'pick folder ended: %{public}s', err.message);
-        });
-    } catch (e) {
-      hilog.error(DOMAIN, TAG, 'pick folder failed: %{public}s', JSON.stringify(e));
-      this.toast('打开文件夹选择器失败');
-    }
-  }
-
-  /** 目录 URI -> 目录里的文件 URI（不含子目录） */
-  private listFolder(dirUri: string): string[] {
-    const out: string[] = [];
-    try {
-      const names: string[] = fs.listFileSync(dirUri);
-      for (const name of names) {
-        out.push(`${dirUri}/${name}`);
-      }
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'list folder failed: %{public}s', JSON.stringify(e));
-      return [];
-    }
-    return out;
   }
 
   private async runImport(uris: string[]): Promise<void> {
@@ -200,15 +238,72 @@ export struct LocalMusicPane {
         .padding({ left: 14, right: 16, top: 9, bottom: 9 })
         .borderRadius(19)
         .backgroundColor(C_RED)
-        .bindMenu(this.importMenu())
+        .onClick(() => {
+          this.scanDeviceAudio();
+        })
+        .accessibilityText('导入音乐，打开文件管理的音频列表')
+        .accessibilityLevel('yes')
 
         Blank()
 
         Text(this.items.length > 0 ? `${this.items.length} 首 · ${formatBytes(LocalMusic.getInstance().totalBytes())}` : '')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
+
+        // 多选入口：有歌才有意义
+        if (this.items.length > 0) {
+          Text(this.selecting ? '完成' : '选择')
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .padding({ left: 6, right: 2, top: 4, bottom: 4 })
+            .onClick(() => {
+              if (this.selecting) {
+                this.exitSelecting();
+              } else {
+                this.enterSelecting();
+              }
+            })
+            .accessibilityText(this.selecting ? '退出多选' : '进入多选')
+            .accessibilityLevel('yes')
+        }
       }
       .width('100%')
+
+      // 多选工具条：全选（来回切）+ 批量移除
+      if (this.selecting) {
+        Row({ space: 12 }) {
+          Text(this.allSelected() ? '取消全选' : '全选')
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .padding({ top: 4, bottom: 4 })
+            .onClick(() => {
+              this.toggleSelectAll();
+            })
+            .accessibilityText(this.allSelected() ? '取消全选' : '全选')
+            .accessibilityLevel('yes')
+
+          Text(`已选 ${this.selectedIds.length} 首`)
+            .fontSize(F_SUB)
+            .fontColor(C_TEXT_SUB)
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+          Text('移除')
+            .fontSize(F_SUB)
+            .fontColor(this.selectedIds.length > 0 ? C_RED : C_TEXT_WEAK)
+            .padding({ top: 4, bottom: 4 })
+            .onClick(() => {
+              this.removeSelected();
+            })
+            .accessibilityText('移除已选中的本地音乐')
+            .accessibilityLevel('yes')
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+        .borderRadius(R_CARD)
+        .backgroundColor(C_CARD)
+      }
 
       if (this.importing || this.progressText.length > 0) {
         Row({ space: 10 }) {
@@ -233,8 +328,10 @@ export struct LocalMusicPane {
       }
 
       if (this.items.length === 0 && !this.importing) {
-        Text('系统不允许应用直接读取设备里的音乐库，所以本地音乐需要手动导入：'
-          + '从上面的按钮选文件或文件夹，选中的音乐会拷一份到应用内（原文件不动）。')
+        Text('系统不允许三方应用自己扫描音乐库，所以导入走文件管理的音频列表：\n'
+          + '点上面的「导入音乐」→ 一屏列出设备上的音频 → 长按任意一首选「全选」→ 确定，'
+          + '一次就能把整个文件夹导进来。\n'
+          + '选中的歌会拷一份到应用内，设备里的原文件不动。')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
           .width('100%')
@@ -259,6 +356,12 @@ export struct LocalMusicPane {
         currentId: this.currentId,
         emptyText: '还没有导入本地音乐',
         bottomInset: this.bottomInset,
+        // 多选模式：点行 = 勾选，行尾换勾选圈（批量移除用）
+        selecting: this.selecting,
+        selectedIds: this.selectedIds,
+        onToggleSelect: (item: SongItem) => {
+          this.toggleSelect(item);
+        },
         onPick: (index: number) => {
           this.onPick(index);
         },

@@ -6,8 +6,9 @@
 本文记调研结论、设计取舍，以及最后实现出来的样子。
 
 > 已实现（`core/local/LocalMusic.ets` + 我的页「本地音乐」分段页）：
-> 导入（选文件 / 选文件夹）、元数据与内嵌封面、去重、删除、混进播放队列、
-> 加进歌单与收藏（非同步侧表）、同步设置页注明本地歌会被抛弃。
+> 导入（文件管理的音频聚合视图，一步到位）、元数据与内嵌封面、去重、
+> 删除（单条 / 多选批量）、混进播放队列、加进歌单与收藏（非同步侧表）、
+> 同步设置页注明本地歌会被抛弃。
 > 没做：同名 `.lrc` 歌词、失效条目标记、空间统计页，详见文末「分期」。
 
 ## 1. 权限：先给结论
@@ -18,14 +19,15 @@
 | --- | --- | --- |
 | `ohos.permission.READ_AUDIO`（API 8+） | 受限开放权限（ACL），需 AGC 审批 | **不能用**。文档把可申请场景写死成「应用需要克隆、备份或同步音频类文件」，并直接给出替代方案：「其他场景下的使用方案：使用 AudioPicker 访问用户音频文件」 |
 | `ohos.permission.READ_MEDIA`（API 9+） | 同上 | 同上：媒体库读写，可申请场景同样是克隆 / 备份 / 同步 |
-| **`AudioViewPicker`**（`@kit.CoreFileKit` 的 `picker`） | **无需任何权限** | **走这条**。这是官方为「应用要读用户音频」指定的正路 |
+| **Picker（`AudioViewPicker` / `DocumentViewPicker` + `mergeMode: AUDIO`）** | **无需任何权限** | **走这条**。官方为「应用要读用户音频」指定的正路就是 Picker；本工程用后者（文件管理的音频聚合视图），一次能看到全机音频，见第 3 节 |
 
 出处：`开发指南/安全/程序访问控制/应用权限管控/应用权限列表/受限开放权限/restricted-permissions`、
 `FAQ/程序框架/程序框架_Ability/HarmonyOS媒体库相关权限申请及配置/faqs-ability-163`。
 
-还有一层：**三方应用没有「枚举音频媒体库」的 API**。Media Library Kit 只覆盖图片和视频
+还有一层：**三方应用没有「自己枚举音频媒体库」的 API**。Media Library Kit 只覆盖图片和视频
 （`photoAccessHelper`），音频相关文档反复写「当需要读取和保存音频文件时，请使用
-AudioViewPicker」。所以「扫描全盘音乐」这条路在设计上就不存在，只能让用户选。
+AudioViewPicker」。所以「应用自己扫描全盘音乐」在设计上就不存在 —— 能让用户看到全机音频
+列表的只有 Picker 的聚合视图（那是文件管理界面在跑，不是我们拿到了权限）。
 
 `WRITE_AUDIO`（往公共目录写音频）同样受限，场景也是克隆 / 备份 / 同步 —— 本项目不需要它
 （导入是往沙箱写，不碰公共目录）。
@@ -56,21 +58,67 @@ FAQ 里还有一条：应用被终止后（包括重启）该权限失效，重�
 这条取舍和项目现有约定是一致的：`AudioCache` 已经在往 `files/lx_media_audio/` 落整首音频，
 `playAt` 已经有一条「本地文件优先」的分支，`module.json5` 也已经为「不申请 ACL」做过一次同样的决定。
 
-## 3. 怎么选文件
+## 3. 怎么选文件（只有一个入口：文件管理的音频聚合视图）
 
-两条入口，能力不一样，建议都做：
+三方应用在**手机**上能拿到的用户音频文件只有一条路：「自己扫全盘」在设计上就不存在
+（见第 1 节：`READ_AUDIO` / `READ_MEDIA` 是受限权限，只批克隆 / 备份 / 同步场景）。
 
-| 方式 | 接口 | 能力 |
+| 方式 | 接口 | 批量能力 |
 | --- | --- | --- |
-| **选文件夹** | `DocumentViewPicker` + `selectMode: DocumentSelectMode.FOLDER`（API 11+）+ `fileSuffixFilters` | 一次把整个音乐目录导进来，这才是本地音乐该有的体验 |
-| 选文件 | `AudioViewPicker.select(AudioSelectOptions)` | 免权限、按音频类型过滤，`maxSelectNumber` 默认 1、上限 500（API 20 及以前） |
+| **导入音乐**（唯一入口） | `DocumentViewPicker` + `mergeMode: MergeTypeMode.AUDIO`（API 15+） | 拉起**文件管理应用的聚合视图（音频分类页）**：一屏列出设备上所有音频文件，多选 / 全选由文件管理界面提供。官方文档：该参数「在 Phone 设备中可正常使用，在其他设备中无效果」 |
 
-`DocumentViewPicker` 的其它有用参数：
+界面上的「导入音乐」是一颗直接打开的按钮（没有二级菜单）。曾经还有两个入口，都撤了：
 
+| 撤掉的 | 原因 |
+| --- | --- |
+| 选文件夹（`selectMode: FOLDER`） | 手机在 API 26 之前不支持这个参数，理由见下 |
+| 选择音乐文件（`AudioViewPicker`） | 能用，但只能逐个多选，批量导入不如聚合视图；留着只是多一条岔路 |
+
+### 「选文件夹」为什么彻底不能用（2026-09-22 查清）
+
+原来那条 `DocumentViewPicker` + `selectMode: FOLDER` 有两个独立的死因，任一条都足以让它废掉：
+
+1. **手机根本不支持选文件夹。** 官方《选择用户文件》指南原文：
+   「选择的文档类型，默认值是 FILE(文件类型)。**从 API 版本 26.0.0 开始，当文件类型是
+   FOLDER 时，Phone 设备支持该参数**」；`allowsMulFolderSelection` 同样标注仅 2in1 支持。
+   本工程 `compatibleSdkVersion = 6.1.0(23)`，手机系统也在 API 23 这一档，
+   所以 `selectMode = FOLDER` 在当时等于没生效 —— 这是「选了文件夹却没反应」的根因。
+2. **就算拿到目录 URI，也枚举不了。** `fs.listFileSync` 的参数按 SDK 文档只接受
+   「应用沙箱路径」（`@ohos.file.fs.d.ts` 里 listFile / listFileSync / listFileExtSync
+   都这么写，整个 fs 模块只有 `stat` / `lstat` 标了 "URIs can be passed since API version 22"）；
+   公开 SDK 里也没有第三方可用的目录枚举接口（`@ohos.file.fileAccess.d.ts` 只有 37 行空壳，
+   真正的 FileAccessHelper 是 systemapi）。
+   而代码当时把枚举异常 catch 成空数组，界面就报「这个目录里没有找到文件」——
+   把「枚举不了」说成了「目录是空的」（这是个真 bug，不只是功能缺失）。
+
+### 查过、没采用的路（都记下来，免得以后重复调研）
+
+| 路线 | 结论 |
+| --- | --- |
+| `Environment.getUserDownloadDir()` → 扫「下载」目录 | **手机不可用**：依赖 syscap `SystemCapability.FileManagement.File.Environment.FolderObtain`，只存在于 2in1 / tablet 的 device-define（手机编译器直接 28005）。下载目录那条路在本工程早就因为同一原因放弃了，见 `DownloadManager.ets` |
+| `fileShare.persistPermission()` 持久化目录授权 | 同因不可用：syscap `AppFileService.FolderAuthorization` 也只有 2in1；且要受限 ACL 权限 `FILE_ACCESS_PERSIST` |
+| `ohos.permission.READ_AUDIO` / `READ_MEDIA` 直读媒体库 | 受限开放权限，AGC 审批场景写死为「克隆 / 备份 / 同步音频类文件」，官方直接给出替代方案：用 AudioViewPicker |
+| `mediaLibrary` 查音频资源 | SDK 里已经没有这个模块（HarmonyOS NEXT 移除）；`photoAccessHelper` 只覆盖图片 / 视频，全文没有 audio |
+| 文件管理里多选 → **分享到本应用** | 技术上可行（声明 `ohos.want.action.sendData` / `sendMultiple` 收 URI），能用上文件管理自己的「全选」；代价是改 `module.json5` 并处理冷启动 / `onNewWant`。**暂不做**，留作聚合视图不好用时的备选 |
+| 华为音乐 / 荣耀音乐的「一键扫描」 | 那是系统应用（有特权权限），三方照不了 |
+
+**去重**（导入与批量管理都靠它）：
+
+| 手段 | 规则 | 说明 |
+| --- | --- | --- |
+| 指纹 | `字节数_小写文件名`（`LocalMusic.importOne`） | 同一首歌换个目录、或一次选两遍，都会被跳过；跨重启有效（`index.json` 里的 `fingerprint`，启动时重建 Set） |
+| 指纹的边界 | 不是内容哈希 | 同名且字节数相同的两首不同歌会被误判为重复；同一首歌重新编码（字节数变了）不会被判重，会各留一份 |
+| 非音频文件 | `isIgnorableFile`（`.lrc` / 封面图 / 说明文本） | 直接摘掉，不算「格式不支持」 |
+| 同名 `.lrc` | 按音频文件名找兄弟文件 | 只授权了选中文件的路径（选文件）读不到，读不到就算了，靠在线匹配兜底 |
+
+`DocumentViewPicker` 的其它参数（以后要用时参考）：
+
+- `mergeMode` 置为非 `DEFAULT` 后**其它参数基本不生效**（官方：「API 版本 26.0.0 及之后的版本
+  当该参数置为非 DEFAULT 时，仅 fileSuffixFilters 参数生效」），所以聚合视图只配了它；
 - `fileSuffixFilters`：`['音频|.mp3,.flac,.m4a,.aac,.ogg,.wav,.amr']`，按后缀过滤；
-- `maxSelectNumber`：API 20 及以前上限 500，**API 21 起取消上限**（文档建议单次不超过 1 万个）；
-- `mergeMode: MergeTypeMode.AUDIO`：文件管理器的聚合视图按音频类型展示；
-- `allowsMulFolderSelection`（26.0.0）：**Phone 上不支持目录多选**，手机只能选一个目录；
+- `maxSelectNumber`：API 20 及以前上限 500，API 21 起取消上限（建议单次不超过 1 万个）；
+- `multiAuthMode` + `multiUriArray`：批量授权模式（手机可用），用于「手里已经有一批 URI，
+  让用户一次确认授权」，本项目暂无来源可传；
 - `constructor(context)` 要用 UIAbilityContext（无参构造会概率性拉起失败）。
 
 格式支持（AVPlayer / AVMetadataExtractor 官方列出的音频格式）：
@@ -230,7 +278,9 @@ files/local_music/
 1. **队列里的本地歌不参与同步**。试听列表（= 播放队列）是同步结构，本地歌进不去；
    播放一份含本地歌的列表时，如果触发了队列镜像（比如远端列表推送），队列会回到
    同步那一份 —— 本地歌会从队列里消失，但**歌单 / 收藏里的不会丢**（它们在侧表里）。
-2. **「选择文件夹」的目录枚举待真机验证**（见下）。
+2. **「选择文件夹」已去掉**（2026-09-22）：手机在 API 26 之前不支持 FOLDER 选择，
+   加上目录 URI 枚举不了，入口与 `pickFolder/listFolder` 一并删除；批量导入改走
+   导入改走文件管理的音频聚合视图（可全选），见第 3 节。
 3. 本地歌没有平台音质可选 —— 设计如此，不是 bug。
 4. 在线匹配依赖平台搜索接口的可用性（内置搜索里网易那个端点就一直标着「待复核」），
    所以是五个平台依次试，某个平台不通不影响其它平台；全都不可用时就没有歌词，
@@ -247,9 +297,9 @@ files/local_music/
 | 3 | 按设置自动匹配一次（`core/local/LyricMatch`） | 要联网，每首歌只搜一次 |
 | 4 | 都没有 | 就显示没有歌词，而不是显示错的 |
 
-`.lrc` 是「选文件夹」时顺带进来的：对每个音频文件，在同一目录找同名的 `.lrc` / `.LRC`
-（`song.mp3` → `song.lrc`）。用音频选择器单选文件时拿不到兄弟文件（只授权了选中的那个），
-那条路就只靠在线匹配。歌词文件可能是 GBK —— `fs.readTextSync` 只支持 utf-8，
+`.lrc` 靠导入时顺带拷一份：对每个音频文件，在同一目录找同名的 `.lrc` / `.LRC`
+（`song.mp3` → `song.lrc`）。选文件这条路只授权了选中的那一个文件，兄弟文件多半读不到，
+读不到就靠在线匹配兜底。歌词文件可能是 GBK —— `fs.readTextSync` 只支持 utf-8，
 所以是读原始字节后先用 UTF-8 解、解出 U+FFFD 再用 GBK 解一遍。
 
 ### 在线匹配为什么是「宁缺勿错」
@@ -288,7 +338,8 @@ files/local_music/
 
 | 事项 | 状态 |
 | --- | --- |
-| **FOLDER 模式返回的目录 URI 能不能用 `fs.listFileSync` 枚举** | **待真机验证**。文档没有明说（只明确 `fs.openSync(uri)` 可用）。代码里已经做了兜底：枚举失败会提示「这个目录里没有找到文件，请改用『选择音乐文件』」，不会静默什么都不发生。若真机不支持，就把「选文件夹」这个入口去掉 |
+| ~~FOLDER 模式返回的目录 URI 能不能用 `fs.listFileSync` 枚举~~ | **已查清（2026-09-22）**：手机在 API 26 之前 `selectMode = FOLDER` 本身不生效（官方指南），且目录 URI 也不是 `listFileSync` 能接受的参数。入口已去掉，见第 3 节 |
+| 聚合视图能不能全选 | **待真机验证**：`mergeMode = AUDIO` 官方标注手机可用，但聚合视图里多选 / 全选的具体交互要装到手机上确认；不好用就改走「文件管理多选 → 分享到本应用」，见第 3 节的备选表 |
 | 大库导入耗时 | 已处理：逐个串行导入 + 进度 + 可取消，界面不会卡住 |
 | 元数据 fd 与播放 fd 冲突 | 已处理：读标签用单独的句柄（第 4 节的官方约束） |
 | 重复导入同一文件 | 已处理：指纹去重（字节数 + 文件名） |
@@ -298,8 +349,9 @@ files/local_music/
 
 ## 11. 分期
 
-- **P0 已完成**：选文件 / 选文件夹导入 → 沙箱副本 + `index.json` → 元数据与封面 → 去重 →
-  「我的」页「本地音乐」分段页（导入钮 + 进度 + 列表 + 删除）→ `playAt` 本地直路
+- **P0 已完成**：导入（文件管理的音频聚合视图）→ 沙箱副本
+  + `index.json` → 元数据与封面 → 去重 →
+  「我的」页「本地音乐」分段页（导入钮 + 进度 + 列表 + 单条删除 + 多选全选/批量移除）→ `playAt` 本地直路
   （在音源检查之前）→ 各处早退 → 空状态引导（说明为什么必须导入）。
 - **P1 已完成**：本地歌加入歌单 / 收藏（非同步侧表）、歌词（同名 `.lrc` 一并导入 +
   在线匹配 + 手动纠正 + 开关）。

@@ -1,11 +1,13 @@
 import { avSession } from '@kit.AVSessionKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { common, wantAgent, WantAgent } from '@kit.AbilityKit';
+import { fileIo as fs, fileUri } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { http } from '@kit.NetworkKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { PlaySettings } from '../settings/PlaySettings';
+import { LyricLine, activeLyricIndex, parseLyric } from '../music/Lyric';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'PlaybackService';
@@ -20,6 +22,8 @@ const POSITION_INTERVAL_MS: number = 1000;
 /** 锁屏封面的解码尺寸（媒体卡上的小图，不用原图尺寸） */
 const COVER_SIZE: number = 300;
 const COVER_TIMEOUT_MS: number = 8000;
+/** 没有封面时的兜底图：应用自己的启动图标（媒体卡上就这么点大，几十 KB 的图足够） */
+const FALLBACK_COVER_RES: string = 'startIcon';
 
 /** 系统媒体控制（锁屏 / 控制中心 / 耳机按键）发来的指令 */
 export type PlaybackCommand = 'play' | 'pause' | 'next' | 'prev' | 'seek' | 'stop';
@@ -77,6 +81,10 @@ export interface PlaybackMediaInfo {
  *  - 收藏：注册 toggleFavorite 指令 + 回写 AVPlaybackState.isFavorite，
  *    播控中心那颗心就是本应用的收藏（对应洛雪的「我的收藏」）。
  *  - 循环模式：注册 setLoopMode 指令 + 回写 AVPlaybackState.loopMode。
+ *
+ * 另外还给**蓝牙设备**（车机、蓝牙音箱）供了一份歌词：AVMetadata.singleLyricText
+ * 传「当前这一句」，系统蓝牙模块读它并下发给已连接的蓝牙设备。这份数据只走蓝牙，
+ * 不影响播控中心，见 refreshBluetoothLyric。
  */
 export class PlaybackService {
   private static instance: PlaybackService | null = null;
@@ -111,6 +119,10 @@ export class PlaybackService {
   private favorite: boolean = false;
   /** 歌词原文（标准 LRC；空串表示这首歌没有可用歌词） */
   private lyric: string = '';
+  /** 歌词原文解析出来的行：蓝牙歌词要按「当前唱到哪句」推，播控中心那边由系统自己解析 */
+  private lyricLines: LyricLine[] = [];
+  /** 已经推给系统的「当前这一句」；没变就不重推，换一句才推一次 */
+  private btLyricText: string = '';
 
   // ------------------------------------------------------------ 播放状态
   private state: avSession.PlaybackState = avSession.PlaybackState.PLAYBACK_STATE_IDLE;
@@ -136,6 +148,9 @@ export class PlaybackService {
   /** 已经处理过的封面地址（成功或失败都记下来，避免反复解码） */
   private coverKey: string = '';
   private coverPixel: image.PixelMap | null = null;
+  /** 这首歌没有封面时的兜底图，解一次缓存住；fallbackFailed 记「解不出来」不再重试 */
+  private fallbackPixel: image.PixelMap | null = null;
+  private fallbackFailed: boolean = false;
 
   // ------------------------------------------------------------ 生命周期
 
@@ -176,7 +191,11 @@ export class PlaybackService {
         hilog.warn(DOMAIN, TAG, 'destroy session failed: %{public}s', JSON.stringify(err));
       });
     }
+    // 会话没了，封面缓存也一起丢掉。coverKey 必须重置：不重置的话下次建会话再放到
+    // 同一首歌时，resolveCover 会以为「这首已经解过」而直接返回空，封面永远上不来
     this.releaseCover();
+    this.coverKey = '';
+    this.releaseFallback();
   }
 
   // ------------------------------------------------------------ 对外：推歌曲信息
@@ -206,8 +225,10 @@ export class PlaybackService {
     if (changed) {
       this.positionMs = 0;
       this.lastPushMs = 0;
-      // 换歌了：上一首的歌词不能留在播控中心 / 桌面歌词上，等新歌词推上来再显示
+      // 换歌了：上一首的歌词不能留在播控中心 / 桌面歌词 / 蓝牙设备上，等新歌词推上来再显示
       this.lyric = '';
+      this.lyricLines = [];
+      this.btLyricText = '';
       this.syncDesktopLyric();
     }
     this.applyMetadata();
@@ -224,14 +245,62 @@ export class PlaybackService {
       return;
     }
     this.lyric = lrc;
+    /**
+     * 蓝牙歌词是按「当前这一句」推的，所以这里顺手把新歌词解析成行、并先定位到当前句，
+     * 让它跟着全量歌词**一次**推出去（换歌时就不会把上一首的句子留在车机上）。
+     * 之后再按播放进度逐句更新，见 refreshBluetoothLyric。
+     */
+    this.lyricLines = lrc.length > 0 ? parseLyric(lrc) : [];
+    this.btLyricText = this.currentBluetoothLine();
     const session = this.session;
     if (session !== null && this.hasMedia) {
       // 只刷新元数据里的歌词字段（其余字段照旧带上，避免被清空）
-      this.pushMetadata(this.currentCover()).catch((err: BusinessError) => {
+      this.pushMetadata(this.coverForPush()).catch((err: BusinessError) => {
         hilog.warn(DOMAIN, TAG, 'push lyric failed: %{public}s', JSON.stringify(err));
       });
     }
     this.syncDesktopLyric();
+  }
+
+  /**
+   * 车载蓝牙歌词：把「当前这一句」重推一次（变了才推）
+   *
+   * 由两个地方驱动：播放进度（updatePosition，逐句换）与设置开关（PlaySession.setBluetoothLyric）。
+   * 关掉开关时 currentBluetoothLine 返回空串，于是这里推一次把字段清掉，
+   * 蓝牙设备随即回到只显示歌名。
+   */
+  refreshBluetoothLyric(): void {
+    const next: string = this.currentBluetoothLine();
+    if (next === this.btLyricText) {
+      return;
+    }
+    this.btLyricText = next;
+    const session = this.session;
+    if (session === null || !this.hasMedia) {
+      return;
+    }
+    this.pushMetadata(this.coverForPush()).catch((err: BusinessError) => {
+      hilog.warn(DOMAIN, TAG, 'push bluetooth lyric failed: %{public}s', JSON.stringify(err));
+    });
+  }
+
+  /**
+   * 当前该出现在蓝牙设备上的那一句
+   *
+   * 开关关着、没有带时间轴的歌词、或还没唱到第一句时返回空串 —— 空串表示不下发这个字段。
+   *
+   * 只取原文那一句，不拼译文：车机与蓝牙音箱的歌词区通常只有窄窄一行，
+   * 原文加译文会被截断，反而不如只给原文清楚。
+   */
+  private currentBluetoothLine(): string {
+    if (!PlaySettings.getInstance().isBluetoothLyric()) {
+      return '';
+    }
+    const index: number = activeLyricIndex(this.lyricLines, this.positionMs / 1000);
+    if (index < 0) {
+      return '';
+    }
+    return this.lyricLines[index].text;
   }
 
   /** 更新当前歌曲的收藏状态（播控中心的心：实心/空心） */
@@ -288,12 +357,18 @@ export class PlaybackService {
     this.syncDesktopLyric();
   }
 
-  /** 进度（由 AVPlayer 的 timeUpdate 驱动，节流后回写） */
+  /**
+   * 进度（由 AVPlayer 的 timeUpdate 驱动，节流后回写）
+   *
+   * 蓝牙歌词的逐句判断放在节流**之前**：它只是一次二分查找加字符串比较，很便宜，
+   * 而回写播放状态（进度条）没必要跟着每 100ms 一次，两者节奏不一样。
+   */
   updatePosition(positionMs: number): void {
     if (positionMs < 0) {
       return;
     }
     this.positionMs = positionMs;
+    this.refreshBluetoothLyric();
     const now: number = Date.now();
     if (now - this.lastPushMs < POSITION_INTERVAL_MS) {
       return;
@@ -312,6 +387,14 @@ export class PlaybackService {
     this.positionMs = 0;
     this.pushPlaybackState(true);
     this.stopBackgroundTask();
+    // 停播后不会再有进度回调，车机／蓝牙音箱那头得主动撤掉最后一句歌词，
+    // 否则它会一直停在停播前的那句话上
+    if (this.btLyricText.length > 0 && this.session !== null) {
+      this.btLyricText = '';
+      this.pushMetadata(this.coverForPush()).catch((err: BusinessError) => {
+        hilog.warn(DOMAIN, TAG, 'clear bluetooth lyric failed: %{public}s', JSON.stringify(err));
+      });
+    }
   }
 
   // ------------------------------------------------------------ 会话
@@ -651,6 +734,10 @@ export class PlaybackService {
    *
    * 分两步：先把文本信息写进去（会话才能尽快 activate），封面再异步补一次 ——
    * 封面要下载 + 解码，可能要好几秒，把 activate 卡在后面会让媒体卡迟迟不出现。
+   *
+   * 两次都拿 coverForPush() 现算该带哪张图：刚切歌时它先不带（等真封面解出来），
+   * 解完（含失败）再带上该带的那张。所以**解析失败也要走第二次推送** ——
+   * 那一次带的是兜底图，专门用来把上一首留在媒体卡上的封面顶掉。
    */
   private applyMetadata(): Promise<void> {
     const session = this.session;
@@ -658,22 +745,25 @@ export class PlaybackService {
       return Promise.resolve();
     }
     const assetId: string = this.assetId;
-    // 已解好的封面只在「就是当前这首歌的封面」时才用，避免切歌后把上一首的图写上去
-    const current: image.PixelMap | null = this.currentCover();
-    const written: Promise<void> = this.pushMetadata(current);
-    this.resolveCover().then((pixel: image.PixelMap | null) => {
-      // 下载期间可能已经切歌，迟到的封面不要再写上去
-      if (pixel === null || this.assetId !== assetId) {
-        return;
+    const written: Promise<void> = this.pushMetadata(this.coverForPush());
+    this.resolveCover().then((): Promise<void> => {
+      // 解封面期间可能已经切歌，迟到的结果不要再写上去
+      if (this.assetId !== assetId) {
+        return Promise.resolve();
       }
-      return this.pushMetadata(pixel);
+      return this.pushMetadata(this.coverForPush());
     }).catch((err: BusinessError) => {
       hilog.warn(DOMAIN, TAG, 'push cover metadata failed: %{public}s', JSON.stringify(err));
     });
     return written;
   }
 
-  /** 真正写元数据；cover 为空时退回 uri 字符串形式，至少别让媒体卡空着 */
+  /**
+   * 真正写元数据
+   *
+   * cover 由 coverForPush() 决定：null 表示「这一轮先不带图」（封面还在路上），
+   * 带兜底图表示「这首歌确实没有封面」。见 coverForPush 的说明。
+   */
   private pushMetadata(cover: image.PixelMap | null): Promise<void> {
     const session = this.session;
     if (session === null) {
@@ -709,6 +799,23 @@ export class PlaybackService {
     if (this.lyric.length > 0) {
       metadata.lyric = this.lyric;
     }
+    /**
+     * 车载蓝牙歌词：当前这一句，纯文本、不带时间标签。
+     *
+     * singleLyricText 是系统为蓝牙歌词专设的字段（OpenHarmony 的对应需求就叫
+     * 「蓝牙歌词增加 singleLyricText 字段」，API 17 起可用）：系统蓝牙模块读它，
+     * 送到已连接的蓝牙设备（车机、蓝牙音箱）上显示。
+     *
+     * 它跟播控中心互不干扰 —— 那边歌名读 title、滚动歌词读 lyric，所以开这个功能
+     * 不会让播控中心显示错乱（这一点跟 Android 上「把歌词写进标题」的做法完全不同，
+     * 那种做法会污染通知栏与锁屏）。
+     *
+     * 空串也照写：这是「当前没有该显示的句子」（开关关着、还没唱到第一句、换歌途中），
+     * 显式写空串而不是省略字段，免得系统按合并处理时把上一句留在车机上。
+     */
+    if (apiAtLeast(17)) {
+      metadata.singleLyricText = this.btLyricText;
+    }
     return session.setAVMetadata(metadata).catch((err: BusinessError) => {
       hilog.warn(DOMAIN, TAG, 'setAVMetadata failed: %{public}s', JSON.stringify(err));
     });
@@ -719,14 +826,78 @@ export class PlaybackService {
     return this.coverKey === this.coverUrl ? this.coverPixel : null;
   }
 
+  /**
+   * 这一轮元数据该带哪张封面
+   *
+   * 系统只在这次带了 mediaImage 时才换图，不带就**沿用上一次的**。所以：
+   *  - 已经解好 → 用解好的那张；
+   *  - 还在解（刚切歌、或正在下载/解码）→ 返回 null，这一轮先不带图。媒体卡这时会
+   *    继续显示上一张，等 resolveCover 回来立刻补推；先塞一张兜底图上去反而会闪一下；
+   *  - 解过了、确实没有（coverUrl 为空，或本地/网络都取不到）→ 用兜底图。
+   *    这一步不能省：不给图的话上一首的封面会一直留在播控中心，看着就是「封面串台」。
+   */
+  private coverForPush(): image.PixelMap | null {
+    const current: image.PixelMap | null = this.currentCover();
+    if (current !== null) {
+      return current;
+    }
+    // coverKey 是「已经解过的那张的地址」：跟当前地址不一致说明还没解（或正在解）
+    if (this.coverKey !== this.coverUrl) {
+      return null;
+    }
+    return this.fallbackCover();
+  }
+
+  /**
+   * 兜底封面：本应用的启动图标
+   *
+   * 没有封面的歌（本地歌里没内嵌图、平台也补不到图）也得给系统一张图，
+   * 否则播控中心会一直留着上一首的封面 —— 那比空着更容易让人误解。
+   * 用应用图标是因为「不给 mediaImage 时系统本来也是退回这个观感」，
+   * 所以这么做不会比系统默认的行为更难看。
+   *
+   * 解一次就缓存住，失败也只试一次（不然每首歌都要白解一遍）。
+   * 这里是同步解：图只有几十 KB，一次性、且只做一次，不值得为它把整条推送链改成异步。
+   */
+  private fallbackCover(): image.PixelMap | null {
+    if (this.fallbackPixel !== null || this.fallbackFailed) {
+      return this.fallbackPixel;
+    }
+    const context = this.context;
+    if (context === null) {
+      return null;
+    }
+    let source: image.ImageSource | null = null;
+    try {
+      const bytes: Uint8Array = context.resourceManager.getMediaByNameSync(FALLBACK_COVER_RES);
+      source = image.createImageSource(bytes.buffer as ArrayBuffer);
+      const options: image.DecodingOptions = {
+        desiredSize: { width: COVER_SIZE, height: COVER_SIZE },
+      };
+      const pixel: image.PixelMap = source.createPixelMapSync(options);
+      this.fallbackPixel = pixel;
+      return pixel;
+    } catch (err) {
+      this.fallbackFailed = true;
+      hilog.warn(DOMAIN, TAG, 'decode fallback cover failed: %{public}s', JSON.stringify(err));
+      return null;
+    } finally {
+      if (source !== null) {
+        source.release().catch(() => {
+        });
+      }
+    }
+  }
+
   // ------------------------------------------------------------ 锁屏封面
 
   /**
    * 把封面地址解成 PixelMap
    *
-   * AVSession 的 mediaImage 只吃 PixelMap 或本地 uri，网络地址系统不会自己去下，
-   * 所以这里自己下自己解；解不出来就由调用方退回字符串形式。
-   * 同一张封面只解一次，结果（含失败）缓存到 coverKey。
+   * AVSession 的 mediaImage 只吃 PixelMap（或系统读得到的本地 uri），网络地址系统不会
+   * 自己去下，所以这里自己把图解出来：网络封面走网络下，本地封面读沙箱文件（decodeCover）。
+   * 同一张封面只解一次，结果（含失败）缓存到 coverKey；解不出来返回 null，
+   * 由 coverForPush 决定这一轮带不带图、要不要用兜底图。
    */
   private resolveCover(): Promise<image.PixelMap | null> {
     const url: string = this.coverUrl;
@@ -753,7 +924,18 @@ export class PlaybackService {
     });
   }
 
-  private async decodeCover(url: string): Promise<image.PixelMap | null> {
+  private decodeCover(url: string): Promise<image.PixelMap | null> {
+    // 本地封面（本地歌 / 云端歌的内嵌图）走文件通道，见 decodeLocalCover：
+    // http 的 request 只支持 http/https，拿 file:// 地址去请求会直接报
+    // 2300001 Unsupported protocol
+    if (!isRemoteUrl(url)) {
+      return this.decodeLocalCover(url);
+    }
+    return this.decodeRemoteCover(url);
+  }
+
+  /** 网络封面：自己下下来再解（网络地址系统不会替应用去下） */
+  private async decodeRemoteCover(url: string): Promise<image.PixelMap | null> {
     let request: http.HttpRequest | null = null;
     try {
       request = http.createHttp();
@@ -787,6 +969,46 @@ export class PlaybackService {
   private releaseCover(): void {
     const pixel = this.coverPixel;
     this.coverPixel = null;
+    if (pixel !== null) {
+      pixel.release();
+    }
+  }
+
+  /**
+   * 本地封面：把沙箱里的图片文件解成 PixelMap
+   *
+   * 地址形如 `file://<bundleName>/data/storage/el2/...`（由 LocalMusic.coverUri /
+   * WebDavLibrary.coverUrlOf 生成），http 通道读不了，但 image 能直接按沙箱路径读文件。
+   * 之前只有网络那一条通道，本地歌的封面就永远解不出来 —— 播控中心要么空着，
+   * 要么一直显示上一首的封面，正是「本地歌的封面到不了播控中心」的根因。
+   */
+  private async decodeLocalCover(uri: string): Promise<image.PixelMap | null> {
+    try {
+      // file://<bundleName>/<沙箱路径> 要先还原成沙箱路径；万一来源直接给的绝对路径就照用
+      const path: string = uri.startsWith('file://') ? new fileUri.FileUri(uri).path : uri;
+      // 文件可能已经不在了（导入之后用户清过数据），先探一下，
+      // 免得 createImageSource 返回空后在下一步抛一个看不懂的错
+      if (!fs.accessSync(path)) {
+        hilog.warn(DOMAIN, TAG, 'local cover missing: %{public}s', path);
+        return null;
+      }
+      const source: image.ImageSource = image.createImageSource(path);
+      const options: image.DecodingOptions = {
+        desiredSize: { width: COVER_SIZE, height: COVER_SIZE },
+      };
+      const pixel: image.PixelMap = await source.createPixelMap(options);
+      source.release().catch(() => {
+      });
+      return pixel;
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'decode local cover failed: %{public}s', JSON.stringify(err));
+      return null;
+    }
+  }
+
+  private releaseFallback(): void {
+    const pixel = this.fallbackPixel;
+    this.fallbackPixel = null;
     if (pixel !== null) {
       pixel.release();
     }
@@ -876,6 +1098,16 @@ function fastSeekStep(time?: number): number {
     return DEFAULT_STEP;
   }
   return time;
+}
+
+/**
+ * 封面地址是不是要从网络取
+ *
+ * http 的 request 只吃 http/https；其余（file:// 沙箱 uri、绝对路径）都是本地文件，
+ * 必须走 image 的文件解码那条路，否则本地歌的封面永远解不出来。
+ */
+function isRemoteUrl(url: string): boolean {
+  return url.startsWith('http://') || url.startsWith('https://');
 }
 
 /** LxPlayer 的状态 -> 系统的播放状态 */

@@ -11,6 +11,7 @@ import { LxQuality } from '../source/LxTypes';
 import { DownloadSettings } from './DownloadSettings';
 import { clearDownloadedFiles, removeDownloadedFile, setDownloadedFile } from './DownloadIndex';
 import { isLocalSong } from '../local/LocalMusic';
+import { isWebDavSong } from '../webdav/WebDavLibrary';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'DownloadManager';
@@ -260,6 +261,11 @@ export class DownloadManager {
     // 本地歌（从设备导入进来的音频）已经在本机了，没有下载的意义：
     // 在这里拦一道，任何入口都不会把它排进下载队列
     if (isLocalSong(song)) {
+      return null;
+    }
+    // 云端歌（WebDAV）也不走这条队列：它没有音源链接，而是由播放缓存的
+    // 「边听边下」自己带认证头下载（见 AudioCache / PlaySession.playWebDavItem）
+    if (isWebDavSong(song)) {
       return null;
     }
     const key: string = downloadKeyOf(song);

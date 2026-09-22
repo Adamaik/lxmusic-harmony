@@ -505,6 +505,25 @@ function mgFormatToQuality(formatType: string): string {
   return '';
 }
 
+/**
+ * 把咪咕给的图片地址补成绝对地址
+ *
+ * 咪咕的 img1 / img2 / img3 基本都是**相对路径**（`/data/oss/resource/...`），搜索、歌单、
+ * 榜单三个接口都一样（实测搜索结果：img1/img2/img3 全是 `/data/oss/...`）。原样当 url 用的话
+ * 谁也加载不出来：列表里只剩占位图，播控中心那边还会被当成一个不存在的本地文件
+ * （PlaybackService 打出 "local cover missing" 后兜底成图标）。
+ * 宿主是 d.musicapp.migu.cn —— 咪咕自己的绝对地址就是 `https://d.musicapp.migu.cn/data/oss/...`，
+ * 洛雪 `mg/musicSearch.js` 里写的是 http 前缀，两种都实测能出图，这里跟接口保持一致用 https。
+ *
+ * 已经是 http(s) 的地址原样返回；空串也原样返回（调用方据此判断「这首歌没有封面」）。
+ */
+export function mgImageUrl(img: string): string {
+  if (img.length === 0 || /^https?:\/\//i.test(img)) {
+    return img;
+  }
+  return `https://d.musicapp.migu.cn${img}`;
+}
+
 /** 解析咪咕搜索结果的 songResultData.resultList（数组的数组） */
 export function parseMgResult(resultList: Object[]): LxMusicInfo[] {
   const out: LxMusicInfo[] = [];
@@ -543,9 +562,6 @@ export function parseMgResult(resultList: Object[]): LxMusicInfo[] {
       if (img.length === 0) {
         img = asString(data['img1']);
       }
-      if (img.length > 0 && !/^https?:/.test(img)) {
-        img = `http://d.musicapp.migu.cn${img}`;
-      }
 
       out.push(createInfo(
         asString(data['name']),
@@ -555,7 +571,7 @@ export function parseMgResult(resultList: Object[]): LxMusicInfo[] {
         asString(data['album']),
         asString(data['albumId']),
         formatPlayTime(asNumber(data['duration'])),
-        img,
+        mgImageUrl(img),
         '',
         types,
         qualityMap,

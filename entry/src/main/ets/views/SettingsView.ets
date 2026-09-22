@@ -18,10 +18,13 @@ const GROUP_SYNC: SettingRowDef[] = [
   { icon: I_REFRESH, title: '同步设置', action: 'sync' },
 ];
 
+/** 播放设置 / 缓存 / 下载 / 云端音乐 */
 const GROUP_PLAY: SettingRowDef[] = [
   { icon: I_VOLUME, title: '播放设置', action: 'play' },
   { icon: I_CACHE, title: '缓存', action: 'cache' },
   { icon: I_DOWNLOAD, title: '下载设置', action: 'download' },
+  // WebDAV 云端音乐：服务器地址 / 账号密码 / 曲库管理都在这一页
+  { icon: I_PERSON, title: 'WebDAV 云端音乐', action: 'webdav' },
 ];
 
 const GROUP_THEME: SettingRowDef[] = [

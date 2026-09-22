@@ -86,6 +86,8 @@ HarmonyOS 没有可直接调用的通用 JS 引擎，所以沙箱改用 **ArkWeb
 | `entry/src/main/ets/core/source/SourceTest.ets` | 测试方法集合（含「导入→搜索→解析」一站式） | — |
 | `entry/src/main/ets/core/music/LxCrypto.ets` | 纯 ArkTS MD5（宿主侧咪咕接口签名用） | `react-native-quick-md5` |
 | `entry/src/main/ets/core/music/MusicSearch.ets` | 内置搜索：酷我 / 酷狗 / 咪咕 | `src/utils/musicSdk/{kw,kg,mg}/musicSearch.js` |
+| `entry/src/main/ets/core/music/PlatformHttp.ets` | 平台接口的 JSON / 文本请求小工具（歌词与评论共用） | `src/utils/request.js` 的那层封装 |
+| `entry/src/main/ets/core/music/PlatformComment.ets` | 内置平台评论（kw/kg/tx/mg/wy） | `src/utils/musicSdk/*/comment.js` |
 | `entry/src/main/ets/core/player/LxPlayer.ets` | 播放器封装（AVPlayer） | `react-native-track-player` |
 | `entry/src/main/ets/components/SourceSandboxHost.ets` | 沙箱宿主（1x1 透明 Web + `javaScriptProxy` 桥） | `QuickJS.java` + `UserApiModule.java` |
 | `entry/src/main/ets/pages/Index.ets` | 测试页面 | — |
@@ -320,6 +322,13 @@ await LxPlayer.getInstance().playUrl(url);
 - 四个平台的接口都用真实请求 + 真实数据验证过：解码出来的 LRC 行数、时间轴单调性、
   当前行定位（`activeLyricIndex`）都在宿主侧用同源代码跑通过。
 
+#### 评论
+
+同一个道理：源协议的 action 白名单里也没有「取评论」，所以评论同样只走内置平台接口
+（`core/music/PlatformComment.ets`），与导入的音源无关。入口在播放页底部工具栏与会话
+「更多」菜单里。平台接口的差异（酷狗的签名、咪咕的游标翻页、QQ 的两套接口、网易改用公开
+GET 等）、与洛雪的差异、以及**尚未在设备上实测**这件事，都写在 `docs/SONG_COMMENT.md`。
+
 内置搜索已覆盖 5 个平台，移植自洛雪的 `src/utils/musicSdk/*/musicSearch.js`：
 
 | 平台 | 是否需要签名 | 参考实现 |
@@ -425,11 +434,11 @@ node tools/lx_engine_selftest.js
 
 运行 App → 测试页：
 
-- **离线自检**：点「载入内置示例源」→「导入并加载」→「解析播放链接」
-  （或直接点「一键离线自检」）。成功后「播放链接」应显示
-  `https://example.com/test-audio.mp3`。
-- **真实音源（完整流程）**：把真实音源脚本**链接**粘进「① 音源」→「导入并加载」→
-  在「② 搜索音乐」输入关键词 →「搜索」→ 结果列表点「播放」。
+- **离线自检**：点「一键离线自检」即可 —— 它自己会读内置示例源，不需要再手动载入脚本。
+  成功后「播放链接」应显示 `https://example.com/test-audio.mp3`。
+- **真实音源（完整流程）**：导入音源有两条入口 —— 把音源脚本**链接**粘进输入框点
+  「导入并加载」，或点「导入音源文件」选设备上的 `.js` 脚本（本地文件同样会走沙箱初始化）。
+  加载好之后在「② 搜索音乐」输入关键词 →「搜索」→ 结果列表点「播放」。
   页面会显示源规则解析出的播放链接，并由 AVPlayer 播放。
 
 ### 方法三：代码调用测试方法

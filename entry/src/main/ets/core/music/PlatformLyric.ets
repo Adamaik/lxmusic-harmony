@@ -1,5 +1,6 @@
 import { LxMusicInfo, decodeName } from './MusicSearch';
 import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
+import { asObjectArray, asRecord, asString, httpGetJson, httpGetText, httpPostForm } from './PlatformHttp';
 import { bytesToUtf8, fromBase64, utf8Bytes } from './LxCrypto';
 import { inflateZlib } from './Inflate';
 
@@ -48,30 +49,6 @@ const KW_XOR_KEY: string = 'yeelion';
 
 // ------------------------------------------------------------------ 小工具
 
-function asString(value: Object | undefined): string {
-  if (value === undefined || value === null) {
-    return '';
-  }
-  if (typeof value === 'string') {
-    return value as string;
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return JSON.stringify(value);
-  }
-  return '';
-}
-
-function asRecord(value: Object | undefined): Record<string, Object> {
-  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-  return value as Record<string, Object>;
-}
-
-function asObjectArray(value: Object | undefined): Object[] {
-  return Array.isArray(value) ? value as Object[] : [];
-}
-
 function toBytes(values: number[]): Uint8Array {
   const out = new Uint8Array(values.length);
   for (let i = 0; i < values.length; i++) {
@@ -93,76 +70,7 @@ function durationSeconds(interval: string): number {
 
 // ------------------------------------------------------------------ HTTP
 
-function httpGetText(url: string, headers?: Record<string, string>): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const options: LxRequestOptions = { method: 'get', timeout: 15000, rawText: true };
-    if (headers !== undefined) {
-      options.headers = headers;
-    }
-    lxRequest(url, options, (resp: LxResponse) => {
-      const body = resp.body;
-      resolve(typeof body === 'string' ? body : JSON.stringify(body));
-    }, (message: string) => {
-      reject(new Error(`请求失败：${message}`));
-    });
-  });
-}
-
-/** 响应体 -> JSON 对象（HTTP 层已经尝试解析，这里再兜一层） */
-function resolveJson(resp: LxResponse): Record<string, Object> | null {
-  const body = resp.body;
-  if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
-    return body as Record<string, Object>;
-  }
-  if (typeof body === 'string') {
-    try {
-      const parsed: Object = JSON.parse(body) as Object;
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as Record<string, Object>;
-      }
-    } catch (e) {
-      return null;
-    }
-  }
-  return null;
-}
-
-function httpGetJson(url: string, headers?: Record<string, string>): Promise<Record<string, Object>> {
-  return new Promise<Record<string, Object>>((resolve, reject) => {
-    const options: LxRequestOptions = { method: 'get', timeout: 15000 };
-    if (headers !== undefined) {
-      options.headers = headers;
-    }
-    lxRequest(url, options, (resp: LxResponse) => {
-      const parsed: Record<string, Object> | null = resolveJson(resp);
-      if (parsed === null) {
-        reject(new Error(`接口返回格式异常（HTTP ${resp.statusCode}）`));
-        return;
-      }
-      resolve(parsed);
-    }, (message: string) => {
-      reject(new Error(`请求失败：${message}`));
-    });
-  });
-}
-
-function httpPostForm(url: string, form: Record<string, string>,
-  headers: Record<string, string>): Promise<Record<string, Object>> {
-  return new Promise<Record<string, Object>>((resolve, reject) => {
-    const options: LxRequestOptions = { method: 'post', timeout: 15000, headers: headers, form: form };
-    lxRequest(url, options, (resp: LxResponse) => {
-      const parsed: Record<string, Object> | null = resolveJson(resp);
-      if (parsed === null) {
-        reject(new Error(`接口返回格式异常（HTTP ${resp.statusCode}）`));
-        return;
-      }
-      resolve(parsed);
-    }, (message: string) => {
-      reject(new Error(`请求失败：${message}`));
-    });
-  });
-}
-
+/** 二进制 GET（酷我歌词的 zlib 流走这条；JSON / 文本请求见 PlatformHttp.ets） */
 function httpGetBinary(url: string): Promise<number[]> {
   return new Promise<number[]>((resolve, reject) => {
     const options: LxRequestOptions = { method: 'get', timeout: 15000, binary: true };

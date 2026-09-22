@@ -16,6 +16,7 @@ import { describeStatus, shouldNotifySyncMessage } from '../core/sync/SyncStatus
 import { buildTitleMaterial, HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
+import { WebDavSettingsView } from '../views/WebDavSettingsView';
 import { I_GEAR, I_GEAR_FILL, I_HOME, I_HOME_FILL, I_PERSON, I_PERSON_FILL, I_PLAYLIST,
   I_PLAYLIST_FILL } from '../ui/Icons';
 import { MiniBarView } from '../views/MiniBar';
@@ -51,6 +52,8 @@ const PAGE_DOWNLOAD: string = 'download';
 const PAGE_APPEARANCE: string = 'appearance';
 /** 在线歌单 / 在线榜单详情 */
 const PAGE_ONLINE: string = 'online';
+/** WebDAV 云端音乐设置（服务器地址 / 账号密码 / 曲库管理） */
+const PAGE_WEBDAV: string = 'webdav';
 
 /** 底部悬浮页签的四个页签 */
 interface TabDef {
@@ -468,6 +471,10 @@ struct Index {
       this.go(PAGE_APPEARANCE);
       return;
     }
+    if (action === 'webdav') {
+      this.go(PAGE_WEBDAV);
+      return;
+    }
     this.showToast('该功能暂未接入');
   }
 
@@ -596,6 +603,16 @@ struct Index {
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
       .titleBar(this.titleBarOptions('外观'))
+    } else if (name === PAGE_WEBDAV) {
+      HdsNavDestination() {
+        Column() {
+          WebDavSettingsView({ bottomInset: this.bottomInset })
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
+      }
+      .titleBar(this.titleBarOptions('WebDAV 云端音乐'))
     } else if (name === PAGE_ONLINE) {
       HdsNavDestination() {
         Column() {
@@ -684,6 +701,11 @@ struct Index {
             MineView({
               topInset: this.topInset,
               bottomInset: this.bottomInset + 96,
+              // 「我的 - 云端音乐」未配置服务器时的「去设置」要能跳到设置子页，
+              // 所以把设置页那套路由回调也给它
+              onNavigate: (action: string) => {
+                this.onSettingAction(action);
+              },
             })
           }
           .tabBar(this.tabBarStyle(2))

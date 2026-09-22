@@ -15,6 +15,7 @@ import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
+import { isWebDavSong } from '../core/webdav/WebDavLibrary';
 
 /**
  * 歌单详情（点歌单进来的那一页）
@@ -108,9 +109,13 @@ export struct PlaylistDetailView {
 
   /** 下载：交给下载管理排队（设置里的文件名格式 / 保存位置都生效） */
   private download(item: SongItem): void {
-    // 本地歌已经在本机了（菜单里也不显示这一项，这里只作兜底）
+    // 本地歌已经在本机了、云端歌由播放缓存的边听边下负责（菜单里也不显示这一项）
     if (isLocalSong(item)) {
       this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
+    if (isWebDavSong(item)) {
+      this.toast(`「${item.name}」是云端音乐，播放时会自动缓存`);
       return;
     }
     const manager = DownloadManager.getInstance();
@@ -228,7 +233,7 @@ export struct PlaylistDetailView {
           this.playSong(item);
         })
       // 本地歌已经在本机了，下载这一项对它没有意义
-      if (!isLocalSong(item)) {
+      if (!isLocalSong(item) && !isWebDavSong(item)) {
         MenuItem({ content: '下载' })
           .onClick(() => {
             this.download(item);
@@ -367,18 +372,18 @@ export struct PlaylistDetailView {
       this.toast('歌单里还没有歌曲');
       return;
     }
-    // 本地歌跳过（已经在本机了）：只把在线歌排进下载队列
+    // 本地歌（已经在本机）与云端歌（由播放缓存负责）都跳过：只把在线歌排进下载队列
     const online: SongItem[] = [];
     let localCount: number = 0;
     for (const item of this.songs) {
-      if (isLocalSong(item)) {
+      if (isLocalSong(item) || isWebDavSong(item)) {
         localCount++;
       } else {
         online.push(item);
       }
     }
     if (online.length === 0) {
-      this.toast('这个歌单里都是本地歌，不需要下载');
+      this.toast('这个歌单里都是本地或云端音乐，不需要下载');
       return;
     }
     const added: number = DownloadManager.getInstance().enqueueMany(online);
@@ -386,7 +391,7 @@ export struct PlaylistDetailView {
       this.toast('这些歌都已经在下载列表里了');
       return;
     }
-    const skipped: string = localCount > 0 ? `（跳过 ${localCount} 首本地歌）` : '';
+    const skipped: string = localCount > 0 ? `（跳过 ${localCount} 首本地 / 云端音乐）` : '';
     this.toast(`已加入下载 ${added} 首${skipped}，可在「我的 - 下载管理」查看进度`);
   }
 

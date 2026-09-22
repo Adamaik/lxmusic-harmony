@@ -7,6 +7,7 @@ import musicSearchTest from './MusicSearch.test';
 import playlistLinkTest from './PlaylistLink.test';
 import shuffleBagTest from './ShuffleBag.test';
 import txWySearchTest from './TxWySearch.test';
+import webDavTest from './WebDav.test';
 
 export default function testsuite() {
   listDescTest();
@@ -18,4 +19,5 @@ export default function testsuite() {
   playlistLinkTest();
   shuffleBagTest();
   txWySearchTest();
+  webDavTest();
 }

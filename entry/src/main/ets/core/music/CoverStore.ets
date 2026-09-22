@@ -36,6 +36,17 @@ interface CoverTask {
   musicInfoJson: string;
 }
 
+/**
+ * 是不是「内置平台」来源（kw / kg / tx / mg / wy）
+ *
+ * 只有这些平台才有「搜索结果不带封面、要按接口现查」这回事，也才可能被源脚本的
+ * `pic` action 兜住。`local`（设备里导入的）与 `webdav`（云服务器上的）两个来源的
+ * 封面各有出处（内嵌标签 / 同目录图片 + 平台匹配），不该走到这里。
+ */
+function isPlatformSource(source: string): boolean {
+  return source === 'kw' || source === 'kg' || source === 'tx' || source === 'mg' || source === 'wy';
+}
+
 export class CoverStore {
   private static instance: CoverStore | null = null;
 
@@ -103,6 +114,13 @@ export class CoverStore {
     if (info === null) {
       return '';
     }
+    // 本地歌 / 云端歌的封面不归这里管：它们的封面是「内嵌标签」或「同目录图片 +
+    // 平台匹配」取好的，已经放在 item.coverUrl 里（上面的 fallback 分支就返回了）。
+    // 走到这里说明确实没有封面 —— 直接返回空串（占位图），别拿 source='local'
+    // 或 'webdav' 去问平台接口和源脚本，那只会白跑一趟还被记成「解析失败」。
+    if (!isPlatformSource(info.source)) {
+      return '';
+    }
     const key: string = this.keyOf(info.source, info.songmid);
     const hit: string | undefined = this.cache.get(key);
     if (hit !== undefined) {
@@ -123,6 +141,10 @@ export class CoverStore {
   request(musicInfoJson: string, onReady: (url: string) => void): void {
     const info: LxMusicInfo | null = this.infoOf(musicInfoJson);
     if (info === null) {
+      return;
+    }
+    // 同 coverFor：本地歌 / 云端歌的封面由它们各自的库负责，这里不管
+    if (!isPlatformSource(info.source)) {
       return;
     }
     const key: string = this.keyOf(info.source, info.songmid);

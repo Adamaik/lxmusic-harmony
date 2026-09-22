@@ -1,6 +1,8 @@
-import { LxMusicInfo, LxQualityItem } from '../music/MusicSearch';
+import { LxMusicInfo, LxQualityItem, mgImageUrl } from '../music/MusicSearch';
 import { musicIdOf } from '../music/MusicId';
 import { SongItem } from '../player/PlaySession';
+import { LOCAL_SOURCE } from '../local/LocalMusic';
+import { WEBDAV_SOURCE } from '../webdav/WebDavTypes';
 import { LxMusicInfoNew, LxMusicMeta, LxQualitySize } from './SyncTypes';
 
 /**
@@ -39,8 +41,10 @@ function parseOldMusicInfo(item: SongItem): LxMusicInfo | null {
   if (typeof info.source !== 'string' || info.source.length === 0) {
     return null;
   }
-  // 本地文件不在同步范围内（洛雪也只同步在线歌曲）
-  if (info.source === 'local') {
+  // 本地文件与云端（WebDAV）文件都不在同步范围内（洛雪也只同步在线歌曲）：
+  // 这两种条目的 musicInfo 是我们自己造的「壳」，服务端不认识，
+  // 上行只会往别人的列表里塞一堆打不开的东西。
+  if (info.source === LOCAL_SOURCE || info.source === WEBDAV_SOURCE) {
     return null;
   }
   if (info.songmid === undefined || info.songmid === null || String(info.songmid).length === 0) {
@@ -245,6 +249,16 @@ export function bestQuality(info: LxMusicInfoNew): string {
 export function fromLxMusicInfo(info: LxMusicInfoNew): SongItem {
   const meta: LxMusicMeta = info.meta;
   const picUrl: string = (meta.picUrl !== undefined && meta.picUrl !== null) ? meta.picUrl : '';
+  /**
+   * 展示 / 播放用的封面地址：咪咕的封面是相对路径（`/data/oss/...`），直接拿去加载
+   * 谁也用不了（列表只剩占位图，播控中心会把它当成不存在的本地文件）。
+   * 老数据（收藏 / 歌单 / 同步回来的）里存的就是这种相对路径，所以在还原成内部条目
+   * 这一层补一次宿主，见 MusicSearch.mgImageUrl。
+   *
+   * 只补 coverUrl，不动下面 SDK 形态里的 img：那份是「与洛雪一致的数据」，同步快照
+   * 按它的 JSON 算 md5，本地擅自改值会让同一份列表在两端算出的 key 对不上。
+   */
+  const coverUrl: string = info.source === 'mg' ? mgImageUrl(picUrl) : picUrl;
   const types: LxQualityItem[] = [];
   const qualitySizes: Record<string, LxQualitySize> | undefined = meta._qualitys;
   if (meta.qualitys !== undefined && meta.qualitys !== null && Array.isArray(meta.qualitys)) {
@@ -292,8 +306,8 @@ export function fromLxMusicInfo(info: LxMusicInfoNew): SongItem {
     id: info.id,
     name: info.name,
     singer: info.singer,
-    coverUrl: picUrl,
-    art: picUrl.length === 0,
+    coverUrl: coverUrl,
+    art: coverUrl.length === 0,
     source: info.source,
     quality: bestQuality(info),
     interval: old.interval,

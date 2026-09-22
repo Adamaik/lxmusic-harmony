@@ -34,13 +34,16 @@
    （`网易接口返回 code 404（该接口当前不可用）`），kg / tx / mg 同样处理；
    搜索页改成聚合搜索后，状态行与空态会直接写出「网易 失败」。
    接口本身仍然不通，这条待办不变。
-2. **歌词**：内置平台歌词已覆盖 kw / kg / tx / mg，网易没有实现
-   （`PlatformLyric.ets` 的 `fetchPlatformLyric()` 里没有 wy 分支），
-   网易来源的歌一律显示「暂无歌词」。
+2. **歌词**：内置平台歌词已覆盖 kw / kg / tx / mg；网易原先没有实现，
+   2026-09-23 补上了 `PlatformLyric.wyLyric()` —— 改走**公开 GET** `/api/song/lyric`
+   （不是 eapi），与搜索一样属于**待实测**（搜索不通时在设备上没法确认）。
 3. **封面**：网易搜索结果本身带 `album.picUrl`，这条不依赖上面的问题，
    但搜索不通就都用不上。
 4. **文档**：`docs/LX_SOURCE_ENGINE.md` 早期写过「五个平台内置搜索全部有效」，
    对网易不成立，已在 2026-09-13 修正为待复核；本条目跟踪真正的修复。
+5. **评论**（2026-09-23 追加）：评论也只能走内置平台接口（源规则里没有「取评论」这个 action，
+   见 `docs/SONG_COMMENT.md`），网易那条用的是公开 `/api/v1/resource/comments`（不是洛雪的 weapi），
+   与歌词同样属于**待实测** —— 搜索不通之前没法在设备上确认，需与本条目一起回归。
 
 ### 证据（2026-09-13 实测）
 
@@ -78,7 +81,8 @@ cd /tmp && node wy_recipe_test.js   # 本次排查用的脚本：对比两种 ea
 | `entry/src/main/ets/core/music/MusicSearch.ets:1101` | `parseWySongs()` 结果解析（解析逻辑本身未验证过，因为拿不到响应） |
 | `entry/src/main/ets/core/music/MusicSearch.ets:1165` | `searchWy()`：失败已改为抛错（见「影响面 1」），接口仍不通 |
 | `entry/src/main/ets/core/music/MusicSearch.ets:1221` | `httpPostForm()`（form 表单提交，与 wy 搜索/歌词共用） |
-| `entry/src/main/ets/core/music/PlatformLyric.ets:413` | `fetchPlatformLyric()`，缺 wy 分支 |
+| `entry/src/main/ets/core/music/PlatformLyric.ets` | `wyLyric()`：公开 GET `/api/song/lyric`（待实测） |
+| `entry/src/main/ets/core/music/PlatformComment.ets` | 内置平台评论的 `wyComments()`（公开 `/api/v1/resource/comments`，待实测）与 `parseWyComments()` |
 | `entry/src/main/ets/core/music/LxCrypto.ets` | `aes128EcbPkcs7HexUpper` / `md5Hex`（eapi 依赖） |
 
 ### 待办拆解
@@ -258,7 +262,8 @@ hdc 截图证据见提交说明。
   `PlatformLyric` 侧丢弃了。
 - **设计债**：`SongListPane`（「我的」与搜索结果共用的歌曲列表）仍是自绘行，
   它的父容器是 `Scroll`，换成官方 `List` 需要连父级一起改；主页签大标题也仍是自绘。
-- **占位功能**：播放页的铃声/更多等入口目前只弹提示。
+- **占位功能**：播放页底部工具栏那颗铃铛（通知）原先只是个占位 —— 点不动、读屏也跳过。
+  2026-09-23 已换成**评论入口**（见 `docs/SONG_COMMENT.md`），底部四个入口现在都是能用的。
   「歌单排序」那颗钮已经删掉（点下去只弹「暂未接入」，摆在那里是误导；
   本地歌单的拖拽排序在 `docs/LX_SYNC.md` 里记着还没做），「新建歌单」是真的能用。
 - **咪咕/网易封面**：mg 搜索结果自带 `img`，wy 也自带（但搜索不通）；

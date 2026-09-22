@@ -47,6 +47,9 @@ export const I_THUMB_UP: Resource = $r('sys.symbol.hand_thumbsup');
 export const I_MORE: Resource = $r('sys.symbol.more');
 /** 列表行右侧的「更多」：圆环里两个竖点（洛雪歌单行尾那个图标） */
 export const I_MORE_CIRCLE: Resource = $r('sys.symbol.dot_grid_1x2_circle');
+/** 多选：已选中 / 未选中（本地音乐的批量移除用） */
+export const I_CHECK_CIRCLE: Resource = $r('sys.symbol.checkmark_circle_fill');
+export const I_CIRCLE: Resource = $r('sys.symbol.circle');
 /** 箭头 */
 export const I_CHEVRON_RIGHT: Resource = $r('sys.symbol.chevron_right');
 export const I_CHEVRON_DOWN: Resource = $r('sys.symbol.chevron_down');
@@ -76,6 +79,13 @@ export const I_SHARE: Resource = $r('sys.symbol.share');
 export const I_REFRESH: Resource = $r('sys.symbol.arrow_2_circlepath');
 /** 通知 */
 export const I_BELL: Resource = $r('sys.symbol.bell');
+/**
+ * 评论（气泡）
+ *
+ * 系统符号表里的 `message` 就是一个对话气泡，语义与洛雪的评论图标一致
+ * （名字都取自 SDK 的 ets-loader/sysResource.js，写错会静默渲染成空白）。
+ */
+export const I_COMMENT: Resource = $r('sys.symbol.message');
 /**
  * 投播至（投屏设备）
  *

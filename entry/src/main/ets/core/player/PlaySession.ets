@@ -2,7 +2,7 @@ import { LxPlayer, LxPlayerBufferListener, LxPlayerStateListener, LxPlayerTimeLi
   LxPlayerCompletionListener, LxPlayerStatus } from './LxPlayer';
 import { PlaybackCommand, PlaybackMediaInfo, PlaybackService } from './PlaybackService';
 import { SourceEngine } from '../source/SourceEngine';
-import { LxMusicInfo, isSearchSupported, searchMusic } from '../music/MusicSearch';
+import { LxMusicInfo, fetchMusicPic, isSearchSupported, searchMusic } from '../music/MusicSearch';
 import { CoverStore } from '../music/CoverStore';
 import { AudioCache } from '../music/AudioCache';
 import { CachedLyricInfo, MediaCache, mediaKeyOf } from '../music/MediaCache';
@@ -15,8 +15,12 @@ import { ShuffleBag } from './ShuffleBag';
 import { PlaySettings } from '../settings/PlaySettings';
 import { fallbackQuality, pickQuality } from '../music/Quality';
 import { downloadedFile } from '../download/DownloadIndex';
-import { LocalMusic, LOCAL_SOURCE } from '../local/LocalMusic';
+import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
 import { AutoMatchResult, autoMatchLyric } from '../local/LyricMatch';
+import { WebDavLibrary, isWebDavSong } from '../webdav/WebDavLibrary';
+import { WebDavClient } from '../webdav/WebDavClient';
+import { WebDavSettings } from '../webdav/WebDavSettings';
+import { WEBDAV_QUALITY } from '../webdav/WebDavTypes';
 import { publishFavoriteIds } from './FavoriteIndex';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -285,6 +289,22 @@ export class PlaySession {
   private playerWired: boolean = false;
   /** 歌名 -> 已经解析出真实 musicInfo 的条目，避免每次播放都重新搜索 */
   private resolveCache: Map<string, SongItem> = new Map();
+  /**
+   * 正在飞着的云端歌匹配（key -> Promise）
+   *
+   * 封面与歌词都要用同一次平台匹配的结果，而两者是各自异步进来的（loadCover 先、
+   * loadLyric 后）。没有这张表的话第二条路会看到「已经在搜了」就放弃，
+   * 结果是「封面有了、歌词没了」。留着 Promise 让后来者等同一个结果。
+   */
+  private webdavMatches: Map<string, Promise<LxMusicInfo | null>> = new Map();
+  /**
+   * 正在飞着的本地歌匹配（key -> Promise）
+   *
+   * 同一首歌可能有两条路同时来问：歌词（`matchLocalLyric`）与评论
+   * （`platformIdentityOf`，本地歌带 `.lrc` 时歌词不会来问、评论却一定会）。
+   * 与云端歌同一套去重，避免为同一首歌连搜两轮平台。
+   */
+  private localMatches: Map<string, Promise<LxMusicInfo | null>> = new Map();
   /** 正在等歌词的那首歌（切歌后旧歌词回来要丢掉） */
   private lyricToken: string = '';
   /** 切歌序号：只在最后一次切歌的链路里继续往下走 */
@@ -1057,6 +1077,89 @@ export class PlaySession {
     }
   }
 
+  /**
+   * 播放一首云端音乐（自己 WebDAV 服务器上的音频）
+   *
+   * 与本地歌的区别：音频不在本机，要带上 Authorization 头去流播（见
+   * LxPlayer.playUrlWithHeaders）；与在线歌的区别：不问音源、不做音质协商
+   * （服务器上是什么码率就是什么码率）。
+   *
+   * 边听边下照旧交给 AudioCache（键就是条目 id，即 `webdav_<key>`），所以听过一遍的歌
+   * 下次直接读本地文件，预取下一首也一样 —— 与在线歌共用同一条缓存链路，
+   * 只是下载请求要自己带头（见 AudioCache 里 DownloadTask.headers）。
+   */
+  private async playWebDavItem(item: SongItem, index: number, token: number): Promise<void> {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    const url: string = key.length > 0 ? lib.urlOf(key) : '';
+    if (url.length === 0) {
+      const message: string = `「${item.name}」已经不在云端曲库里了，请到「我的 - 云端音乐」重新添加`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const config = WebDavSettings.getInstance().config();
+    if (config.url.length === 0) {
+      const message: string = '请先在「设置 - WebDAV 云端音乐」里填好服务器地址';
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const headers: Record<string, string> = WebDavClient.getInstance().authHeaders(config);
+    // 条目 id 就是 mediaKeyOf(musicInfoJson)（都是 `webdav_<key>`），下载索引按它找文件
+    const cacheKey: string = item.id;
+    this.currentCacheKey = cacheKey;
+    this.currentCacheQuality = WEBDAV_QUALITY;
+    this.currentUrlFromCache = false;
+    this.currentLocalPath = '';
+    // 封面与歌词都不挡住出声（与在线歌一致）：封面在加入曲库/匹配时就取好了，
+    // 歌词先看同目录的 .lrc，其次平台匹配
+    this.loadCover(item);
+    this.loadLyric(item);
+    this.pushQueueState();
+
+    const audioCache = AudioCache.getInstance();
+    // 1) 已经缓存到本机：直接读本地文件，不联网
+    const local: string = audioCache.localPath(cacheKey, WEBDAV_QUALITY);
+    if (local.length > 0) {
+      audioCache.setPlayingPath(local);
+      this.currentLocalPath = local;
+      this.setStatus('loading', '正在读取缓存…');
+      try {
+        await LxPlayer.getInstance().playLocal(local);
+        if (this.playToken !== token) {
+          return;
+        }
+        void this.prefetchNext(token, index);
+        return;
+      } catch (e) {
+        // 缓存文件坏了（截断 / 上次下到一半的残留）：丢掉它，改走网络
+        hilog.warn(DOMAIN, TAG, 'webdav cache file failed, drop it: %{public}s', (e as Error).message);
+        audioCache.dropPath(local);
+        this.currentLocalPath = '';
+      }
+    }
+    audioCache.setPlayingPath('');
+
+    // 2) 带认证头流播
+    this.setStatus('loading', '正在连接云服务器…');
+    try {
+      await LxPlayer.getInstance().playUrlWithHeaders(url, headers);
+      if (this.playToken !== token) {
+        return;
+      }
+      // 3) 边听边下：下完整首，下次播放就走上面的本地分支
+      audioCache.cacheSong(cacheKey, WEBDAV_QUALITY, url, headers);
+      // 4) 预取下一首
+      void this.prefetchNext(token, index);
+    } catch (e) {
+      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      hilog.error(DOMAIN, TAG, 'play webdav failed: %{public}s', (e as Error).message);
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
   async playAt(index: number): Promise<void> {
     if (index < 0 || index >= this.queue.length) {
       return;
@@ -1094,6 +1197,13 @@ export class PlaySession {
     // 位置必须在音源检查之前 —— 没导入音源的用户也要能听自己手机里的歌。
     if (item.source === LOCAL_SOURCE) {
       await this.playLocalItem(item, index, token);
+      return;
+    }
+
+    // 云端音乐（自己 WebDAV 服务器上的音频）：带 Authorization 头直接流播，
+    // 同样不看音源脸色，所以也排在音源检查之前。
+    if (isWebDavSong(item)) {
+      await this.playWebDavItem(item, index, token);
       return;
     }
 
@@ -1256,6 +1366,11 @@ export class PlaySession {
     if (item.source === LOCAL_SOURCE) {
       return;
     }
+    // 云端歌的预取：地址就在曲库里（不用解析），只需要把请求头带上排给 AudioCache
+    if (isWebDavSong(item)) {
+      this.prefetchWebDav(item);
+      return;
+    }
     const engine = SourceEngine.getInstance();
     if (!engine.isInited()) {
       return;
@@ -1351,19 +1466,146 @@ export class PlaySession {
     if (item.source === LOCAL_SOURCE) {
       return;
     }
+    // 云端歌：同目录封面在加入曲库时就下好了；没有的话按平台匹配补一张
+    if (isWebDavSong(item)) {
+      this.loadWebDavCover(item);
+      return;
+    }
     CoverStore.getInstance().request(item.musicInfoJson, (url: string) => {
+      this.applyCoverUrl(item, url);
+    });
+  }
+
+  /** 封面到了：回填条目，若正是当前这首就同时推给播放栏与锁屏媒体卡 */
+  private applyCoverUrl(item: SongItem, url: string): void {
+    if (url.length === 0) {
+      return;
+    }
+    item.coverUrl = url;
+    item.art = false;
+    if (this.current === item) {
+      AppStorage.setOrCreate(K_CURRENT_COVER, url);
+      AppStorage.setOrCreate(K_CURRENT_ART, false);
+      // 封面到了再推一次，锁屏媒体卡才有图
+      this.syncMediaInfo(item);
+    }
+  }
+
+  // ------------------------------------------------------------ 云端歌的匹配（封面 / 歌词）
+
+  /**
+   * 云端歌的平台匹配（歌名 + 歌手 + 时长 -> 平台歌曲）
+   *
+   * 与本地歌用的是同一套「宁缺勿错」的打分（core/local/LyricMatch），因为问题是同一个：
+   * 云端文件同样没有平台身份，只有标签或文件名。结果落盘在曲库里（matchJson），
+   * 而且**只搜一次**（matchTried）——不然每放一次就联网搜一遍。
+   *
+   * 封面与歌词都要用这个结果，两边可能同时进来问，所以同一首歌只留一个在飞的 Promise，
+   * 后来者等同一个结果，不会出现「封面搜着、歌词因为去重被跳过」。
+   */
+  private webDavMatch(key: string, name: string, singer: string,
+    durationMs: number): Promise<LxMusicInfo | null> {
+    const inflight: Promise<LxMusicInfo | null> | undefined = this.webdavMatches.get(key);
+    if (inflight !== undefined) {
+      return inflight;
+    }
+    const pending: Promise<LxMusicInfo | null> = this.runWebDavMatch(key, name, singer, durationMs);
+    this.webdavMatches.set(key, pending);
+    pending.then((): void => {
+      this.webdavMatches.delete(key);
+    }).catch((): void => {
+      this.webdavMatches.delete(key);
+    });
+    return pending;
+  }
+
+  private async runWebDavMatch(key: string, name: string, singer: string,
+    durationMs: number): Promise<LxMusicInfo | null> {
+    const lib = WebDavLibrary.getInstance();
+    const existing: LxMusicInfo | null = lib.matchOf(key);
+    if (existing !== null) {
+      return existing;
+    }
+    const auto: boolean = PlaySettings.getInstance().getAutoMatchLyric();
+    if (!auto || lib.matchTried(key)) {
+      return null;
+    }
+    try {
+      const found: AutoMatchResult = await autoMatchLyric(name, singer, durationMs);
+      // 与本地歌同一口径：只有平台真的应答过才记「搜过了」，断网时不能记
+      if (found.searched) {
+        lib.markMatchTried(key);
+      }
+      if (found.match !== null) {
+        lib.saveMatch(key, found.match.source, JSON.stringify(found.match.info));
+        return found.match.info;
+      }
+      return null;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'webdav match failed: %{public}s', (e as Error).message);
+      return null;
+    }
+  }
+
+  /** 云端歌的封面：同目录图优先（加入曲库时已下好），否则用匹配到的平台封面 */
+  private loadWebDavCover(item: SongItem): void {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    if (key.length === 0) {
+      return;
+    }
+    const known: LxMusicInfo | null = lib.matchOf(key);
+    if (known !== null) {
+      this.applyWebDavCover(item, key, known);
+      return;
+    }
+    this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key)).then((info: LxMusicInfo | null) => {
+      if (info !== null) {
+        this.applyWebDavCover(item, key, info);
+      }
+    }).catch((err: Error) => {
+      hilog.info(DOMAIN, TAG, 'webdav cover match failed: %{public}s', err.message);
+    });
+  }
+
+  private applyWebDavCover(item: SongItem, key: string, info: LxMusicInfo): void {
+    const lib = WebDavLibrary.getInstance();
+    const known: string = lib.coverUrlOfKey(key);
+    if (known.length > 0) {
+      this.applyCoverUrl(item, known);
+      return;
+    }
+    void fetchMusicPic(info).then((url: string) => {
       if (url.length === 0) {
         return;
       }
-      item.coverUrl = url;
-      item.art = false;
-      if (this.current === item) {
-        AppStorage.setOrCreate(K_CURRENT_COVER, url);
-        AppStorage.setOrCreate(K_CURRENT_ART, false);
-        // 封面到了再推一次，锁屏媒体卡才有图
-        this.syncMediaInfo(item);
-      }
+      // 存进曲库索引：下次启动不必再查一次
+      lib.saveRemoteCover(key, url);
+      this.applyCoverUrl(item, url);
+    }).catch((err: Error) => {
+      // 取封面失败不影响听歌：列表里那一行退回占位封面
+      hilog.info(DOMAIN, TAG, 'webdav cover fetch failed: %{public}s', err.message);
     });
+  }
+
+  /** 云端歌的预取：地址在曲库里现成，把带头的一并排给 AudioCache */
+  private prefetchWebDav(item: SongItem): void {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    const url: string = key.length > 0 ? lib.urlOf(key) : '';
+    if (url.length === 0) {
+      return;
+    }
+    const config = WebDavSettings.getInstance().config();
+    if (config.url.length === 0) {
+      return;
+    }
+    const cache = AudioCache.getInstance();
+    if (cache.localPath(item.id, WEBDAV_QUALITY).length > 0) {
+      // 已经是本地文件了，切过去本来就不用联网
+      return;
+    }
+    cache.prefetchSong(item.id, WEBDAV_QUALITY, url, WebDavClient.getInstance().authHeaders(config));
   }
 
   /**
@@ -1379,6 +1621,11 @@ export class PlaySession {
     // 本地歌的歌词：同名 .lrc 优先（精确、离线），其次在线匹配
     if (item.source === LOCAL_SOURCE) {
       this.loadLocalLyric(item);
+      return;
+    }
+    // 云端歌同理：服务器上同目录的 .lrc 优先，其次在线匹配
+    if (isWebDavSong(item)) {
+      this.loadWebDavLyric(item);
       return;
     }
     AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
@@ -1430,26 +1677,62 @@ export class PlaySession {
     void this.matchLocalLyric(item, key, token);
   }
 
+  /**
+   * 本地歌的平台匹配：有存好的匹配就直接用，否则按设置自动搜一次（只搜一次）
+   *
+   * 与云端歌的 `runWebDavMatch` 是一对。取歌词与取评论都要用它 —— 区别在于歌词那条路
+   * 「本地已经有 .lrc」时根本不会走到这里（见 `loadLocalLyric`），评论则一定会来问一次。
+   * 异常照旧往外抛，由调用方决定怎么善后（歌词那边收尾成「暂无歌词」）。
+   */
+  private async runLocalMatch(item: SongItem, key: string): Promise<LxMusicInfo | null> {
+    const music = LocalMusic.getInstance();
+    const existing: LxMusicInfo | null = music.matchOf(key);
+    if (existing !== null) {
+      return existing;
+    }
+    const auto: boolean = PlaySettings.getInstance().getAutoMatchLyric();
+    if (!auto || music.matchTried(key)) {
+      return null;
+    }
+    const found: AutoMatchResult = await autoMatchLyric(item.name, item.singer,
+      music.durationMsOf(key));
+    // 只有平台真的应答过才记「搜过了」：全平台都没连上（断网）时不能记，
+    // 否则第一次播放恰好没网的用户以后有网也不会再匹配，等于永久没有歌词
+    if (found.searched) {
+      music.markMatchTried(key);
+    }
+    if (found.match !== null) {
+      music.saveMatch(key, found.match.source, JSON.stringify(found.match.info));
+      return found.match.info;
+    }
+    return null;
+  }
+
+  /**
+   * 本地歌匹配的去重包装（与云端歌的 `webDavMatch` 同一套）
+   *
+   * 歌词与评论可能同时进来问同一个 key，留一个在飞的 Promise 让后来者等同一个结果。
+   */
+  private localMatch(item: SongItem, key: string): Promise<LxMusicInfo | null> {
+    const inflight: Promise<LxMusicInfo | null> | undefined = this.localMatches.get(key);
+    if (inflight !== undefined) {
+      return inflight;
+    }
+    const pending: Promise<LxMusicInfo | null> = this.runLocalMatch(item, key);
+    this.localMatches.set(key, pending);
+    pending.then((): void => {
+      this.localMatches.delete(key);
+    }).catch((): void => {
+      this.localMatches.delete(key);
+    });
+    return pending;
+  }
+
   /** 本地歌的在线歌词：有存好的匹配就直接取词，否则按设置自动搜一次 */
   private async matchLocalLyric(item: SongItem, key: string, token: string): Promise<void> {
-    const music = LocalMusic.getInstance();
     AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
     try {
-      let info: LxMusicInfo | null = music.matchOf(key);
-      const auto: boolean = PlaySettings.getInstance().getAutoMatchLyric();
-      if (info === null && auto && !music.matchTried(key)) {
-        const found: AutoMatchResult = await autoMatchLyric(item.name, item.singer,
-          music.durationMsOf(key));
-        // 只有平台真的应答过才记「搜过了」：全平台都没连上（断网）时不能记，
-        // 否则第一次播放恰好没网的用户以后有网也不会再匹配，等于永久没有歌词
-        if (found.searched) {
-          music.markMatchTried(key);
-        }
-        if (found.match !== null) {
-          music.saveMatch(key, found.match.source, JSON.stringify(found.match.info));
-          info = found.match.info;
-        }
-      }
+      const info: LxMusicInfo | null = await this.localMatch(item, key);
       if (this.lyricToken !== token) {
         return;
       }
@@ -1473,6 +1756,113 @@ export class PlaySession {
       this.applyLyricResult(token, result.lyric, result.tlyric);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'local lyric failed: %{public}s', (e as Error).message);
+      if (this.lyricToken === token) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        this.pushLyricToSystem('', '');
+      }
+    }
+  }
+
+  /**
+   * 取「这首歌在平台上的身份」（评论这类功能要它）
+   *
+   * 三种来源各有各的来路：
+   *   - **音源音乐**（在线歌）：条目自己就带着平台 musicInfo（搜索 / 歌单 / 榜单结果都是平台的）；
+   *   - **本地音乐**：没有平台身份，只能靠匹配（与取歌词同一条链路、同一份结果）；
+   *   - **WebDAV 云端音乐**：同上。
+   *
+   * 为什么这里还要再匹配一次：取歌词那条路在「本地已经有 .lrc」「服务器同目录有 .lrc」时
+   * 根本不会走到匹配，而评论与歌词不一样 —— 它对本地文件毫无兴趣，**一定要平台身份**。
+   * 所以打开评论时按需补一次匹配：仍受「自动匹配歌词」开关约束，`matchTried` 记过的也不再搜，
+   * 不会出现「看一次评论就联网搜一轮」。
+   *
+   * 任何一步（解析失败 / 没有平台身份 / 匹配不到）都返回 null，
+   * 由界面负责说明「为什么看不到评论」。
+   */
+  async platformIdentityOf(item: SongItem): Promise<LxMusicInfo | null> {
+    try {
+      if (isWebDavSong(item)) {
+        const lib = WebDavLibrary.getInstance();
+        const key: string = lib.keyOfId(item.id);
+        if (key.length === 0) {
+          return null;
+        }
+        // 云端歌的匹配自带并发去重与「只搜一次」，与封面 / 歌词共用同一个结果
+        return await this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key));
+      }
+      if (isLocalSong(item)) {
+        const music = LocalMusic.getInstance();
+        const key: string = music.keyOfId(item.id);
+        if (key.length === 0) {
+          return null;
+        }
+        return await this.localMatch(item, key);
+      }
+      if (item.musicInfoJson.length === 0) {
+        return null;
+      }
+      return JSON.parse(item.musicInfoJson) as LxMusicInfo;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'resolve platform identity failed: %{public}s', (e as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * 云端歌的歌词
+   *
+   * 顺序与本地歌一致：服务器上同目录的 `.lrc`（加入曲库时一起取回来的，精确、离线）
+   * -> 之前匹配好的平台歌词 -> 按设置自动匹配一次 -> 没有就是没有。
+   */
+  private loadWebDavLyric(item: SongItem): void {
+    const token: string = item.id;
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    if (key.length === 0) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+      return;
+    }
+    const local: string = lib.lrcTextOf(key);
+    if (local.length > 0) {
+      this.applyLyricResult(token, local, '');
+      return;
+    }
+    void this.matchWebDavLyric(item, key, token);
+  }
+
+  private async matchWebDavLyric(item: SongItem, key: string, token: string): Promise<void> {
+    const lib = WebDavLibrary.getInstance();
+    AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
+    try {
+      let info: LxMusicInfo | null = lib.matchOf(key);
+      if (info === null) {
+        info = await this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key));
+      }
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (info === null) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        return;
+      }
+      // 匹配到手了，顺手把封面也补上（同一次结果，封面那条路可能已经补过了）
+      this.applyWebDavCover(item, key, info);
+      // 取词结果按条目 id 缓存（云端歌就是 webdav_<key>，与本地歌 / 在线歌互不干扰）
+      const cached: CachedLyricInfo | null = MediaCache.getInstance().getLyric(item.id);
+      if (cached !== null) {
+        this.applyLyricResult(token, cached.lyric, cached.tlyric);
+        return;
+      }
+      const result: PlatformLyric = await fetchPlatformLyric(info);
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (result.lyric.length > 0 && hasTimeTag(result.lyric)) {
+        MediaCache.getInstance().saveLyric(item.id, { lyric: result.lyric, tlyric: result.tlyric });
+      }
+      this.applyLyricResult(token, result.lyric, result.tlyric);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'webdav lyric failed: %{public}s', (e as Error).message);
       if (this.lyricToken === token) {
         AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
         this.pushLyricToSystem('', '');
@@ -1794,6 +2184,17 @@ export class PlaySession {
   setDesktopLyric(value: boolean): void {
     PlaySettings.getInstance().setDesktopLyric(value);
     PlaybackService.getInstance().refreshDesktopLyric();
+  }
+
+  /**
+   * 「设置 - 播放设置 - 车载蓝牙歌词」
+   *
+   * 往 AVMetadata.singleLyricText 写「当前这一句」，由系统蓝牙模块送给车机／蓝牙音箱。
+   * 改完立刻重推一次：打开时不必等下一句（当句就上去），关闭时把字段清掉。
+   */
+  setBluetoothLyric(value: boolean): void {
+    PlaySettings.getInstance().setBluetoothLyric(value);
+    PlaybackService.getInstance().refreshBluetoothLyric();
   }
 
   /**

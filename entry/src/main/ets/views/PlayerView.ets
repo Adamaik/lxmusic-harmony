@@ -5,7 +5,7 @@ import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURR
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
   K_SHOW_MINI_LYRIC } from '../core/settings/PlaySettings';
-import { I_BELL, I_CAST, I_CHEVRON_DOWN, I_DOWNLOAD, I_MORE_CIRCLE, I_NEXT, I_ORDER_PLAY,
+import { I_CAST, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE, I_NEXT, I_ORDER_PLAY,
   I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE, IconGlyph } from '../ui/Icons';
 import { CoverArt, FavoriteHeart } from '../ui/Widgets';
 import { AVCastPicker, AVCastPickerStyle } from '@kit.AVSessionKit';
@@ -15,11 +15,13 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
+import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
 import { C_BG } from '../ui/Theme';
 import { HdsEdgeFlowLight } from '../ui/Hds';
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
+import { CommentSheet } from './CommentSheet';
 
 function formatTime(seconds: number): string {
   const total: number = Math.max(0, Math.floor(seconds));
@@ -73,8 +75,8 @@ export struct PlayerView {
   @StorageLink(K_LYRIC_CENTERED) lyricCentered: boolean = true;
   @StorageLink(K_LYRIC_FONT_SIZE) lyricFontSize: number = 19;
   @StorageLink(K_LYRIC_KEEP_SCREEN) @Watch('syncKeepScreenOn') lyricKeepScreen: boolean = true;
-  /** 当前这首歌的条目 id：传给收藏爱心（换歌时爱心跟着换状态） */
-  @StorageLink(K_CURRENT_ID) currentId: string = '';
+  /** 当前这首歌的条目 id：传给收藏爱心（换歌时爱心跟着换状态），也在换歌时收起评论页 */
+  @StorageLink(K_CURRENT_ID) @Watch('onCurrentIdChanged') currentId: string = '';
   @StorageLink(K_CURRENT_NAME) name: string = '';
   @StorageLink(K_CURRENT_SINGER) singer: string = '';
   @StorageLink(K_CURRENT_COVER) cover: string = '';
@@ -97,6 +99,8 @@ export struct PlayerView {
   @State moreOpen: boolean = false;
   /** 「匹配歌词」面板是否展开（本地歌专用） */
   @State matchOpen: boolean = false;
+  /** 评论页是否展开（铺满播放器的自绘覆盖物，见 CommentSheet 开头的说明） */
+  @State commentOpen: boolean = false;
   /** 当前唱到的歌词行；-1 = 没有时间轴/还没开始 */
   @State activeLine: number = -1;
   /**
@@ -243,9 +247,12 @@ export struct PlayerView {
     }
   }
 
-  /** 音质标签：本地歌没有音质档，显示「本地」而不是内部的 'local' 标记 */
+  /** 音质标签：本地歌 / 云端歌都没有音质档，显示「本地」「云端」而不是内部标记 */
   private qualityLabel(): string {
-    return this.quality === 'local' ? '本地' : this.quality;
+    if (this.quality === 'local') {
+      return '本地';
+    }
+    return this.quality === 'webdav' ? '云端' : this.quality;
   }
 
   /** 当前这首是不是本地音乐（决定要不要给「匹配歌词」入口） */
@@ -253,24 +260,75 @@ export struct PlayerView {
     return LocalMusic.getInstance().hasId(this.currentId);
   }
 
-  /** 本地歌的时长（毫秒，0 = 未知）：给匹配结果排序用 */
+  /** 当前这首是不是云端（WebDAV）音乐：匹配歌词的入口对它与本地歌一样需要 */
+  private isCurrentWebDav(): boolean {
+    return WebDavLibrary.getInstance().hasId(this.currentId);
+  }
+
+  /** 本地歌 / 云端歌的时长（毫秒，0 = 未知）：给匹配结果排序用 */
   private currentLocalDurationMs(): number {
+    if (this.isCurrentWebDav()) {
+      const lib = WebDavLibrary.getInstance();
+      return lib.durationMsOf(lib.keyOfId(this.currentId));
+    }
     const music = LocalMusic.getInstance();
     return music.durationMsOf(music.keyOfId(this.currentId));
   }
 
-  /** 用户在手动的匹配面板里选中了一条：记住它并重新取词 */
+  /**
+   * 用户在手动的匹配面板里选中了一条：记住它并重新取词
+   *
+   * 本地歌与云端歌的匹配结果各存各的库（都是非同步侧表那一套），按当前这首的来源选。
+   */
   private applyLyricMatch(info: LxMusicInfo, source: string): void {
-    const music = LocalMusic.getInstance();
-    const key: string = music.keyOfId(this.currentId);
+    const key: string = this.matchOwnerKey();
     if (key.length === 0) {
       this.matchOpen = false;
       return;
     }
-    music.saveMatch(key, source, JSON.stringify(info));
+    if (this.isCurrentWebDav()) {
+      WebDavLibrary.getInstance().saveMatch(key, source, JSON.stringify(info));
+    } else {
+      LocalMusic.getInstance().saveMatch(key, source, JSON.stringify(info));
+    }
     this.matchOpen = false;
     this.toast(`已匹配到「${info.name} - ${info.singer}」，正在取词`);
     PlaySession.getInstance().refreshLyric();
+  }
+
+  /** 当前这首在它所属库里的 key（本地 / 云端；都不是则空串） */
+  private matchOwnerKey(): string {
+    if (this.isCurrentWebDav()) {
+      return WebDavLibrary.getInstance().keyOfId(this.currentId);
+    }
+    return LocalMusic.getInstance().keyOfId(this.currentId);
+  }
+
+  /**
+   * 换歌了就把评论页收起来
+   *
+   * 洛雪遇到切歌只提示一句「这已经是「X」的评论啦」，等用户自己点刷新；
+   * 这里直接收起：那一层铺满整个播放器，显示的又永远是「当前这首」的评论，
+   * 换歌后留着容易让人以为是新歌的评论。下次点开自然就是新歌的。
+   */
+  onCurrentIdChanged(): void {
+    this.commentOpen = false;
+  }
+
+  /**
+   * 取当前这首歌的「平台身份」（评论要它，评论只存在于音乐平台上）
+   *
+   * 三种来源都由 `PlaySession.platformIdentityOf` 统一解析：在线歌用它自己的 musicInfo；
+   * 本地歌 / 云端歌用它匹配到的那一首 —— 与取歌词同一条匹配结果，必要时**按需补一次匹配**
+   * （本地歌带 .lrc 时取词不会去匹配，但评论仍然需要平台身份）。
+   */
+  private async resolveCommentTarget(): Promise<string> {
+    const item: SongItem | null = PlaySession.getInstance().current;
+    if (item === null) {
+      return '';
+    }
+    const info: LxMusicInfo | null = await PlaySession.getInstance().platformIdentityOf(item);
+    return info !== null ? JSON.stringify(info) : '';
   }
 
   /** 下载当前这首歌（设置里的文件名格式 / 保存位置都生效） */
@@ -281,9 +339,13 @@ export struct PlayerView {
       this.toast('还没有正在播放的歌');
       return;
     }
-    // 本地歌已经在本机了，没什么可下的
+    // 本地歌已经在本机了、云端歌由播放缓存的边听边下负责，没什么可下的
     if (isLocalSong(item)) {
       this.toast(`「${item.name}」已经在本机了`);
+      return;
+    }
+    if (isWebDavSong(item)) {
+      this.toast(`「${item.name}」是云端音乐，播放时会自动缓存`);
       return;
     }
     const manager = DownloadManager.getInstance();
@@ -379,9 +441,14 @@ export struct PlayerView {
       this.moreItem('添加到下一个播放', () => {
         this.addCurrentToQueue(true);
       })
+      // 洛雪的评论入口就在播放页的「更多」底部菜单里（Vertical/Player 的 MoreBtn），
+      // 底部那排图标上的评论钮是同一条路的快捷入口
+      this.moreItem('查看评论', () => {
+        this.commentOpen = true;
+      })
 
-      // 本地歌才有：自动匹配没把握（或没匹配上）时，让用户自己搜一次、选正确的那条
-      if (this.isCurrentLocal()) {
+      // 本地歌 / 云端歌才有：自动匹配没把握（或没匹配上）时，让用户自己搜一次、选正确的那条
+      if (this.isCurrentLocal() || this.isCurrentWebDav()) {
         this.moreItem('匹配歌词', () => {
           this.moreOpen = false;
           this.matchOpen = true;
@@ -463,6 +530,28 @@ export struct PlayerView {
     .width('100%')
     .height('100%')
     .backgroundColor('#8A000000')
+  }
+
+  /**
+   * 评论页
+   *
+   * 洛雪是 push 一个独立 screen（`navigation.pushCommentScreen`），这里和「更多」「匹配歌词」
+   * 一样自绘一层铺满播放器的覆盖物 —— 播放器本身是系统半模态，不再往上叠系统弹层。
+   * 页面内容与数据都在 views/CommentSheet.ets。
+   */
+  @Builder
+  commentOverlay() {
+    CommentSheet({
+      songName: this.name,
+      bottomInset: this.bottomInset,
+      needsMatch: this.isCurrentLocal() || this.isCurrentWebDav(),
+      onResolveTarget: () => this.resolveCommentTarget(),
+      onClose: () => {
+        this.commentOpen = false;
+      },
+    })
+      .width('100%')
+      .height('100%')
   }
 
   /** 播放模式按钮的图标：列表循环 / 顺序播放 / 单曲循环 / 随机播放 */
@@ -1025,13 +1114,23 @@ export struct PlayerView {
         .accessibilityText('投播至')
         .accessibilityLevel('yes')
 
+        /**
+         * 评论（原位是那颗没接功能的铃铛）
+         *
+         * 洛雪的播放页把评论收在「更多」菜单里，横向布局才在工具栏上给一颗钮。
+         * 这里把它放到工具栏：一来「更多」里同样有入口，二来这颗钮原本就是个占位
+         * （点不动、读屏也跳过），换成评论钮之后底部这排四个入口都是能用的。
+         */
         Stack({ alignContent: Alignment.Center }) {
-          IconGlyph({ symbol: I_BELL, iconSize: 22, color: '#8CFFFFFF' })
+          IconGlyph({ symbol: I_COMMENT, iconSize: 22, color: '#8CFFFFFF' })
         }
         .layoutWeight(1)
         .height(44)
-        // 这个入口还没接功能，读屏就不要报出一个点不动的按钮
-        .accessibilityLevel('no')
+        .onClick(() => {
+          this.commentOpen = true;
+        })
+        .accessibilityText('查看评论')
+        .accessibilityLevel('yes')
 
         Stack({ alignContent: Alignment.Center }) {
           IconGlyph({ symbol: I_DOWNLOAD, iconSize: 22, color: '#8CFFFFFF' })
@@ -1150,6 +1249,11 @@ export struct PlayerView {
       if (this.matchOpen) {
         this.matchOverlay()
       }
+
+      // 评论页：与上面两层同一套做法（自绘、铺满）
+      if (this.commentOpen) {
+        this.commentOverlay()
+      }
     }
     .width('100%')
     .height('100%')
@@ -1157,8 +1261,8 @@ export struct PlayerView {
     .gesture(
       PanGesture({ direction: PanDirection.Vertical, distance: 12 })
         .onActionEnd((event: GestureEvent) => {
-          // 「更多」面板开着时不下滑关闭：在面板上往下拖不该把整个播放器收掉
-          if (!this.moreOpen && event.offsetY > 70) {
+          // 「更多」/「评论」面板开着时不下滑关闭：在面板上往下拖不该把整个播放器收掉
+          if (!this.moreOpen && !this.commentOpen && event.offsetY > 70) {
             this.onClose();
           }
         })

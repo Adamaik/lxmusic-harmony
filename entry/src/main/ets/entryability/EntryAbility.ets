@@ -4,6 +4,8 @@ import { window } from '@kit.ArkUI';
 import { PlaybackService } from '../core/player/PlaybackService';
 import { PlaySession } from '../core/player/PlaySession';
 import { LocalMusic } from '../core/local/LocalMusic';
+import { WebDavLibrary } from '../core/webdav/WebDavLibrary';
+import { WebDavSettings } from '../core/webdav/WebDavSettings';
 import { AudioCache } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
 import { SyncManager } from '../core/sync/SyncManager';
@@ -25,6 +27,8 @@ export default class EntryAbility extends UIAbility {
     // 本地音乐库：要读回导入过的索引（歌单 / 收藏里属于本地歌的那部分也挂在它上面），
     // 必须早于 SyncManager.init —— 音乐库镜像到界面时会读这份侧表
     LocalMusic.getInstance().init(this.context);
+    // 云端音乐库（WebDAV）：同样有自己的索引与歌单侧表，也要早于 SyncManager.init
+    WebDavLibrary.getInstance().init(this.context);
     // 同步模块也要 Context：读配置、落音乐库、找 gzip 的临时目录，越早准备越好
     SyncManager.getInstance().init(this.context);
     // 缓存：元数据（播放地址 / 歌词）与播放缓存都要沙箱目录，同样尽早初始化
@@ -40,6 +44,9 @@ export default class EntryAbility extends UIAbility {
     // 建出来之前恢复好，否则列表第一帧是空的
     DownloadSettings.getInstance().init(this.context);
     DownloadManager.getInstance().init(this.context);
+    // WebDAV 连接设置（服务器地址 / 账号密码）：要早于界面创建，
+    // 设置页与浏览页用 @StorageLink 订阅它发布的值
+    WebDavSettings.getInstance().init(this.context);
   }
 
   onDestroy(): void {

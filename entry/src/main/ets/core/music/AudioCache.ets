@@ -73,6 +73,13 @@ interface DownloadTask {
   key: string;
   quality: string;
   url: string;
+  /**
+   * 附加请求头（WebDAV 的 `Authorization` 之类）
+   *
+   * 只有需要认证的源才用得上：AVPlayer 那边能靠 `setMediaSource` 带头，
+   * 而缓存是我们自己发 HTTP，头要自己带上，否则下回来的是 401 的页面。
+   */
+  headers: Record<string, string>;
   /** 上次尝试开始的时间：失败后要隔一会儿再试，别死循环打接口 */
   attemptedAt: number;
 }
@@ -231,8 +238,8 @@ export class AudioCache {
    *
    * 优先级最高的一类任务（正在听的就是它），会顶掉排在前面的同类任务。
    */
-  cacheSong(key: string, quality: string, url: string): void {
-    this.enqueue(key, quality, url, false);
+  cacheSong(key: string, quality: string, url: string, headers?: Record<string, string>): void {
+    this.enqueue(key, quality, url, false, headers);
   }
 
   /**
@@ -244,11 +251,12 @@ export class AudioCache {
    *
    * 注意它同样受「播放优先」约束：正在听的这首缓冲不够时，预取会一直排队等着。
    */
-  prefetchSong(key: string, quality: string, url: string): void {
-    this.enqueue(key, quality, url, true);
+  prefetchSong(key: string, quality: string, url: string, headers?: Record<string, string>): void {
+    this.enqueue(key, quality, url, true, headers);
   }
 
-  private enqueue(key: string, quality: string, url: string, prefetch: boolean): void {
+  private enqueue(key: string, quality: string, url: string, prefetch: boolean,
+    headers?: Record<string, string>): void {
     if (!this.isEnabled() || key.length === 0 || url.length === 0) {
       return;
     }
@@ -267,7 +275,13 @@ export class AudioCache {
       && this.pendingNext.quality === quality) {
       return;
     }
-    const task: DownloadTask = { key: key, quality: quality, url: url, attemptedAt: 0 };
+    const task: DownloadTask = {
+      key: key,
+      quality: quality,
+      url: url,
+      headers: headers !== undefined ? headers : {},
+      attemptedAt: 0,
+    };
     if (prefetch) {
       this.pendingNext = task;
     } else {
@@ -479,6 +493,10 @@ export class AudioCache {
         const headers: Record<string, string> = {
           'Range': `bytes=${offset}-${offset + CHUNK_BYTES - 1}`,
         };
+        // 需要认证的源（WebDAV）在这里补上自己的头：不带就是 401，下回来一页 HTML
+        for (const name of Object.keys(task.headers)) {
+          headers[name] = task.headers[name];
+        }
         const response: http.HttpResponse = await request.request(task.url, {
           method: http.RequestMethod.GET,
           header: headers,

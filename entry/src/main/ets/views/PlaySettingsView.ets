@@ -2,7 +2,8 @@ import { C_BG, C_CARD, C_RED, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SegPills, SettingLabel, TOGGLE_LABELS, ToggleSetting } from '../ui/SettingWidgets';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
-import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_DESKTOP_LYRIC, K_EXTEND_QUALITY,
+import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_BLUETOOTH_LYRIC, K_DESKTOP_LYRIC,
+  K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
   K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
@@ -89,7 +90,8 @@ struct SliderSetting {
  * 对应设置页里的「播放设置」，参考图上的分区：
  *   一、音质：播放音质（128K/320K/FLAC/24Bit）、拓展音质（开关 + Hi-Res/全景声/全景声+/母带）、
  *       与其他应用同时播放
- *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、桌面歌词
+ *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、
+ *       桌面歌词、车载蓝牙歌词
  *
  * 参考图里还有一项「歌词帧率」，这里没做：本移植版没有逐帧渲染的动效（歌词靠
  * AVPlayer 的 timeUpdate 一秒一推、行间是 240ms 的补间），给一个帧率选项只是摆设。
@@ -101,6 +103,7 @@ struct SliderSetting {
  *   - 歌词各项 -> PlayerView（封面页小歌词 / 歌词页背景、对齐、字号）
  *   - 歌词页不熄屏 -> 页面把窗口的 keepScreenOn 打开（见 pages/Index.ets）
  *   - 桌面歌词 -> PlaybackService 控制系统歌词悬浮窗的显隐
+ *   - 车载蓝牙歌词 -> PlaybackService 往 AVMetadata.singleLyricText 写当前这一句，走系统蓝牙模块
  */
 @Component
 export struct PlaySettingsView {
@@ -115,7 +118,9 @@ export struct PlaySettingsView {
   @StorageLink(K_LYRIC_FONT_SIZE) fontSize: number = 19;
   @StorageLink(K_LYRIC_KEEP_SCREEN) keepScreen: boolean = true;
   @StorageLink(K_DESKTOP_LYRIC) desktopLyric: boolean = true;
-  /** 本地音乐自动匹配歌词（要联网搜一次，所以给了开关） */
+  /** 车载蓝牙歌词：往 AVMetadata.singleLyricText 写当前这一句，由系统蓝牙模块送给车机 */
+  @StorageLink(K_BLUETOOTH_LYRIC) bluetoothLyric: boolean = false;
+  /** 本地音乐 / 云端（WebDAV）音乐自动匹配歌词（要联网搜一次，所以给了开关） */
   @StorageLink(K_AUTO_MATCH_LYRIC) autoMatchLyric: boolean = true;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
@@ -156,6 +161,19 @@ export struct PlaySettingsView {
     }
     return '桌面歌词是系统的悬浮歌词窗，由系统按时间轴自己滚动：播放中且这首歌有词时显示，'
       + '暂停不收起，停播、换到没词的歌或关掉这个开关时收起。';
+  }
+
+  /**
+   * 车载蓝牙歌词这一项的说明
+   *
+   * 讲清三件事：开关做的是什么、手机这边不受影响、以及能不能显示由车机决定 ——
+   * 免得用户在自己车上没看到歌词，以为开关坏了。
+   */
+  private bluetoothLyricHint(): string {
+    return '把正在唱的这一句交给系统蓝牙模块，由它下发给已连接的蓝牙设备（车机、蓝牙音箱）显示。'
+      + '手机这边的播控中心不受影响：歌名、滚动歌词各有各的字段。'
+      + '能不能显示取决于车机或音箱本身是否支持（车机端通常还要打开「歌词显示」）；'
+      + '每换一句都会重推一次蓝牙媒体信息，不在车里时建议关掉，以免影响车机播放的流畅度。';
   }
 
   build() {
@@ -256,17 +274,26 @@ export struct PlaySettingsView {
             })
             HintText({ text: this.desktopLyricHint() })
             ToggleSetting({
-              label: '本地音乐自动匹配歌词',
+              label: '车载蓝牙歌词',
+              value: this.bluetoothLyric,
+              onPick: (next: boolean) => {
+                // 走会话：既改设置，也让播控服务立刻重推（打开当句就上去，关闭立刻清掉）
+                PlaySession.getInstance().setBluetoothLyric(next);
+              },
+            })
+            HintText({ text: this.bluetoothLyricHint() })
+            ToggleSetting({
+              label: '本地 / 云端自动匹配歌词',
               value: this.autoMatchLyric,
               onPick: (next: boolean) => {
                 PlaySettings.getInstance().setAutoMatchLyric(next);
               },
             })
             HintText({
-              text: '本地歌没有平台身份，只能拿歌名与歌手去平台上搜一首对应的歌再取词（要联网，'
-                + '每首歌只搜一次）。匹配没把握时宁可不显示 —— 配错的歌词比没有歌词更糟；'
-                + '这时可以在播放页的「更多 - 匹配歌词」里自己搜一次、选正确的那条。'
-                + '同目录下的同名 .lrc 会随导入一起拷进来，优先用它，不联网也不会配错。',
+              text: '本地歌与云端歌（WebDAV）都没有平台身份，只能拿歌名与歌手去平台上搜一首'
+                + '对应的歌再取词（要联网，每首歌只搜一次）。匹配没把握时宁可不显示 —— '
+                + '配错的歌词比没有歌词更糟；这时可以在播放页的「更多 - 匹配歌词」里自己搜一次、'
+                + '选正确的那条。同目录下的同名 .lrc 会一起导入 / 取回，优先用它，不联网也不会配错。',
             })
           }
           .width('100%')

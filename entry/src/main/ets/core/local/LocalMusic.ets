@@ -7,6 +7,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SongItem } from '../player/PlaySession';
 import { LxMusicInfo } from '../music/MusicSearch';
 import { bytesToUtf8 } from '../music/LxCrypto';
+import { SongSideTable } from './SideTable';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LocalMusic';
@@ -41,6 +42,16 @@ const LRC_MAX_BYTES: number = 512 * 1024;
 export const K_LOCAL_VERSION: string = 'local_version';
 /** 导入进度（`3/120 歌名`），空闲时是空串 */
 export const K_LOCAL_PROGRESS: string = 'local_progress';
+
+/**
+ * 本地歌在 SongItem.source / musicInfo.source 里的标记
+ *
+ * 声明放在类之前：类字段 `source` 的初值直接引用它，写在文件后面时静态检查会
+ * 认不出这个字段（`implements SongSideTable` 就会报「缺少 source」）。
+ */
+export const LOCAL_SOURCE: string = 'local';
+/** 本地歌的条目 id 前缀（洛雪也用 'local' 表示本地歌曲） */
+export const LOCAL_ID_PREFIX: string = 'local_';
 
 /** 一条本地歌曲（落盘索引里的一行） */
 export interface LocalSong {
@@ -113,7 +124,7 @@ interface LocalIndex {
  * 侧表单独存的原因：参与同步的那份数据要按 listData() 的 JSON 算 md5 和服务端比对，
  * 往里塞任何字段都会改掉 md5。侧表在另一个文件里，同步链路完全看不见它。
  */
-export class LocalMusic {
+export class LocalMusic implements SongSideTable {
   private static instance: LocalMusic | null = null;
 
   static getInstance(): LocalMusic {
@@ -122,6 +133,15 @@ export class LocalMusic {
     }
     return LocalMusic.instance;
   }
+
+  /**
+   * 这张侧表持有的条目标记
+   *
+   * 实现了 `SongSideTable`（见 core/local/SideTable），所以 LocalLibrary 能把
+   * 「本地音乐」与「云端（WebDAV）音乐」两张侧表放在一个数组里统一读写：
+   * 加歌单 / 收藏、算曲目数、合并列表、删歌单清引用都不必各写一遍。
+   */
+  source: string = LOCAL_SOURCE;
 
   private dir: string = '';
   private coverDir: string = '';
@@ -852,11 +872,6 @@ export class LocalMusic {
 }
 
 // ------------------------------------------------------------ 工具
-
-/** 本地歌在 SongItem.source / musicInfo.source 里的标记 */
-export const LOCAL_SOURCE: string = 'local';
-/** 本地歌的条目 id 前缀（洛雪也用 'local' 表示本地歌曲） */
-export const LOCAL_ID_PREFIX: string = 'local_';
 
 /**
  * 这条是不是本地歌（设备里导入进来的音频）

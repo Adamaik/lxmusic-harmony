@@ -9,6 +9,7 @@ import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
+import { isWebDavSong } from '../core/webdav/WebDavLibrary';
 
 /**
  * 播放列表的内容
@@ -82,6 +83,11 @@ export struct PlayQueueContent {
       this.toast(`「${item.name}」已经在本机了`);
       return;
     }
+    // 云端歌的下载由播放缓存负责，不排进下载队列
+    if (isWebDavSong(item)) {
+      this.toast(`「${item.name}」是云端音乐，播放时会自动缓存`);
+      return;
+    }
     const manager = DownloadManager.getInstance();
     const state: DownloadItem | null = manager.stateOf(downloadKeyOf(item));
     if (state !== null && state.status === 'done') {
@@ -113,8 +119,8 @@ export struct PlayQueueContent {
         .onClick(() => {
           this.toggleFavorite(item);
         })
-      // 本地歌已经在本机了，下载这一项对它没有意义
-      if (!isLocalSong(item)) {
+      // 本地歌已经在本机了、云端歌由播放缓存负责，下载这一项对它们都没有意义
+      if (!isLocalSong(item) && !isWebDavSong(item)) {
         MenuItem({ content: '下载' })
           .onClick(() => {
             this.download(item);

@@ -59,6 +59,14 @@ export const K_LYRIC_KEEP_SCREEN: string = 'cfg_lyric_keep_screen';
 /** 桌面歌词（系统歌词悬浮窗）开关 */
 export const K_DESKTOP_LYRIC: string = 'cfg_desktop_lyric';
 /**
+ * 车载蓝牙歌词
+ *
+ * 把「当前这一句」写进 AVMetadata.singleLyricText：系统蓝牙模块读这个字段，
+ * 把它送到已连接的蓝牙设备（车机、蓝牙音箱）显示。
+ * 跟桌面歌词不是一回事：那个是手机上的悬浮窗，读的是 AVMetadata.lyric。
+ */
+export const K_BLUETOOTH_LYRIC: string = 'cfg_bluetooth_lyric';
+/**
  * 本地音乐自动匹配歌词
  *
  * 本地歌没有平台身份，只能拿「歌名 + 歌手 + 时长」去平台搜一首对应的在线歌再取词，
@@ -81,6 +89,7 @@ interface PlaySettingsData {
   lyricKeepScreenOn?: boolean;
   desktopLyric?: boolean;
   autoMatchLyric?: boolean;
+  bluetoothLyric?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -132,6 +141,14 @@ export class PlaySettings {
   private desktopLyric: boolean = true;
   /** 本地歌自动匹配歌词默认开，见 K_AUTO_MATCH_LYRIC 的说明 */
   private autoMatchLyric: boolean = true;
+  /**
+   * 车载蓝牙歌词默认关。
+   *
+   * 每换一句就要重推一次元数据、触发一次蓝牙侧的更新，华为官方明确提醒过
+   * 「开启蓝牙歌词同步后可能导致车载播放音乐卡顿」——不在车里就不该付这个代价，
+   * 所以跟洛雪上游（player.isShowBluetoothLyric）一样默认关，要用时自己开。
+   */
+  private bluetoothLyric: boolean = false;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -183,6 +200,7 @@ export class PlaySettings {
       lyricKeepScreenOn: this.lyricKeepScreenOn,
       desktopLyric: this.desktopLyric,
       autoMatchLyric: this.autoMatchLyric,
+      bluetoothLyric: this.bluetoothLyric,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -232,6 +250,9 @@ export class PlaySettings {
     if (data.autoMatchLyric !== undefined) {
       this.autoMatchLyric = data.autoMatchLyric;
     }
+    if (data.bluetoothLyric !== undefined) {
+      this.bluetoothLyric = data.bluetoothLyric;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -252,6 +273,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_LYRIC_KEEP_SCREEN, this.lyricKeepScreenOn);
       AppStorage.setOrCreate(K_DESKTOP_LYRIC, this.desktopLyric);
       AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
+      AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, this.bluetoothLyric);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -299,6 +321,11 @@ export class PlaySettings {
 
   isDesktopLyric(): boolean {
     return this.desktopLyric;
+  }
+
+  /** 车载蓝牙歌词（写 AVMetadata.singleLyricText，见 K_BLUETOOTH_LYRIC） */
+  isBluetoothLyric(): boolean {
+    return this.bluetoothLyric;
   }
 
   /**
@@ -425,6 +452,16 @@ export class PlaySettings {
     }
     this.desktopLyric = value;
     AppStorage.setOrCreate(K_DESKTOP_LYRIC, value);
+    this.write();
+  }
+
+  /** 车载蓝牙歌词开关（改完由 PlaySession.setBluetoothLyric 让播控服务立刻重推一次） */
+  setBluetoothLyric(value: boolean): void {
+    if (value === this.bluetoothLyric) {
+      return;
+    }
+    this.bluetoothLyric = value;
+    AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, value);
     this.write();
   }
 

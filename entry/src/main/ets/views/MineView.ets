@@ -7,14 +7,16 @@ import { CapsuleSegment } from '../ui/CapsuleSegment';
 import { SongListPane } from './PlaylistView';
 import { DownloadListPane } from './DownloadListView';
 import { LocalMusicPane, confirmRemoveLocalSongs, removeLocalSongs } from './LocalMusicView';
+import { WebDavPane } from './WebDavView';
+import { WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { DownloadManager } from '../core/download/DownloadManager';
 
-const TABS: string[] = ['播放历史', '平台音乐', '下载管理', '本地音乐'];
+const TABS: string[] = ['播放历史', '下载管理', '本地音乐', '云端音乐'];
 
 /**
  * 我的页
  *
- * 标题右侧是清空按钮；下面是分段胶囊（播放历史/平台音乐/下载管理/本地音乐），
+ * 标题右侧是清空按钮；下面是分段胶囊（播放历史 / 下载管理 / 本地音乐 / 云端音乐），
  * 再下面是当前分段对应的列表。
  *
  * 收藏不在这里 —— 它已经搬到「歌单」页，作为那个永远存在的内置歌单。
@@ -24,6 +26,9 @@ export struct MineView {
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   onOpenQueue: () => void = () => {
+  };
+  /** 去设置里的某个子页（云端音乐未配置时的「去设置」走它，由 Index 实现路由） */
+  onNavigate: (action: string) => void = () => {
   };
   @State segmentIndex: number = 0;
   @State history: SongItem[] = [];
@@ -52,16 +57,26 @@ export struct MineView {
 
   /** 当前分段有多少条（决定清空按钮要不要弹确认） */
   private currentCount(): number {
-    if (this.segmentIndex === 3) {
+    if (this.segmentIndex === 2) {
       return LocalMusic.getInstance().count();
+    }
+    if (this.segmentIndex === 3) {
+      return WebDavLibrary.getInstance().count();
     }
     return this.currentList().length;
   }
 
+  /**
+   * 这个分段有没有「清空」这回事
+   *
+   * 云端音乐没有：曲库是服务器的一份缓存，服务器上的文件不归这个应用管，
+   * 要拿掉什么直接在服务器上删、回面板刷新一下即可（本地缓存那点东西在设置页里清）。
+   */
+  private showClear(): boolean {
+    return this.segmentIndex !== 3;
+  }
+
   private emptyText(): string {
-    if (this.segmentIndex === 1) {
-      return '还没有从平台导入过音乐';
-    }
     return '这里还是空的';
   }
 
@@ -71,7 +86,7 @@ export struct MineView {
       this.refresh();
       return;
     }
-    if (this.segmentIndex === 2) {
+    if (this.segmentIndex === 1) {
       // 下载管理：只清「已完成 / 失败」的记录（正在下的留着），文件一并删掉
       const removed: number = DownloadManager.getInstance().clearFinished();
       if (removed > 0) {
@@ -79,7 +94,7 @@ export struct MineView {
       }
       return;
     }
-    if (this.segmentIndex === 3) {
+    if (this.segmentIndex === 2) {
       // 本地音乐：删掉应用内的副本（设备里的原文件不动），收藏 / 队列里的同一条也一起摘掉
       const removed: number = removeLocalSongs(LocalMusic.getInstance().songsForUi());
       this.getUIContext().getPromptAction().showToast({ message: `已移除 ${removed} 首本地音乐` });
@@ -106,7 +121,9 @@ export struct MineView {
       Row({ space: 10 }) {
         PageTitle({ text: '我的' })
         Blank()
-        RoundIconButton({ icon: I_TRASH, boxSize: 40, iconSize: 20, label: '清空播放记录', onTap: () => { this.confirmClear(); } })
+        if (this.showClear()) {
+          RoundIconButton({ icon: I_TRASH, boxSize: 40, iconSize: 20, label: '清空播放记录', onTap: () => { this.confirmClear(); } })
+        }
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 12 })
@@ -125,12 +142,12 @@ export struct MineView {
       .width('100%')
       .padding({ left: 16, right: 16, bottom: 8 })
 
-      // 下载管理与本地音乐是另一套数据（带进度 / 状态 / 导入入口），各有自己的列表
-      if (this.segmentIndex === 2) {
+      // 下载管理 / 本地音乐 / 云端音乐是另一套数据（带进度 / 状态 / 扫描入口），各有自己的列表
+      if (this.segmentIndex === 1) {
         DownloadListPane({ bottomInset: this.bottomInset })
           .layoutWeight(1)
           .width('100%')
-      } else if (this.segmentIndex === 3) {
+      } else if (this.segmentIndex === 2) {
         LocalMusicPane({
           currentId: this.currentId,
           bottomInset: this.bottomInset,
@@ -140,6 +157,24 @@ export struct MineView {
               this.currentId = list[index].id;
               PlaySession.getInstance().setQueueAndPlay(list, index);
             }
+          },
+        })
+          .layoutWeight(1)
+          .width('100%')
+      } else if (this.segmentIndex === 3) {
+        // 云端音乐（WebDAV）：面板里自己扫服务器（连上就能放），未配置时给「去设置」
+        WebDavPane({
+          currentId: this.currentId,
+          bottomInset: this.bottomInset,
+          onPick: (index: number) => {
+            const list: SongItem[] = WebDavLibrary.getInstance().songsForUi();
+            if (index >= 0 && index < list.length) {
+              this.currentId = list[index].id;
+              PlaySession.getInstance().setQueueAndPlay(list, index);
+            }
+          },
+          onOpenSettings: () => {
+            this.onNavigate('webdav');
           },
         })
           .layoutWeight(1)
@@ -160,7 +195,7 @@ export struct MineView {
             }
           },
           // 播放历史里也会有本地歌（刚从本地音乐放过的），行菜单里的「从本地音乐移除」
-          // 要真的能用，不能点了没反应
+          // 要真的能用，不能点了没反应（云端歌不需要这一项：服务器上的文件不归应用管）
           onRemoveLocal: (item: SongItem) => {
             confirmRemoveLocalSongs(this.getUIContext(), [item], (removed: number) => {
               this.refresh();
