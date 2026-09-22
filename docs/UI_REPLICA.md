@@ -11,10 +11,12 @@ views/RecommendView.ets         推荐：顶栏来源下拉框 + 排行榜横滑
 views/PlaylistView.ets          歌单：列表 + SongListPane（与「我的」共用）
 views/ImportPlaylistSheet.ets   导入歌单：粘贴分享链接 → 解析预览 → 落成本地歌单
 views/MineView.ets              我的：播放历史/收藏/平台音乐/下载管理 分段胶囊
-views/SettingsView.ets          设置：搜索框、登录卡、音源/播放/下载/主题/其它 分组
+views/SettingsView.ets          设置：搜索框、登录卡、音源/播放/下载/外观/关于 分组
+views/AboutView.ets             关于（设置 - 关于）：应用信息 + 作者/开源协议/仓库地址 + 反馈渠道
 views/SourceSettingsView.ets    音源设置（真功能：导入在线音源、加载、删除、日志、离线自检）
 views/SearchView.ets            搜索页（真功能：一次聚合搜五平台 + 结果按平台筛选下拉框）
 views/PlayerView.ets            全屏播放器：封面页/歌词页横滑双页（歌词随进度自动滚动）
+views/CommentSheet.ets          歌曲评论：热门/最新页签 + 分页列表（自绘覆盖物，见 docs/SONG_COMMENT.md）
 views/PlayQueueSheet.ets        播放列表内容（外面的半模态是系统 bindSheet）
 views/MiniBar.ets               HdsTabs 迷你栏内容：折叠=唱片圆钮，展开=迷你播放器
 ui/Theme.ets / ui/Icons.ets / ui/Glass.ets / ui/Widgets.ets   设计基建
@@ -40,7 +42,7 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
 - 其余：`magnifyingglass` 搜索、`record_circle` 音源、`music_note_list` 播放列表、
   `play_fill`/`pause_fill`/`backward_end_fill`/`forward_end_fill` 播放控制、
   `repeat`、`heart(_fill)`、`star_trophy` 榜单、`doc_plaintext` 分类、
-  `paintbrush` 主题、`hand_thumbsup` 其它、`speaker_wave_3` 播放中指示……
+  `paintbrush` 外观、`info_circle` 关于、`message` 评论、`speaker_wave_3` 播放中指示……
 - 官方图标支持 `symbolEffect` 动效，需要时可直接加在 `IconGlyph` 上。
 - 全应用不再有自绘路径图标：播放页那颗播放钮也从自绘「水滴」改成了圆形底 +
   官方 `play_fill` / `pause_fill`（原来那条 `PLAY_BLOB` 路径和 `scalePath()` 已删除）。

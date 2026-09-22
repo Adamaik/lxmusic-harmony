@@ -16,6 +16,7 @@ import { describeStatus, shouldNotifySyncMessage } from '../core/sync/SyncStatus
 import { buildTitleMaterial, HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
+import { AboutView } from '../views/AboutView';
 import { WebDavSettingsView } from '../views/WebDavSettingsView';
 import { I_GEAR, I_GEAR_FILL, I_HOME, I_HOME_FILL, I_PERSON, I_PERSON_FILL, I_PLAYLIST,
   I_PLAYLIST_FILL } from '../ui/Icons';
@@ -54,6 +55,8 @@ const PAGE_APPEARANCE: string = 'appearance';
 const PAGE_ONLINE: string = 'online';
 /** WebDAV 云端音乐设置（服务器地址 / 账号密码 / 曲库管理） */
 const PAGE_WEBDAV: string = 'webdav';
+/** 关于（作者 / 开源协议 / 仓库地址 / 反馈渠道） */
+const PAGE_ABOUT: string = 'about';
 
 /** 底部悬浮页签的四个页签 */
 interface TabDef {
@@ -464,7 +467,7 @@ struct Index {
       return;
     }
     if (action === 'about') {
-      this.showToast('洛雪音乐 HarmonyOS 复刻版 · 界面演示');
+      this.go(PAGE_ABOUT);
       return;
     }
     if (action === 'appearance') {
@@ -613,6 +616,16 @@ struct Index {
         .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
       }
       .titleBar(this.titleBarOptions('WebDAV 云端音乐'))
+    } else if (name === PAGE_ABOUT) {
+      HdsNavDestination() {
+        Column() {
+          AboutView({ bottomInset: this.bottomInset })
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ top: HDS_TITLE_BAR_HEIGHT + this.topInset })
+      }
+      .titleBar(this.titleBarOptions('关于'))
     } else if (name === PAGE_ONLINE) {
       HdsNavDestination() {
         Column() {

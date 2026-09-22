@@ -1,5 +1,5 @@
 import { C_BG, C_CARD, C_DIVIDER, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
-import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_GEAR, I_PERSON, I_REFRESH, I_THUMB_UP,
+import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
   I_VOLUME, IconGlyph } from '../ui/Icons';
 import { PageTitle } from '../ui/Widgets';
 
@@ -31,9 +31,15 @@ const GROUP_THEME: SettingRowDef[] = [
   { icon: I_BRUSH, title: '外观', action: 'appearance' },
 ];
 
-const GROUP_OTHER: SettingRowDef[] = [
-  { icon: I_THUMB_UP, title: '其它', action: 'other' },
-  { icon: I_GEAR, title: '关于', action: 'about' },
+/**
+ * 关于
+ *
+ * 原来这一组里还有一项「其它」——它点了只弹「该功能暂未接入」，摆在那里是误导，
+ * 已按用户要求去掉（同批删掉了那个死入口）。图标也从齿轮换成信息图标：
+ * 齿轮是「设置」的语汇，和底部页签栏那颗齿轮撞在一起反而看不出是「关于」。
+ */
+const GROUP_ABOUT: SettingRowDef[] = [
+  { icon: I_INFO, title: '关于', action: 'about' },
 ];
 
 /**
@@ -100,7 +106,7 @@ struct SettingRow {
 /**
  * 设置页
  *
- * 顶部是系统的 Search 组件；下面依次是登录卡、音源设置、播放/下载设置、主题、其它/关于，
+ * 顶部是系统的 Search 组件；下面依次是登录卡、音源设置、播放/下载设置、外观、关于，
  * 每一组都是一张白色圆角卡（与洛雪一致）。搜索词会过滤各组里的设置项。
  */
 @Component
@@ -234,8 +240,8 @@ export struct SettingsView {
           this.hint('玻璃材质档位、首页流光、封面取色、深浅模式都在这一页；'
             + '标题栏与底部页签栏用的是同一档材质')
 
-          // ------------------------------------------------ 其它 / 关于
-          this.cardGroup(GROUP_OTHER)
+          // ------------------------------------------------ 关于
+          this.cardGroup(GROUP_ABOUT)
         }
         .width('100%')
         .padding({ left: 16, right: 16, bottom: this.bottomInset + 16 })

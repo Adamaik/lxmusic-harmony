@@ -103,6 +103,12 @@ export const I_DOC: Resource = $r('sys.symbol.doc_plaintext');
 export const I_STAR: Resource = $r('sys.symbol.star');
 /** 关于 */
 export const I_INFO: Resource = $r('sys.symbol.info_circle');
+/** 复制（两张叠起来的文档） */
+export const I_COPY: Resource = $r('sys.symbol.doc_text_on_doc_text');
+/** 打开外部链接（右上方向的箭头） */
+export const I_EXTERNAL: Resource = $r('sys.symbol.arrowshape_turn_up_right');
+/** 群 / 多人 */
+export const I_GROUP: Resource = $r('sys.symbol.person_2');
 
 /**
  * 官方符号图标
