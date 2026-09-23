@@ -47,7 +47,7 @@
 
 ## 如何使用
 1. 自行构建签名安装
-2. 通过链接加入测试群组：https://appgallery.huawei.com/link/invite-test-wap?taskId=b4a29d53aca2244132b9a2b9b5c3bc74&invitationCode=9eHG2pO3r9g
+2. 通过链接加入测试群组：https://appgallery.huawei.com/apptest/dIPtAbdACo
 
 ## 构建
 
