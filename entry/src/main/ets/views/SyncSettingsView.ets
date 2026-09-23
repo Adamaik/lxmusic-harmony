@@ -1,5 +1,4 @@
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
-  R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ICON_GREEN, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { I_CLOSE, I_PLUS, I_REFRESH, I_TRASH, IconGlyph } from '../ui/Icons';
 import { RoundIconButton } from '../ui/Widgets';
 import { LibrarySummary } from '../core/sync/LocalLibrary';
@@ -18,6 +17,8 @@ import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
  */
 @Component
 export struct SyncSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @State host: string = '';
   @State authCode: string = '';
@@ -180,7 +181,7 @@ export struct SyncSettingsView {
             .textAlign(TextAlign.Start)
           Text(this.statusText)
             .fontSize(F_SUB)
-            .fontColor(this.connected ? '#2FBE5B' : C_TEXT_WEAK)
+            .fontColor(this.connected ? C_ICON_GREEN : C_TEXT_WEAK)
             .width('100%')
             .textAlign(TextAlign.Start)
         }
@@ -292,15 +293,15 @@ export struct SyncSettingsView {
         if (this.progress > 0) {
           Text(`${this.progress}%`)
             .fontSize(F_SUB)
-            .fontColor(this.progress >= 100 ? '#2FBE5B' : C_RED)
+            .fontColor(this.progress >= 100 ? C_ICON_GREEN : C_RED)
         }
       }
       .width('100%')
 
       Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
         .width('100%')
-        .color(this.progress >= 100 ? '#2FBE5B' : C_RED)
-        .backgroundColor('#F2F2F4')
+        .color(this.progress >= 100 ? C_ICON_GREEN : C_RED)
+        .backgroundColor(C_FILL_SOFT)
         .style({ strokeWidth: 6 })
     }
     .width('100%')
@@ -416,7 +417,7 @@ export struct SyncSettingsView {
           .placeholderColor(C_TEXT_WEAK)
           .placeholderFont({ size: 13 })
           .fontSize(13)
-          .backgroundColor('#F2F2F4')
+          .backgroundColor(C_FILL_SOFT)
           .layoutWeight(1)
           .onChange((value: string) => {
             this.newName = value;
@@ -425,7 +426,7 @@ export struct SyncSettingsView {
           .placeholderColor(C_TEXT_WEAK)
           .placeholderFont({ size: 13 })
           .fontSize(13)
-          .backgroundColor('#F2F2F4')
+          .backgroundColor(C_FILL_SOFT)
           .layoutWeight(1)
           .onChange((value: string) => {
             this.newSinger = value;
@@ -448,6 +449,9 @@ export struct SyncSettingsView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           this.infoCard()
 
           if (this.enable) {

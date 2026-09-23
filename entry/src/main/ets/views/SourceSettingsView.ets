@@ -10,8 +10,7 @@ import { DEFAULT_MUSIC_INFO_JSON, formatTestResult, runOfflineSelfTest } from '.
 import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '@kit.UIDesignKit';
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB,
-  R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SourceSettingsView';
@@ -36,6 +35,7 @@ const PLATFORM_NAMES: Record<string, string> = {
  */
 @Component
 export struct SourceSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   onBack: () => void = () => {
@@ -196,6 +196,9 @@ export struct SourceSettingsView {
       // 标题栏与返回键由 HdsNavDestination 提供，这里不再自绘头部
       Scroll() {
         Column({ space: 16 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           Text(this.status)
             .fontSize(F_SUB)
             .fontColor(C_TEXT_SUB)
@@ -213,7 +216,7 @@ export struct SourceSettingsView {
               .height(72)
               .width('100%')
               .fontSize(12.5)
-              .backgroundColor('#F5F5F7')
+              .backgroundColor(C_FILL_SOFT)
               .borderRadius(10)
               .onChange((value: string) => {
                 this.sourceInput = value;
@@ -232,7 +235,7 @@ export struct SourceSettingsView {
                 .fontSize(14)
                 .height(40)
                 .layoutWeight(1)
-                .backgroundColor('#EDEDF0')
+                .backgroundColor(C_FILL_SOFT_STRONG)
                 .fontColor(C_TEXT)
                 .enabled(!this.busy)
                 .onClick(() => {
@@ -275,7 +278,7 @@ export struct SourceSettingsView {
                     },
                     suffixItem: this.loadedId === item.id
                       ? new SuffixText({ text: '已就绪' })
-                      : new SuffixArrow({ color: '#C2C2C6' }),
+                      : new SuffixArrow({ color: C_CHEVRON }),
                     cardHeight: 68,
                     onClick: () => {
                       this.loadSource(item.id);
@@ -292,7 +295,7 @@ export struct SourceSettingsView {
                     .fontSize(13)
                     .height(34)
                     .layoutWeight(1)
-                    .backgroundColor('#EDEDF0')
+                    .backgroundColor(C_FILL_SOFT_STRONG)
                     .fontColor(C_TEXT)
                     .onClick(() => {
                       this.loadSource(item.id);
@@ -301,7 +304,7 @@ export struct SourceSettingsView {
                     .fontSize(13)
                     .height(34)
                     .layoutWeight(1)
-                    .backgroundColor('#1FE33B3B')
+                    .backgroundColor(C_RED_TINT)
                     .fontColor(C_RED)
                     .onClick(() => {
                       this.removeSource(item.id);
@@ -326,7 +329,7 @@ export struct SourceSettingsView {
                 .fontSize(13)
                 .height(36)
                 .layoutWeight(1)
-                .backgroundColor('#EDEDF0')
+                .backgroundColor(C_FILL_SOFT_STRONG)
                 .fontColor(C_TEXT)
                 .onClick(() => {
                   this.toggleSandboxEnv();
@@ -335,7 +338,7 @@ export struct SourceSettingsView {
                 .fontSize(13)
                 .height(36)
                 .layoutWeight(1)
-                .backgroundColor('#EDEDF0')
+                .backgroundColor(C_FILL_SOFT_STRONG)
                 .fontColor(C_TEXT)
                 .enabled(!this.busy)
                 .onClick(() => {
@@ -346,7 +349,7 @@ export struct SourceSettingsView {
             if (this.testUrl.length > 0) {
               Text(this.testUrl)
                 .fontSize(11.5)
-                .fontColor('#1A7F37')
+                .fontColor(C_ICON_GREEN)
                 .width('100%')
                 .textAlign(TextAlign.Start)
                 .copyOption(CopyOptions.LocalDevice)
@@ -368,7 +371,7 @@ export struct SourceSettingsView {
             ForEach(this.logs, (line: string, i: number) => {
               Text(line)
                 .fontSize(11)
-                .fontColor('#55555A')
+                .fontColor(C_TEXT_SUB)
                 .width('100%')
                 .textAlign(TextAlign.Start)
                 .copyOption(CopyOptions.LocalDevice)

@@ -20,7 +20,7 @@ import { LxMusicInfoNew, LxMusicMeta, LxQualitySize } from './SyncTypes';
 /** 音质从高到低，用来给同步回来的歌曲挑一个默认音质 */
 const QUALITY_ORDER: string[] = ['flac24bit', 'flac', '320k', '128k'];
 
-/** 这条内部歌曲能不能参与同步：必须有真实的平台 musicInfo（演示数据没有） */
+/** 这条内部歌曲能不能参与同步：必须有真实的平台 musicInfo（本地歌 / 云端歌没有） */
 export function isSyncable(item: SongItem): boolean {
   return parseOldMusicInfo(item) !== null;
 }

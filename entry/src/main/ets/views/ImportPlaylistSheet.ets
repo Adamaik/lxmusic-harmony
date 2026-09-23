@@ -9,7 +9,8 @@ import {
 } from '../core/music/MusicList';
 import { PlaySession, PlaylistSummary, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { SyncManager } from '../core/sync/SyncManager';
-import { C_CARD, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
+import { C_CARD, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_DOWNLOAD, IconGlyph } from '../ui/Icons';
 import { CoverArt } from '../ui/Widgets';
 
@@ -171,6 +172,9 @@ export struct ImportPlaylistSheet {
         return;
       }
       this.existing = summary;
+      // 自建歌单与收藏歌单互斥：这张线上歌单既然被拉进了自己的库（自建歌单），
+      // 就把它的「收藏」记录摘掉 —— 同一条线上歌单不会两边都占（主键同一个口径）
+      CollectedPlaylists.getInstance().removeByKey(link.listId);
       this.status = '';
       // 先收掉忙碌态再回调：宿主收到回调就会关面板（面板随即销毁），
       // 之后别再往自己的状态上写
@@ -206,7 +210,7 @@ export struct ImportPlaylistSheet {
         .fontSize(13.5)
         .height(88)
         .borderRadius(12)
-        .backgroundColor('#F2F2F4')
+        .backgroundColor(C_FILL_SOFT)
         .onChange((value: string) => {
           this.shareText = value;
         })
@@ -223,7 +227,7 @@ export struct ImportPlaylistSheet {
         Button('清空')
           .height(42)
           .fontSize(15)
-          .backgroundColor('#E8E8EA')
+          .backgroundColor(C_FILL_SOFT_STRONG)
           .fontColor(C_TEXT)
           .enabled(!this.busy && this.shareText.length > 0)
           .onClick(() => {
@@ -266,7 +270,7 @@ export struct ImportPlaylistSheet {
               .fontColor(C_RED)
               .padding({ left: 7, right: 7, top: 2, bottom: 2 })
               .borderRadius(8)
-              .backgroundColor('#14E33B3B')
+              .backgroundColor(C_RED_TINT)
             if (this.info.author.length > 0) {
               Text(this.info.author)
                 .fontSize(F_SUB)
@@ -316,7 +320,7 @@ export struct ImportPlaylistSheet {
         .placeholderFont({ size: 14 })
         .fontSize(14)
         .height(44)
-        .backgroundColor('#F2F2F4')
+        .backgroundColor(C_FILL_SOFT)
         .onChange((value: string) => {
           this.listName = value;
         })

@@ -119,6 +119,13 @@ export class LxPlayer {
   private loadedProbeOk: boolean = true;
   /** 最近一次播放进度往前走的时刻：判断「卡住」用（见 STALL_MS） */
   private lastProgressAt: number = 0;
+  /**
+   * 被别的应用抢走焦点期间由系统暂停（INTERRUPT_HINT_PAUSE 之后、RESUME 之前）
+   *
+   * 和「用户自己按的暂停」分开记：只有这个标记为真，打断结束才自动接着放 ——
+   * 用户主动停的不该在别的声音结束后自己响起来，见 PlaySettings.K_AUTO_RESUME_AFTER_INTERRUPT。
+   */
+  private focusPaused: boolean = false;
 
   // ------------------------------------------------------------ 订阅
 
@@ -446,6 +453,8 @@ export class LxPlayer {
     this.currentMs = 0;
     // 换了实例：缓冲水位从零开始（上一次的转圈状态也要收掉、灰段也要从头长）
     this.bufferedEndMs = 0;
+    // 打断标记是跟着这一首/这个实例走的，新实例从头开始记
+    this.focusPaused = false;
     this.updateBuffer(false, 0);
 
     const player: media.AVPlayer = await media.createAVPlayer();
@@ -542,6 +551,14 @@ export class LxPlayer {
       hilog.error(DOMAIN, TAG, 'playback error: %{public}s', `${err.code} ${err.message}`);
       this.update('error', `播放错误：${err.message}`);
     });
+    // 音频焦点被打断 / 打断结束：这是「与其他应用同时播放」之外的另一半 ——
+    // 那个管的是要不要被打断，这个管的是被打断之后接不接着放（见 onAudioInterrupt）
+    player.on('audioInterrupt', (info: audio.InterruptEvent) => {
+      if (this.avPlayer !== player) {
+        return;
+      }
+      this.onAudioInterrupt(info);
+    });
     return player;
   }
 
@@ -620,6 +637,66 @@ export class LxPlayer {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'set audioInterruptMode failed: %{public}s', JSON.stringify(err));
     }
+  }
+
+  /**
+   * 音频焦点被打断 / 打断结束
+   *
+   * 官方《音频焦点介绍》与 FAQ「播放视频时被打断导致播放状态异常」里那两条必须做的事：
+   *   1. 收到强制暂停（INTERRUPT_HINT_PAUSE）时，**系统只是把声音停了，AVPlayer 自己的
+   *      状态不会跟着变**，应用要主动 pause() 一次把状态对齐 —— 否则界面和播控中心会停在
+   *      「正在播放」，恢复时还得连着点两次播放键；
+   *   2. 打断结束（INTERRUPT_HINT_RESUME）一定是共享类型，系统不替应用恢复，
+   *      要接着放只能应用自己 play() —— 这一条就是「被打断结束后自动重新播放」那个开关。
+   *
+   * STOP 是彻底失去焦点（之后不会再收到 RESUME），只把标记清掉、不恢复；
+   * DUCK / UNDUCK 是「降音量 / 恢复音量」，系统自己就做了，这里不用管。
+   */
+  private onAudioInterrupt(info: audio.InterruptEvent): void {
+    switch (info.hintType) {
+      case audio.InterruptHint.INTERRUPT_HINT_PAUSE:
+        this.focusPaused = true;
+        this.pauseOnInterrupt();
+        return;
+      case audio.InterruptHint.INTERRUPT_HINT_STOP:
+        // 彻底失焦：清掉标记，之后不管什么时机都不「自己响起来」
+        this.focusPaused = false;
+        this.pauseOnInterrupt();
+        return;
+      case audio.InterruptHint.INTERRUPT_HINT_RESUME:
+        this.resumeAfterInterrupt();
+        return;
+      default:
+        return;
+    }
+  }
+
+  /** 系统已经把声音停了：把我们的状态也对齐（pause 内部只在 playing 态才真的调） */
+  private pauseOnInterrupt(): void {
+    this.pause().catch((err: Error) => {
+      hilog.warn(DOMAIN, TAG, 'pause for audio interrupt failed: %{public}s', err.message);
+    });
+  }
+
+  /**
+   * 打断结束：只有「本来就播着、被系统暂停了、开关也开着」才接着放
+   *
+   * 用户自己按的暂停不会有 RESUME（暂停时焦点已经释放了），所以这里不必再区分；
+   * 但打断期间用户可能已经自己按了播放、或切了歌（旧实例已释放）—— 那就不归这里管。
+   */
+  private resumeAfterInterrupt(): void {
+    const interrupted: boolean = this.focusPaused;
+    this.focusPaused = false;
+    if (!interrupted || !PlaySettings.getInstance().isAutoResumeAfterInterrupt()) {
+      return;
+    }
+    const player = this.avPlayer;
+    if (player === null || this.status !== 'paused') {
+      return;
+    }
+    player.play().catch((err: BusinessError) => {
+      hilog.warn(DOMAIN, TAG, 'resume after audio interrupt failed: %{public}s', JSON.stringify(err));
+    });
   }
 
   async resume(): Promise<void> {

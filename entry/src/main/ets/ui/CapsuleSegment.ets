@@ -25,8 +25,10 @@ import {
  *
  * 另外两点写法上的注意：
  *   - 系统组件的尺寸 / 颜色只能通过 `LengthMetrics` / `ColorMetrics` 传，不能直接写数字；
- *   - `ColorMetrics.resourceColor()` 收的是 Resource，而本工程色板在 `ui/Theme.ets` 里是
- *     十六进制常量，所以这里用 `rgba()` 换算（数值与 C_SEG_BG / C_RED 一致，改色板要跟着改）。
+ *   - 颜色用 `ColorMetrics.resourceColor()` 传**资源 token**（色板在 `ui/Theme.ets`
+ *     与 `resources` 下同名同义的 base / dark 两份 color.json）：传 Resource 而不是 rgba 数值，
+ *     深色模式才能跟着换成深色那份。之前因为色板是十六进制常量只能 rgba 换算，
+ *     深色模式下就一直是一块浅灰底。
  */
 @ComponentV2
 export struct CapsuleSegment {
@@ -76,16 +78,16 @@ export struct CapsuleSegment {
         this.current = index;
         this.onSelect(index);
       },
-      // 底：与我的页底色同色系的浅灰（C_SEG_BG = #EBEBED）
-      buttonBackgroundColor: ColorMetrics.rgba(0xEB, 0xEB, 0xED, 1),
+      // 底：与「我的」页底色同色系的浅灰（C_SEG_BG，深色模式下自动换成深色那份）
+      buttonBackgroundColor: ColorMetrics.resourceColor($r('app.color.c_seg_bg')),
       buttonMinHeight: LengthMetrics.vp(this.compact ? 30 : 40),
       buttonBorderRadius: LengthMetrics.vp(this.compact ? 15 : 20),
       itemMinHeight: LengthMetrics.vp(this.compact ? 30 : 40),
       itemBorderRadius: LengthMetrics.vp(this.compact ? 15 : 20),
-      // 未选中：深灰正文色；选中：反白字 + 强调色药丸（C_RED = #E33B3B）
-      itemFontColor: ColorMetrics.rgba(0x3A, 0x3A, 0x3C, 1),
-      itemSelectedFontColor: ColorMetrics.rgba(0xFF, 0xFF, 0xFF, 1),
-      itemSelectedBackgroundColor: ColorMetrics.rgba(0xE3, 0x3B, 0x3B, 1),
+      // 未选中：正文色（深色模式下是浅色字）；选中：反白字 + 强调色药丸（C_RED）
+      itemFontColor: ColorMetrics.resourceColor($r('app.color.c_seg_unselected')),
+      itemSelectedFontColor: ColorMetrics.resourceColor($r('app.color.c_on_accent')),
+      itemSelectedBackgroundColor: ColorMetrics.resourceColor($r('app.color.c_red')),
     })
       .width('100%')
   }

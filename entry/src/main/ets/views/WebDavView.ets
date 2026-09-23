@@ -1,13 +1,25 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { SongItem } from '../core/player/PlaySession';
+import { PlaylistSummary, SongItem } from '../core/player/PlaySession';
 import { K_WEBDAV_PROGRESS, K_WEBDAV_VERSION, WebDavLibrary, WebDavScanResult } from '../core/webdav/WebDavLibrary';
 import { WebDavSettings } from '../core/webdav/WebDavSettings';
 import { C_CARD, C_DIVIDER, C_RED, C_TEXT_SUB, C_TEXT_WEAK, F_SUB, R_CARD } from '../ui/Theme';
 import { I_REFRESH, IconGlyph } from '../ui/Icons';
-import { SongListPane } from './PlaylistView';
+import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
+  SelectSession, toggleSelected } from '../ui/Selection';
+import { SyncManager } from '../core/sync/SyncManager';
+import { SongListPane } from './SongListPane';
+import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'WebDavPane';
+
+/**
+ * 云端音乐的多选能做什么
+ *
+ * 没有「删除」：列表是服务器那台机器的一份缓存，文件不归这个应用管，要拿掉什么
+ * 直接在服务器上删、回来刷新一下（本地缓存那点东西在「设置 - WebDAV」里清）。
+ */
+const CLOUD_ACTIONS: string[] = ['收藏', '加入播放列表', '加入歌单'];
 
 /**
  * 云端音乐面板（我的 -> 云端音乐）
@@ -25,6 +37,13 @@ const TAG: string = 'WebDavPane';
 export struct WebDavPane {
   @Prop currentId: string = '';
   @Prop bottomInset: number = 0;
+  /**
+   * 顶部占位：让出透明标题栏那一段（状态栏 + 标题栏，由壳层算好）
+   *
+   * 这一页的头部（刷新 / 选择 / 扫描状态）是常驻控件，不该滚进标题栏底下，
+   * 所以用一段固定占位，而不是首页那种 `contentStartOffset`。
+   */
+  @Prop topInset: number = 0;
   onPick: (index: number) => void = () => {
   };
   /** 去「设置 - WebDAV 云端音乐」配服务器（未配置时的空状态要有个去处） */
@@ -34,6 +53,12 @@ export struct WebDavPane {
   @State scanning: boolean = false;
   /** 一句状态说明（扫完的结果 / 上次扫描时间 / 未配置的引导） */
   @State status: string = '';
+  /** 多选（长按进）：收藏 / 入歌单 / 入播放列表 */
+  @State selecting: boolean = false;
+  /** 勾选一变就往全局会话里发布一次（顶栏与底栏都听它，见 ui/Selection.ets） */
+  @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  @State pickerOpen: boolean = false;
+  @State candidates: PlaylistSummary[] = [];
   @StorageLink(K_WEBDAV_VERSION) @Watch('onLibraryChanged') libraryVersion: number = 0;
   @StorageLink(K_WEBDAV_PROGRESS) progressText: string = '';
 
@@ -50,6 +75,162 @@ export struct WebDavPane {
 
   private refresh(): void {
     this.items = WebDavLibrary.getInstance().songsForUi();
+    // 重扫之后把已经不存在的勾选摘掉
+    if (this.selectedIds.length > 0) {
+      const alive: string[] = [];
+      for (const item of this.items) {
+        alive.push(item.id);
+      }
+      const pruned: string[] = pruneSelected(this.selectedIds, alive);
+      if (pruned.length !== this.selectedIds.length) {
+        this.selectedIds = pruned;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ 多选
+
+  private enterSelectingFrom(item: SongItem): void {
+    this.selecting = true;
+    this.selectedIds = [item.id];
+    // @Watch 只在**值真的变了**时才回调，进多选这一下不能只靠它（同一条二次长按就不变）
+    this.publishSelectBar();
+  }
+
+  private exitSelecting(): void {
+    this.selecting = false;
+    this.selectedIds = [];
+    SelectSession.getInstance().end();
+  }
+
+  /** 勾选数一变就把工具条的状态重发一遍（顶栏的标题、底栏主操作的可用态都在听） */
+  private syncSelectBar(): void {
+    if (!this.selecting) {
+      return;
+    }
+    this.publishSelectBar();
+  }
+
+  /** 把「勾了几首 / 能做什么」交给全局会话：顶栏与底栏据此绘制 */
+  private publishSelectBar(): void {
+    SelectSession.getInstance().show(
+      this.selectedIds.length,
+      allSelectedOf(this.selectedIds, this.items.length),
+      selectActionsOf(CLOUD_ACTIONS),
+      () => {
+        this.exitSelecting();
+      },
+      () => {
+        this.toggleSelectAll();
+      },
+      (index: number) => {
+        this.onAction(index);
+      });
+  }
+
+  /** 页面被弹掉时把工具条一起收走（不然它会留在下一层页面上） */
+  aboutToDisappear(): void {
+    SelectSession.getInstance().end();
+  }
+
+  private toggleSelect(item: SongItem): void {
+    this.selectedIds = toggleSelected(this.selectedIds, item.id);
+  }
+
+  private toggleSelectAll(): void {
+    if (allSelectedOf(this.selectedIds, this.items.length)) {
+      this.selectedIds = [];
+      return;
+    }
+    const ids: string[] = [];
+    for (const item of this.items) {
+      ids.push(item.id);
+    }
+    this.selectedIds = ids;
+  }
+
+  private selected(): SongItem[] {
+    return selectedSongs(this.items, this.selectedIds);
+  }
+
+  private openPlaylistPicker(): void {
+    if (this.selected().length === 0) {
+      this.toast('先勾选要加入歌单的歌');
+      return;
+    }
+    this.candidates = SyncManager.getInstance().getLibrary().playlistSummaries();
+    this.pickerOpen = true;
+  }
+
+  private addSelectedToPlaylist(playlist: PlaylistSummary): void {
+    const targets: SongItem[] = this.selected();
+    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, targets);
+    this.pickerOpen = false;
+    this.exitSelecting();
+    this.toast(added > 0 ? `已把 ${added} 首加入「${playlist.name}」` : `「${playlist.name}」里已经有这些歌了`);
+  }
+
+  private createPlaylistAndAdd(name: string): void {
+    if (name.length === 0) {
+      return;
+    }
+    const targets: SongItem[] = this.selected();
+    const library = SyncManager.getInstance().getLibrary();
+    const id: string = library.createPlaylist(name);
+    library.addMusicToPlaylist(id, targets);
+    this.pickerOpen = false;
+    this.exitSelecting();
+    this.toast(`已新建歌单「${name}」并加入 ${targets.length} 首`);
+  }
+
+  /**
+   * 批量操作：按**会话里那一项的叫法**分发（底栏按下标回调，这里翻译回它是什么）
+   *
+   * 不按下标硬编码：底栏的排列是「各页面的操作 + 红字那枚主操作放最后」
+   * （见 ui/Selection.ets 的 selectActionsOf），下标会随操作项数量变。
+   */
+  private onAction(index: number): void {
+    const actions: SelectAction[] = SelectSession.getInstance().actions;
+    if (index < 0 || index >= actions.length) {
+      return;
+    }
+    const label: string = actions[index].label;
+    const targets: SongItem[] = this.selected();
+    if (targets.length === 0) {
+      this.toast('先勾选歌曲');
+      return;
+    }
+    if (label === '收藏') {
+      this.toast(favoriteSongs(targets));
+      return;
+    }
+    if (label === '加入播放列表') {
+      this.toast(queueSongs(targets, false));
+      return;
+    }
+    this.openPlaylistPicker();
+  }
+
+  private toast(message: string): void {
+    if (message.length === 0) {
+      return;
+    }
+    this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
+  @Builder
+  playlistPickerSheet() {
+    AddToPlaylistSheet({
+      songName: `已选 ${this.selectedIds.length} 首`,
+      candidates: this.candidates,
+      bottomInset: this.bottomInset,
+      onPick: (playlist: PlaylistSummary) => {
+        this.addSelectedToPlaylist(playlist);
+      },
+      onCreate: (name: string) => {
+        this.createPlaylistAndAdd(name);
+      },
+    })
   }
 
   private autoScanIfNeeded(): void {
@@ -137,9 +318,29 @@ export struct WebDavPane {
           : '')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
+
+        // 多选入口：有歌才有意义（长按任意一行也行）
+        if (this.items.length > 0) {
+          Text(this.selecting ? '完成' : '选择')
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .padding({ left: 6, right: 2, top: 4, bottom: 4 })
+            .onClick(() => {
+              if (this.selecting) {
+                this.exitSelecting();
+              } else {
+                this.selecting = true;
+                this.selectedIds = [];
+              }
+            })
+            .accessibilityText(this.selecting ? '退出多选' : '进入多选')
+            .accessibilityLevel('yes')
+        }
       }
       .width('100%')
 
+      // 多选的工具条不在这里 —— 顶栏那条由壳层画，底栏那条在 PanePage 的悬浮栏里。
+      // 云端歌只能收藏 / 入库，删不掉（文件在服务器上）
       if (this.progressText.length > 0) {
         Row({ space: 10 }) {
           LoadingProgress()
@@ -192,6 +393,8 @@ export struct WebDavPane {
 
   build() {
     Column() {
+      Column().height(this.topInset).width('100%')
+
       this.header()
 
       Divider()
@@ -204,6 +407,16 @@ export struct WebDavPane {
         currentId: this.currentId,
         emptyText: '云端曲库还是空的',
         bottomInset: this.bottomInset,
+        // 多选：长按进，点行 = 勾选
+        selectable: true,
+        selecting: this.selecting,
+        selectedIds: this.selectedIds,
+        onToggleSelect: (item: SongItem) => {
+          this.toggleSelect(item);
+        },
+        onRequestSelect: (item: SongItem) => {
+          this.enterSelectingFrom(item);
+        },
         onPick: (index: number) => {
           this.onPick(index);
         },
@@ -213,6 +426,14 @@ export struct WebDavPane {
     }
     .width('100%')
     .height('100%')
+    .bindSheet($$this.pickerOpen, this.playlistPickerSheet(), {
+      preferType: SheetType.BOTTOM,
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      detentSelection: SheetSize.MEDIUM,
+      dragBar: true,
+      showClose: true,
+      title: { title: '添加到歌单' },
+    })
   }
 }
 

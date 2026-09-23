@@ -103,7 +103,7 @@ export struct CommentSheet {
     return this.kindIndex === 0 ? 'hot' : 'new';
   }
 
-  /** 当前歌的平台身份：没有（本地歌没匹配上 / 演示数据 / 平台不支持）就返回 null */
+  /** 当前歌的平台身份：没有（本地歌没匹配上 / 平台不支持）就返回 null */
   private target(): LxMusicInfo | null {
     if (this.targetJson.length === 0) {
       return null;

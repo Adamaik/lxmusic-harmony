@@ -5,7 +5,11 @@
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
     "deviceTypes": [
-      "phone"
+      "phone",
+      // 平板：界面已按窗口宽度自适应（底部两条悬浮栏的宽度、内容列的最大宽度都按窗口算，
+      // 见 ui/Layout.ets 与 ui/Widgets.ets 的 WidePane）。不声明 tablet 的话，
+      // 平板上只能跑手机的兼容模式：整屏被拉伸放大，字发虚、控件比例也不对
+      "tablet"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,

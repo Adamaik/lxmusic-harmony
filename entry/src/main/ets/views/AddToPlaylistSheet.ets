@@ -1,5 +1,5 @@
 import { PlaylistSummary } from '../core/player/PlaySession';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 
 /**
  * 「添加到歌单」的选歌单面板
@@ -39,7 +39,7 @@ export struct AddToPlaylistSheet {
           .placeholderFont({ size: 14 })
           .fontSize(14)
           .height(44)
-          .backgroundColor('#F2F2F4')
+          .backgroundColor(C_FILL_SOFT)
           .layoutWeight(1)
           .onChange((value: string) => {
             this.name = value;

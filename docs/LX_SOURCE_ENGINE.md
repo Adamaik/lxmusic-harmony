@@ -229,11 +229,11 @@ await LxPlayer.getInstance().playUrl(url);
 
 #### 宿主侧播放链路的五个关键点
 
-1. **没有 musicInfo 的条目要先补搜索。** 洛雪的演示歌单/推荐/历史只有歌名歌手，
-   `PlaySession.playAt()` 遇到这种条目会走 `ensurePlayable()` → `resolveItem()`：
-   在「当前源声明的平台 ∩ 内置搜索支持的平台」上按 `歌名 + 歌手` 搜一次，取最像的
-   一条（先全等，再去掉空格/括号后包含匹配），转成带 musicInfo 的 `SongItem` 替换
-   队列里这一条。以前这里直接走「演示模式」只推进度条，就是「点了播放没声音」的根因。
+1. **没有 musicInfo 的条目要先补搜索。** 条目可能来自当前音源脚本不支持的平台
+   （`musicInfo` 补不上），`PlaySession.playAt()` 遇到这种条目会走 `ensurePlayable()` →
+   `resolveItem()`：在「当前源声明的平台 ∩ 内置搜索支持的平台」上按 `歌名 + 歌手` 搜一次，
+   取最像的一条（先全等，再去掉空格/括号后包含匹配），转成带 musicInfo 的 `SongItem`
+   替换队列里这一条。少了这一步就是「点了播放没声音」。
 2. **音质要和源协商。** 设置里选的播放音质源不一定支持，`negotiateQuality()` 在
    「`supported[platform].qualitys`」∩「该曲目的 `_types`」里按 flac24bit → 128k
    从高到低挑一个。`pickQuality()`（`MusicSearch.ets`）只从 320k 往下找，曲目缺

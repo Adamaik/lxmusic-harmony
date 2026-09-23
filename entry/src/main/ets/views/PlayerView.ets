@@ -5,7 +5,7 @@ import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURR
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
   K_SHOW_MINI_LYRIC } from '../core/settings/PlaySettings';
-import { I_CAST, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE, I_NEXT, I_ORDER_PLAY,
+import { I_CAST, I_CHECK_CIRCLE, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE, I_NEXT, I_ORDER_PLAY,
   I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE, IconGlyph } from '../ui/Icons';
 import { CoverArt, FavoriteHeart } from '../ui/Widgets';
 import { AVCastPicker, AVCastPickerStyle } from '@kit.AVSessionKit';
@@ -17,11 +17,12 @@ import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/D
 import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
 import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
-import { C_BG } from '../ui/Theme';
+import { C_BG, C_RED } from '../ui/Theme';
 import { HdsEdgeFlowLight } from '../ui/Hds';
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
+import { LOCAL_QUALITY_MARK, isFileQuality, qualityLabel, switchableQualitys } from '../core/music/Quality';
 
 function formatTime(seconds: number): string {
   const total: number = Math.max(0, Math.floor(seconds));
@@ -99,6 +100,8 @@ export struct PlayerView {
   @State moreOpen: boolean = false;
   /** 「匹配歌词」面板是否展开（本地歌专用） */
   @State matchOpen: boolean = false;
+  /** 音质面板是否展开（进度条下面那颗音质钮点出来的） */
+  @State qualityOpen: boolean = false;
   /** 评论页是否展开（铺满播放器的自绘覆盖物，见 CommentSheet 开头的说明） */
   @State commentOpen: boolean = false;
   /** 当前唱到的歌词行；-1 = 没有时间轴/还没开始 */
@@ -245,14 +248,6 @@ export struct PlayerView {
     } catch (err) {
       this.toast(`分享失败：${(err as BusinessError).message}`);
     }
-  }
-
-  /** 音质标签：本地歌 / 云端歌都没有音质档，显示「本地」「云端」而不是内部标记 */
-  private qualityLabel(): string {
-    if (this.quality === 'local') {
-      return '本地';
-    }
-    return this.quality === 'webdav' ? '云端' : this.quality;
   }
 
   /** 当前这首是不是本地音乐（决定要不要给「匹配歌词」入口） */
@@ -494,6 +489,193 @@ export struct PlayerView {
     .backgroundColor('#8A000000')
   }
 
+  // ------------------------------------------------------------ 音质
+
+  /**
+   * 这首歌现在能切到哪几档（空数组 = 没得切，见 Quality.switchableQualitys）
+   *
+   * 读「正在播的那一首」而不是界面上的字段：音质档列表来自歌曲条目里的 musicInfo。
+   */
+  private qualityOptions(): string[] {
+    const item: SongItem | null = PlaySession.getInstance().current;
+    if (item === null) {
+      return [];
+    }
+    return switchableQualitys(item.musicInfoJson, item.source, this.quality);
+  }
+
+  /** 面板顶上那行「当前：xxx」 */
+  private currentQualityText(): string {
+    return `当前：${qualityLabel(this.quality)}`;
+  }
+
+  /**
+   * 没得切时的那句说明
+   *
+   * 三种情况各说各的：本地文件、云端文件（音质由文件本身决定），
+   * 以及在线歌但只有一档 / 连音质列表都没给。
+   */
+  private noChoiceHint(): string {
+    if (PlaySession.getInstance().current === null) {
+      return '还没有正在播放的歌。';
+    }
+    if (isFileQuality(this.quality)) {
+      // isFileQuality 为真时只可能是「本地」或「云端」两个标记之一，所以拿其中一个当判断
+      return this.quality === LOCAL_QUALITY_MARK
+        ? '这是本机上的音频文件，音质由文件本身决定，没法切换。'
+        : '这是云端服务器上的音频文件，音质由文件本身决定，没法切换。';
+    }
+    const options: string[] = this.qualityOptions();
+    if (options.length === 1) {
+      return `这首歌只有 ${qualityLabel(options[0])} 一档可选。`;
+    }
+    return '这首歌没有可切换的音质档（音源可能没给出这首歌的音质列表）。';
+  }
+
+  /** 面板里点某一档：收起面板，交给播放会话换档重放 */
+  private pickQuality(quality: string): void {
+    this.qualityOpen = false;
+    void PlaySession.getInstance().switchQuality(quality);
+  }
+
+  /**
+   * 音质钮（进度条下面那一行中间那颗胶囊）
+   *
+   * 原来它只是一段文字（当前音质），现在是个钮：点开音质面板换档。
+   * 可切的档超过一档才挂右边那枚小箭头 —— 本地 / 云端文件没有档可切，
+   * 标着箭头却点不出东西更让人困惑；点它仍然会开面板，那里给一句说明。
+   */
+  @Builder
+  qualityButton() {
+    Row({ space: 3 }) {
+      Text(qualityLabel(this.quality))
+        .fontSize(11.5)
+        .fontColor('#CCFFFFFF')
+      if (this.qualityOptions().length > 1) {
+        IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 12, color: '#CCFFFFFF' })
+      }
+    }
+    .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+    .borderRadius(10)
+    .backgroundColor('#26FFFFFF')
+    .onClick(() => {
+      this.qualityOpen = true;
+    })
+    .accessibilityText(`音质：${qualityLabel(this.quality)}，点按切换`)
+    .accessibilityLevel('yes')
+  }
+
+  /** 音质面板里的一项：正在用的那一档标主题红并带一枚勾（尺寸与「更多」那几项一致） */
+  @Builder
+  qualityItem(quality: string) {
+    Row({ space: 6 }) {
+      Text(qualityLabel(quality))
+        .fontSize(16)
+        .fontColor(this.quality === quality ? C_RED : '#F2FFFFFF')
+      if (this.quality === quality) {
+        IconGlyph({ symbol: I_CHECK_CIRCLE, iconSize: 15, color: C_RED })
+          .accessibilityLevel('no')
+      }
+    }
+    .width('100%')
+    .height(54)
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      this.pickQuality(quality);
+    })
+    .accessibilityText(this.quality === quality
+      ? `${qualityLabel(quality)}，当前音质`
+      : `切换到 ${qualityLabel(quality)}`)
+    .accessibilityLevel('yes')
+  }
+
+  /**
+   * 音质面板
+   *
+   * 与「更多」同一套自绘底部面板（遮罩 + 深色圆角 + 上滑动效）：播放器本身就是系统的
+   * 半模态，不再往它上面叠系统弹层（原因见 morePanel 的说明）。
+   *
+   * 档位只有一档或没有（本地 / 云端文件）时不给列表，只给一句说明 —— 列一排点不动的档
+   * 不如直接说清楚为什么不能切。
+   */
+  @Builder
+  qualityPanel() {
+    Column() {
+      Text('播放音质')
+        .fontSize(13)
+        .fontColor('#8CFFFFFF')
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 16, bottom: 4 })
+      Text(this.currentQualityText())
+        .fontSize(12)
+        .fontColor('#66FFFFFF')
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ bottom: 10 })
+
+      if (this.qualityOptions().length > 1) {
+        ForEach(this.qualityOptions(), (quality: string) => {
+          this.qualityItem(quality)
+        }, (quality: string) => quality)
+
+        Text('换档会用新音质把这个位置重新解析一次（中间会重新缓冲一小会儿）；'
+          + '选中的这一档同时成为以后播放的音质（设置 - 播放设置）。')
+          .fontSize(11.5)
+          .fontColor('#59FFFFFF')
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .lineHeight(16)
+          .padding({ left: 24, right: 24, top: 4, bottom: 10 })
+      } else {
+        Text(this.noChoiceHint())
+          .fontSize(13)
+          .fontColor('#8CFFFFFF')
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .lineHeight(19)
+          .padding({ left: 24, right: 24, top: 2, bottom: 16 })
+      }
+
+      Divider()
+        .strokeWidth(0.5)
+        .color('#26FFFFFF')
+        .margin({ top: 8 })
+
+      Text('取消')
+        .fontSize(16)
+        .fontColor('#8CFFFFFF')
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .height(54)
+        .onClick(() => {
+          this.qualityOpen = false;
+        })
+    }
+    .width('100%')
+    .padding({ bottom: this.bottomInset + 4 })
+    .borderRadius({ topLeft: 20, topRight: 20 })
+    .backgroundColor('#232326')
+    .transition(TransitionEffect.translate({ y: 320 }).animation({ duration: 240, curve: Curve.Friction }))
+  }
+
+  /** 音质面板那一层：点面板以外收起（与 moreOverlay 同一套） */
+  @Builder
+  qualityOverlay() {
+    Column() {
+      Column()
+        .width('100%')
+        .layoutWeight(1)
+        .onClick(() => {
+          this.qualityOpen = false;
+        })
+      this.qualityPanel()
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#8A000000')
+  }
+
   /**
    * 「匹配歌词」面板
    *
@@ -718,6 +900,8 @@ export struct PlayerView {
           url: this.cover,
           name: this.name,
           art: this.art,
+          // 没有歌 / 没有封面 / 封面失效：兜底给聆听的应用图标（见 ui/Widgets.ets 的 CoverArt）
+          appIcon: true,
           boxSize: 252,
           // 圆角来自外观设置（默认 12）
           radius: this.coverRadius,
@@ -998,12 +1182,7 @@ export struct PlayerView {
           .fontSize(11.5)
           .fontColor('#A6FFFFFF')
         Blank()
-        Text(this.qualityLabel())
-          .fontSize(11.5)
-          .fontColor('#CCFFFFFF')
-          .padding({ left: 10, right: 10, top: 3, bottom: 3 })
-          .borderRadius(9)
-          .backgroundColor('#26FFFFFF')
+        this.qualityButton()
         Blank()
         Text(formatTime(this.duration))
           .fontSize(11.5)
@@ -1245,6 +1424,11 @@ export struct PlayerView {
         this.moreOverlay()
       }
 
+      // 音质面板：进度条下面那颗音质钮点出来的（同一套自绘面板）
+      if (this.qualityOpen) {
+        this.qualityOverlay()
+      }
+
       // 「匹配歌词」：同样是自绘面板（播放器本身是系统半模态，不再叠系统弹层）
       if (this.matchOpen) {
         this.matchOverlay()
@@ -1261,8 +1445,8 @@ export struct PlayerView {
     .gesture(
       PanGesture({ direction: PanDirection.Vertical, distance: 12 })
         .onActionEnd((event: GestureEvent) => {
-          // 「更多」/「评论」面板开着时不下滑关闭：在面板上往下拖不该把整个播放器收掉
-          if (!this.moreOpen && !this.commentOpen && event.offsetY > 70) {
+          // 「更多」/「音质」/「评论」面板开着时不下滑关闭：在面板上往下拖不该把整个播放器收掉
+          if (!this.moreOpen && !this.qualityOpen && !this.commentOpen && event.offsetY > 70) {
             this.onClose();
           }
         })

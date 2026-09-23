@@ -1,8 +1,7 @@
 import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { C_BG, C_CARD, C_DIVIDER, C_ICON_BLUE, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB,
-  R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_ICON_BLUE, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { HintText } from '../ui/SettingWidgets';
 import { I_CHECK_CIRCLE, I_COPY, I_EXTERNAL, I_GROUP, IconGlyph } from '../ui/Icons';
 
@@ -43,6 +42,8 @@ function readVersionName(): string {
  */
 @Component
 export struct AboutView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @State version: string = '';
   /** 群号刚复制过（给一个短暂的「已复制」反馈） */
@@ -191,7 +192,7 @@ export struct AboutView {
     .padding({ left: 18, right: 16, top: 14, bottom: 15 })
     .stateStyles({
       normal: { .backgroundColor(Color.Transparent) },
-      pressed: { .backgroundColor('#14404044') },
+      pressed: { .backgroundColor(C_PRESSED) },
     })
     .onClick(() => {
       this.openRepo();
@@ -220,7 +221,12 @@ export struct AboutView {
   feedbackCard() {
     Row({ space: 12 }) {
       Stack({ alignContent: Alignment.Center }) {
-        Circle().width(34).height(34).fill('#0F000000')
+        // 圆底色用 Column + 圆角，不用 Circle().fill(资源色)：fill 取不到资源时会退回黑色
+        Column()
+          .width(34)
+          .height(34)
+          .borderRadius(17)
+          .backgroundColor(C_ICON_CIRCLE)
         IconGlyph({ symbol: I_GROUP, iconSize: 19, color: C_TEXT })
       }
       .width(34)
@@ -259,7 +265,7 @@ export struct AboutView {
     .backgroundColor(C_CARD)
     .stateStyles({
       normal: { .backgroundColor(C_CARD) },
-      pressed: { .backgroundColor('#14404044') },
+      pressed: { .backgroundColor(C_PRESSED) },
     })
     .onClick(() => {
       this.copyGroup();
@@ -272,6 +278,9 @@ export struct AboutView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           this.appCard()
 
           this.aboutCard()

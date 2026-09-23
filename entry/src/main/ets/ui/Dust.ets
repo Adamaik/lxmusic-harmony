@@ -1,4 +1,3 @@
-import { C_RED } from './Theme';
 
 /**
  * 删除时的粒子飘散
@@ -125,7 +124,10 @@ export struct DustLayer {
               position: [this.posX, this.posY],
               size: [12, 12],
             },
-            color: { range: [C_RED, '#FFB08A'] },
+            // 粒子色给字面量而不是主题 token：Particle 的颜色范围是渲染管线里的取值，
+            // 拿不准它认不认资源色（认不出会落到默认色，粒子就不是红的了）；
+            // 这两个色本身在深浅两种底色上都成立，不需要跟着模式变
+            color: { range: ['#E33B3B', '#FFB08A'] },
             opacity: { range: [1.0, 0.0] },
             scale: { range: [1.0, 0.25] },
             velocity: { speed: [40, 220], angle: [0, 360] },

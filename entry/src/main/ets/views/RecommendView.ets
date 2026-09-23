@@ -1,7 +1,7 @@
 import { LIST_PLATFORMS, LxBoardItem, LxPlaylistItem, LxSortItem, OnlineRoute, getBoards, getRecommendPlaylists, platformName, sortListOf } from '../core/music/MusicList';
-import { C_BG, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
-import { I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_MIC, I_PLAY, I_SEARCH, IconGlyph } from '../ui/Icons';
-import { CoverArt, PageTitle, RoundIconButton, SectionTitle } from '../ui/Widgets';
+import { C_BG, C_CHEVRON, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_MIC, I_PLAY, IconGlyph } from '../ui/Icons';
+import { CoverArt, SectionTitle, TopFade } from '../ui/Widgets';
 import { HdsFlowLightBackground } from '../ui/Hds';
 import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_FLOW_LIGHT, K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
@@ -154,8 +154,14 @@ class PlaylistSource implements IDataSource {
   }
 }
 
-/** 推荐来源的持久化键（放在 AppStorage 里，切页签回来还在） */
-const K_RECOMMEND_SOURCE: string = 'recommend_source';
+/**
+ * 推荐来源的持久化键（放在 AppStorage 里，切页签回来还在）
+ *
+ * 导出给壳层用：「推荐来源」那个胶囊跟「搜索」钮一起搬进了标题栏 —— 沉浸光感只在
+ * Navigation 标题栏 / 底部 TabBar 里生效（见 ui/Glass.ets 的开头说明），所以改这个值
+ * 的人变成了壳层，本页只订阅它、变了就重新取数。
+ */
+export const K_RECOMMEND_SOURCE: string = 'recommend_source';
 
 /**
  * 推荐页
@@ -176,8 +182,8 @@ export struct RecommendView {
   };
   onOpenOnline: (route: OnlineRoute) => void = () => {
   };
-  /** 当前推荐来源，切走再回来保持上次选的平台 */
-  @StorageLink(K_RECOMMEND_SOURCE) platform: string = 'kw';
+  /** 当前推荐来源，切走再回来保持上次选的平台（改值的是标题栏里那颗来源胶囊） */
+  @StorageLink(K_RECOMMEND_SOURCE) @Watch('onPlatformChanged') platform: string = 'kw';
   /** 首页是否挂 HDS 背景流光（外观设置里可关，关掉就不挂这一层） */
   @StorageLink(K_FLOW_LIGHT) flowLight: boolean = true;
   /** 玻璃厚度档位（外观设置）：两个下拉框的玻璃跟着它变 */
@@ -263,16 +269,23 @@ export struct RecommendView {
     }
   }
 
-  private switchPlatform(id: string): void {
-    if (id === this.platform) {
+  /**
+   * 推荐来源变了（标题栏里的来源胶囊改的就是这个值）
+   *
+   * 与 switchPlatform 的区别：那个是「点自己画的胶囊」时调的，会先写值再重置；
+   * 现在写值的是壳层，本页只能靠 @Watch 感知 —— 重置的逻辑挪到这里，
+   * 两条路（壳层改值 / 首次进入）都走同一套。
+   */
+  private onPlatformChanged(): void {
+    if (!LIST_PLATFORMS.includes(this.platform)) {
       return;
     }
-    this.platform = id;
-    this.sorts = sortListOf(id);
+    this.sorts = sortListOf(this.platform);
     this.sortIndex = 0;
     this.playlists = [];
     this.playlistSource.setItems(this.playlists);
     this.page = 0;
+    this.noMore = false;
     void this.reload();
   }
 
@@ -327,24 +340,12 @@ export struct RecommendView {
   // ------------------------------------------------------------ 构建
 
   /**
-   * 来源下拉菜单
+   * 排序下拉菜单（各平台给的排序项不一样，有几个列几个）
    *
-   * 用系统的 Menu + MenuItem（和歌单页的「更多」菜单同一套），而不是 Select 自带的菜单：
-   * 这样胶囊与菜单都由这里控制，也不会出现组件内外两套尺寸打架的问题。
+   * 注意「推荐来源」那颗胶囊已经不在本页了：它跟「搜索」钮一起搬到了标题栏
+   * （沉浸光感只在 Navigation 标题栏里生效），所以来源那一份菜单也跟着搬去了
+   * pages/Index.ets，本页只留排序这一份 —— 排序是列表自己的事，跟着列表走。
    */
-  @Builder
-  sourceMenu() {
-    Menu() {
-      ForEach(LIST_PLATFORMS, (id: string) => {
-        MenuItem({ content: platformName(id) })
-          .onClick(() => {
-            this.switchPlatform(id);
-          })
-      }, (id: string) => id)
-    }
-  }
-
-  /** 排序下拉菜单（各平台给的排序项不一样，有几个列几个） */
   @Builder
   sortMenu() {
     Menu() {
@@ -356,7 +357,6 @@ export struct RecommendView {
       }, (item: LxSortItem, index: number) => `${index}_${item.id}`)
     }
   }
-
 
   @Builder
   playlistRow(item: LxPlaylistItem) {
@@ -392,7 +392,7 @@ export struct RecommendView {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 17, color: '#C2C2C6' })
+      IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 17, color: C_CHEVRON })
     }
     .width('100%')
     .height(78)
@@ -423,7 +423,7 @@ export struct RecommendView {
           .fontColor(C_RED)
           .padding({ left: 18, right: 18, top: 8, bottom: 8 })
           .borderRadius(18)
-          .backgroundColor('#14E33B3B')
+          .backgroundColor(C_RED_TINT)
           .onClick(() => {
             void this.reload();
           })
@@ -451,39 +451,10 @@ export struct RecommendView {
       }
 
       Column() {
-      // ---------------------------------------------------- 顶栏
-      Row({ space: 10 }) {
-        PageTitle({ text: '推荐' })
-        Blank()
-        /**
-         * 推荐来源（酷我 / 酷狗 / 咪咕 / QQ / 网易云）
-         *
-         * 自己画胶囊 + 系统的下拉菜单（bindMenu），不再用系统 `Select` 外面再套一层自绘框：
-         * Select 自带一套内边距与高度（≥40vp），塞进 38vp 的框里就会出现「框一种尺寸、
-         * 文字按另一种尺寸排」的错位。现在框高、文字基线、箭头间距全由这里定，必然对得上。
-         *
-         * 位置仍是原来那颗「音源设置」圆钮的位置（音源设置在「设置」页有入口）。
-         */
-        Row({ space: 3 }) {
-          Text(platformName(this.platform))
-            .fontSize(14.5)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(C_TEXT)
-            .maxLines(1)
-          IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 14, color: C_TEXT_SUB })
-        }
-        .height(36)
-        .padding({ left: 14, right: 10 })
-        .attributeModifier(thinGlass(18, false, '', this.materialLevel))
-        .systemMaterial(immersiveMaterialFor(this.materialLevel))
-        .bindMenu(this.sourceMenu())
-        .accessibilityText(`推荐来源：${platformName(this.platform)}，点按切换`)
-        .accessibilityLevel('yes')
-        RoundIconButton({ icon: I_SEARCH, boxSize: 40, iconSize: 21, label: '搜索', onTap: this.onOpenSearch })
-      }
-      .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 6 })
-
+      // 页头（大标题 + 来源胶囊 + 搜索钮）搬到了壳层的 HdsNavigation 标题栏里，
+      // 见 pages/Index.ets 的 homeHeader：沉浸光感只在标题栏 / 底部 TabBar 里生效，
+      // 留在内容区的话 systemMaterial 会被系统判定为 out of scope。这里只留出
+      // 标题栏那一段的高度（topInset 由壳层传来的是「状态栏 + 标题栏」）。
       // ---------------------------------------------------- 内容
       Refresh({ refreshing: $$this.refreshing }) {
         List({ space: 0 }) {
@@ -497,7 +468,7 @@ export struct RecommendView {
                   .fontColor(C_RED)
                   .padding({ left: 8, right: 8, top: 2, bottom: 2 })
                   .borderRadius(9)
-                  .backgroundColor('#14E33B3B')
+                  .backgroundColor(C_RED_TINT)
                 Blank()
               }
               .width('100%')
@@ -621,6 +592,15 @@ export struct RecommendView {
         .scrollBar(BarState.Off)
         .width('100%')
         .height('100%')
+        /**
+         * 起始偏移：列表第一行落在透明标题栏下方，但**内容可以滚进这段区域**
+         *
+         * 之前这里是给外层容器加 `padding({ top })`，那会让列表的可视区从标题栏下面
+         * 才开始，卡片滑到标题栏下边缘就被整块裁掉（看着像"被顶栏挡住"）。
+         * 换成 List 自己的 contentStartOffset 之后，偏移只是"内容起点"，滚动时列表项
+         * 能正常进入到标题栏底下、透过透明标题栏显示出来。
+         */
+        .contentStartOffset(this.topInset + 6)
         .onReachEnd(() => {
           void this.loadMore();
         })
@@ -633,6 +613,12 @@ export struct RecommendView {
       }
       .width('100%')
       .height('100%')
+
+      /**
+       * 顶栏渐隐：内容从透明的标题栏底下穿过时，靠近顶部的位置淡出到看不见，
+       * 标题那两个字才不会被列表文字顶穿。压在内容之上、标题栏之下。
+       */
+      TopFade({ fadeHeight: this.topInset + 10 })
     }
     .width('100%')
     .height('100%')

@@ -1,6 +1,12 @@
 import { LxMusicInfo, fetchMusicPic } from './MusicSearch';
 import { MediaCache } from './MediaCache';
 import { SourceEngine } from '../source/SourceEngine';
+import { http } from '@kit.NetworkKit';
+import { image } from '@kit.ImageKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+const DOMAIN: number = 0x0001;
+const TAG: string = 'CoverStore';
 
 /**
  * 封面缓存 / 懒解析
@@ -37,6 +43,20 @@ interface CoverTask {
 }
 
 /**
+ * 封面位图缓存上限（按封面地址先进先出）
+ *
+ * 不是「给所有列表行都存一张」：列表行按地址加载就够，这份缓存只服务那些**会被反复重建**
+ * 的封面（底栏那颗迷你栏封面每切一次页签就重建一次）。十来张足够，位图占的是内存。
+ */
+const PIXEL_CACHE_MAX: number = 12;
+/** 解码边长（px）：迷你栏封面 44–56vp，三倍屏也就 168px，给 240 足够且省内存 */
+const PIXEL_SIDE: number = 240;
+/** 单张封面的下载上限：封面本来就是小图，遇到异常大的文件不如下去按地址加载 */
+const PIXEL_BYTES_MAX: number = 2 * 1024 * 1024;
+/** 封面请求用的 UA：部分图床对空 UA 会直接拒绝（与下载链路同一份口径） */
+const UA: string = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99 Mobile Safari/537.36';
+
+/**
  * 是不是「内置平台」来源（kw / kg / tx / mg / wy）
  *
  * 只有这些平台才有「搜索结果不带封面、要按接口现查」这回事，也才可能被源脚本的
@@ -45,6 +65,55 @@ interface CoverTask {
  */
 function isPlatformSource(source: string): boolean {
   return source === 'kw' || source === 'kg' || source === 'tx' || source === 'mg' || source === 'wy';
+}
+
+/** 是不是网络封面（http/https）：只有网络图要自己去下字节，本地图直接按路径解 */
+function isNetworkUrl(url: string): boolean {
+  return url.startsWith('http://') || url.startsWith('https://');
+}
+
+/** 沙箱路径：createImageSource 只吃路径，带 file:// 前缀的要去掉 */
+function localPathOf(url: string): string {
+  return url.startsWith('file://') ? url.substring('file://'.length) : url;
+}
+
+/**
+ * 下一张封面的原始字节（给位图解码用）；失败 / 太大都返回 null，不抛
+ *
+ * 与下载链路（`core/download/DownloadTags.ets` 的 `fetchBinary`）同一个写法：带 UA、
+ * 带超时、结束就 destroy。封面是网络图（平台接口给的是地址，不是本地文件），
+ * 所以不能走 `image.createImageSource(uri)` —— 那个只吃沙箱路径。
+ */
+function fetchCoverBytes(url: string): Promise<ArrayBuffer | null> {
+  return new Promise<ArrayBuffer | null>((resolve: (value: ArrayBuffer | null) => void) => {
+    const request: http.HttpRequest = http.createHttp();
+    const done = (bytes: ArrayBuffer | null): void => {
+      try {
+        request.destroy();
+      } catch (e) {
+        // 已经结束的请求 destroy 报错无所谓
+      }
+      resolve(bytes);
+    };
+    request.request(url, {
+      method: http.RequestMethod.GET,
+      header: { 'User-Agent': UA },
+      expectDataType: http.HttpDataType.ARRAY_BUFFER,
+      connectTimeout: 8000,
+      readTimeout: 15000,
+    }).then((response: http.HttpResponse) => {
+      const body: string | Object | ArrayBuffer = response.result;
+      if (response.responseCode !== http.ResponseCode.OK || !(body instanceof ArrayBuffer)) {
+        done(null);
+        return;
+      }
+      const bytes: ArrayBuffer = body as ArrayBuffer;
+      done(bytes.byteLength > 0 && bytes.byteLength <= PIXEL_BYTES_MAX ? bytes : null);
+    }).catch((e: Object) => {
+      hilog.info(DOMAIN, TAG, 'cover bytes fetch failed: %{public}s', JSON.stringify(e));
+      done(null);
+    });
+  });
 }
 
 export class CoverStore {
@@ -59,6 +128,12 @@ export class CoverStore {
 
   private cache: Map<string, string> = new Map();
   private failed: Set<string> = new Set();
+  /** 已解好的封面位图（按封面地址）；这份只给「会被反复重建」的封面用，见 pixelFor */
+  private pixels: Map<string, image.PixelMap> = new Map();
+  /** 正在解的地址（同一张不并发解两次） */
+  private pixelBusy: Set<string> = new Set();
+  /** 解不出来的地址（网络失败 / 格式不认 / 太大）：不再重试，免得每次重建都去下一遍 */
+  private pixelFailed: Set<string> = new Set();
   /** musicInfoJson -> 解析结果，避免列表重画时反复 parse */
   private infoCache: Map<string, LxMusicInfo> = new Map();
   /** 已入队 / 正在解析的 key，避免重复排队 */
@@ -103,7 +178,7 @@ export class CoverStore {
 
   /**
    * 列表行用：已经有封面就直接返回，没有就返回空串（占位封面）并把这首排进解析队列。
-   * @param musicInfoJson 该条目的 musicInfo（演示条目为空串）
+   * @param musicInfoJson 该条目的 musicInfo（没有 musicInfo 的条目为空串）
    * @param fallback      搜索结果里自带的封面（非空就直接用，不再请求）
    */
   coverFor(musicInfoJson: string, fallback: string): string {
@@ -169,6 +244,104 @@ export class CoverStore {
       list.push(onReady);
     }
     this.enqueue(info, musicInfoJson);
+  }
+
+  /**
+   * 内存里已解好的封面位图；没有就返回 undefined 并在后台解一张
+   *
+   * 为什么要自己存一份解好的位图：`Image(地址)` 是**异步**加载的，节点一被重建
+   * （切换底部页签时 HDS 会把迷你栏整个重建一遍、列表回收重排也是一样）就会先露一段
+   * 「还没有图」的空窗，那块垫底（`CoverArt` 里是 `#1C1C1E`）就被看见 —— 用户看到的就是
+   * 「封面先黑一下，然后再亮起来」。`Image(位图)` 是**同步**绘制：位图在内存里，
+   * 重建多少次都直接画出来，没有那段空窗。
+   *
+   * 这个接口是尽力而为的：第一次仍然按地址加载（调用方拿到 undefined 就照旧画地址），
+   * 解好之后的重建才命中这份位图；网络失败 / 解不开 / 文件太大都只是回到原来的行为。
+   * 官方文档对 `Image` 的 `syncLoad` 也写了「加载时闪烁就设 true，同步加载时不显示占位图」
+   * —— 但那是拿主线程做加载（我们的封面是网络图，主线程上等一次网络请求更糟），
+   * 所以这里选「先同步解好、之后同步画」。
+   */
+  pixelFor(url: string): image.PixelMap | undefined {
+    if (url.length === 0 || this.pixelFailed.has(url)) {
+      return undefined;
+    }
+    const hit: image.PixelMap | undefined = this.pixels.get(url);
+    if (hit !== undefined) {
+      return hit;
+    }
+    void this.decodePixel(url);
+    return undefined;
+  }
+
+  /**
+   * 提前解一张封面（切歌时调一次）
+   *
+   * 迷你栏在**每次切换页签**时都会被重建，所以当前这首的封面最好在用户切页签之前就解好：
+   * 那样第一次重建就已经能命中位图，连一次「按地址加载」都不用等。
+   */
+  preloadPixel(url: string): void {
+    if (url.length > 0) {
+      void this.decodePixel(url);
+    }
+  }
+
+  /** 解一张封面：下载原始字节（本地文件除外）→ 解成指定尺寸的位图 → 记进缓存。失败不再重试 */
+  private async decodePixel(url: string): Promise<void> {
+    if (url.length === 0 || this.pixelBusy.has(url) || this.pixels.has(url) || this.pixelFailed.has(url)) {
+      return;
+    }
+    this.pixelBusy.add(url);
+    let source: image.ImageSource | null = null;
+    try {
+      if (isNetworkUrl(url)) {
+        const bytes: ArrayBuffer | null = await fetchCoverBytes(url);
+        if (bytes === null) {
+          this.pixelFailed.add(url);
+          return;
+        }
+        source = image.createImageSource(bytes);
+      } else {
+        // 本地文件的封面（本地音乐那张图）：直接按沙箱路径解，不用下载。
+        // createImageSource 只吃沙箱路径，所以把 file:// 前缀摘掉
+        source = image.createImageSource(localPathOf(url));
+      }
+      const options: image.DecodingOptions = {
+        desiredSize: { width: PIXEL_SIDE, height: PIXEL_SIDE },
+      };
+      const pixel: image.PixelMap = await source.createPixelMap(options);
+      this.rememberPixel(url, pixel);
+    } catch (e) {
+      this.pixelFailed.add(url);
+      hilog.info(DOMAIN, TAG, 'cover bitmap decode skipped: %{public}s', JSON.stringify(e));
+    } finally {
+      this.pixelBusy.delete(url);
+      if (source !== null) {
+        try {
+          await source.release();
+        } catch (e) {
+          // 释放失败无所谓：ImageSource 只是解码用的临时对象，位图已经拿到了
+        }
+      }
+    }
+  }
+
+  /** 记进位图缓存；超上限就挤掉最早的一张（并把它的内存放掉） */
+  private rememberPixel(url: string, pixel: image.PixelMap): void {
+    if (this.pixels.has(url)) {
+      void pixel.release();
+      return;
+    }
+    while (this.pixels.size >= PIXEL_CACHE_MAX) {
+      for (const oldest of this.pixels.keys()) {
+        const dropped: image.PixelMap | undefined = this.pixels.get(oldest);
+        this.pixels.delete(oldest);
+        if (dropped !== undefined) {
+          void dropped.release();
+        }
+        break;
+      }
+    }
+    this.pixels.set(url, pixel);
   }
 
   private enqueue(info: LxMusicInfo, musicInfoJson: string): void {

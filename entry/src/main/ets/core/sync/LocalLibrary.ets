@@ -74,7 +74,7 @@ export class LocalLibrary implements LibrarySink {
   private webdav: WebDavLibrary = WebDavLibrary.getInstance();
   private data: LxListData = defaultListData();
   private dislike: string = '';
-  /** 本地是否已经有一份库（没有则说明是首次安装，界面上的演示数据先留着） */
+  /** 本地是否已经有一份库（没有则说明是首次安装，界面就是空的） */
   private initialized: boolean = false;
   /** 正在应用远端数据 / 镜像到界面时抑制上行，避免自己发的动作绕回来 */
   private applying: boolean = false;
@@ -263,7 +263,7 @@ export class LocalLibrary implements LibrarySink {
     }
     this.applying = true;
     try {
-      session.adoptLibraryState(queue, favorites, this.playlistSummaries());
+      session.adoptLibraryState(queue, favorites);
     } finally {
       this.applying = false;
     }
@@ -281,7 +281,8 @@ export class LocalLibrary implements LibrarySink {
     const nextDefault: LxMusicInfoNew[] = musicsOf(session.queue);
     const nextLove: LxMusicInfoNew[] = musicsOf(session.favorites);
 
-    // 会话里有歌、却一首也转不成同步结构，说明这些条目缺 musicInfo（例如演示数据）。
+    // 会话里有歌、却一首也转不成同步结构，说明这些条目不是平台歌曲（本地歌 / 云端歌
+    // 走各自的侧表，见 core/local/SideTable），或者缺 musicInfo。
     // 这种时候绝不能拿「空结果」去覆盖已有列表：本机和云端的收藏 / 试听列表会被一起清掉。
     // 按列表各判各的：一份不可用不影响另一份照常同步。
     const defaultUsable: boolean = session.queue.length === 0 || nextDefault.length > 0;
@@ -1140,7 +1141,7 @@ export class LocalLibrary implements LibrarySink {
 
 // ------------------------------------------------------------------ 工具
 
-/** 把 SongItem 列表转成同步用歌曲（丢掉不能同步的演示条目） */
+/** 把 SongItem 列表转成同步用歌曲（丢掉不能同步的条目：本地歌 / 云端歌等非平台歌曲） */
 function musicsOf(items: SongItem[]): LxMusicInfoNew[] {
   const out: LxMusicInfoNew[] = [];
   const seen: Set<string> = new Set<string>();

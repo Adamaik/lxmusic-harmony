@@ -1,5 +1,5 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
-import { common } from '@kit.AbilityKit';
+import { common, ConfigurationConstant } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { clampMaterialLevel } from '../../ui/Hds';
 
@@ -14,12 +14,15 @@ const SETTINGS_VERSION: number = 1;
  *
  * 对应界面上这几项：
  *   玻璃材质档位（跟随系统 / 弱 / 均衡 / 强）
+ *   深浅模式（跟随系统 / 浅色 / 深色）
  *   首页流光（HDS 背景流光）
  *   播放页封面圆角
  *
- * 深浅模式**没有**放进来：那要先把全部颜色迁到资源（resources/base 与 resources/dark
- * 下的同名 token），而现在自绘界面用的是 Theme.ets 里的常量，只切系统模式会出现
- * 「浅色界面 + 深色系统栏」的四不像。宁可先不给这个开关，也不给一个点着没用的。
+ * 深浅模式是**真的能切**的：界面颜色已经全部迁到资源 token
+ * （`resources/base` 与 `resources/dark` 下的同名色，见 ui/Theme.ets），
+ * 切模式 = 改应用级 colorMode，系统按 dark 那份资源重画一遍即可。
+ * （早先不给这个开关，是因为颜色还写死在 Theme.ets 的常量里，切了只会得到
+ * 「浅色界面 + 深色系统栏」的四不像。）
  *
  * 存法：一份 JSON 落在应用沙箱（filesDir/appearance_settings.json），同时把每个值写进
  * AppStorage —— 界面用 @StorageLink 订阅即可实时响应，改完立即落盘。
@@ -35,6 +38,18 @@ const SETTINGS_VERSION: number = 1;
 export const K_MATERIAL_LEVEL: string = 'cfg_material_level';
 export const K_FLOW_LIGHT: string = 'cfg_flow_light';
 export const K_COVER_RADIUS: string = 'cfg_cover_radius';
+export const K_COLOR_MODE: string = 'cfg_color_mode';
+
+/** 深浅模式档位：0 跟随系统 / 1 浅色 / 2 深色 */
+export const COLOR_MODE_LABELS: string[] = ['跟随系统', '浅色', '深色'];
+export const COLOR_MODE_MAX: number = COLOR_MODE_LABELS.length - 1;
+
+function clampColorMode(value: number): number {
+  if (Number.isNaN(value) || value < 0 || value > COLOR_MODE_MAX) {
+    return 0;
+  }
+  return Math.round(value);
+}
 
 /** 播放页封面圆角范围（vp）与默认值 */
 export const COVER_RADIUS_MIN: number = 0;
@@ -60,6 +75,7 @@ interface AppearanceSettingsData {
   materialLevel?: number;
   flowLight?: boolean;
   coverRadius?: number;
+  colorMode?: number;
 }
 
 export class AppearanceSettings {
@@ -86,6 +102,8 @@ export class AppearanceSettings {
   private flowLight: boolean = true;
   /** 播放页封面圆角：默认 12，与改动前一致；0 是直角，40 接近圆形 */
   private coverRadius: number = COVER_RADIUS_DEFAULT;
+  /** 深浅模式默认「跟随系统」 */
+  private colorMode: number = 0;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -129,6 +147,7 @@ export class AppearanceSettings {
       materialLevel: this.materialLevel,
       flowLight: this.flowLight,
       coverRadius: this.coverRadius,
+      colorMode: this.colorMode,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -157,6 +176,10 @@ export class AppearanceSettings {
     if (radius !== undefined) {
       this.coverRadius = clampCoverRadius(radius);
     }
+    const mode: number | undefined = data.colorMode;
+    if (mode !== undefined) {
+      this.colorMode = clampColorMode(mode);
+    }
   }
 
   /** 把内存里的值同步到 AppStorage，界面据此实时刷新 */
@@ -165,6 +188,7 @@ export class AppearanceSettings {
       AppStorage.setOrCreate(K_MATERIAL_LEVEL, this.materialLevel);
       AppStorage.setOrCreate(K_FLOW_LIGHT, this.flowLight);
       AppStorage.setOrCreate(K_COVER_RADIUS, this.coverRadius);
+      AppStorage.setOrCreate(K_COLOR_MODE, this.colorMode);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -184,6 +208,35 @@ export class AppearanceSettings {
 
   getCoverRadius(): number {
     return this.coverRadius;
+  }
+
+  getColorMode(): number {
+    return this.colorMode;
+  }
+
+  /**
+   * 把「深浅模式」这一档落到系统上（应用级 colorMode）
+   *
+   * 启动时调一次（EntryAbility.onCreate，界面还没起来就得定下来，不然第一帧是错的），
+   * 用户在外观页改档位时再调一次。系统会按新的模式重新解析 dark 那份颜色资源，
+   * 界面跟着重画。
+   */
+  applyColorMode(context: common.Context): void {
+    try {
+      context.getApplicationContext().setColorMode(this.colorModeConstant());
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to apply color mode: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private colorModeConstant(): ConfigurationConstant.ColorMode {
+    if (this.colorMode === 1) {
+      return ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT;
+    }
+    if (this.colorMode === 2) {
+      return ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    }
+    return ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
   }
 
   // ---------------------------------------------------------------- 写入
@@ -221,5 +274,17 @@ export class AppearanceSettings {
     if (persist) {
       this.write();
     }
+  }
+
+  /** 改深浅模式：先落状态与 AppStorage，再由调用方（外观页）把 context 传进来落到系统上 */
+  setColorMode(value: number, context: common.Context): void {
+    const next: number = clampColorMode(value);
+    if (next === this.colorMode) {
+      return;
+    }
+    this.colorMode = next;
+    AppStorage.setOrCreate(K_COLOR_MODE, next);
+    this.write();
+    this.applyColorMode(context);
   }
 }

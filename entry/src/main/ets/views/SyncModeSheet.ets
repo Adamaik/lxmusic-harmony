@@ -1,4 +1,4 @@
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { C_CHEVRON, C_DIVIDER, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { IconGlyph, I_CHEVRON_RIGHT } from '../ui/Icons';
 import { DISLIKE_MODE_OPTIONS, LIST_MODE_OPTIONS, SyncModeOption, SYNC_MODE_CANCEL } from '../core/sync/SyncTypes';
 
@@ -53,13 +53,13 @@ export struct SyncModeContent {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
 
-        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 17, color: '#C2C2C6' })
+        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 17, color: C_CHEVRON })
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: 11, bottom: 11 })
       .stateStyles({
         normal: { .backgroundColor(Color.Transparent) },
-        pressed: { .backgroundColor('#14404044') },
+        pressed: { .backgroundColor(C_PRESSED) },
       })
       .onClick(() => {
         this.onPick(option.value);

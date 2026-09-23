@@ -8,7 +8,7 @@ import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { I_CHEVRON_DOWN, I_CLOSE, I_SEARCH, IconGlyph } from '../ui/Icons';
 import { EmptyState, SectionTitle } from '../ui/Widgets';
-import { SongListPane } from './PlaylistView';
+import { SongListPane } from './SongListPane';
 
 /** 平台筛选项里「不筛」的那一项 */
 const FILTER_ALL: string = '';
@@ -30,6 +30,8 @@ const PER_PLATFORM_LIMIT: number = 30;
 @Component
 export struct SearchView {
   @Prop bottomInset: number = 0;
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」），见根容器上的说明 */
+  @Prop topInset: number = 0;
   @State keyword: string = '';
   /**
    * 曲目自带的音质字段来自设置里的那一份（设置 - 播放设置 - 播放音质）：
@@ -337,6 +339,15 @@ export struct SearchView {
     }
     .width('100%')
     .height('100%')
+    /**
+     * 让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）
+     *
+     * 这一页**没有**跟着首页做成「内容从透明标题栏底下滑过去」：它的搜索栏是钉在顶部的
+     * 固定控件，不是滚动内容的一部分 —— 搜索栏和下面的结果列表都不该钻到标题底下去
+     * （搜索框滑走、或者结果行压在「搜索」两个字下面都不是想要的）。所以这里用普通
+     * 内边距让位，标题栏背后露出来的就是页面底色本身，与这一页其余部分同色。
+     */
+    .padding({ top: this.topInset })
     .backgroundColor(C_BG)
   }
 

@@ -1,7 +1,7 @@
-import { C_BG, C_CARD, C_DIVIDER, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
   I_VOLUME, IconGlyph } from '../ui/Icons';
-import { PageTitle } from '../ui/Widgets';
+import { TopFade } from '../ui/Widgets';
 
 /** 设置项 */
 interface SettingRowDef {
@@ -64,10 +64,13 @@ struct SettingRow {
     Column() {
       Row({ space: 13 }) {
         Stack({ alignContent: Alignment.Center }) {
-          Circle()
+          // 圆底色用 Column + 圆角画，不用 Circle().fill()：fill 收资源色时不可靠
+          // （取不到就退回形状默认的黑色，之前那版设置页的图标圈就是一团黑）
+          Column()
             .width(34)
             .height(34)
-            .fill('#0F000000')
+            .borderRadius(17)
+            .backgroundColor(C_ICON_CIRCLE)
           IconGlyph({ symbol: this.icon, iconSize: 20, color: C_TEXT })
         }
         .width(34)
@@ -79,14 +82,14 @@ struct SettingRow {
           .layoutWeight(1)
           .textAlign(TextAlign.Start)
 
-        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: '#C2C2C6' })
+        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_CHEVRON })
       }
       .width('100%')
       .height(63)
       .padding({ left: 14, right: 14 })
       .stateStyles({
         normal: { .backgroundColor(Color.Transparent) },
-        pressed: { .backgroundColor('#14404044') },
+        pressed: { .backgroundColor(C_PRESSED) },
       })
       .onClick(() => {
         this.onTap();
@@ -158,15 +161,15 @@ export struct SettingsView {
   }
 
   build() {
-    Column() {
-      Row() {
-        PageTitle({ text: '设置' })
-      }
-      .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInset + 6, bottom: 12 })
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
+        Scroll() {
+          Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走，
+          // 所以往下滚时下面的设置项能进到标题栏底下并透出来
+          // （用容器内边距就会把内容整块裁在标题栏下边缘，看着像"被顶栏挡住"）
+          Column().height(this.topInset + 6).width('100%')
 
-      Scroll() {
-        Column({ space: 14 }) {
           // ------------------------------------------------ 搜索设置（系统 Search 组件）
           Search({ value: this.keyword, placeholder: '搜索设置' })
             .placeholderColor(C_TEXT_WEAK)
@@ -181,7 +184,11 @@ export struct SettingsView {
           // ------------------------------------------------ 登录音乐
           Row({ space: 14 }) {
             Stack({ alignContent: Alignment.Center }) {
-              Circle().width(52).height(52).fill('#C9C9CE')
+              Column()
+                .width(52)
+                .height(52)
+                .borderRadius(26)
+                .backgroundColor(C_FILL_SOFT_STRONG)
               IconGlyph({
               symbol: I_PERSON,
               iconSize: 34,
@@ -212,7 +219,7 @@ export struct SettingsView {
             IconGlyph({
               symbol: I_CHEVRON_RIGHT,
               iconSize: 18,
-              color: '#C2C2C6',
+              color: C_CHEVRON,
             })
           }
           .width('100%')
@@ -249,6 +256,15 @@ export struct SettingsView {
       .scrollBar(BarState.Off)
       .layoutWeight(1)
       .align(Alignment.Top)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(C_BG)
+
+    // 顶栏渐隐：设置项从透明标题栏底下穿过时靠近顶部淡出，别顶穿「设置」两个字。
+    // 高度只给到标题栏下缘再略多一点（壳层传来的 topInset 本身就是「状态栏 + 标题栏」），
+    // 渐隐在标题栏下缘就收干净，不会顺带压暗下面正常的内容。
+    TopFade({ fadeHeight: this.topInset + 10 })
     }
     .width('100%')
     .height('100%')

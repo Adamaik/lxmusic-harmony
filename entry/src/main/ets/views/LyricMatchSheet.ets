@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LxMusicInfo } from '../core/music/MusicSearch';
 import { LyricCandidate, MATCH_PLATFORMS, platformLabel, scoreCandidate, searchCandidates } from
   '../core/local/LyricMatch';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LyricMatchSheet';
@@ -123,7 +123,7 @@ export struct LyricMatchSheet {
           .placeholderFont({ size: 14 })
           .fontSize(14)
           .height(44)
-          .backgroundColor('#F2F2F4')
+          .backgroundColor(C_FILL_SOFT)
           .layoutWeight(1)
           .onChange((value: string) => {
             this.keyword = value;
@@ -187,7 +187,7 @@ export struct LyricMatchSheet {
                   .fontColor(C_TEXT_SUB)
                   .padding({ left: 6, right: 6, top: 1, bottom: 1 })
                   .borderRadius(7)
-                  .backgroundColor('#F2F2F4')
+                  .backgroundColor(C_FILL_SOFT)
               }
               .width('100%')
             }

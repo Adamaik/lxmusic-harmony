@@ -1,18 +1,21 @@
 # 洛雪移动端 UI 复刻（HarmonyOS）
 
-目标：界面与洛雪音乐移动端一致，功能可以先不接。播放链路复用了原有的
-「内置搜索 → 自定义音源解析播放链接 → AVPlayer」，其余数据是内存里的演示数据。
+目标：界面与洛雪音乐移动端一致。播放链路复用了原有的
+「内置搜索 → 自定义音源解析播放链接 → AVPlayer」；界面上的数据一律来自真实来源
+（内置平台接口 / 本地音乐库 / 同步 / 本地与云端导入），**没有任何内置演示数据**。
 
 ## 页面结构
 
 ```
-pages/Index.ets                 壳层：四个页签 + 底部玻璃层 + 全屏播放器 + 播放列表半模态 + 音源沙箱
-views/RecommendView.ets         推荐：顶栏来源下拉框 + 排行榜横滑卡片 + 推荐歌单（栏内排序下拉框）
-views/PlaylistView.ets          歌单：列表 + SongListPane（与「我的」共用）
+pages/Index.ets                 壳层：两个页签（推荐 / 我的）+ 底部玻璃层 + 全屏播放器 + 播放列表半模态 + 音源沙箱
+views/RecommendView.ets         推荐：排行榜横滑卡片 + 推荐歌单列表（栏内排序下拉框）
+views/MineView.ets              我的（照华为音乐的「我的」重排）：快捷入口卡 + 自建歌单卡 + 设置卡
+views/HistoryView.ets           最近播放（我的 - 快捷入口）：播放历史列表 + 多选（只删记录）
+views/PanePage.ets              子页面外壳：单页签 Tabs + 页内悬浮迷你播放条（本地 / 历史 / 下载 / 云端四页共用）
+views/SongListPane.ets          歌曲列表（那四页、歌单详情、在线榜单、搜索结果共用）
 views/ImportPlaylistSheet.ets   导入歌单：粘贴分享链接 → 解析预览 → 落成本地歌单
-views/MineView.ets              我的：播放历史/收藏/平台音乐/下载管理 分段胶囊
-views/SettingsView.ets          设置：搜索框、登录卡、音源/播放/下载/外观/关于 分组
-views/AboutView.ets             关于（设置 - 关于）：应用信息 + 作者/开源协议/仓库地址 + 反馈渠道
+views/SettingsView.ets          设置（我的 - 设置卡）：搜索框、登录卡、音源/播放/下载/外观/关于 分组
+views/AboutView.ets             关于（设置 / 我的 - 帮助和反馈）：应用信息 + 作者/开源协议/仓库地址 + 反馈渠道
 views/SourceSettingsView.ets    音源设置（真功能：导入在线音源、加载、删除、日志、离线自检）
 views/SearchView.ets            搜索页（真功能：一次聚合搜五平台 + 结果按平台筛选下拉框）
 views/PlayerView.ets            全屏播放器：封面页/歌词页横滑双页（歌词随进度自动滚动）
@@ -20,12 +23,16 @@ views/CommentSheet.ets          歌曲评论：热门/最新页签 + 分页列�
 views/PlayQueueSheet.ets        播放列表内容（外面的半模态是系统 bindSheet）
 views/MiniBar.ets               HdsTabs 迷你栏内容：折叠=唱片圆钮，展开=迷你播放器
 ui/Theme.ets / ui/Icons.ets / ui/Glass.ets / ui/Widgets.ets   设计基建
-core/player/PlaySession.ets     播放会话/队列/历史（演示数据也在这里）
+ui/Layout.ets                   宽屏适配：断点、底部两条栏的宽度、内容列最大宽度（折叠屏 / 平板）
+ui/Selection.ets                多选：全局会话（顶栏 / 底栏都听它）+ 底栏操作条 + 勾选 / 批量操作助手
+ui/Hds.ets                      HDS 接入：材质档位、光效、栏高常量
+core/player/PlaySession.ets     播放会话/队列/历史
 core/music/CoverStore.ets       封面懒解析 + 缓存（列表陆续出图）
 core/music/Lyric.ets            LRC 解析与当前行定位
 core/music/PlatformLyric.ets    内置平台歌词（kw/kg/tx/mg）
 core/music/Inflate.ets          纯 ArkTS zlib/deflate 解压（酷我歌词用）
 core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短链跟随 + lxmusic 深链，见 docs/LIST_IMPORT.md）
+core/sync/CollectedPlaylists.ets 收藏歌单（收藏**线上**歌单，纯本地落盘、不参与同步；见下面那一节）
 ```
 
 ## 图标：官方符号图标库
@@ -37,12 +44,18 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
   （本机 4042 个），不是猜的；写错名字会静默渲染成空白。
   可用 `node -e "console.log(Object.keys(require('<sdk>/ets/build-tools/ets-loader/sysResource.js').sys.symbol))"`
   导出全量清单。
-- 底部导航用官方成对变体：未选中 `house` / 选中 `house_fill`（歌单
-  `music_note_list(_fill)`、我的 `person(_fill)`、设置 `gearshape(_fill)`）。
+- 底部导航用官方成对变体：未选中 `house` / 选中 `house_fill`（我的 `person(_fill)`）。
+  歌单与设置不再是页签（内容搬进了「我的」页），
+  「我的」页那排快捷入口用 `folder`（本地音乐）/ `clock`（最近播放）/ `heart_fill`（收藏）/
+  `download`（下载管理）/ `cloud`（云端音乐），设置卡用 `gearshape` 与
+  `questionmark_circle`（帮助和反馈）。
 - 其余：`magnifyingglass` 搜索、`record_circle` 音源、`music_note_list` 播放列表、
   `play_fill`/`pause_fill`/`backward_end_fill`/`forward_end_fill` 播放控制、
   `repeat`、`heart(_fill)`、`star_trophy` 榜单、`doc_plaintext` 分类、
   `paintbrush` 外观、`info_circle` 关于、`message` 评论、`speaker_wave_3` 播放中指示……
+- 多选那一套（顶栏那颗「全选」+ 底栏每项的图标）：`checkmark_square_on_square`（全选，
+  与华为音乐多选时顶栏右上那颗钮同一个符号）、`xmark`（取消）、`add_songlist`、
+  `remove_songlist`、`list_badge_play`、`heart_slash`、`minus_circle`、`arrow_down_to_line`。
 - 官方图标支持 `symbolEffect` 动效，需要时可直接加在 `IconGlyph` 上。
 - 全应用不再有自绘路径图标：播放页那颗播放钮也从自绘「水滴」改成了圆形底 +
   官方 `play_fill` / `pause_fill`（原来那条 `PLAY_BLOB` 路径和 `scalePath()` 已删除）。
@@ -88,8 +101,8 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
 
 | 控件 | 现在的做法 |
 | --- | --- |
-| 我的页分段筛选 | 系统 `CapsuleSegmentButtonV2`（`ui/CapsuleSegment.ets`，V2 组件）——与派音同一个组件 |
-| 顶栏圆钮（搜索 / 导入 / 新建 / 清空…）| 派音那颗钮的配方：10% 白底 + 纯白 1vp 描边，**去掉阴影、去掉轮廓光效** |
+| 我的页快捷入口 / 歌单卡 | 照华为音乐的「我的」：图标 + 名字 + 条数的入口排（本地音乐 / 最近播放 / 收藏 / 下载管理 / 云端音乐）、一张自建歌单卡（`自建歌单 N` + 「新建歌单 / 歌单导入」浅灰动作区 + 歌单行）、一张设置卡（设置 / 帮助和反馈）。「收藏歌单」不在这张卡上 —— 收藏的是线上歌单，那一段跟着推荐页（见下面「收藏歌单」一节） |
+| 顶栏圆钮（搜索 / 导入 / 新建…）| 派音那颗钮的配方：10% 白底 + 纯白 1vp 描边，**去掉阴影、去掉轮廓光效** |
 | 两个下拉框 | **自己画胶囊 + 系统下拉菜单**（`bindMenu` + `Menu`/`MenuItem`），不是系统 `Select`：Select 自带一套内边距与高度（≥40vp），外面再套自绘框会出现「框一种尺寸、文字按另一种尺寸排」的错位。自绘后框高（36 / 30）、圆角（18 / 15）、内边距、箭头间距全可控 |
 | 标题栏 / 底部页签栏 / 半模态 | HDS 的系统材质（平台认可的表面，材质真能渲染） |
 
@@ -122,15 +135,15 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
    - `interactive` = 按压形变反馈；`lightEffect` = 光感交互反馈（动感光效的来源）。
 2. **轮廓点光**（可选，`withPointLight()`）：HDS 的 `pointLight` 着色器（`SOFT` 柔光 +
    `BORDER` 只照亮轮廓），给悬浮控件边沿加一圈光，让它们「立」起来。
-   圆钮、两个下拉框、我的页分段栏都开了。
+   圆钮、两个下拉框都开了。
 3. **自绘兜底**：毛玻璃模糊 + **上亮下暗的轻渐变**（纯色底太死）+ 1vp 系统玻璃描边 +
    轻阴影。只有在设备没有材质能力位、或材质构造失败时才是唯一的一层；
    支持时它仍然先画上去 —— 材质生效会接管底色 / 描边 / 阴影，
    万一某个机型上材质在内容区不渲染，控件也不会变成一片透明。
 
-走这一套的控件（改档位时一起变厚变薄）：顶栏圆钮（搜索 / 导入 / 新建 / 清空…）、
-**两个下拉框**（首页来源、「推荐歌单」栏的排序）、**我的页分段筛选**（做成左右留边、
-大圆角的浮动玻璃条，与底部导航栏同一个观感）、搜索框、页内悬浮迷你播放条、提示条。
+走这一套的控件（改档位时一起变厚变薄）：顶栏圆钮（搜索…）、
+**两个下拉框**（首页来源、「推荐歌单」栏的排序）、搜索框、提示条。
+（页内那条悬浮迷你栏**不在**这一套里：它是 Tabs 的悬浮栏、材质由框架画，见下面「页内迷你栏」。）
 
 ### 材质档位（标题栏 / 页签栏 / 半模态 + 全部自绘玻璃层）
 
@@ -158,13 +171,19 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
 
 ### 子页面标题栏
 
-`Index.titleBarOptions(title, scroller?)` 一个函数管全部 9 个子页面：
+`Index.subTitleBarStyle(scroller?)` 只管样式（常规态与多选态共用一份），
+`Index.titleBarOptions(title, scroller?)` 出常规那条、`Index.pageTitleBar(title, scroller?)` 按
+「当前有没有在多选」在两套内容之间切，一个函数管全部子页面：
 
-- `blurStrategy: ENABLE` + `systemMaterialEffect`：标题栏是磨砂玻璃，而不是一条死白；
+- `blurStrategy: DISABLE` + 底色透明 + `maskExtraHeight: 0`：标题栏**表面纯透明**，
+  与首页同一套（不再是一条死白、下面也没有那条 32vp 的蒙版带）。这一段原来写的是
+  `blurStrategy: ENABLE` / 渐变模糊，2026-09 已按上面那条改掉；
+- `systemMaterialEffect`：标题栏**按钮**的液态玻璃（返回键、多选时的「取消」与「全选」都走它）；
 - 标题与图标色取 `$r('sys.color.font_primary')`（跟随系统深浅模式）；
-- 传了 `scroller` 才开 `IMMERSIVE_GRADIENT_BLUR`：在线歌单 / 歌单详情两页的封面会滚到
-  标题栏底下，靠 `HdsNavDestination.bindToScrollable([scroller])` 拿滚动偏移，
-  返回键从浮在封面上渐变成浮在磨砂上；白底设置页不绑滚动，直接上材质更稳。
+- 传了 `scroller` 只为 `bindToScrollable([scroller])`（在线歌单 / 歌单详情两页的封面会滚到
+  标题栏底下）。注意上面那句 `enableScrollEffect: false` 已经是关闭状态，官方那套
+  「滚动到多少就起多少磨砂」目前**没有生效** —— 留着那份 `scrollEffectStyle` 是为了将来真要
+  打开时样式是通透的那一份。
 
 > **模拟器不支持 HDS 沉浸视效**（官方文档明确列出：点光源效果、按压阴影、
 > 双边边缘流光、背景流光、自带背景的双边流光、沉浸光感材质）。
@@ -181,14 +200,38 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
 
 | 项 | 作用范围 |
 | --- | --- |
+| 深浅模式 | 整个应用（跟随系统 / 浅色 / 深色），写 `setColorMode`，启动时读回 |
 | 玻璃材质档位 | 标题栏 / 底部页签栏 / 半模态 |
 | 首页流光 | 首页 HDS 背景流光（关掉就不挂这一层，省一份着色器） |
 | 播放页封面圆角 | 播放页大封面（0 直角 ~ 40 接近圆形，默认 12） |
 
-**深浅模式故意没放进来**：自绘界面的颜色还在 `ui/Theme.ets` 的常量里，只切系统的
-`setColorMode` 会出现「浅色界面 + 深色系统栏」的四不像。要开放这一项，得先把全部颜色
-迁到资源（`resources/base` 与 `resources/dark` 下的同名 token，含现在散在视图里的
-内联色值），再读设置里的档位去 `setColorMode`。
+## 深浅模式（每个颜色都是资源 token）
+
+规则只有一条：**界面代码里不写死颜色**，一律用 `ui/Theme.ets` 里的 token；
+token 的取值分两份、同名同义，放在
+
+- `resources/base/element/color.json`（亮色）
+- `resources/dark/element/color.json`（深色）
+
+系统切到深色模式时用 dark 那份覆盖，`$r('app.color.xxx')` 在渲染时按当前配置解析，
+不需要应用自己判断模式。`ui/Theme.ets` 里的每个常量就是一条 `$r('app.color.xxx')`，
+所以调用处写 `C_TEXT` / `C_BG` 的老写法一行都没改。
+
+几个必须跟着 token 走、否则深色下一定出问题的地方（都是踩过的）：
+
+| 位置 | 写死会怎样 |
+| --- | --- |
+| 底部页签栏的图标 / 文字（`pages/Index.ets`）| 栏底是**系统材质**，深色下变深；写死的深灰图标会整颗消失 |
+| 迷你栏内容（`views/MiniBar.ets`）| 同上，迷你播放器的播放/下一首图标、转圈都压在系统材质上 |
+| 页签栏底下的渐隐蒙层（`gradientMask.maskColor`）| 写死浅灰会在深色页面上横一条浅色带 |
+| 提示条玻璃底（`C_GLASS_SOLID`）| 写死白底黑字会在深色界面上一直亮着 |
+| 状态栏字色（`pages/Index.ets`、`entryability/EntryAbility.ets`）| 深色模式下黑字压在近黑底上，时间电量看不见 |
+| 系统组件的颜色（`ui/CapsuleSegment.ets`）| 系统组件只收 `ColorMetrics`，必须用 `ColorMetrics.resourceColor($r(...))` 传资源，不能算 rgba 数值 |
+
+与深浅模式无关的装饰色仍保留字面量：占位封面配色、榜单卡片渐变、平台品牌色的色相、
+播放页（那一页本来就在深色封面上）、评论面板（自绘的深色面板）、封面上的白字。
+品牌色与它的淡底是例外 —— 它们也是 token，深色下色值提亮一档、淡底加深一档：
+原来那套 12% 淡底是 `'#1F' + 色值` 算出来的，深色下算不出也没法当资源用。
 
 ## 动效与无障碍（照着派音那套补齐的）
 
@@ -211,6 +254,109 @@ core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短
   （之前全应用 0 处）：圆钮、歌曲行、迷你栏、播放页控制区；
   纯装饰的图标（封面上的音量指示、行尾箭头、未接功能的铃铛）标 `accessibilityLevel('no')`，
   读屏不会报出一个点不动的按钮。
+
+## 多选：长按进多选
+
+本地音乐 / 最近播放 / 下载管理 / 云端音乐原来是「我的」页里的四个分段，现在是四个**子页面**
+（「我的」页那排快捷入口点进去，页内自带迷你播放条，见 `views/PanePage.ets`）。多选的行为
+一点没变：**长按任意一行就进多选**（顺手把长按那一条勾上），点行变勾选 / 取消，
+行尾的心与「更多」换成勾选圈。
+
+**工具条长在系统自己该在的位置上**（2026-09 按华为音乐那一屏改的）：顶栏一条、底栏一条，
+页内不再有第三条。全应用统一，六个能进多选的页面（歌单详情 / 在线歌单 / 最近播放 /
+本地音乐 / 下载管理 / 云端音乐）一套写法。
+
+- **顶栏**（`HdsNavDestination` 的标题栏，壳层画，见 `pages/Index.ets` 的 `pageTitleBar`）：
+  左边那颗钮从「返回」变成「取消」（叉）、标题变成「已选中 N 项」、右边多一颗「全选」钮
+  （已经全选时读屏文案是「取消全选」）。三样都走 HDS 自己的槽位
+  （`backIcon` / `title` / `menu`），**样式一个字都不改** —— 那颗叉与那颗全选的液态玻璃
+  就是原来那颗返回键那一套（`systemMaterialEffect`），所以**没有自绘玻璃圆钮**：内容区里
+  自绘的玻璃在沉浸光感的生效范围之外，材质根本不渲染（见「系统材质在内容区不生效」一节）。
+  叉用的是 `backIcon.action`，因此**没有**再挂 `onBackPressed` —— 官方写明这两条不要同时设
+  （多选时按系统返回手势是退整页，要退多选请点左上那颗叉）。
+- **底栏**（页面本来就有的那条悬浮胶囊，`Tabs.barFloatingStyle`）：多选时它**顶掉迷你播放条**，
+  内容换成 `ui/Selection.ets` 的 `SelectionActions` —— 一行「图标 + 文案」，最多 6 项均分整条，
+  红字那项是主操作。胶囊的圆角、边距、离底距离、材质一个字都没改，所以它看上去与迷你条
+  是同一条胶囊；`PanePage` 那四个面板的底栏也在 `PanePage` 里一起切（它订阅同一个会话）。
+
+上下两条要读同一份状态（勾选状态在各页面自己身上，而两条栏一条在壳层、一条在宿主的 Tabs 里），
+所以 `ui/Selection.ets` 里放了一个全局会话 `SelectSession`：当前在多选的那个页面把
+「勾了几项 / 操作项 / 三个回调」写进去，会话再发布 `K_SELECT_ACTIVE` / `K_SELECT_COUNT` /
+`K_SELECT_ALL` 三个订阅值，顶栏与底栏各自 `@StorageLink` 它仨就够了 —— 同一时刻只可能有一个
+页面在多选。各页面在 `enterSelecting` 与 `@Watch('syncSelectBar') selectedIds` 两处发布会话，
+`aboutToDisappear` 里收走（不然工具条会留在下一层页面上）。
+
+能做什么**以各列表自己的能力为准**（下表），只是长相与华为音乐那一屏一样。底栏那条只有 56vp 高，
+长文案在栏里换短写（`shortLabelOf`：'添加到播放列表' → '播放列表'、'从歌单中删除' → '移除'、
+'删除记录' → '删除'…），但**分发用的还是原文案**（各页面按会话里那一项的叫法分发，不按下标
+硬编码 —— 主操作排在最后，下标会随操作项数量变）。图标也按文案认（`iconOfLabel`，都是 SDK 里
+现成的符号：`add_songlist` / `remove_songlist` / `list_badge_play` / `heart_slash` /
+`minus_circle` / `arrow_down_to_line`）。
+
+| 列表 | 批量操作（底栏从左到右，**粗体**是红字主操作） | 说明 |
+| --- | --- | --- |
+| 播放历史 | 收藏 / 播放列表 / 歌单 / **删除** | 「删除」只删记录（`PlaySession.removeHistory`），文件与收藏都不动 |
+| 下载管理 | 重新下载 / **删除** | 删除连已下载的文件一起删；「重新下载」只重排失败的，下到一半的不动 |
+| 本地音乐 | 收藏 / 播放列表 / 歌单 / **移除** | 移除的是应用内副本，设备里的原文件不动 |
+| 云端音乐 | 收藏 / 播放列表 / 歌单 | 没有删除/移除：文件在服务器上，本地这份只是缓存 |
+| 歌单详情 / 收藏 | 收藏 / 歌单 / 播放列表 / 下一首 / 下载 / **从歌单中删除** | 这两页是同一个 `PlaylistDetailView`（「收藏」进的是内置收藏歌单的详情）。在**收藏**这一页里不给「收藏」（那些歌本来就在收藏里），主操作变成「取消收藏」；批量取消走 `PlaySession.removeFavorites`，只上行一次同步 |
+| 在线歌单 / 榜单的歌曲 | 歌单 / 播放列表 / 下一首 / 下载 / **收藏** | 在线列表最常见的就是把这几首收进收藏，所以主操作是「收藏」。没有「从歌单中删除」这类 —— 这些歌不在我们的库里，拿不掉 |
+
+两个实现上的取舍：
+
+- **长按不再弹那一行的菜单**（`SongListPane` 的 `selectable` 开关；歌单详情页同样把长按
+  让给了多选）—— 菜单没丢，还在行尾那颗「更多」上，点它照样出来（另外菜单末尾多了一项
+  「多选」，给想不起来长按的人留的）。长按腾出来做多选，两个手势就不会打架。
+  不开这个开关的列表（搜索结果、在线榜单）行为一点不变。
+- **这几页原来那个「清空」垃圾桶去掉了**：全选之后删能做到同一件事，还不用为每一页
+  各写一套「清空什么」的规则（云端音乐本来就没有清空这回事）。本地音乐与云端音乐
+  保留了右上角那枚「选择」文字钮 —— 想不起来长按的时候点它。
+
+### 歌单详情页的两条栏不再让位
+
+工具条搬进顶栏与底栏之后，歌单详情 / 在线歌单这两页的 `contentStartOffset` 回到**一直**是
+`topInset + 6`（原来是 `this.selecting ? 0 : topInset + 6`）：顶栏那条不占内容区，列表不必
+为它让位，勾选前后列表不会整体下移；底栏那条本来就已经在列表的让位里（末尾那个
+`bottomInset + HDS_BAR_HEIGHT + 26` 的占位），换了内容也不用改。
+
+## 收藏歌单（收藏**线上**歌单）
+
+与「收藏的歌」是两件事，界面上各有一个位置：
+
+| | 收藏的歌 | 收藏歌单 |
+| --- | --- | --- |
+| 是什么 | 洛雪的 loveList，一张内置歌单（「我的收藏」） | **线上**歌单（推荐页里别人的那张） |
+| 入口 | 任一行上的爱心；多选里的「收藏」 | 点开一张在线歌单，顶部那颗「收藏歌单」钮（`views/OnlineListView.ets`） |
+| 在哪看 | 「我的」页快捷入口「收藏」 | 「我的」页歌单卡里「自建歌单 \| 收藏歌单」**右边那一段** |
+| 参与同步 | 是（整份 love 列表覆盖上行） | **否**，纯本地 |
+
+**自建歌单与收藏歌单互斥**（指的是这两段之间，与「收藏的歌」无关）：一张歌单要么在
+自己的库里（自建 = 自己建的 + 导入的），要么在收藏里。两个方向都堵住了：
+
+- 收藏着的线上歌单被「歌单导入」（我的 → 歌单卡那块动作区）拉进库里时，
+  `ImportPlaylistSheet` 顺手调 `CollectedPlaylists.removeByKey(link.listId)` 摘掉收藏记录；
+- 已经导入过的那张（`playlistBySourceListId` 查得到）不再让收藏，点那颗钮会提示一句
+  「已经导入到我的歌单里了」。
+
+为什么不把收藏的线上歌单直接拉成本地歌单：那是「歌单导入」的活，会占同步库、也把
+几百首歌全落下来；收藏只是「记一下这张歌单，回头再看」，点开走在线详情页。
+
+实现：`core/sync/CollectedPlaylists.ets` —— 每条记 `{source, id, name, cover, meta}`
+（列表要显示的那几项一起快照，打开「我的」时不必为了显示这一行再请求接口；主键是
+`collectedKeyOf` = `${平台}__${歌单id}`，与洛雪那套 `sourceListId` 同一个口径）。
+一份 JSON 落应用沙箱（`collected_playlists.json`），改完发布一个 AppStorage 版本号
+（`K_COLLECTED_VERSION`）给界面订阅。**为什么不走同步**：洛雪的 `ListData` 只有
+defaultList / loveList / userList 三段，协议里没有歌单这一级的收藏。
+
+榜单（kind='board'）没有这颗钮：榜单不是歌单，bangid 与歌单 id 不是一回事。
+在线歌单页也**不再有「导入到我的歌单」**入口（2026-09 按用户要求删掉）——
+要入库就在「我的」页用「歌单导入」粘分享链接，那是同一条流程。
+
+## 下载全部一律先确认
+
+歌单级的下载（歌单详情页那颗下载钮、在线列表那颗下载钮）**不直接排队**，先弹一句
+「确定要把「X」里的 N 首歌全部加入下载吗？」——整张歌单动辄几百首，点一下就全排进
+下载队列太莽。多选里的「下载」不弹：那是用户一首首勾出来的，已经表达过意图了。
 
 ## HDS 增强组件
 
@@ -296,19 +442,16 @@ new BottomTabBarStyle(
 
 ```ts
 .barFloatingStyle({
-  // 页签栏和迷你栏分别贴左右两边，中间的空隙 = 剩余宽度，所以页签栏要给足宽度
-  barWidth: { smallWidth: 280, mediumWidth: 340, largeWidth: 440 },
-  barSideMargin: 12,
-  barBottomMargin: this.bottomInset + 10,
-  gradientMask: { maskColor: '#66F1F1F2', maskHeight: 104 },   // 内容从页签栏底下淡出
-  systemMaterialEffect: { materialType: hdsMaterial.MaterialType.IMMERSIVE,
-                          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE },
+  // 宽度只声明页签栏那一档（284 / 328 是 HDS 对四个页签的档位值，我们两个页签收窄了），
+  // 迷你栏多宽、怎么让位由 HDS 按形态自己算 —— **不要**再塞 miniBarWidth / barSideMargin /
+  // barLayoutMode，那会顶掉 HDS 的让位动画（踩过的坑，见 pages/Index.ets 里的说明）
+  barWidth: { smallWidth: this.floatingBarSmallWidthVp(), mediumWidth: 176, largeWidth: 200 },
+  barBottomMargin: this.homeTabBarBottomMarginVp(),          // 压手势条，至少 16
+  systemMaterialEffect: buildTitleMaterial(this.materialLevel),
   miniBar: {
     miniBarBuilder: () => this.miniBarBuilder(),   // 必须用箭头函数包一层，理由见下
-    miniBarWidth: { smallWidth: 286, mediumWidth: 300, largeWidth: 328 },  // 展开上限 328vp
-    miniBarStyle: HdsBarStyle.COLLAPSE,
-    onBarStyleChange: (mini, tab, miniW, tabW, mode) => {
-      AppStorage.setOrCreate(K_MINI_EXPANDED, mini === HdsBarStyle.EXPAND);
+    onBarStyleChange: (miniBarStyle: HdsBarStyle) => {
+      AppStorage.setOrCreate(K_MINI_EXPANDED, miniBarStyle === HdsBarStyle.EXPAND);
     },
   },
 })
@@ -322,9 +465,70 @@ new BottomTabBarStyle(
 2. **形态用 AppStorage 传，不靠 builder 重跑**：`onBarStyleChange` 把结果写进
    `K_MINI_EXPANDED`，迷你栏内容组件（`views/MiniBar.ets`）用 `@StorageLink` 订阅，
    这样即使 HDS 不重新调用 builder，内容也会跟着展开/折叠切换。
+3. **封面要画「已解好的位图」，不能只给地址**：HDS 在**每次切换页签**时都会重建迷你栏，
+   而 `Image(地址)` 是异步加载的 —— 重建出来的那一瞬间它还没有图，底下垫的东西就被看见，
+   表现就是「切页签时右边那颗封面先黑一下、再亮起来」。现在这颗封面由迷你栏自绘
+   （`MiniBar.coverView`，不再用 `CoverArt`）：最下面是一层淡圆底 + **应用图标**
+   （照派音那颗圆封面，加载期间露的是默认封面而不是黑块），真封面优先画
+   `CoverStore.pixelFor()` 解好的位图（`Image(位图)` 是同步绘制，重建多少次都不闪），
+   没解好才退回按地址加载。位图在切歌时就 `preloadPixel()` 解好，缓存十来张、超了就释放。
+   （官方文档对 `Image.syncLoad(true)` 的说法是「加载时闪烁就设 true，同步加载不显示占位图」，
+   但那是拿主线程做加载 —— 我们的封面是网络图，主线程上等一次网络请求更糟，所以不用它。）
 
-页签栏和迷你栏的宽度分档都按 HdsTabs 自身宽度算（<440vp 用 `smallWidth`，
-440~600 用 `mediumWidth`，更大用 `largeWidth`），手机竖屏落在 `smallWidth`。
+### 宽屏（折叠屏展开态 / 平板）：两条栏的宽度必须一起算
+
+分档宽度**不能写死**。官方文档里有三条互相牵制的规则：
+
+| 规则 | 出处 |
+| --- | --- |
+| 页签数 ≥ 4 时，单条栏宽度不超过 **328vp** | `HdsBarWidthRangeOptions` 各档默认值说明 |
+| `miniBarStyle` **只在 HdsTabs 宽度 < 600vp 时生效**；≥ 600vp 时迷你栏恒为展开态 | `HdsTabsMiniBar.miniBarStyle` |
+| 宽度 > 600vp 且两条同时展开时，页签栏与迷你栏**整体底部居中**并排显示 | 左右布局场景说明 |
+
+也就是说 **≥ 600vp 的窗口上页签栏与迷你栏会同时占宽**。原来那组写死值
+（页签栏 280/340/440 + 迷你栏 286/300/328）只在「手机 + 迷你栏折叠」下恰好放得下：
+600vp 档位的窗口里 340 + 300 = 640vp 已经超过可用宽度，两条栏直接叠在一起 ——
+设置那颗齿轮被迷你栏的唱片圆钮压住，就是用户反馈的那张截图。
+
+现在改成按**窗口实际宽度**算（`ui/Layout.ets`）：迷你栏先按可用宽度的 50% 取值
+（收敛到 [232, 328]），剩下的全给页签栏（上限 328、下限 224），保证
+
+```
+页签栏 + 迷你栏 + 8vp 缝 = 窗口宽 - 2 × 边距
+```
+
+任何窗口宽度下都不会重叠；窄屏（迷你栏折叠）按「圆钮 56vp + 页签栏」算，
+展开时按「展开的迷你栏 + 折叠的页签栏」算。窗口尺寸一变（旋转、折叠屏展开/折叠、
+平板分屏、自由窗口拖拽）由 `pages/Index.ets` 的 `windowSizeChange` 监听重算一次。
+
+三个分档槽位给同一个值是故意的：值本身已经按当前窗口算好了，系统挑中哪一档都用它，
+不会出现「按 A 档算、用 B 档渲染」。
+
+### 宽屏：内容列收窄 + 平板设备类型
+
+- `entry/src/main/module.json5` 的 `deviceTypes` 补上 `tablet`：不声明的话平板上
+  只能跑手机的兼容模式，整屏被拉伸放大，字发虚、控件比例也不对。
+- 内容列在宽屏（≥ 600vp）收成居中一列，最大 `CONTENT_MAX_WIDTH = 720vp`
+  （`ui/Widgets.ets` 的 `WidePane`，壳层按窗口宽度把上限传进去）：否则列表与设置项
+  会从屏幕左边缘一直拉到右边缘，一行的封面和文字隔着半个屏幕。手机（< 600vp）
+  的约束值是窗口宽度本身 = 不限宽，界面与改之前逐像素一致。
+- 歌单详情 / 在线详情 / 本地音乐 / 最近播放 / 下载管理 / 云端音乐这六页里那条**页内**
+  迷你栏（不在页签体系里）。后四页共用同一个外壳 `views/PanePage.ets`，
+  另两页各有自己的一份（`views/PlaylistDetailView.ets`、`views/OnlineListView.ets`）。
+  **它是 Tabs 自带的悬浮栏，不是自绘玻璃**（2026-09 改）：这一页是压在 HdsNavigation
+  路由栈上的 NavDestination，把壳层那条带迷你栏的 HdsTabs 整个盖住了，所以得自己挂一条；
+  而沉浸光感有生效范围 —— 普通组件画在内容区设 `systemMaterial` 只会得到
+  `Material inactive: out of scope`。做法是页面根容器放一个只有一个页签的 `Tabs`
+  （`barPosition: BarPosition.End` + `vertical(false)` + `barOverlap(true)`），
+  迷你栏当它的 `tabBar` 内容，胶囊的形状、圆角、材质由
+  `barFloatingStyle({ systemMaterial })` 交给框架画 —— 与壳层 HDS 那条同一套口径
+  （左右边距、离底距离、栏高都共用常量与函数），差别只有宽度：宽屏收成与 HdsTabs 那条
+  迷你栏同宽（壳层把算好的宽度写进 AppStorage 的 `K_BAR_MINI_WIDTH`，`ui/Layout.ets`），
+  窄屏**铺满**（窗口宽 － 左右边距），也就是「把壳层那条延长」。
+  栏里**只放内容不给底**（再叠自绘玻璃会把材质盖住）。
+  两个坑：`systemMaterial` 必须传 `uiMaterial.ImmersiveMaterial` 实例（HDS 的
+  `SystemMaterialParams` 是个普通对象，能编译过但运行时不构成材质）；
+  `barWidth` **必须显式给**，不给的话框架按自己的默认宽度画，内容会被挤在一条窄胶囊里。
 
 ### 播放列表：官方半模态
 
@@ -403,7 +607,7 @@ HdsListItemCard({
      （华为论坛同款问题，官方回帖确认的根因）。
      背景层负责延伸进状态栏（根 Stack 的 `expandSafeArea`），标题栏内容负责避让，两者分开管。
 
-**还没换的**：`SongListPane`（「我的」页与搜索结果里共用的歌曲列表）仍是自绘行——
+**还没换的**：`SongListPane`（那四个子页面与搜索结果里共用的歌曲列表）仍是自绘行——
 它的父容器是 Scroll，要换成官方 List 得连父级一起改；播放页进度条那行、封面页的
 信息行、状态提示条也仍是自绘。主页签的标题栏还是自绘大标题（`hideTitleBar(true)`）。
 
@@ -446,21 +650,31 @@ HdsListItemCard({
 - **音质选择从搜索页撤掉了**：它和「设置 - 播放设置 - 播放音质」写的是同一个值
   （两边各写一趟，还各自有个默认值），留在搜索页只是多一个入口；现在搜索页只负责
   搜索，音质统一听设置的。
+  换档的入口在**播放页**：进度条下面那颗音质胶囊是个钮，点开是「播放音质」面板，
+  里面只列这首歌真能切过去的档（见下面「音质按源声明协商」）。
 - 状态行与空态会说清楚「哪个平台没通」（`本次 酷我 30 · 酷狗 失败 · …`），
   失败的平台可以单独切过去看，而不是笼统地报一句「搜索失败」。
 
 ## 数据与功能边界
 
-- 演示数据（播放历史、歌单、精选推荐、播放队列、排行榜卡片）在
-  `PlaySession.seed()` 里，内容与截图一致。
+- **没有任何内置演示数据**：早期版本在 `PlaySession.seed()` 里铺过一套与参考截图一致的
+  演示歌单 / 演示队列 / 卡片，发布前已全部删除（那是复刻阶段的脚手架）。现在空库就是
+  空界面：歌单页只列「我的收藏」一项，队列为空时播放器显示「先点一首歌」。
 - 搜索是**真功能**：推荐页右上角放大镜 / 搜索结果可直接播放（走原有音源链路）。
-- **演示歌单里的歌也能真出声**：这些条目只有歌名/歌手、没有 musicInfo，所以
-  `PlaySession.ensurePlayable()` 会先按「歌名 + 歌手」在当前音源声明且内置搜索支持的
-  平台上搜一次，拿到真实 musicInfo 后再交给源规则解析播放链接，并把队列里这条替换成
-  真实条目（封面、时长跟着变真实）。解析结果按歌名缓存在 `resolveCache` 里，不会每次重搜。
+- **没有 musicInfo 的条目也能真出声**：条目可能来自当前音源脚本不支持的平台
+  （musicInfo 补不上），`PlaySession.ensurePlayable()` 会先按「歌名 + 歌手」在当前音源
+  声明且内置搜索支持的平台上搜一次，拿到真实 musicInfo 后再交给源规则解析播放链接，
+  并把队列里这条替换成真实条目（封面、时长跟着变真实）。解析结果按歌名缓存在
+  `resolveCache` 里，不会每次重搜。
 - **音质按源声明协商**：设置里选的音质不一定被音源支持，`negotiateQuality()` 会在
   「源声明的 qualitys」∩「这首歌提供的 `_types`」里从高到低挑一个；直接把用户选的音质
   丢给源，遇到不支持该音质的源就会解析失败（表现出来就是点了没反应）。
+  播放页那颗音质钮（`views/PlayerView.ets` 的 `qualityButton` / `qualityPanel`）列的也是这个交集
+  （`Quality.switchableQualitys`）：本地 / 云端文件没有档可切，面板里给一句说明而不是一排
+  点不动的档；选中某一档 = 写「播放音质」这个设置（同一个值，不另开一份）+
+  用新档把当前这首歌重新解析一次，进度与暂停态都保留（`PlaySession.switchQuality`）。
+  拓展档（母带 / 全景声…）只在设置里开了「拓展音质」时才列 —— 没开的时候选它就是解析失败，
+  与其点了没反应不如不列。
 - **进度 / 时长 / 播放态全部来自 AVPlayer**：`LxPlayer` 把 `timeUpdate` / `durationUpdate` /
   `stateChange` 通过订阅回调交给 `PlaySession` 回写 AppStorage，播完自动下一首挂在
   `completed` 上。以前是 `PlaySession` 每秒 +1 自己造进度，所以没声音时界面照样走进度条，
@@ -485,7 +699,7 @@ HdsListItemCard({
   跟随真实进度自动居中滚动，点某一行可跳到那一句；两个平台都取不到时显示「暂无歌词」。
   （wy 目前取不到：它的 eapi 端点连搜索接口都返回 404，需要单独重做。）
 - **没有加载音源时不再假装播放**：点播放会提示「请先在音源设置导入并加载一个音源」，
-  而不是进入「演示模式」空转。
+  而不是只推进度条、看着像在放却没声音。
 - **音源去重**：同一个「名字 + 版本 + 作者」重复导入只保留一条——脚本内容相同直接跳过，
   内容变了就覆盖更新且 id 不变；启动时还会清理历史遗留的重复项。
   （`SourceMeta` 的 `@version` 常自带 `v`，展示时不再补一个 v，避免出现 `vv1.2.1`。）

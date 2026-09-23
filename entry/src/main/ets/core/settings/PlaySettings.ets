@@ -12,8 +12,10 @@ const SETTINGS_VERSION: number = 1;
  * 播放设置（设置 - 播放设置）
  *
  * 对应界面上这几项：
- *   播放音质 / 拓展音质（含 Hi-Res、全景声、全景声+、母带）/ 与其他应用同时播放
- *   播放页显示小歌词 / 歌词页模糊效果 / 歌词居中显示 / 歌词字号 / 歌词页不熄屏
+ *   播放音质 / 拓展音质（含 Hi-Res、全景声、全景声+、母带）/ 与其他应用同时播放 /
+ *   被打断结束后自动重新播放
+ *   播放页显示小歌词 / 歌词页模糊效果 / 歌词居中显示 / 歌词字号 / 歌词页不熄屏 /
+ *   桌面歌词 / 车载蓝牙歌词 / 本地与云端自动匹配歌词
  *
  * 存法：一份 JSON 落在应用沙箱（filesDir/play_settings.json），同时把每个值写进
  * AppStorage——界面用 @StorageLink 订阅即可实时响应，播放器侧直接读本单例。
@@ -74,6 +76,19 @@ export const K_BLUETOOTH_LYRIC: string = 'cfg_bluetooth_lyric';
  * 所以给一个开关；关掉之后仍然可以在播放页手动匹配。
  */
 export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
+/**
+ * 被打断结束后自动重新播放
+ *
+ * 焦点被别的应用抢走时，系统会把我们的音频流暂停（强制类型 + INTERRUPT_HINT_PAUSE），
+ * 打断结束（电话挂断、闹铃停、视频看完）只会再发一个 INTERRUPT_HINT_RESUME ——
+ * 这个提示**一定是共享类型**：系统不替应用恢复播放，必须应用自己再 play() 一次
+ * （见《音频焦点介绍》的典型场景表：音乐 + 来电铃声 → 挂断后收到 RESUME、重新启动播放）。
+ * 所以「挂断之后接不接着放」只能由应用决定，这里给它一个开关。
+ *
+ * 默认开：这是官方推荐的适配方式，也是用户在音乐应用上的预期（来电挂断接着听）。
+ * 「与其他应用同时播放」开着时走独立焦点模式、不会被打断，这一项也就不起作用。
+ */
+export const K_AUTO_RESUME_AFTER_INTERRUPT: string = 'cfg_auto_resume_after_interrupt';
 
 /** 落盘结构（字段全部可选：老文件里可能缺字段，缺的用默认值） */
 interface PlaySettingsData {
@@ -90,6 +105,7 @@ interface PlaySettingsData {
   desktopLyric?: boolean;
   autoMatchLyric?: boolean;
   bluetoothLyric?: boolean;
+  autoResumeAfterInterrupt?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -149,6 +165,13 @@ export class PlaySettings {
    * 所以跟洛雪上游（player.isShowBluetoothLyric）一样默认关，要用时自己开。
    */
   private bluetoothLyric: boolean = false;
+  /**
+   * 被打断结束后自动重新播放，默认开。
+   *
+   * 落点是 LxPlayer 的 audioInterrupt 监听：收到 RESUME 时若这一项开着就接着放
+   * （见 K_AUTO_RESUME_AFTER_INTERRUPT 的说明）。
+   */
+  private autoResumeAfterInterrupt: boolean = true;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -201,6 +224,7 @@ export class PlaySettings {
       desktopLyric: this.desktopLyric,
       autoMatchLyric: this.autoMatchLyric,
       bluetoothLyric: this.bluetoothLyric,
+      autoResumeAfterInterrupt: this.autoResumeAfterInterrupt,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -253,6 +277,9 @@ export class PlaySettings {
     if (data.bluetoothLyric !== undefined) {
       this.bluetoothLyric = data.bluetoothLyric;
     }
+    if (data.autoResumeAfterInterrupt !== undefined) {
+      this.autoResumeAfterInterrupt = data.autoResumeAfterInterrupt;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -274,6 +301,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_DESKTOP_LYRIC, this.desktopLyric);
       AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
       AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, this.bluetoothLyric);
+      AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, this.autoResumeAfterInterrupt);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -476,6 +504,25 @@ export class PlaySettings {
     }
     this.autoMatchLyric = value;
     AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, value);
+    this.write();
+  }
+
+  /**
+   * 被打断结束后自动重新播放
+   *
+   * 由 LxPlayer 在处理 audioInterrupt 时读（见 K_AUTO_RESUME_AFTER_INTERRUPT）：
+   * 读的是本单例的当前值、而不是缓存一份，所以用户拨了开关立刻生效。
+   */
+  isAutoResumeAfterInterrupt(): boolean {
+    return this.autoResumeAfterInterrupt;
+  }
+
+  setAutoResumeAfterInterrupt(value: boolean): void {
+    if (value === this.autoResumeAfterInterrupt) {
+      return;
+    }
+    this.autoResumeAfterInterrupt = value;
+    AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, value);
     this.write();
   }
 }

@@ -1,8 +1,9 @@
-import { C_BG, C_CARD, C_RED, R_CARD } from '../ui/Theme';
-import { HintText, OptionSetting, SegPills, SettingLabel, TOGGLE_LABELS, ToggleSetting } from '../ui/SettingWidgets';
+import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
+import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
-import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_BLUETOOTH_LYRIC, K_DESKTOP_LYRIC,
+import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_RESUME_AFTER_INTERRUPT,
+  K_BLUETOOTH_LYRIC, K_DESKTOP_LYRIC,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
@@ -23,18 +24,18 @@ struct ExtendQualitySetting {
   };
 
   build() {
-    Column({ space: 9 }) {
-      SettingLabel({ label: this.label })
-      SegPills({
-        labels: TOGGLE_LABELS,
-        activeIndex: this.on ? 0 : 1,
-        onPick: (index: number) => {
-          this.onToggle(index === 0);
+    Column({ space: 8 }) {
+      ToggleSetting({
+        label: this.label,
+        value: this.on,
+        onPick: (next: boolean) => {
+          this.onToggle(next);
         },
       })
       if (this.on) {
-        SegPills({
-          labels: this.options,
+        OptionSetting({
+          label: '拓展音质档位',
+          options: this.options,
           activeIndex: this.activeIndex,
           onPick: (index: number) => {
             this.onPickOption(index);
@@ -49,47 +50,12 @@ struct ExtendQualitySetting {
   }
 }
 
-/** 字号滑块（拖动实时变，松手才落盘由外面决定） */
-@Component
-struct SliderSetting {
-  @Prop label: string = '';
-  @Prop value: number = 19;
-  @Prop min: number = 13;
-  @Prop max: number = 30;
-  onPick: (value: number, done: boolean) => void = () => {
-  };
-
-  build() {
-    Column({ space: 4 }) {
-      SettingLabel({ label: this.label, value: `${this.value}` })
-      Slider({
-        value: this.value,
-        min: this.min,
-        max: this.max,
-        step: 1,
-        style: SliderStyle.OutSet,
-      })
-        .trackThickness(3)
-        .blockSize({ width: 18, height: 18 })
-        .blockColor(Color.White)
-        .selectedColor(C_RED)
-        .trackColor('#E4E4E8')
-        .width('100%')
-        .onChange((value: number, mode: SliderChangeMode) => {
-          const done: boolean = mode === SliderChangeMode.End || mode === SliderChangeMode.Click;
-          this.onPick(value, done);
-        })
-    }
-    .width('100%')
-  }
-}
-
 /**
  * 播放设置
  *
  * 对应设置页里的「播放设置」，参考图上的分区：
  *   一、音质：播放音质（128K/320K/FLAC/24Bit）、拓展音质（开关 + Hi-Res/全景声/全景声+/母带）、
- *       与其他应用同时播放
+ *       与其他应用同时播放、被其他应用打断结束后自动重新播放
  *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、
  *       桌面歌词、车载蓝牙歌词
  *
@@ -100,6 +66,7 @@ struct SliderSetting {
  * 真机上生效的路径：
  *   - 播放音质 / 拓展音质 -> PlaySession.negotiateQuality 解析播放链接时按候选顺序取
  *   - 与其他应用同时播放 -> LxPlayer 建 AVPlayer 时设 audioInterruptMode
+ *   - 被打断结束后自动重新播放 -> LxPlayer 的 audioInterrupt 监听收到 RESUME 时再 play 一次
  *   - 歌词各项 -> PlayerView（封面页小歌词 / 歌词页背景、对齐、字号）
  *   - 歌词页不熄屏 -> 页面把窗口的 keepScreenOn 打开（见 pages/Index.ets）
  *   - 桌面歌词 -> PlaybackService 控制系统歌词悬浮窗的显隐
@@ -107,6 +74,8 @@ struct SliderSetting {
  */
 @Component
 export struct PlaySettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @StorageLink(K_PLAY_QUALITY) quality: string = '128k';
   @StorageLink(K_EXTEND_QUALITY) extend: boolean = false;
@@ -122,6 +91,8 @@ export struct PlaySettingsView {
   @StorageLink(K_BLUETOOTH_LYRIC) bluetoothLyric: boolean = false;
   /** 本地音乐 / 云端（WebDAV）音乐自动匹配歌词（要联网搜一次，所以给了开关） */
   @StorageLink(K_AUTO_MATCH_LYRIC) autoMatchLyric: boolean = true;
+  /** 被打断（来电 / 闹铃 / 别的应用出声）结束后自动接着放 */
+  @StorageLink(K_AUTO_RESUME_AFTER_INTERRUPT) autoResume: boolean = true;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
@@ -176,12 +147,31 @@ export struct PlaySettingsView {
       + '每换一句都会重推一次蓝牙媒体信息，不在车里时建议关掉，以免影响车机播放的流畅度。';
   }
 
+  /**
+   * 「被打断结束后自动重新播放」的说明
+   *
+   * 要讲两件事：这一项在什么场景下管用（来电 / 闹铃 / 别的应用出声），以及它和上面那项
+   * 「与其他应用同时播放」的关系 —— 同时播放走独立焦点，基本不会被我们这边的开关管到。
+   * 不说清就会出现「开关拨了没反应」的困惑（与桌面歌词那一项的处理一致）。
+   */
+  private autoResumeHint(): string {
+    const base: string = '被来电、闹铃或别的应用的声音打断时，系统会把我们暂停；这一项开着，'
+      + '打断结束（挂断、闹铃停）就自动接着放，关掉则停在暂停、等你自己按播放。';
+    if (this.playWithOthers) {
+      return base + '「与其他应用同时播放」开着时走独立音频焦点模式，一般不会被打断，这一项多半用不上。';
+    }
+    return base;
+  }
+
   build() {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           // ------------------------------------------------ 音质
-          Column({ space: 17 }) {
+          Column({ space: 8 }) {
             OptionSetting({
               label: '播放音质',
               options: MAIN_QUALITY_LABELS,
@@ -217,16 +207,25 @@ export struct PlaySettingsView {
                 PlaySession.getInstance().setPlayWithOthers(next);
               },
             })
+
+            ToggleSetting({
+              label: '被其他应用打断结束后自动重新播放',
+              value: this.autoResume,
+              onPick: (next: boolean) => {
+                PlaySettings.getInstance().setAutoResumeAfterInterrupt(next);
+              },
+            })
+            HintText({ text: this.autoResumeHint() })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
           HintText({ text: '播放音质是首选档：这首没有该档时会自动往下退，不会因为选高了就放不出来。' })
 
           // ------------------------------------------------ 歌词
-          Column({ space: 17 }) {
+          Column({ space: 8 }) {
             ToggleSetting({
               label: '播放页显示小歌词',
               value: this.showMiniLyric,
@@ -297,7 +296,8 @@ export struct PlaySettingsView {
             })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })          .borderRadius(R_CARD)
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
           HintText({

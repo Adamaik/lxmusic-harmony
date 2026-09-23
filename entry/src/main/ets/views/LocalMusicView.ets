@@ -3,14 +3,21 @@ import { UIContext } from '@kit.ArkUI';
 import { picker } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { SongItem, PlaySession } from '../core/player/PlaySession';
+import { PlaylistSummary, SongItem, PlaySession } from '../core/player/PlaySession';
 import { ImportResult, K_LOCAL_PROGRESS, K_LOCAL_VERSION, LocalMusic } from '../core/local/LocalMusic';
 import { C_CARD, C_DIVIDER, C_RED, C_TEXT_SUB, C_TEXT_WEAK, F_SUB, R_CARD } from '../ui/Theme';
 import { I_IMPORT, IconGlyph } from '../ui/Icons';
-import { SongListPane } from './PlaylistView';
+import { allSelectedOf, favoriteSongs, queueSongs, selectActionsOf, SelectAction, selectedSongs, SelectSession,
+  toggleSelected } from '../ui/Selection';
+import { SyncManager } from '../core/sync/SyncManager';
+import { SongListPane } from './SongListPane';
+import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LocalMusicPane';
+
+/** 本地音乐的多选能做什么（「移除」是红底那枚主操作） */
+const LOCAL_ACTIONS: string[] = ['收藏', '加入播放列表', '加入歌单'];
 
 /**
  * 本地音乐面板（我的 -> 本地音乐）
@@ -23,19 +30,33 @@ const TAG: string = 'LocalMusicPane';
  * 导入按钮直接拉起**文件管理的音频聚合视图**（`mergeMode = AUDIO`）：一屏列出
  * 设备上所有音频，全选一次导完。不再提供别的入口，理由见 `scanDeviceAudio()`。
  * 详细调研见 docs/LOCAL_MUSIC.md。
+ *
+ * 多选与「我的」页其它列表一致：长按任意一行进多选（右上角那枚「选择」是另一个入口，
+ * 想不起来长按的时候点它），能收藏 / 入歌单 / 入播放列表，以及移除应用内副本。
  */
 @Component
 export struct LocalMusicPane {
   @Prop currentId: string = '';
   @Prop bottomInset: number = 0;
+  /**
+   * 顶部占位：让出透明标题栏那一段（状态栏 + 标题栏，由壳层算好）
+   *
+   * 这一页的头部（导入 / 选择）是常驻控件，不该滚进标题栏底下，所以用一段固定占位，
+   * 而不是首页那种 `contentStartOffset`。
+   */
+  @Prop topInset: number = 0;
   onPick: (index: number) => void = () => {
   };
   @State items: SongItem[] = [];
   /** 导入进行中（进度文案在 AppStorage 里，切走再回来还能看到） */
   @State importing: boolean = false;
-  /** 多选模式（批量移除用）：打开后点行是勾选，行尾换成勾选圈 */
+  /** 多选模式（长按进）：打开后点行是勾选，行尾换成勾选圈 */
   @State selecting: boolean = false;
-  @State selectedIds: string[] = [];
+  /** 勾选一变就往全局会话里发布一次（顶栏与底栏都听它，见 ui/Selection.ets） */
+  @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  /** 「加入歌单」面板 */
+  @State pickerOpen: boolean = false;
+  @State candidates: PlaylistSummary[] = [];
   @StorageLink(K_LOCAL_VERSION) @Watch('onLibraryChanged') libraryVersion: number = 0;
   @StorageLink(K_LOCAL_PROGRESS) progressText: string = '';
 
@@ -53,15 +74,18 @@ export struct LocalMusicPane {
     // 否则「移除 N」会带着幽灵条目算数
     if (this.selectedIds.length > 0) {
       const alive: string[] = [];
+      for (const item of this.items) {
+        alive.push(item.id);
+      }
+      const pruned: string[] = [];
       for (const id of this.selectedIds) {
-        for (const item of this.items) {
-          if (item.id === id) {
-            alive.push(id);
-            break;
-          }
+        if (alive.includes(id)) {
+          pruned.push(id);
         }
       }
-      this.selectedIds = alive;
+      if (pruned.length !== this.selectedIds.length) {
+        this.selectedIds = pruned;
+      }
     }
   }
 
@@ -70,31 +94,58 @@ export struct LocalMusicPane {
   private enterSelecting(): void {
     this.selecting = true;
     this.selectedIds = [];
+    // @Watch 只在**值真的变了**时才回调，进多选这一下不能只靠它（本来就没勾任何歌时不变）
+    this.publishSelectBar();
+  }
+
+  /** 长按某一行进多选：顺手把长按的那条勾上 */
+  private enterSelectingFrom(item: SongItem): void {
+    this.enterSelecting();
+    this.selectedIds = [item.id];
   }
 
   private exitSelecting(): void {
     this.selecting = false;
     this.selectedIds = [];
+    SelectSession.getInstance().end();
+  }
+
+  /** 勾选数一变就把工具条的状态重发一遍（顶栏的标题、底栏主操作的可用态都在听） */
+  private syncSelectBar(): void {
+    if (!this.selecting) {
+      return;
+    }
+    this.publishSelectBar();
+  }
+
+  /** 把「勾了几首 / 能做什么」交给全局会话：顶栏与底栏据此绘制 */
+  private publishSelectBar(): void {
+    SelectSession.getInstance().show(
+      this.selectedIds.length,
+      this.allSelected(),
+      selectActionsOf(LOCAL_ACTIONS, '移除'),
+      () => {
+        this.exitSelecting();
+      },
+      () => {
+        this.toggleSelectAll();
+      },
+      (index: number) => {
+        this.onAction(index);
+      });
+  }
+
+  /** 页面被弹掉时把工具条一起收走（不然它会留在下一层页面上） */
+  aboutToDisappear(): void {
+    SelectSession.getInstance().end();
   }
 
   private toggleSelect(item: SongItem): void {
-    const next: string[] = [];
-    let hit: boolean = false;
-    for (const id of this.selectedIds) {
-      if (id === item.id) {
-        hit = true;
-      } else {
-        next.push(id);
-      }
-    }
-    if (!hit) {
-      next.push(item.id);
-    }
-    this.selectedIds = next;
+    this.selectedIds = toggleSelected(this.selectedIds, item.id);
   }
 
   private allSelected(): boolean {
-    return this.items.length > 0 && this.selectedIds.length === this.items.length;
+    return allSelectedOf(this.selectedIds, this.items.length);
   }
 
   /** 全选 / 取消全选（一个按钮来回切，列表大了才有意义） */
@@ -111,13 +162,7 @@ export struct LocalMusicPane {
   }
 
   private selectedItems(): SongItem[] {
-    const out: SongItem[] = [];
-    for (const item of this.items) {
-      if (this.selectedIds.indexOf(item.id) >= 0) {
-        out.push(item);
-      }
-    }
-    return out;
+    return selectedSongs(this.items, this.selectedIds);
   }
 
   /** 批量移除（走共用那句确认框，删的是应用内副本，设备里的原文件不动） */
@@ -132,6 +177,83 @@ export struct LocalMusicPane {
       this.refresh();
       this.toast(`已移除 ${removed} 首`);
     });
+  }
+
+  private openPlaylistPicker(): void {
+    if (this.selectedItems().length === 0) {
+      this.toast('先勾选要加入歌单的歌');
+      return;
+    }
+    this.candidates = SyncManager.getInstance().getLibrary().playlistSummaries();
+    this.pickerOpen = true;
+  }
+
+  private addSelectedToPlaylist(playlist: PlaylistSummary): void {
+    const targets: SongItem[] = this.selectedItems();
+    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, targets);
+    this.pickerOpen = false;
+    this.exitSelecting();
+    this.toast(added > 0 ? `已把 ${added} 首加入「${playlist.name}」` : `「${playlist.name}」里已经有这些歌了`);
+  }
+
+  private createPlaylistAndAdd(name: string): void {
+    if (name.length === 0) {
+      return;
+    }
+    const targets: SongItem[] = this.selectedItems();
+    const library = SyncManager.getInstance().getLibrary();
+    const id: string = library.createPlaylist(name);
+    library.addMusicToPlaylist(id, targets);
+    this.pickerOpen = false;
+    this.exitSelecting();
+    this.toast(`已新建歌单「${name}」并加入 ${targets.length} 首`);
+  }
+
+  /**
+   * 批量操作：按**会话里那一项的叫法**分发（底栏按下标回调，这里翻译回它是什么）
+   *
+   * 不按下标硬编码：底栏的排列是「各页面的操作 + 红字那枚主操作放最后」
+   * （见 ui/Selection.ets 的 selectActionsOf），下标会随操作项数量变。
+   */
+  private onAction(index: number): void {
+    const actions: SelectAction[] = SelectSession.getInstance().actions;
+    if (index < 0 || index >= actions.length) {
+      return;
+    }
+    const label: string = actions[index].label;
+    if (label === '移除') {
+      this.removeSelected();
+      return;
+    }
+    const targets: SongItem[] = this.selectedItems();
+    if (targets.length === 0) {
+      this.toast('先勾选歌曲');
+      return;
+    }
+    if (label === '收藏') {
+      this.toast(favoriteSongs(targets));
+      return;
+    }
+    if (label === '加入播放列表') {
+      this.toast(queueSongs(targets, false));
+      return;
+    }
+    this.openPlaylistPicker();
+  }
+
+  @Builder
+  playlistPickerSheet() {
+    AddToPlaylistSheet({
+      songName: `已选 ${this.selectedIds.length} 首`,
+      candidates: this.candidates,
+      bottomInset: this.bottomInset,
+      onPick: (playlist: PlaylistSummary) => {
+        this.addSelectedToPlaylist(playlist);
+      },
+      onCreate: (name: string) => {
+        this.createPlaylistAndAdd(name);
+      },
+    })
   }
 
   private toast(message: string): void {
@@ -269,42 +391,6 @@ export struct LocalMusicPane {
       }
       .width('100%')
 
-      // 多选工具条：全选（来回切）+ 批量移除
-      if (this.selecting) {
-        Row({ space: 12 }) {
-          Text(this.allSelected() ? '取消全选' : '全选')
-            .fontSize(F_SUB)
-            .fontColor(C_RED)
-            .padding({ top: 4, bottom: 4 })
-            .onClick(() => {
-              this.toggleSelectAll();
-            })
-            .accessibilityText(this.allSelected() ? '取消全选' : '全选')
-            .accessibilityLevel('yes')
-
-          Text(`已选 ${this.selectedIds.length} 首`)
-            .fontSize(F_SUB)
-            .fontColor(C_TEXT_SUB)
-            .layoutWeight(1)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-          Text('移除')
-            .fontSize(F_SUB)
-            .fontColor(this.selectedIds.length > 0 ? C_RED : C_TEXT_WEAK)
-            .padding({ top: 4, bottom: 4 })
-            .onClick(() => {
-              this.removeSelected();
-            })
-            .accessibilityText('移除已选中的本地音乐')
-            .accessibilityLevel('yes')
-        }
-        .width('100%')
-        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-        .borderRadius(R_CARD)
-        .backgroundColor(C_CARD)
-      }
-
       if (this.importing || this.progressText.length > 0) {
         Row({ space: 10 }) {
           Text(this.progressText.length > 0 ? `正在导入 ${this.progressText}` : '正在导入…')
@@ -344,6 +430,8 @@ export struct LocalMusicPane {
 
   build() {
     Column() {
+      Column().height(this.topInset).width('100%')
+
       this.header()
 
       Divider()
@@ -356,11 +444,15 @@ export struct LocalMusicPane {
         currentId: this.currentId,
         emptyText: '还没有导入本地音乐',
         bottomInset: this.bottomInset,
-        // 多选模式：点行 = 勾选，行尾换勾选圈（批量移除用）
+        // 多选模式：长按进多选，点行 = 勾选，行尾换勾选圈
+        selectable: true,
         selecting: this.selecting,
         selectedIds: this.selectedIds,
         onToggleSelect: (item: SongItem) => {
           this.toggleSelect(item);
+        },
+        onRequestSelect: (item: SongItem) => {
+          this.enterSelectingFrom(item);
         },
         onPick: (index: number) => {
           this.onPick(index);
@@ -374,6 +466,14 @@ export struct LocalMusicPane {
     }
     .width('100%')
     .height('100%')
+    .bindSheet($$this.pickerOpen, this.playlistPickerSheet(), {
+      preferType: SheetType.BOTTOM,
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      detentSelection: SheetSize.MEDIUM,
+      dragBar: true,
+      showClose: true,
+      title: { title: '添加到歌单' },
+    })
   }
 }
 

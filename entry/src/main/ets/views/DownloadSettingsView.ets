@@ -19,6 +19,8 @@ import { DownloadSettings, K_DOWNLOAD_DIR_URI, K_DOWNLOAD_MARK_QUALITY, K_DOWNLO
  */
 @Component
 export struct DownloadSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @StorageLink(K_DOWNLOAD_NAME_FORMAT) nameFormat: string = 'song';
   @StorageLink(K_DOWNLOAD_MARK_QUALITY) markQuality: boolean = true;
@@ -39,7 +41,10 @@ export struct DownloadSettingsView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
-          Column({ space: 17 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
+          Column({ space: 8 }) {
             OptionSetting({
               label: '文件名称格式',
               options: NAME_FORMAT_LABELS,
@@ -61,7 +66,7 @@ export struct DownloadSettingsView {
             SettingLabel({ label: '下载目录', value: this.folderLabel() })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 

@@ -2,7 +2,7 @@ import { K_LIBRARY_VERSION, PlaySession, SongItem } from '../core/player/PlaySes
 import { K_CURRENT_ID, K_QUEUE_COUNT } from '../core/player/PlaySession';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_SUB } from '../ui/Theme';
+import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SUB } from '../ui/Theme';
 import { I_QUEUE, I_TRASH, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
@@ -186,7 +186,7 @@ export struct PlayQueueContent {
       if (this.currentId === item.id) {
         IconGlyph({ symbol: I_VOLUME, iconSize: 19, color: C_RED })
       }
-      IconGlyph({ symbol: I_TRASH, iconSize: 19, color: '#9A9AA0' })
+      IconGlyph({ symbol: I_TRASH, iconSize: 19, color: C_TEXT_SUB })
         .onClick(() => {
           this.deleteAt(index);
         })

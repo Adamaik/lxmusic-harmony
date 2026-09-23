@@ -1,7 +1,6 @@
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
-  R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { I_CACHE, IconGlyph } from '../ui/Icons';
-import { AudioCache, K_CACHE_VERSION } from '../core/music/AudioCache';
+import { AudioCache, K_CACHE_AUTO_DOWNLOAD, K_CACHE_VERSION } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
 
 /**
@@ -15,9 +14,15 @@ import { MediaCache } from '../core/music/MediaCache';
  * 说明一点差别：洛雪靠播放器自带的边播边缓存，上限是给播放器的；HarmonyOS 的
  * AVPlayer 没有流式缓存，所以这里是「边播边把整首下到沙箱」，上限由我们自己的
  * LRU 淘汰执行（详见 core/music/AudioCache.ets）。
+ *
+ * 「缓存时自动下载」是这里多出来的一个开关：打开后边听边存改由下载器做，
+ * 文件直接落到下载文件夹（「我的 - 下载管理」里能看见、能删），上限随之失效。
+ * 开关打开时会弹一次确认 —— 这几件事和「缓存」的直觉不一样，得先讲清楚。
  */
 @Component
 export struct CacheSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @State limitMb: number = 0;
   @State limitText: string = '';
@@ -26,9 +31,20 @@ export struct CacheSettingsView {
   @State urlCount: number = 0;
   @State lyricCount: number = 0;
   @State picCount: number = 0;
+  /** 开关在设置里真实的状态（AudioCache 落盘时写进 AppStorage，这里订阅它） */
+  @StorageLink(K_CACHE_AUTO_DOWNLOAD) @Watch('syncAutoDownload') autoDownload: boolean = false;
+  /**
+   * 滑块当前的位置
+   *
+   * 不与上面那份共用：开启要先弹窗确认，确认之前设置里还是关的。弹窗里点「取消」
+   * 要把滑块拨回去 —— 那必须是**真的变了一次状态值**，界面才会重绘（只把设置里
+   * 那份读回 false 是看不出变化的，滑块会停在「开」上）。
+   */
+  @State autoSwitchOn: boolean = false;
   @StorageLink(K_CACHE_VERSION) @Watch('refresh') cacheVersion: number = 0;
 
   aboutToAppear(): void {
+    this.syncAutoDownload();
     this.syncLimitText();
     this.refresh();
   }
@@ -45,6 +61,59 @@ export struct CacheSettingsView {
     this.picCount = media.picCount();
   }
 
+  /** 开关状态以设置里那份为准（别处改了它这里要跟着变） */
+  private syncAutoDownload(): void {
+    this.autoSwitchOn = this.autoDownload;
+  }
+
+  /**
+   * 拨开「缓存时自动下载」：先把代价讲清楚，点了「开启」才真的落盘
+   *
+   * 这条开关与「缓存」的直觉不一样（文件不在沙箱里、上限不生效、删了就得重新下），
+   * 所以不能一拨就算开：弹窗里点「取消」就把滑块拨回去，什么都不改。
+   */
+  private confirmAutoDownload(): void {
+    this.getUIContext().showAlertDialog({
+      title: '开启「缓存时自动下载」',
+      message: '播放过的歌会自动下载到「下载」文件夹，不再放进应用沙箱的缓存目录。\n\n'
+        + '· 缓存上限对这个模式不生效：文件会一直留着，直到你在「我的 - 下载管理」里删掉；\n'
+        + '· 删掉下载的音乐，本地这份就没了，下次播放要重新下载；\n'
+        + '· 边听边下会和播放一起占网络（播放卡顿时会先等一等再下）。\n\n'
+        + '开启后，这些歌会出现在「我的 - 下载管理」里，可以单独删。',
+      autoCancel: true,
+      buttons: [
+        {
+          value: '取消',
+          action: () => {
+            this.autoSwitchOn = false;
+          },
+        },
+        {
+          value: '开启',
+          fontColor: C_RED,
+          action: () => {
+            AudioCache.getInstance().setAutoDownload(true);
+            this.syncAutoDownload();
+            this.refresh();
+            this.toast('已开启：播放时自动下载到「下载」文件夹');
+          },
+        },
+      ],
+      // 点弹窗外 / 按返回键也算取消，同样把滑块拨回去
+      cancel: () => {
+        this.autoSwitchOn = false;
+      },
+    });
+  }
+
+  /** 关掉：不用弹窗（回到「文件在沙箱、受上限约束」而已），但把排队中的缓存任务重排一遍 */
+  private turnOffAutoDownload(): void {
+    AudioCache.getInstance().setAutoDownload(false);
+    this.syncAutoDownload();
+    this.refresh();
+    this.toast('已关闭：播放时不再自动下载');
+  }
+
   /** 把输入框回填成已保存的上限（进页面 / 提交后调用） */
   private syncLimitText(): void {
     const mb: number = AudioCache.getInstance().getLimitMb();
@@ -57,7 +126,8 @@ export struct CacheSettingsView {
     const text: string = this.limitText.trim();
     if (text.length === 0) {
       AudioCache.getInstance().setLimitMb(0);
-      this.toast('已关闭播放缓存');
+      // 开着「缓存时自动下载」时上限本来就不生效，别报成「已关闭播放缓存」（缓存其实还在下）
+      this.toast(this.autoDownload ? '上限已设为 0（当前模式下不生效）' : '已关闭播放缓存');
       this.syncLimitText();
       this.refresh();
       return;
@@ -107,7 +177,7 @@ export struct CacheSettingsView {
       autoCancel: true,
       buttons: [
         { value: '取消', action: () => { } },
-        { value: '清空', fontColor: '#E33B3B', action: onOk },
+        { value: '清空', fontColor: C_RED, action: onOk },
       ],
     });
   }
@@ -174,7 +244,9 @@ export struct CacheSettingsView {
             .fontColor(C_TEXT)
             .width('100%')
             .textAlign(TextAlign.Start)
-          Text(this.limitMb > 0 ? '超过上限会淘汰最早播放的' : '当前未开启，播放时不会缓存到本地')
+          Text(this.autoDownload
+            ? '「缓存时自动下载」开着，这个上限暂不生效'
+            : (this.limitMb > 0 ? '超过上限会淘汰最早播放的' : '当前未开启，播放时不会缓存到本地'))
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
             .width('100%')
@@ -190,7 +262,7 @@ export struct CacheSettingsView {
           .fontSize(14)
           .width(88)
           .height(38)
-          .backgroundColor('#F2F2F4')
+          .backgroundColor(C_FILL_SOFT)
           .onChange((value: string) => {
             this.limitText = value;
           })
@@ -204,6 +276,41 @@ export struct CacheSettingsView {
         Text('MB')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 10 }) {
+        Column({ space: 4 }) {
+          Text('缓存时自动下载')
+            .fontSize(F_ITEM)
+            .fontColor(C_TEXT)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          Text(this.autoDownload
+            ? '已开启：文件在「下载」文件夹，缓存上限不生效'
+            : '播放时自动下载到「下载」文件夹（无上限，在下载管理里删）')
+            .fontSize(F_SUB)
+            .fontColor(C_TEXT_WEAK)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.autoSwitchOn })
+          .selectedColor(C_RED)
+          .onChange((isOn: boolean) => {
+            // 拨开要弹窗确认（确认之前设置里还是关的），拨回去直接生效
+            this.autoSwitchOn = isOn;
+            if (isOn) {
+              this.confirmAutoDownload();
+              return;
+            }
+            this.turnOffAutoDownload();
+          })
       }
       .width('100%')
       .padding({ left: 14, right: 14, top: 12, bottom: 12 })
@@ -290,10 +397,15 @@ export struct CacheSettingsView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           this.sectionTitle('播放缓存', sizeText(this.audioBytes))
           this.audioCard()
           Text('边听边把整首下到应用沙箱，下次播放直接读本地：不联网、不受源脚本影响。'
-            + '上限设 0 即关闭缓存。')
+            + '上限设 0 即关闭缓存。开了「缓存时自动下载」则改为下到「下载」文件夹，'
+            + '文件在「我的 - 下载管理」里可见可删（那时这个上限不生效）。'
+            + '开启之前已经缓存在沙箱里的歌不会自动搬过去，想清掉点上面的「清空」。')
             .fontSize(11.5)
             .fontColor(C_TEXT_WEAK)
             .width('100%')

@@ -82,7 +82,7 @@ export class SyncManager {
       this.publishState();
     });
 
-    // 已经落过库就先镜像到界面（收藏/歌单/试听列表），首次安装保留演示数据
+    // 已经落过库就先镜像到界面（收藏 / 听列表），没落过库就什么都不铺、界面是空的
     if (this.library.isInitialized()) {
       this.library.mirrorToSession();
     }

@@ -1,4 +1,5 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { resourceManager } from '@kit.LocalizationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { PlaybackService } from '../core/player/PlaybackService';
@@ -9,6 +10,7 @@ import { WebDavSettings } from '../core/webdav/WebDavSettings';
 import { AudioCache } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
 import { SyncManager } from '../core/sync/SyncManager';
+import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
 import { PlaySettings } from '../core/settings/PlaySettings';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
 import { DownloadSettings } from '../core/download/DownloadSettings';
@@ -47,6 +49,9 @@ export default class EntryAbility extends UIAbility {
     // WebDAV 连接设置（服务器地址 / 账号密码）：要早于界面创建，
     // 设置页与浏览页用 @StorageLink 订阅它发布的值
     WebDavSettings.getInstance().init(this.context);
+    // 收藏歌单（歌单级的收藏，纯本地）：要早于界面创建 —— 「我的」页歌单卡那一段
+    // 与歌单详情页那颗「收藏歌单」钮都订阅它发布的版本号
+    CollectedPlaylists.getInstance().init(this.context);
   }
 
   onDestroy(): void {
@@ -66,27 +71,40 @@ export default class EntryAbility extends UIAbility {
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
     });
 
+    // 深浅模式先定下来（界面颜色已全部迁到资源 token，见 ui/Theme.ets 与
+    // resources 下的 base / dark 两份 color.json）：跟随系统，外观设置里选了
+    // 「浅色 / 深色」时按存档覆盖。**必须在下面给状态栏定字色之前**，
+    // 否则按「覆盖前的模式」算出来的字色会与最终界面不一致。
+    try {
+      AppearanceSettings.getInstance().applyColorMode(this.context);
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+    }
+
     // 洛雪移动端是「内容铺满、状态栏压在内容上」的观感，这里开全屏布局；
     // 具体的安全区留白由页面自己读 AvoidArea 处理（见 pages/Index.ets）。
+    // 状态栏字色按当前深浅模式给：启动窗口的底色是深色（dark 那份
+    // start_window_background = #000000）时，黑字会整条看不见。
     try {
       const mainWindow: window.Window = windowStage.getMainWindowSync();
       mainWindow.setWindowLayoutFullScreen(true);
+      const dark: boolean = this.isDarkMode();
       mainWindow.setWindowSystemBarProperties({
-        statusBarContentColor: '#000000',
-        navigationBarContentColor: '#000000',
+        statusBarContentColor: dark ? '#FFFFFF' : '#000000',
+        navigationBarContentColor: dark ? '#FFFFFF' : '#000000',
       });
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to enable full screen layout. Cause: %{public}s',
         JSON.stringify(err));
     }
+  }
 
-    // 深浅模式先固定「跟随系统」：自绘界面的颜色还在 Theme.ets 的常量里，
-    // 还没有迁到资源（base / dark 同名 token），所以外观设置里暂时不开放这一项。
-    // 等颜色迁完资源，这里改成读外观设置里存的档位即可。
+  /** 当前是不是深色模式（读资源管理器的配置，UI 还没起来时也能用） */
+  private isDarkMode(): boolean {
     try {
-      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      return this.context.resourceManager.getConfigurationSync().colorMode === resourceManager.ColorMode.DARK;
     } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      return false;
     }
   }
 

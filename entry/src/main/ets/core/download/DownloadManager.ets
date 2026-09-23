@@ -4,12 +4,16 @@ import { http } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SongItem } from '../player/PlaySession';
+import { LxPlayer } from '../player/LxPlayer';
 import { mediaKeyOf } from '../music/MediaCache';
 import { fallbackQuality, pickQuality } from '../music/Quality';
 import { SourceEngine } from '../source/SourceEngine';
 import { LxQuality } from '../source/LxTypes';
 import { DownloadSettings } from './DownloadSettings';
-import { clearDownloadedFiles, removeDownloadedFile, setDownloadedFile } from './DownloadIndex';
+import { DownloadTagData, collectDownloadTags, tagSummary } from './DownloadTags';
+import { AutoDownloadSong, clearDownloadedFiles, removeDownloadedFile, setAutoDownloadHandler,
+  setDownloadedFile } from './DownloadIndex';
+import { TagSink } from './TagWriter';
 import { isLocalSong } from '../local/LocalMusic';
 import { isWebDavSong } from '../webdav/WebDavLibrary';
 
@@ -31,6 +35,12 @@ const MAX_ACTIVE: number = 2;
 const MAX_NAME_LEN: number = 90;
 /** 进度刷新节流：每收一块数据都重绘列表太浪费 */
 const PROGRESS_THROTTLE_MS: number = 400;
+/**
+ * 自动下载（「缓存时自动下载」排进来的）在播放挨饿时隔多久回来看一眼
+ *
+ * 与播放缓存那边的 WAIT_DELAY_MS 一个量级：只是回来看一眼，不占网络。
+ */
+const AUTO_WAIT_MS: number = 4000;
 
 /** 音质 -> 扩展名（拿不到链接后缀时用） */
 const EXT_BY_QUALITY: Record<string, string> = {
@@ -71,6 +81,14 @@ export interface DownloadItem {
   error: string;
   /** 非致命提示（例如系统下载目录不可用、已改存到应用内目录），列表里跟在状态后面显示 */
   note: string;
+  /** 标签（封面 / 歌词）嵌入结果：嵌进去了就写「已嵌入封面与歌词」，容器不支持就如实说明 */
+  tagNote: string;
+  /**
+   * 是不是「缓存时自动下载」排进来的（不是用户点的那一下）
+   *
+   * 只影响调度：自动排进来的在播放挨饿时不抢网络（见 pump），用户点的立即开工。
+   */
+  auto: boolean;
   createdAt: number;
 }
 
@@ -107,7 +125,7 @@ const INDEX_VERSION: number = 1;
  * 下载记录的唯一键
  *
  * mediaKey（平台_歌曲id_哈希）优先：同一首歌在不同列表里 id 可能不同，
- * 但 musicInfo 是一样的；没有 musicInfo 的条目（演示数据）退回条目 id。
+ * 但 musicInfo 是一样的；没有 musicInfo 的条目退回条目 id。
  */
 export function downloadKeyOf(song: SongItem): string {
   const media: string = mediaKeyOf(song.musicInfoJson);
@@ -123,6 +141,16 @@ function asNumber(value: Object | undefined): number {
     return Number.isNaN(parsed) ? 0 : parsed;
   }
   return 0;
+}
+
+/**
+ * 老索引文件里没有的字段补成空串
+ *
+ * 下载记录是 JSON 落盘的，加了新字段（如 tagNote）之后，升级前写下的文件里
+ * 没有这个键，读出来就是 undefined —— 界面上一取 .length 就崩。
+ */
+function orEmpty(value: string | undefined): string {
+  return value !== undefined && value !== null ? value : '';
 }
 
 /** 文件名不能带路径分隔符与系统保留字符，统一洗一遍 */
@@ -162,6 +190,8 @@ export class DownloadManager {
   private requests: Map<string, http.HttpRequest> = new Map<string, http.HttpRequest>();
   private lastBumpAt: number = 0;
   private persistTimer: number = 0;
+  /** 自动下载等播放缓过来时的复查定时器 */
+  private pumpTimer: number = 0;
 
   init(context: common.Context): void {
     if (this.inited) {
@@ -179,8 +209,34 @@ export class DownloadManager {
     }
     this.inited = true;
     this.loadIndex();
+    // 「缓存时自动下载」的入口注册在这里：播放层不 import 下载器，只按
+    // DownloadIndex 里的窄接口说话（那个模块是叶子，见它的说明）
+    setAutoDownloadHandler((song: AutoDownloadSong): boolean => {
+      return this.enqueueAuto(song) !== null;
+    });
     this.bump();
     hilog.info(DOMAIN, TAG, 'download manager ready, %{public}d record(s)', this.items.length);
+  }
+
+  /**
+   * 「缓存时自动下载」排进来的一首：与用户点的下载同一条队列
+   *
+   * 只把字段搬过来（DownloadIndex 里那份声明是为了不 import SongItem）。
+   * 音质用播放用的那一档，别让听的和存下来的不是一个东西。
+   */
+  private enqueueAuto(song: AutoDownloadSong): DownloadItem | null {
+    const item: SongItem = {
+      id: song.id,
+      name: song.name,
+      singer: song.singer,
+      coverUrl: song.coverUrl,
+      art: song.art,
+      source: song.source,
+      quality: song.quality,
+      interval: song.interval,
+      musicInfoJson: song.musicInfoJson,
+    };
+    return this.enqueue(item, true);
   }
 
   isReady(): boolean {
@@ -253,8 +309,10 @@ export class DownloadManager {
    *
    * 已经下过 / 正在下的直接返回已有记录（不重复下）；失败过的重新排一次队。
    * 返回 null 表示当前状态没法下（没有音源、条目没有 musicInfo 等）。
+   *
+   * @param auto 「缓存时自动下载」排进来的（见 pump 里的让路规则），用户点的下载传 false
    */
-  enqueue(song: SongItem): DownloadItem | null {
+  enqueue(song: SongItem, auto: boolean = false): DownloadItem | null {
     if (!this.inited) {
       return null;
     }
@@ -274,9 +332,12 @@ export class DownloadManager {
     }
     const existed: DownloadItem | null = this.stateOf(key);
     if (existed !== null) {
+      // 用户点的那一下比自动排的更急：本来是自动排的，现在就当成手动下载（立即开工）
+      existed.auto = existed.auto && auto;
       if (existed.status === 'error') {
         existed.status = 'waiting';
         existed.error = '';
+        existed.tagNote = '';
         existed.received = 0;
         existed.total = 0;
         this.persist();
@@ -301,6 +362,8 @@ export class DownloadManager {
       status: 'waiting',
       error: '',
       note: '',
+      tagNote: '',
+      auto: auto,
       createdAt: Date.now(),
     };
     this.items.push(item);
@@ -332,6 +395,9 @@ export class DownloadManager {
     item.status = 'waiting';
     item.error = '';
     item.note = '';
+    item.tagNote = '';
+    // 用户点的「重新下载」就按手动下载走：立即开工，不再等播放缓过来
+    item.auto = false;
     item.received = 0;
     item.total = 0;
     this.persist();
@@ -606,18 +672,48 @@ export class DownloadManager {
       if (next === null) {
         return;
       }
+      // 自动排进来的给播放让路：播放器正等着数据（起播 / 卡顿 / 缓冲不够）就先不开工，
+      // 过几秒回来看一眼。用户自己点的下载不受这条约束 —— 那是用户正在等的活儿
+      // （同一套判断见 LxPlayer.canUseBandwidthForCache 与 AudioCache 的让路调度）。
+      if (next.auto && !LxPlayer.getInstance().canUseBandwidthForCache()) {
+        this.schedulePump();
+        return;
+      }
       this.active++;
       void this.startTask(next);
     }
   }
 
+  /**
+   * 下一个该开工的：用户点的下载排在自动下载前面
+   *
+   * 自动排进来的可以等（就是「边听边下」那批），别让它们把用户正在等的下载堵在后面。
+   */
   private nextWaiting(): DownloadItem | null {
+    let auto: DownloadItem | null = null;
     for (const item of this.items) {
-      if (item.status === 'waiting') {
+      if (item.status !== 'waiting') {
+        continue;
+      }
+      if (!item.auto) {
         return item;
       }
+      if (auto === null) {
+        auto = item;
+      }
     }
-    return null;
+    return auto;
+  }
+
+  /** 自动下载等播放缓过来时的复查（不占网络，只是过一会儿回来看一眼） */
+  private schedulePump(): void {
+    if (this.pumpTimer !== 0) {
+      return;
+    }
+    this.pumpTimer = setTimeout(() => {
+      this.pumpTimer = 0;
+      this.pump();
+    }, AUTO_WAIT_MS);
   }
 
   /**
@@ -643,11 +739,15 @@ export class DownloadManager {
   private async runTask(item: DownloadItem): Promise<void> {
     item.status = 'downloading';
     item.error = '';
+    item.tagNote = '';
     item.received = 0;
     item.total = 0;
     this.bump();
 
     // 1) 解析播放链接（要几秒，期间可能被删掉）
+    //    封面与歌词同时开跑：标签必须赶在音频数据落盘之前凑齐（见 TagSink）
+    const tagsTask: Promise<DownloadTagData> =
+      collectDownloadTags(item.name, item.singer, item.musicInfoJson, item.coverUrl);
     let url: string = '';
     try {
       url = await this.resolveUrl(item);
@@ -658,9 +758,11 @@ export class DownloadManager {
     if (item.status !== 'downloading') {
       return;
     }
+    const tags: DownloadTagData = await tagsTask;
 
     // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）
-    const fileName: string = this.buildFileName(item, url);
+    const ext: string = this.extOf(url, item.quality);
+    const fileName: string = this.buildFileName(item, ext);
     item.fileName = fileName;
     let write: WriteTarget | null = null;
     try {
@@ -687,6 +789,8 @@ export class DownloadManager {
     const file: fs.File = write.handle;
     const request: http.HttpRequest = http.createHttp();
     this.requests.set(item.key, request);
+    // 封面 / 歌词跟着音频一起写进文件：mp3 写 ID3v2、flac 写元数据块（见 TagSink）
+    const sink: TagSink = new TagSink(file.fd, tags);
 
     request.on('headersReceive', (header: Object) => {
       const length: number = asNumber((header as Record<string, Object>)['content-length']);
@@ -697,7 +801,7 @@ export class DownloadManager {
     });
     request.on('dataReceive', (data: ArrayBuffer) => {
       try {
-        fs.writeSync(file.fd, data);
+        sink.write(data);
         item.received += data.byteLength;
         this.throttledBump();
       } catch (e) {
@@ -711,6 +815,8 @@ export class DownloadManager {
         connectTimeout: 20000,
         readTimeout: 300000,
       });
+      // 收尾：开头还攒着的（下载太短、没认出来）补写出去
+      sink.finish();
       this.closeQuietly(file);
       this.requests.delete(item.key);
       if (item.status !== 'downloading') {
@@ -723,6 +829,7 @@ export class DownloadManager {
         this.fail(item, `下载失败（HTTP ${code}）`);
         return;
       }
+      item.tagNote = this.tagNoteOf(sink, tags, ext);
       try {
         if (part.length > 0) {
           // 沙箱路径：写完才改名（.part 不会被当成正式文件）
@@ -785,6 +892,20 @@ export class DownloadManager {
     item.total = 0;
   }
 
+  /**
+   * 标签嵌入结果（列表里跟「已下载」一起显示）
+   *
+   * 三种情况分开说：真嵌进去了就说嵌了什么；容器是我们写不了标签的（m4a 等）
+   * 如实说明，免得用户以为「封面歌词没嵌进去」是下载出了问题；其余（这首歌
+   * 本来就取不到封面 / 歌词）不写，那不是异常。
+   */
+  private tagNoteOf(sink: TagSink, tags: DownloadTagData, ext: string): string {
+    if (sink.embedded()) {
+      return tagSummary(tags);
+    }
+    return sink.knownFormat() === 'other' ? `${ext} 暂不支持写入标签` : '';
+  }
+
   // ---------------------------------------------------------------- 文件名
 
   /**
@@ -793,7 +914,7 @@ export class DownloadManager {
    *   标注音质：开就把音质缀在名字后面，例如 `夜、萤火虫和你-128k.mp3`
    * 扩展名先从链接里认（很多平台会给 .mp3/.flac），认不出按音质推。
    */
-  private buildFileName(item: DownloadItem, url: string): string {
+  private buildFileName(item: DownloadItem, ext: string): string {
     const settings = DownloadSettings.getInstance();
     const format: string = settings.getNameFormat();
     let base: string = item.name;
@@ -805,7 +926,6 @@ export class DownloadManager {
     if (settings.isMarkQuality() && item.quality.length > 0) {
       base = `${base}-${item.quality}`;
     }
-    const ext: string = this.extOf(url, item.quality);
     let name: string = `${sanitizeFileName(base)}.${ext}`;
     if (name.length > MAX_NAME_LEN) {
       const keep: number = MAX_NAME_LEN - ext.length - 1;
@@ -913,6 +1033,10 @@ export class DownloadManager {
       const kept: DownloadItem[] = [];
       for (const raw of data.items) {
         const item: DownloadItem = raw;
+        // 老文件可能没有这几个字段（tagNote / auto 都是后加的）
+        item.note = orEmpty(item.note);
+        item.tagNote = orEmpty(item.tagNote);
+        item.auto = item.auto === true;
         // 重启时正在下的那些没法接着下（链接带时效），标成可重试
         if (item.status === 'downloading' || item.status === 'waiting') {
           item.status = 'error';

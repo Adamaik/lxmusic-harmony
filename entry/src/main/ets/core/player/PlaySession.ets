@@ -13,14 +13,17 @@ import { BridgeResult, LxQuality, SupportedSource } from '../source/LxTypes';
 import { PlayStateStore } from './PlayStateStore';
 import { ShuffleBag } from './ShuffleBag';
 import { PlaySettings } from '../settings/PlaySettings';
-import { fallbackQuality, pickQuality } from '../music/Quality';
-import { downloadedFile } from '../download/DownloadIndex';
+import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
+import { AutoDownloadSong, downloadedFile, requestAutoDownload } from '../download/DownloadIndex';
 import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
 import { AutoMatchResult, autoMatchLyric } from '../local/LyricMatch';
 import { WebDavLibrary, isWebDavSong } from '../webdav/WebDavLibrary';
 import { WebDavClient } from '../webdav/WebDavClient';
 import { WebDavSettings } from '../webdav/WebDavSettings';
 import { WEBDAV_QUALITY } from '../webdav/WebDavTypes';
+import { BookEngine } from '../book/BookEngine';
+import { BookAudio, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE, bookShelfId, parseBookPayload } from '../book/BookTypes';
+import { BookShelf } from '../book/BookShelf';
 import { publishFavoriteIds } from './FavoriteIndex';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -35,10 +38,9 @@ const TAG: string = 'PlaySession';
  * 这样底部导航、迷你播放器、全屏播放器不用互相传参就能保持一致。
  *
  * 播放链路：条目里的 musicInfo（内置搜索得到）-> 导入的音源解析出播放链接 -> AVPlayer。
- * 洛雪的演示歌单/推荐/历史都只有歌名，没有 musicInfo，所以这里补了一步：
+ * 拿到手的条目可能没有 musicInfo（比如它来自当前音源脚本不支持的平台），所以这里补了一步：
  * 遇到没有 musicInfo 的条目，先按「歌名 + 歌手」在当前音源支持的平台上搜一次，
- * 拿到真实 musicInfo 再走源规则解析。少了这一步，界面会在「演示模式」下假装播放，
- * 表现出来就是「点了播放没有声音」。
+ * 拿到真实 musicInfo 再走源规则解析。少了这一步，表现出来就是「点了播放没有声音」。
  */
 
 export const K_QUEUE_COUNT: string = 'ps_queue_count';
@@ -106,12 +108,12 @@ export interface SongItem {
   coverUrl: string;
   /** 无真实封面时是否使用洛雪内置的黑心占位封面 */
   art: boolean;
-  /** 平台：kw / kg / mg / tx / wy；演示数据为空 */
+  /** 平台：kw / kg / mg / tx / wy；本地歌与云端歌带自己的 source（见 LOCAL_SOURCE） */
   source: string;
   quality: string;
-  /** mm:ss，用于展示与模拟进度 */
+  /** mm:ss，列表里展示的时长 */
   interval: string;
-  /** 真实搜索结果的 musicInfo JSON；演示数据为空串 */
+  /** 真实搜索结果的 musicInfo JSON；没有 musicInfo 的条目为空串（走 resolveItem 再补） */
   musicInfoJson: string;
 }
 
@@ -140,7 +142,7 @@ const PLAY_STATE_VERSION: number = 1;
 /** 进度条那条灰段多久打一条诊断日志（毫秒） */
 const BUFFER_LOG_INTERVAL_MS: number = 5000;
 
-/** 系统媒体卡用的歌曲标识：有条目 id 就用 id，演示数据退回「歌名 + 歌手」 */
+/** 系统媒体卡用的歌曲标识：有条目 id 就用 id，没有就退回「歌名 + 歌手」 */
 function assetIdOf(item: SongItem): string {
   return item.id.length > 0 ? item.id : `${item.name}\u0001${item.singer}`;
 }
@@ -182,7 +184,8 @@ function normalizeName(name: string): string {  let out: string = '';
   return out;
 }
 
-let demoSeq: number = 0;
+/** 缺 songmid 的条目用的序号（保证列表里的 key 唯一） */
+let itemSeq: number = 0;
 
 /**
  * 两条记录是不是同一首歌
@@ -190,7 +193,7 @@ let demoSeq: number = 0;
  * 不能用 id 直接比：队列落库再读回来时，条目 id 会变成洛雪新格式的
  * `${source}_${songmid}`（见 SyncConvert.fromLxMusicInfo），跟界面上的 `search_12` 对不上。
  * 所以按 musicInfo 里的「平台 + 歌曲 id（+ 酷狗的 hash）」比，这才是一首歌的真正身份；
- * 演示条目没有 musicInfo，退回「歌名 + 歌手」。
+ * 没有 musicInfo 的条目退回「歌名 + 歌手」。
  */
 function sameSong(a: SongItem, b: SongItem): boolean {
   const keyA: string = mediaKeyOf(a.musicInfoJson);
@@ -201,20 +204,14 @@ function sameSong(a: SongItem, b: SongItem): boolean {
   return a.name.length > 0 && a.name === b.name && a.singer === b.singer;
 }
 
-/** 造一条演示歌曲（与截图里的歌单/历史保持一致） */
-function demo(name: string, singer: string, interval: string, art: boolean = true): SongItem {
-  demoSeq++;
-  return {
-    id: `demo_${demoSeq}`,
-    name: name,
-    singer: singer,
-    coverUrl: '',
-    art: art,
-    source: '',
-    quality: '128k',
-    interval: interval,
-    musicInfoJson: '',
-  };
+/**
+ * 是不是早期版本铺的演示条目（id 以 demo_ 开头）
+ *
+ * 只用于恢复播放现场时把它们丢掉：老版本的存档里可能还留着这种假歌。发布版不再产生
+ * 这种条目，所以新装的机器上这个判断永远为假。
+ */
+function isDemoEntry(item: SongItem): boolean {
+  return item.id.startsWith('demo_');
 }
 
 /** 由真实搜索结果转成队列条目 */
@@ -228,10 +225,10 @@ export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
   if (songmid.length === 0) {
     // 缺 songmid 的条目同步不出去（SyncConvert 判它不可同步），也就不会出现在
     // 收藏/歌单里，这里退回序号保证列表里的 key 仍然唯一
-    demoSeq++;
+    itemSeq++;
   }
   return {
-    id: songmid.length > 0 ? musicIdOf(info) : `search_${demoSeq}`,
+    id: songmid.length > 0 ? musicIdOf(info) : `search_${itemSeq}`,
     name: info.name,
     singer: info.singer,
     coverUrl: info.img,
@@ -260,8 +257,6 @@ export class PlaySession {
   history: SongItem[] = [];
   /** 收藏（我的 -> 收藏） */
   favorites: SongItem[] = [];
-  /** 歌单 */
-  playlists: PlaylistSummary[] = [];
   /**
    * 当前选中的音质
    *
@@ -285,7 +280,14 @@ export class PlaySession {
    */
   playMode: string = 'list';
 
-  private seeded: boolean = false;
+  private bootstrapped: boolean = false;
+  /**
+   * 音乐库是否已经把真实数据镜像进来
+   *
+   * 是则队列 / 收藏都已经是库里的数据，启动时不许再动它们；否说明是空库（首次安装、
+   * 没连同步、还没新建过歌单），界面就是空的。
+   */
+  private libraryLoaded: boolean = false;
   private playerWired: boolean = false;
   /** 歌名 -> 已经解析出真实 musicInfo 的条目，避免每次播放都重新搜索 */
   private resolveCache: Map<string, SongItem> = new Map();
@@ -336,8 +338,6 @@ export class PlaySession {
   private librarySink: LibrarySink | null = null;
   /** 正在接受同步模块写入数据：此时不把自己的改动当作「本地改动」回传 */
   private adoptingLibrary: boolean = false;
-  /** 音乐库是否已经把真实数据镜像进来（有则 seed() 不能再铺演示数据） */
-  private libraryLoaded: boolean = false;
   /**
    * 这一轮播放的缓存现场
    *
@@ -355,7 +355,7 @@ export class PlaySession {
   private stateInited: boolean = false;
   /**
    * 已经读过上次的播放现场。
-   * 读之前一律不许回写：启动过程中音乐库镜像、seed() 都会调 pushQueueState，
+   * 读之前一律不许回写：启动过程中音乐库镜像、bootstrap() 都会调 pushQueueState，
    * 那时 currentIndex 还是 -1，回写就把存着的「正在播放」冲成空的了。
    */
   private stateRestored: boolean = false;
@@ -363,10 +363,27 @@ export class PlaySession {
   /** 恢复现场后要接着放的位置（秒）+ 对应下标：等真正出声时再 seek */
   private resumePosition: number = 0;
   private resumeIndex: number = -1;
+  /**
+   * 上面那次「接着放」原本是暂停态（切音质时用户按着暂停）
+   *
+   * 重新解析出来的音频一定会先响一下，所以出声那一刻要立刻按回去。
+   * 只在同一次切档里有效：resumeIndex 一变（用户又切了别的歌）就作废，见 applyResumePaused。
+   */
+  private resumePaused: boolean = false;
+  /**
+   * 「这一次播放」指定要用哪一档音质（播放页切档用），空串 = 按设置协商
+   *
+   * 为什么需要这么个口子：协商是从设置那一档往下挑，而「拓展音质」开着时拓展档排在
+   * 普通档前面 —— 用户在播放页明明点了 320K，协商却可能给他母带。用户点了哪一档就放
+   * 哪一档，这里给一次性的指定；设置本身照改（下一次播放、下载链路都用新的那一档），
+   * 而协商出来的档仍然是「源与曲目都支持」的那一档（列表只列支持的）。
+   * 在 playAt 开头读走并清掉，避免漏给下一首。
+   */
+  private playQualityOverride: string = '';
 
   /**
    * 绑定沙箱目录（播放现场落盘用）。
-   * EntryAbility.onCreate 里调一次，必须早于 seed()（seed 末尾会读现场）。
+   * EntryAbility.onCreate 里调一次，必须早于 bootstrap()（它末尾会读现场）。
    */
   init(context: common.Context): void {
     if (this.stateInited) {
@@ -406,7 +423,7 @@ export class PlaySession {
   }
 
   /**
-   * 恢复上次的播放现场（seed() 末尾调用一次）
+   * 恢复上次的播放现场（bootstrap() 末尾调用一次）
    *
    * 不自动出声：只把「正在播的这首歌」摆回队列的当前项、进度条停在退出时的位置，
    * 用户按播放时再从那里接着放（见 applyResumeSeek）。
@@ -432,11 +449,12 @@ export class PlaySession {
     const state: PersistedPlayState = JSON.parse(text) as PersistedPlayState;
     const current: SongItem | null | undefined = state.current;
     if (state.version !== PLAY_STATE_VERSION || current === undefined || current === null
-      || current.id.length === 0) {
+      || current.id.length === 0 || isDemoEntry(current)) {
       return;
     }
     if (state.history !== undefined && state.history.length > 0) {
-      this.history = state.history;
+      // 演示条目一并丢掉：那是早期版本铺的假歌，不该跟着现场恢复回来
+      this.history = state.history.filter((item: SongItem) => !isDemoEntry(item));
     }
     if (state.playMode !== undefined && state.playMode.length > 0) {
       this.playMode = state.playMode;
@@ -478,6 +496,23 @@ export class PlaySession {
     LxPlayer.getInstance().seek(position * 1000);
   }
 
+  /**
+   * 切音质时若原本是暂停态，重新出声后立刻按回去
+   *
+   * **必须在 applyResumeSeek 之前调**：那个方法一成功就把 resumeIndex 清成 -1，
+   * 之后这里就分不清「这次出声属于同一次切档」还是「用户已经切了别的歌」了。
+   */
+  private applyResumePaused(): void {
+    if (!this.resumePaused) {
+      return;
+    }
+    this.resumePaused = false;
+    if (this.resumeIndex !== this.currentIndex) {
+      return;
+    }
+    void LxPlayer.getInstance().pause();
+  }
+
   setNoticeListener(listener: ((text: string) => void) | null): void {
     this.noticeListener = listener;
   }
@@ -499,7 +534,7 @@ export class PlaySession {
    * 走这里而不是直接赋值，是为了：1) 抑制上行（这些数据本来就来自服务端）；
    * 2) 一并更新队列状态与版本号，让各列表页刷新。
    */
-  adoptLibraryState(queue: SongItem[], favorites: SongItem[], playlists: PlaylistSummary[]): void {
+  adoptLibraryState(queue: SongItem[], favorites: SongItem[]): void {
     // 正在播的那首如果还在新队列里就保持「当前」指向它，否则清掉当前项：
     // 队列被换掉后还指着一首没在播的歌，迷你播放器显示的歌名会跟实际出声的对不上。
     let nextIndex: number = -1;
@@ -517,7 +552,6 @@ export class PlaySession {
     try {
       this.queue = queue;
       this.favorites = favorites;
-      this.playlists = playlists;
       this.currentIndex = nextIndex;
       this.bumpQueueVersion();
       this.pushQueueState();
@@ -537,52 +571,36 @@ export class PlaySession {
   }
 
   /**
-   * 首次进入界面时铺一套与洛雪移动端一致的演示数据
+   * 接上播放器、把上次退出时的播放现场恢复回来（`pages/Index` 的 aboutToAppear 里调一次）
    *
-   * 只有「音乐库里没有真实数据」时才铺：SyncManager 在 EntryAbility.onCreate 里
-   * 就会把落过盘的库镜像进来（真实队列 / 收藏 / 歌单），Index 的 aboutToAppear
-   * 比它晚，如果这里再把演示数据写回队列和收藏，就把真实数据冲掉了 ——
-   * 而且下一次本地改动会把这个空收藏当成本地改动上行，等于把云端收藏也清空。
+   * **不铺任何数据**：空库就是空界面 —— 队列、收藏、歌单都为空，等用户自己搜、自己导入。
+   * （早期版本这里铺过一套与参考截图一致的演示歌单 / 演示队列，发布版不该再有这种东西：
+   * 用户会把它当成自己库里的数据，点进去还什么都没有。）
+   *
+   * 关键顺序：SyncManager 在 EntryAbility.onCreate 里就会把落过盘的库镜像进来
+   * （真实队列 / 收藏），Index 的 aboutToAppear 比它晚 —— 库已经镜像过就一个字都不能动，
+   * 否则既冲掉真实数据，又会让下一次本地改动把空收藏当成本地改动上行、清空云端收藏。
    */
-  seed(): void {
-    if (this.seeded) {
+  bootstrap(): void {
+    if (this.bootstrapped) {
       return;
     }
-    this.seeded = true;
+    this.bootstrapped = true;
     this.wirePlayer();
 
-    // 播放历史不铺演示数据：它是真实的使用记录，混进几条假歌会让用户
-    // 以为「我的 - 播放历史」里真播过这些歌
-    this.history = [];
-
-    // 推荐位与排行榜不再需要演示数据：推荐页直接读平台接口
-    // （core/music/MusicList.ets），有网就有内容，没网就显示重试。
-
     if (this.libraryLoaded) {
-      // 队列 / 收藏 / 歌单已经是音乐库里的真实数据，保持原样；
-      // 末尾会把上次退出时的播放现场（正在播放的那首 + 进度）恢复回来
+      // 队列 / 收藏已经是音乐库里的真实数据，保持原样
       this.restorePlayState();
       return;
     }
 
-    // 收藏不铺演示数据：收藏是参与同步的真实数据（洛雪的 loveList），
-    // 里面混进几条没有 musicInfo 的假歌既播不了、又会被当成「已经有了」影响收藏判断
+    // 空库：只把「空」发布出去（界面上的爱心、队列计数要有个确定的初值），
+    // 播放历史也清空 —— 它是真实的使用记录，不能带任何预置内容
+    this.history = [];
     this.favorites = [];
     this.publishFavorites();
-
-    this.playlists = [
-      { id: 'pl_default', name: '茗秋瞳喜欢的音乐', count: 530 },
-    ];
-
-    this.queue = [
-      demo('听', '张杰', '04:31'),
-      demo('剑心', '张杰', '04:12'),
-      demo('你曾是少年', '焦迈奇', '04:24'),
-      demo('passion', 'silent anthem / heart embrace', '03:11'),
-      demo('夜、萤火虫和你', 'AniFace', '03:37'),
-      demo('金榜题名', '王朝1982 / 朱旭BooBoo / 刘书含Rose', '03:45'),
-    ];
-
+    this.queue = [];
+    this.currentIndex = -1;
     this.restorePlayState();
   }
 
@@ -815,6 +833,9 @@ export class PlaySession {
 
   private onPlayerState(status: LxPlayerStatus, message: string): void {    if (status === 'playing') {
       this.setStatus('playing', '正在播放');
+      // 切音质后接着放：先判暂停态（它要读 resumeIndex，applyResumeSeek 会把它清掉），
+      // 再跳到原来的位置
+      this.applyResumePaused();
       // 重启恢复后第一次出声：跳到退出时的位置接着放
       this.applyResumeSeek();
       return;
@@ -966,7 +987,7 @@ export class PlaySession {
     return results[0];
   }
 
-  /** 给没有 musicInfo 的条目（演示歌单/推荐/历史）搜一个真实 musicInfo */
+  /** 给没有 musicInfo 的条目（音源脚本不支持的平台）搜一个真实 musicInfo */
   private async resolveItem(item: SongItem): Promise<SongItem> {
     const key: string = `${item.name}\u0001${item.singer}`;
     const cached: SongItem | undefined = this.resolveCache.get(key);
@@ -1032,6 +1053,47 @@ export class PlaySession {
     // 播放队列即洛雪的「试听列表」，换队列要同步出去
     this.notifyLibrary();
     await this.playAt(startIndex);
+  }
+
+  /**
+   * 切换当前这首歌的音质（播放页那颗音质钮点出来的面板）
+   *
+   * 音质在这套实现里是**一份全局设置**（设置 - 播放设置 - 播放音质）：协商从它开始
+   * 往下退（见 Quality.pickQuality），下载链路读的也是同一份。所以这里「切档」= 改设置 +
+   * 用新档把这个位置重新解析一遍，而不是给这一首挂一个临时的档 —— 后者下一首就会跳回
+   * 原来的档，用户会觉得「切了没用」。
+   *
+   * 位置尽量不动：记下当前进度与暂停态，新音频第一次出声时会跳回原位置并恢复暂停态
+   * （与「重启后接着放」共用同一套机制，见 applyResumeSeek / applyResumePaused）。
+   * 切档必然要重新取一次播放地址，中间会有一次重新缓冲，这一点避免不了。
+   *
+   * @returns 是否处理了这次切换（false = 当前没有正在播的歌）
+   */
+  async switchQuality(quality: string): Promise<boolean> {
+    const index: number = this.currentIndex;
+    if (index < 0 || index >= this.queue.length) {
+      return false;
+    }
+    const settings = PlaySettings.getInstance();
+    if (isExtendedQuality(quality)) {
+      // 拓展档只有开着「拓展音质」时才会被协商到（见 PlaySettings.qualityCandidates）
+      settings.setExtendQuality(true);
+      settings.setExtendQualityType(quality);
+    } else {
+      settings.setQuality(quality);
+    }
+    const item: SongItem = this.queue[index];
+    if (item.quality === quality) {
+      // 已经在放这一档：设置记下来就够了，不必把正在响的音频打断重来
+      return true;
+    }
+    this.resumePosition = AppStorage.get<number>(K_PROGRESS) ?? 0;
+    this.resumeIndex = index;
+    this.resumePaused = (AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle') === 'paused';
+    // 这一次就用用户点的那一档（设置照改，见 playQualityOverride 的说明）
+    this.playQualityOverride = quality;
+    await this.playAt(index);
+    return true;
   }
 
   /**
@@ -1160,10 +1222,91 @@ export class PlaySession {
     }
   }
 
+  /**
+   * 播放一集有声书
+   *
+   * 与云端歌（WebDAV）是同一条思路的第三条链路：音频地址不在条目里，要现场解析，
+   * 但解析方式不是「问音源」也不是「拼服务器地址」，而是「拿这一章的地址去问书源规则」
+   * （`ruleContent` 从章节页里挖出 mp3/m4a 直链）。
+   *
+   * 三个要点：
+   *   1. **要带书源的请求头**：有声书的音频 CDN 普遍校验 Referer（悦听、六月都是），
+   *      不带就是 403 —— 所以走 playUrlWithHeaders；
+   *   2. 有声书**没有歌词**，所以不调 loadLyric（否则会去平台接口白搜一轮）；
+   *      封面在加入书架/入队时就拿到了，也不重新解析；
+   *   3. 解析要几秒（书源规则可能还要再抓一两次网络），期间状态是 loading，
+   *      与在线歌一致由 AVPlayer 的 stateChange 决定何时真正显示「播放中」。
+   */
+  private async playBookItem(item: SongItem, index: number, token: number): Promise<void> {
+    const payload: BookPlayPayload | null = parseBookPayload(item.musicInfoJson);
+    if (payload === null) {
+      const message: string = `「${item.name}」缺听书信息，请回到书籍页重新点一次`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const source = BookEngine.getInstance().getSource(payload.sourceId);
+    if (source === null) {
+      const message: string = `这本书用的书源（${payload.sourceId}）已经被删掉了，请重新导入后再听`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+
+    this.currentCacheKey = item.id;
+    this.currentCacheQuality = BOOK_QUALITY;
+    this.currentUrlFromCache = false;
+    this.currentLocalPath = '';
+    this.loadCover(item);
+    this.pushQueueState();
+    // 听书记一下「听到第几集」，下次打开这本书直接续播
+    BookShelf.getInstance().updateProgress(bookShelfId(payload), payload.chapterIndex);
+
+    this.setStatus('loading', `正在解析「${item.name}」…`);
+    try {
+      const audio: BookAudio = await BookEngine.getInstance().resolveAudioOf(
+        payload.sourceId,
+        payload.bookUrl,
+        payload.bookName,
+        payload.chapterUrl,
+        payload.chapterName,
+        payload.chapterIndex
+      );
+      if (this.playToken !== token) {
+        return;
+      }
+      if (audio.url.length === 0) {
+        const message: string = `「${item.name}」没解析出音频地址（书源规则可能已失效，或这一集需要登录）`;
+        this.setStatus('error', message);
+        this.notify(message);
+        return;
+      }
+      const headers: Record<string, string> = BookEngine.getInstance().audioHeaders(payload.sourceId);
+      this.setStatus('loading', '正在缓冲…');
+      await LxPlayer.getInstance().playUrlWithHeaders(audio.url, headers);
+      if (this.playToken !== token) {
+        return;
+      }
+      hilog.info(DOMAIN, TAG, 'book chapter %{public}d playing: %{public}s (from %{public}s)',
+        index, item.name, audio.from);
+    } catch (e) {
+      if (this.playToken !== token) {
+        return;
+      }
+      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      hilog.error(DOMAIN, TAG, 'play book failed: %{public}s', (e as Error).message);
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
   async playAt(index: number): Promise<void> {
     if (index < 0 || index >= this.queue.length) {
       return;
     }
+    // 播放页指定的音质：只作用于这一次播放，读完即清（下面几条早退路径也不会漏给下一首）
+    const forcedQuality: string = this.playQualityOverride;
+    this.playQualityOverride = '';
     // 每次切歌领一个号：解析/取链接要几秒，期间用户又点了别的歌的话，
     // 旧的那次必须丢掉，不能等它回来把新歌覆盖掉
     const token: number = ++this.playToken;
@@ -1207,6 +1350,13 @@ export class PlaySession {
       return;
     }
 
+    // 听书（阅读书源里的有声书）：章节地址 -> 书源规则解析出音频直链再播。
+    // 与云端歌同一个道理：它自己会去抓直链，不依赖「当前加载的音源」。
+    if (item.source === BOOK_SOURCE) {
+      await this.playBookItem(item, index, token);
+      return;
+    }
+
     const engine = SourceEngine.getInstance();
     if (!engine.isInited()) {
       const message: string = '请先在「设置 - 音源设置」导入并加载一个音源，才可以播放';
@@ -1231,7 +1381,10 @@ export class PlaySession {
       this.loadCover(item);
       this.loadLyric(item);
 
-      let quality: string = pickQuality(item.musicInfoJson, item.source, item.quality);
+      // 有指定档就用指定档（播放页切档），否则按设置协商（见 playQualityOverride 的说明）
+      let quality: string = forcedQuality.length > 0
+        ? forcedQuality
+        : pickQuality(item.musicInfoJson, item.source, item.quality);
       item.quality = quality;
       AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
 
@@ -1324,8 +1477,11 @@ export class PlaySession {
       // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
-      // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支
-      audioCache.cacheSong(cacheKey, quality, url);
+      // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支。
+      //    开了「缓存时自动下载」则交给下载器，文件直接落在下载文件夹里（见 autoDownload）
+      if (!(audioCache.isAutoDownload() && this.autoDownload(item, cacheKey, quality))) {
+        audioCache.cacheSong(cacheKey, quality, url);
+      }
       // 4) 预取下一首：切歌时直接读本地文件，不用现场解析 + 缓冲
       void this.prefetchNext(token, index);
     } catch (e) {
@@ -1339,6 +1495,37 @@ export class PlaySession {
   }
 
   /**
+   * 「缓存时自动下载」：把这首歌排给下载器，而不是放进沙箱里的播放缓存
+   *
+   * 返回 false 表示下载器不收 —— 本地歌、云端歌（WebDAV）、没有 musicInfo 的条目，
+   * 或者下载器还没就绪。调用方必须照旧走播放缓存，不能让这首歌既下不了又缓不上。
+   *
+   * 排进去之后把沙箱里那份缓存删掉（dropKey）：同一首歌不必占两处地方，而且用户
+   * 在下载管理里删掉它时，「本地这份就没了、下次播放要重新下」这条承诺才成立。
+   */
+  private autoDownload(item: SongItem, key: string, quality: string): boolean {
+    const song: AutoDownloadSong = {
+      id: item.id,
+      name: item.name,
+      singer: item.singer,
+      coverUrl: item.coverUrl,
+      art: item.art,
+      source: item.source,
+      quality: quality,
+      interval: item.interval,
+      musicInfoJson: item.musicInfoJson,
+    };
+    if (!requestAutoDownload(song)) {
+      return false;
+    }
+    if (key.length > 0) {
+      AudioCache.getInstance().dropKey(key);
+    }
+    hilog.info(DOMAIN, TAG, 'auto download queued: %{public}s (%{public}s)', item.name, quality);
+    return true;
+  }
+
+  /**
    * 预取下一首
    *
    * 切歌时的卡顿主要来自「切的这一刻才开始干活」：解析播放链接（要走音源沙箱 + 平台接口）
@@ -1349,6 +1536,8 @@ export class PlaySession {
    *
    * 预取永远不抢当前这首的带宽：真正下载的时机由 AudioCache 按「播放优先」决定
    * （见 LxPlayer.canUseBandwidthForCache），这里只负责把活儿排上去。
+   * 开了「缓存时自动下载」时不走缓存这条路：直接排给下载器（同一个让路判断，
+   * 见 DownloadManager.pump），也就不必在这里先把地址解析一遍。
    *
    * 拿不到 musicInfo 的条目跳过：那要先按歌名搜一次，代价比预取本身还大，
    * 留到真正切过去时再解析（走 ensurePlayable 那条路）。
@@ -1371,6 +1560,11 @@ export class PlaySession {
       this.prefetchWebDav(item);
       return;
     }
+    // 听书不预取：每一集都要跑一遍书源规则（可能有多次网络往返）才拿到直链，
+    // 提前解析的收益比不上它抢走的带宽与站点压力，留到真正切过去时再解析
+    if (item.source === BOOK_SOURCE) {
+      return;
+    }
     const engine = SourceEngine.getInstance();
     if (!engine.isInited()) {
       return;
@@ -1384,6 +1578,11 @@ export class PlaySession {
       const cache = AudioCache.getInstance();
       if (cache.localPath(key, quality).length > 0) {
         // 已经是本地文件了，切过去本来就不用联网
+        return;
+      }
+      // 开了「缓存时自动下载」：直接排给下载器（它自己解析地址，不必在这里先解析一遍），
+      // 文件进下载文件夹，切过去时走「已下载文件」那条分支
+      if (cache.isAutoDownload() && this.autoDownload(item, key, quality)) {
         return;
       }
       let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
@@ -1469,6 +1668,11 @@ export class PlaySession {
     // 云端歌：同目录封面在加入曲库时就下好了；没有的话按平台匹配补一张
     if (isWebDavSong(item)) {
       this.loadWebDavCover(item);
+      return;
+    }
+    // 听书：封面来自书源搜索/详情，item.coverUrl 里已经有了；musicInfoJson 装的是
+    // 书籍载荷而不是 musicInfo，再往平台接口问就是把书当成歌名去搜，纯属白跑
+    if (item.source === BOOK_SOURCE) {
       return;
     }
     CoverStore.getInstance().request(item.musicInfoJson, (url: string) => {
@@ -1626,6 +1830,11 @@ export class PlaySession {
     // 云端歌同理：服务器上同目录的 .lrc 优先，其次在线匹配
     if (isWebDavSong(item)) {
       this.loadWebDavLyric(item);
+      return;
+    }
+    // 有声书没有歌词：不往平台接口白搜一轮（载荷里也不是 musicInfo，搜不出东西）
+    if (item.source === BOOK_SOURCE) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
       return;
     }
     AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
@@ -2364,6 +2573,35 @@ export class PlaySession {
     return true;
   }
 
+  /**
+   * 批量取消收藏：把一批歌从收藏里摘掉，返回实际摘掉的数量
+   *
+   * 与 addFavorites 同一个理由：逐首调 removeFavorite 的话每首都会上行一次同步
+   * （整份 love 列表覆盖），所以这里一次性改完、只通知一次。
+   * 歌单详情页多选里的「取消收藏」走的就是它（内置收藏歌单里删歌 / 取消收藏）。
+   */
+  removeFavorites(ids: string[]): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const remains: SongItem[] = [];
+    for (const entry of this.favorites) {
+      if (ids.indexOf(entry.id) < 0) {
+        remains.push(entry);
+      }
+    }
+    const removed: number = this.favorites.length - remains.length;
+    if (removed === 0) {
+      return 0;
+    }
+    this.favorites = remains;
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+    return removed;
+  }
+
   clearFavorites(): void {
     if (this.favorites.length === 0) {
       return;
@@ -2479,6 +2717,26 @@ export class PlaySession {
     this.history = [];
     this.pushHistoryState();
     this.persistPlayState(true);
+  }
+
+  /** 从播放历史里删掉几条（只删记录，文件与收藏都不动）；返回真删掉的条数 */
+  removeHistory(ids: string[]): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const kept: SongItem[] = [];
+    for (const entry of this.history) {
+      if (!ids.includes(entry.id)) {
+        kept.push(entry);
+      }
+    }
+    const removed: number = this.history.length - kept.length;
+    if (removed > 0) {
+      this.history = kept;
+      this.pushHistoryState();
+      this.persistPlayState(true);
+    }
+    return removed;
   }
 
   formatProgress(seconds: number): string {

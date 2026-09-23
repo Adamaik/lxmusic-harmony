@@ -9,6 +9,8 @@
  * 共 4042 个），不是猜的；写错名字会静默渲染成空白。
  */
 
+import { C_ICON } from './Theme';
+
 /** 首页（推荐） */
 export const I_HOME: Resource = $r('sys.symbol.house');
 export const I_HOME_FILL: Resource = $r('sys.symbol.house_fill');
@@ -18,6 +20,11 @@ export const I_PLAYLIST_FILL: Resource = $r('sys.symbol.music_note_list_fill');
 /** 我的 */
 export const I_PERSON: Resource = $r('sys.symbol.person');
 export const I_PERSON_FILL: Resource = $r('sys.symbol.person_fill');
+/** 听书（书页：未选中空心 / 选中实心） */
+export const I_BOOK: Resource = $r('sys.symbol.book_pages');
+export const I_BOOK_FILL: Resource = $r('sys.symbol.book_pages_fill');
+/** 我的书架（听书页里的书架分段） */
+export const I_BOOKSHELF: Resource = $r('sys.symbol.bookshelf');
 /** 设置 */
 export const I_GEAR: Resource = $r('sys.symbol.gearshape');
 export const I_GEAR_FILL: Resource = $r('sys.symbol.gearshape_fill');
@@ -50,6 +57,25 @@ export const I_MORE_CIRCLE: Resource = $r('sys.symbol.dot_grid_1x2_circle');
 /** 多选：已选中 / 未选中（本地音乐的批量移除用） */
 export const I_CHECK_CIRCLE: Resource = $r('sys.symbol.checkmark_circle_fill');
 export const I_CIRCLE: Resource = $r('sys.symbol.circle');
+/**
+ * 多选顶栏右侧那颗「全选」钮（两张叠起来的方块 + 勾）
+ *
+ * 与华为音乐多选时顶栏右上那颗钮是**同一个符号**（那张截图上的就是它），
+ * 所以这里不去自绘：交给 HDS 标题栏的菜单槽位画，玻璃动效与返回键同源。
+ */
+export const I_SELECT_ALL: Resource = $r('sys.symbol.checkmark_square_on_square');
+/** 批量操作：加入歌单（带加号的歌单，洛雪那套「加入歌单」的语义） */
+export const I_ADD_SONGLIST: Resource = $r('sys.symbol.add_songlist');
+/** 批量操作：从歌单里移除（带减号的歌单） */
+export const I_REMOVE_SONGLIST: Resource = $r('sys.symbol.remove_songlist');
+/** 批量操作：加入播放列表（列表 + 播放标记） */
+export const I_LIST_PLAY: Resource = $r('sys.symbol.list_badge_play');
+/** 批量操作：取消收藏（划掉的心） */
+export const I_HEART_SLASH: Resource = $r('sys.symbol.heart_slash');
+/** 批量操作：移除（圈起来的减号，与「删除」的垃圾桶区分开） */
+export const I_MINUS_CIRCLE: Resource = $r('sys.symbol.minus_circle');
+/** 批量操作：下载 / 重新下载（箭头落到一条线上，与华为音乐那颗下载钮一致） */
+export const I_DOWNLOAD_TO_LINE: Resource = $r('sys.symbol.arrow_down_to_line');
 /** 箭头 */
 export const I_CHEVRON_RIGHT: Resource = $r('sys.symbol.chevron_right');
 export const I_CHEVRON_DOWN: Resource = $r('sys.symbol.chevron_down');
@@ -109,6 +135,14 @@ export const I_COPY: Resource = $r('sys.symbol.doc_text_on_doc_text');
 export const I_EXTERNAL: Resource = $r('sys.symbol.arrowshape_turn_up_right');
 /** 群 / 多人 */
 export const I_GROUP: Resource = $r('sys.symbol.person_2');
+/** 本地音乐（文件夹）—— 「我的」页那个快捷入口 */
+export const I_FOLDER: Resource = $r('sys.symbol.folder');
+/** 最近播放（时钟） */
+export const I_CLOCK: Resource = $r('sys.symbol.clock');
+/** 云端音乐 */
+export const I_CLOUD: Resource = $r('sys.symbol.cloud');
+/** 帮助和反馈（问号圈） */
+export const I_HELP: Resource = $r('sys.symbol.questionmark_circle');
 
 /**
  * 官方符号图标
@@ -117,7 +151,8 @@ export const I_GROUP: Resource = $r('sys.symbol.person_2');
 export struct IconGlyph {
   @Prop symbol: Resource;
   @Prop iconSize: number = 22;
-  @Prop color: ResourceColor = '#1A1A1A';
+  // 默认色走主题 token（深浅模式各一份）；不要在调用处写死颜色，否则深色模式下会看不见
+  @Prop color: ResourceColor = C_ICON;
   @Prop weight: FontWeight = FontWeight.Medium;
   /**
    * 换图时走系统的符号替换动效（播放 <-> 暂停、收藏 <-> 取消收藏这类成对图标）。

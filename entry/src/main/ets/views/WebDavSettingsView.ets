@@ -3,8 +3,7 @@ import { K_WEBDAV_PROGRESS, K_WEBDAV_VERSION, WebDavLibrary, WebDavScanResult } 
 import { K_WEBDAV_READ_TAGS, K_WEBDAV_URL, WebDavSettings, normalizeServerUrl } from '../core/webdav/WebDavSettings';
 import { WebDavClient } from '../core/webdav/WebDavClient';
 import { WebDavConfig, WebDavProbeResult } from '../core/webdav/WebDavTypes';
-import { C_BG, C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
-  R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { HintText, ToggleSetting } from '../ui/SettingWidgets';
 import { describeAgo, describeScan } from './WebDavView';
 
@@ -28,6 +27,8 @@ const TAG: string = 'WebDavSettings';
  */
 @Component
 export struct WebDavSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @State host: string = '';
   @State user: string = '';
@@ -277,7 +278,7 @@ export struct WebDavSettingsView {
           .fontSize(14)
           .height(36)
           .layoutWeight(1)
-          .backgroundColor('#EDEDF0')
+          .backgroundColor(C_FILL_SOFT_STRONG)
           .fontColor(C_TEXT)
           .enabled(!this.busy)
           .onClick(() => {
@@ -360,7 +361,7 @@ export struct WebDavSettingsView {
         .fontSize(14)
         .height(36)
         .width('100%')
-        .backgroundColor('#1FE33B3B')
+        .backgroundColor(C_RED_TINT)
         .fontColor(C_RED)
         .onClick(() => {
           this.confirmClearCache();
@@ -376,6 +377,9 @@ export struct WebDavSettingsView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
           this.sectionTitle('服务器')
           this.serverCard()
           HintText({ text: '填 WebDAV 目录的完整地址（Nextcloud 通常是 '
@@ -386,7 +390,7 @@ export struct WebDavSettingsView {
 
           this.sectionTitle('扫描')
           Column() {
-            Column({ space: 17 }) {
+            Column({ space: 8 }) {
               ToggleSetting({
                 label: '读取云端标签',
                 value: this.readTags,
@@ -399,7 +403,7 @@ export struct WebDavSettingsView {
                 + '关掉就用文件名猜（「歌手 - 歌名」这种命名能猜对），播放时照样能听。' })
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: 17, bottom: 17 })
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           }
           .width('100%')
           .borderRadius(R_CARD)

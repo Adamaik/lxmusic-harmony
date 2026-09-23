@@ -1,15 +1,66 @@
-import { C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB,
-  R_COVER } from './Theme';
-import { immersiveMaterialFor, thinGlass } from './Glass';
+import { C_BG, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, C_TOP_FADE, C_TOP_FADE_END,
+  F_ITEM, F_SECTION, F_SUB, R_COVER } from './Theme';
+import { immersiveMaterialFor, materialFirstGlass, thinGlass } from './Glass';
 import { I_CHEVRON_RIGHT, I_DOC, I_HEART, I_HEART_FILLED, I_MORE, I_TRASH, I_VOLUME, IconGlyph } from './Icons';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { LAYOUT_UNBOUNDED } from './Layout';
 
 /**
  * 通用小组件：封面、圆形图标按钮、歌曲行
  */
 
-/** 占位封面配色（搜索结果/演示数据没有真实封面图时用） */
+/**
+ * 宽屏内容列（平板 / 折叠屏展开态）
+ *
+ * 手机（< 600vp）铺满整屏，与改之前一模一样；宽屏把内容收成居中一列（最大
+ * CONTENT_MAX_WIDTH），两侧留白 —— 否则列表与设置项会从屏幕左边缘一直拉到右边缘，
+ * 一行的封面和文字隔着半个屏幕，读起来很散。
+ *
+ * maxWidth 传 0 表示「不限宽」（窄屏，或窗口宽度还没量到），见 ui/Layout.ets。
+ *
+ * `fadeTop` 给子页面用：> 0 时在这层内容上方压一条「底色 → 全透明」的渐隐，高度就是
+ * 传进来的值。子页面的标题栏和首页一样是纯透明的，内容会从它底下滑过去，不给渐隐
+ * 的话列表文字会直接撞在标题上。**内容要让出标题栏那一段是各页面自己的事**
+ * （在滚动容器里加一段会跟着滚走的顶部占位，见各设置页里的说明）—— 这一层不能用
+ * `padding` 让位：内边距会把滚动内容裁在标题栏下边缘，看起来就"像被顶栏挡住"。
+ */
+@Component
+export struct WidePane {
+  @Prop maxWidth: number = 0;
+  /** 渐隐蒙版高度（vp）：0 = 不加（页签页内容自带渐隐，不需要这层） */
+  @Prop fadeTop: number = 0;
+  @BuilderParam content: () => void;
+
+  build() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Row() {
+        Column() {
+          this.content()
+        }
+        .width('100%')
+        .height('100%')
+        .constraintSize({ maxWidth: this.maxWidth > 0 ? this.maxWidth : LAYOUT_UNBOUNDED })
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      // 收窄后两侧的留白也跟着页面底色走：子页面（设置类）本身就是这个底色，
+      // 不给底色的话两侧会露出 HdsNavDestination 的默认底，中间一条灰、两边一条白
+      .backgroundColor(C_BG)
+
+      // 子页面（fadeTop > 0）：内容从透明标题栏底下滑过去时靠近顶部淡出，别把标题顶穿。
+      // 页签页（fadeTop = 0）不加：它们的内容在自己的 Stack 里已经带了渐隐。
+      if (this.fadeTop > 0) {
+        TopFade({ fadeHeight: this.fadeTop })
+      }
+    }
+    .width('100%')
+    .height('100%')
+  }
+}
+
+/** 占位封面配色（没有真实封面图时用：本地歌、还没解析出封面的搜索结果等） */
 const PALETTES: string[][] = [
   ['#2B2B33', '#141417'],
   ['#3A2E1E', '#191410'],
@@ -75,6 +126,12 @@ struct HeartCover {
  * 专辑封面。
  * url 有值时显示网络图；否则用内置占位（黑心封面或按曲名生成的渐变块）。
  *
+ * `appIcon` 为真时（全屏播放器 / 底部迷你播放器）**所有兜底都换成聆听的应用图标**：
+ * 没有正在播放的歌、这首歌没有封面、封面地址失效，一律是那颗音符。播放器上与其放
+ * 一块按曲名生成的渐变块（没有歌名时就是一块什么都没有的深色方块），不如放应用
+ * 自己的图标 —— 至少认得出是谁在放。列表类（搜索结果、歌单曲目）不开这个开关：
+ * 一屏几十张小图全变成同一个图标，反而分不出哪首是哪首。
+ *
  * 这里**故意不给 Image 设 alt**：alt 是「加载中」的占位图，之前挂的是应用图标，
  * 于是封面还没下完的那一瞬间会先闪一张 App 图标（全屏播放器弹起来的时候最明显，
  * 用户反馈「很丑」）。去掉之后加载期间就是一块深色圆角底，图到了直接换上；
@@ -87,6 +144,13 @@ export struct CoverArt {
   @Prop name: string = '';
   /** 是否使用洛雪那套黑心占位封面 */
   @Prop art: boolean = false;
+  /**
+   * 兜底图换成聆听的应用图标（全屏播放器 / 底部迷你播放器开，列表类别开）
+   *
+   * 优先级在 `art` 之上：播放器上即使这首歌标了「用黑心占位」，也还是给应用图标 ——
+   * 「没有封面」在播放器上只该有一种样子。
+   */
+  @Prop appIcon: boolean = false;
   @Prop boxSize: number = 48;
   @Prop radius: number = R_COVER;
   /**
@@ -118,6 +182,14 @@ export struct CoverArt {
         Column()
           .width('100%')
           .height('100%')
+      } else if (this.appIcon) {
+        // 聆听的应用图标（与锁屏媒体卡的兜底封面同一张，见 PlaybackService 的 FALLBACK_COVER_RES）。
+        // Cover 而不是 Contain：图标本身带方形底，铺满才像一张「默认封面」
+        Image($r('app.media.startIcon'))
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover)
+          .draggable(false)
       } else if (this.art) {
         HeartCover({ boxSize: this.boxSize, radius: this.radius })
       } else {
@@ -181,22 +253,29 @@ export struct EmptyState {
 
 /** 顶栏右侧那种白色玻璃圆钮 */
 @Component
-export struct RoundIconButton {
-  @Prop icon: Resource;
+export struct RoundIconButton {  @Prop icon: Resource;
   @Prop boxSize: number = 40;
   @Prop iconSize: number = 20;
   @Prop color: ResourceColor = C_ICON;
   @Prop filled: boolean = true;
   /** 读屏用的说明（这个钮里只有图形，读屏读不出「搜索」「音源」这类含义） */
   @Prop label: string = '';
+  /**
+   * 这颗钮是否画在**沉浸光感的生效范围**里（Navigation 标题栏 / 底部 TabBar）
+   *
+   * 为真时不再自绘玻璃底：那些位置系统材质真的会渲染，而材质层级在 backgroundColor /
+   * backgroundBlurStyle 之下，自绘一层底就把它盖住了（官方 FAQ 的「背景色或背景模糊
+   * 遮挡材质效果」）。材质不可用的设备上自动退回自绘，不会变成透明钮。
+   */
+  @Prop materialFirst: boolean = false;
   onTap: () => void = () => {
   };
   /** 玻璃厚度档位（外观设置）：订阅它，改档位时全部悬浮圆钮一起变厚变薄 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
 
   build() {
-    // 用官方的圆形 Button 承载（带系统按压/焦点态），玻璃底（毛玻璃 + 半透明白 + 1vp 亮边）
-    // 由 GlassModifier 给；内容区的普通组件吃不到系统材质，见 ui/Glass.ets 开头的限制说明
+    // 用官方的圆形 Button 承载（带系统按压/焦点态），玻璃底由 GlassModifier 给：
+    // 内容区里只能自绘（普通组件不在沉浸光感生效范围内），标题栏里则交给系统材质
     Button({ type: ButtonType.Circle, stateEffect: true }) {
       IconGlyph({
               symbol: this.icon,
@@ -206,11 +285,11 @@ export struct RoundIconButton {
     }
     .width(this.boxSize)
     .height(this.boxSize)
-    // 玻璃三层：系统沉浸材质（与底部导航栏同一套引擎）+ 按压形变 + 光感反馈，
-    // 外加轮廓点光；材质不可用时退化成自绘磨砂
     // 派音那颗悬浮圆钮的配方：极淡的白底 + 纯白 1vp 描边，没有阴影、没有光效。
     // 玻璃感来自「透出背后的内容」这一件事，而不是加阴影或者描边发亮。
-    .attributeModifier(thinGlass(this.boxSize / 2, false, '', this.materialLevel))
+    .attributeModifier(this.materialFirst
+      ? materialFirstGlass(this.boxSize / 2, this.materialLevel)
+      : thinGlass(this.boxSize / 2, false, '', this.materialLevel))
     // 系统沉浸材质（和底部导航栏同一族的观感）。挂在组件上而不是 AttributeModifier 里：
     // 属性修改器里能调哪些接口有讲究，直接挂更稳。设备没有能力位时这里是 undefined，
     // 等于不设材质，界面就落在上面那层自绘玻璃上。
@@ -220,6 +299,35 @@ export struct RoundIconButton {
     })
     .accessibilityText(this.label)
     .accessibilityLevel(this.label.length > 0 ? 'yes' : 'auto')
+  }
+}
+
+/**
+ * 顶栏渐隐蒙版
+ *
+ * 首页标题栏是纯透明的（华为音乐那一套），内容会从标题底下穿过去。不加这一层的话，
+ * 行文字会直接撞在「推荐」两个字后面，很脏。这一层从页面底色渐隐到全透明，压在
+ * **滚动内容之上、标题栏之下**（标题栏是 HDS 的独立图层，永远在这之上），
+ * 于是内容越靠近顶部越淡，而标题、来源胶囊、搜索钮始终清晰。
+ *
+ * 铺满宽度、不拦触摸：它只是一层视觉遮罩，不该影响滚动与点击。
+ */
+@Component
+export struct TopFade {
+  /** 蒙版高度（vp）。调用方按「状态栏 + 标题栏 + 一点余量」给。
+   *  不能叫 `height` —— 那个名字和组件基类自带的同名属性冲突，编译会报 not assignable。 */
+  @Prop fadeHeight: number = 120;
+
+  build() {
+    Column()
+      .width('100%')
+      .height(this.fadeHeight)
+      .linearGradient({
+        // 180 = 从上往下，0.0 落在顶边：顶边是底色本身，越往下越透
+        angle: 180,
+        colors: [[C_TOP_FADE, 0.0], [C_TOP_FADE_END, 1.0]],
+      })
+      .hitTestBehavior(HitTestMode.Transparent)
   }
 }
 

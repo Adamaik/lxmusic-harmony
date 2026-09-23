@@ -1,28 +1,30 @@
-import { C_BG, C_CARD, C_RED, R_CARD } from '../ui/Theme';
-import { HintText, OptionSetting, SettingLabel, ToggleSetting } from '../ui/SettingWidgets';
+import { common } from '@kit.AbilityKit';
+import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
+import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
 import { hdsEffectSupported, hdsMaterialType, isEmulatorDevice, MATERIAL_LEVEL_LABELS } from '../ui/Hds';
 import { isGlassMaterialSupported } from '../ui/Glass';
-import { AppearanceSettings, COVER_RADIUS_DEFAULT, COVER_RADIUS_MAX, COVER_RADIUS_MIN,
-  K_COVER_RADIUS, K_FLOW_LIGHT, K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { AppearanceSettings, COLOR_MODE_LABELS, COVER_RADIUS_DEFAULT, COVER_RADIUS_MAX,
+  COVER_RADIUS_MIN, K_COLOR_MODE, K_COVER_RADIUS, K_FLOW_LIGHT, K_MATERIAL_LEVEL }
+  from '../core/settings/AppearanceSettings';
 
 /**
  * 外观设置（设置 - 外观）
  *
- * 三组：
- *   一、玻璃材质档位：跟随系统 / 弱 / 均衡 / 强 —— 标题栏、底部页签栏、半模态三处共用；
- *   二、光效与圆角：首页流光（HDS 背景流光）、播放页封面圆角；
- *   三、底部把 HDS 能力的实际生效情况摊开（能力位 / 材质类型 / 是否模拟器），
+ * 四组：
+ *   一、深浅模式：跟随系统 / 浅色 / 深色 —— 界面颜色都是 base / dark 同名资源，
+ *      这一档改的是应用级 colorMode（见 core/settings/AppearanceSettings.ets）；
+ *   二、玻璃材质档位：跟随系统 / 弱 / 均衡 / 强 —— 标题栏、底部页签栏、半模态三处共用；
+ *   三、光效与圆角：首页流光（HDS 背景流光）、播放页封面圆角；
+ *   四、底部把 HDS 能力的实际生效情况摊开（能力位 / 材质类型 / 是否模拟器），
  *      效果对不上时先看这一行，不用猜。
- *
- * 深浅模式没有放进来：那要先把全部颜色迁到资源（base / dark 同名 token），
- * 现在自绘界面用的是 Theme.ets 里的常量，只切系统模式会出现「浅色界面 + 深色系统栏」
- * 的四不像。宁可先不给这个开关，也不给一个点着没用的。
  *
  * 之前设置页里的「主题」是一个死入口：点进去提示「该功能暂未接入」。外观相关的
  * 选择全都在这里，改完立即生效并落盘（AppearanceSettings，沙箱 JSON + AppStorage）。
  */
 @Component
 export struct AppearanceSettingsView {
+  /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   /** 材质档位：0 跟随系统 / 1 弱 / 2 均衡 / 3 强 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
@@ -30,6 +32,18 @@ export struct AppearanceSettingsView {
   @StorageLink(K_FLOW_LIGHT) flowLight: boolean = true;
   /** 播放页封面圆角 */
   @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
+  /** 深浅模式：0 跟随系统 / 1 浅色 / 2 深色 */
+  @StorageLink(K_COLOR_MODE) colorMode: number = 0;
+
+  /** 「跟随系统」时才说明这一档的实际含义：选了浅色 / 深色就是钉死的 */
+  private colorModeHint(): string {
+    if (this.colorMode === 0) {
+      return '跟随系统：手机切到深色模式，界面跟着变。'
+        + '界面上所有颜色都是 base / dark 两份同名资源（resources 下 base / dark 两份同名 color.json），'
+        + '不跟随的话在深色系统里会出现白卡片配浅字这类看不清的问题。';
+    }
+    return '这一档会覆盖系统设置：无论手机是什么模式，应用都用这一档的深浅。';
+  }
 
   /** 这一行是给「效果对不上」时看的：能力位、材质类型、模拟器都要摆出来 */
   private capabilityText(): string {
@@ -64,8 +78,29 @@ export struct AppearanceSettingsView {
     Column() {
       Scroll() {
         Column({ space: 14 }) {
+          // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          Column().height(this.topInset + 6).width('100%')
+          // ------------------------------------------------ 深浅模式
+          Column({ space: 8 }) {
+            OptionSetting({
+              label: '深浅模式',
+              options: COLOR_MODE_LABELS,
+              activeIndex: this.colorMode,
+              onPick: (index: number) => {
+                AppearanceSettings.getInstance().setColorMode(index, this.getUIContext()
+                  .getHostContext() as common.Context);
+              },
+            })
+            HintText({ text: this.colorModeHint() })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .borderRadius(R_CARD)
+          .backgroundColor(C_CARD)
+
           // ------------------------------------------------ 玻璃材质
-          Column({ space: 17 }) {
+          Column({ space: 8 }) {
             OptionSetting({
               label: '玻璃材质档位',
               options: MATERIAL_LEVEL_LABELS,
@@ -77,12 +112,12 @@ export struct AppearanceSettingsView {
             HintText({ text: this.materialHint() })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
           // ------------------------------------------------ 光效
-          Column({ space: 17 }) {
+          Column({ space: 8 }) {
             ToggleSetting({
               label: '首页流光',
               value: this.flowLight,
@@ -93,34 +128,22 @@ export struct AppearanceSettingsView {
             HintText({ text: this.flowLightHint() })
 
             // 封面圆角：拖动实时变（播放页封面跟着走），松手才落盘
-            Column({ space: 4 }) {
-              SettingLabel({ label: '播放页封面圆角', value: `${this.coverRadius}` })
-              Slider({
-                value: this.coverRadius,
-                min: COVER_RADIUS_MIN,
-                max: COVER_RADIUS_MAX,
-                step: 1,
-                style: SliderStyle.OutSet,
-              })
-                .trackThickness(3)
-                .blockSize({ width: 18, height: 18 })
-                .blockColor(Color.White)
-                .selectedColor(C_RED)
-                .trackColor('#E4E4E8')
-                .width('100%')
-                .onChange((value: number, mode: SliderChangeMode) => {
-                  const done: boolean = mode === SliderChangeMode.End || mode === SliderChangeMode.Click;
-                  AppearanceSettings.getInstance().setCoverRadius(value, done);
-                })
-            }
-            .width('100%')
+            SliderSetting({
+              label: '播放页封面圆角',
+              value: this.coverRadius,
+              min: COVER_RADIUS_MIN,
+              max: COVER_RADIUS_MAX,
+              onPick: (value: number, done: boolean) => {
+                AppearanceSettings.getInstance().setCoverRadius(value, done);
+              },
+            })
             HintText({
               text: '0 是直角，40 接近圆形。播放页的大封面与小歌词下面的小封面共用这一个值，'
                 + '列表里的封面不受影响（那是列表自己的排版）。',
             })
           }
           .width('100%')
-          .padding({ left: 16, right: 16, top: 17, bottom: 17 })
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
