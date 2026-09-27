@@ -1,4 +1,5 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { LengthMetrics } from '@kit.ArkUI';
 import { K_WEBDAV_PROGRESS, K_WEBDAV_VERSION, WebDavLibrary, WebDavScanResult } from '../core/webdav/WebDavLibrary';
 import { K_WEBDAV_READ_TAGS, K_WEBDAV_URL, WebDavSettings, normalizeServerUrl } from '../core/webdav/WebDavSettings';
 import { WebDavClient } from '../core/webdav/WebDavClient';
@@ -6,6 +7,7 @@ import { WebDavConfig, WebDavProbeResult } from '../core/webdav/WebDavTypes';
 import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { HintText, ToggleSetting } from '../ui/SettingWidgets';
 import { describeAgo, describeScan } from './WebDavView';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'WebDavSettings';
@@ -44,6 +46,17 @@ export struct WebDavSettingsView {
   @StorageLink(K_WEBDAV_READ_TAGS) readTags: boolean = true;
   @StorageLink(K_WEBDAV_VERSION) @Watch('onLibraryChanged') libraryVersion: number = 0;
   @StorageLink(K_WEBDAV_PROGRESS) progressText: string = '';
+  /**
+   * 窗口宽度（vp）：宽屏下这几组并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     const settings = WebDavSettings.getInstance();
@@ -376,45 +389,75 @@ export struct WebDavSettingsView {
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每组 48% 宽（见 ui/Layout.ets 的 cardWidthOf），
+         * 自动一行两张。每一组（小标题 + 卡 + 说明）包在一个 Column 里当**一个单元**：
+         * 说明文字本身铺满宽度，不包起来会把换行打断，两组就并不到一排去。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          // 各组高矮差得多（服务器那组一张长卡），居中的话短的会飘在半空
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
-          this.sectionTitle('服务器')
-          this.serverCard()
-          HintText({ text: '填 WebDAV 目录的完整地址（Nextcloud 通常是 '
-            + 'https://你的域名/remote.php/dav/files/用户名/音乐目录）。'
-            + '「测试连接并扫描」连上之后会把该目录（含子目录）里的音乐扫出来，直接就能播。' })
 
-          this.actionCard()
+          // ------------------------------------------------ 服务器（标题 + 卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            this.sectionTitle('服务器')
+            this.serverCard()
+            HintText({ text: '填 WebDAV 目录的完整地址（Nextcloud 通常是 '
+              + 'https://你的域名/remote.php/dav/files/用户名/音乐目录）。'
+              + '「测试连接并扫描」连上之后会把该目录（含子目录）里的音乐扫出来，直接就能播。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
 
-          this.sectionTitle('扫描')
-          Column() {
-            Column({ space: 8 }) {
-              ToggleSetting({
-                label: '读取云端标签',
-                value: this.readTags,
-                onPick: (next: boolean) => {
-                  WebDavSettings.getInstance().setReadTags(next);
-                },
-              })
-              HintText({ text: '开启后，扫描时会逐首读取服务器上文件里的标签（歌名 / 歌手 / 专辑 / 时长），'
-                + '匹配封面和歌词会准很多，代价是每首发一次请求，几十首的目录会明显慢一点。'
-                + '关掉就用文件名猜（「歌手 - 歌名」这种命名能猜对），播放时照样能听。' })
+          Column({ space: 14 }) {
+            this.actionCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 扫描（标题 + 卡是一个单元）
+          Column({ space: 14 }) {
+            this.sectionTitle('扫描')
+            Column() {
+              Column({ space: 8 }) {
+                ToggleSetting({
+                  label: '读取云端标签',
+                  value: this.readTags,
+                  onPick: (next: boolean) => {
+                    WebDavSettings.getInstance().setReadTags(next);
+                  },
+                })
+                HintText({ text: '开启后，扫描时会逐首读取服务器上文件里的标签（歌名 / 歌手 / 专辑 / 时长），'
+                  + '匹配封面和歌词会准很多，代价是每首发一次请求，几十首的目录会明显慢一点。'
+                  + '关掉就用文件名猜（「歌手 - 歌名」这种命名能猜对），播放时照样能听。' })
+              }
+              .width('100%')
+              .padding({ left: 16, right: 16, top: 8, bottom: 8 })
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
           }
-          .width('100%')
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
+          .width(cardWidthOf(this.windowWidth))
 
-          this.sectionTitle('曲库与缓存')
-          this.libraryCard()
-          HintText({ text: '曲库就是「上次扫描的结果」这份缓存：服务器上的文件不归这个应用管，'
-            + '要拿掉什么直接在服务器上删、然后重新扫描。'
-            + '云端音乐不参与洛雪同步（与本地音乐一致：同步只传在线歌曲）；'
-            + '歌单与收藏里的云端歌存在「非同步侧表」里，上行时不会发出去。' })
+          // ------------------------------------------------ 曲库与缓存（标题 + 卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            this.sectionTitle('曲库与缓存')
+            this.libraryCard()
+            HintText({ text: '曲库就是「上次扫描的结果」这份缓存：服务器上的文件不归这个应用管，'
+              + '要拿掉什么直接在服务器上删、然后重新扫描。'
+              + '云端音乐不参与洛雪同步（与本地音乐一致：同步只传在线歌曲）；'
+              + '歌单与收藏里的云端歌存在「非同步侧表」里，上行时不会发出去。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           Column().height(this.bottomInset + 20).width('100%')
         }

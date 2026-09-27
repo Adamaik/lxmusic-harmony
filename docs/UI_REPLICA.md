@@ -64,9 +64,11 @@ core/sync/CollectedPlaylists.ets 收藏歌单（收藏**线上**歌单，纯本�
 
 三层叠加：
 
-1. **沉浸式系统材质**（`uiMaterial.ImmersiveMaterial`，API 26）：系统在材质层做滤镜，
-   `interactive: true` 是按压形变反馈，`lightEffect` 是光感交互反馈。
+1. **沉浸式系统材质**（`uiMaterial.ImmersiveMaterial`，**API 26 / 鸿蒙7 起**）：系统在材质层做
+   滤镜，`interactive: true` 是按压形变反馈，`lightEffect` 是光感交互反馈。
    封装在 `ui/Glass.ets`，每个玻璃层同时设置材质与 `backgroundBlurStyle` 兜底。
+   **鸿蒙6（API 23）上这条接口不存在**，整条路径不调，改由下面第 3 条的轮廓点光出光感 ——
+   见「沉浸光感（`.systemMaterial`）的生效范围与版本红线」。
 2. **HDS 光效**（UI Design Kit `@kit.UIDesignKit`，见 `ui/Hds.ets`）：走 `hdsEffect` 的
    **着色器**路径 —— `HdsEffectBuilder().shaderEffect({...}).buildEffect()` 产出一个
    `VisualEffect`（`uiEffect.VisualEffect`，API 12 起的通用属性），挂在任意组件的
@@ -78,7 +80,11 @@ core/sync/CollectedPlaylists.ets 收藏歌单（收藏**线上**歌单，纯本�
      挂在播放页的播放钮下面（白色主光带 + 一点品牌红副光带）。
    - 两者都铺满父容器、`HitTestMode.Transparent`，不影响布局与交互；
      首页流光可在「设置 - 外观」里关掉。
-3. **HDS 玻璃材质色**：描边取 `$r('sys.color.glass_material_outline_primary')`，
+3. **HDS 轮廓点光**（`hdsPointLight()`，同样 `@kit.UIDesignKit`，**API 20 / 鸿蒙6 起**）：
+   `pointLight` 着色器（`SOFT` 柔光 + `BORDER` 只照亮轮廓），**鸿蒙6 的「普通光效」** ——
+   系统材质不可用时替代材质的 `lightEffect`，给悬浮控件边沿加一圈光。
+   由 `glassLight()` 挂上去（`ui/Glass.ets`），与 `.systemMaterial()` 成对出现。
+4. **HDS 玻璃材质色**：描边取 `$r('sys.color.glass_material_outline_primary')`，
    亮暗模式与系统一致；取不到时退回自绘高光边。
 
 ### 悬浮控件的玻璃：照着派音抄（这才是「为什么它好看」的答案）
@@ -109,41 +115,94 @@ core/sync/CollectedPlaylists.ets 收藏歌单（收藏**线上**歌单，纯本�
 之前的「粗糙」有两层原因：一是给悬浮控件**加了阴影和自发光**，那会把它变成"实心白牌子"；
 二是我一直在手画本该交给平台的组件。
 
-### 系统材质（`.systemMaterial`）在内容区不生效这件事
+### 沉浸光感（`.systemMaterial`）的生效范围与**版本红线**
 
-`uiMaterial` / `.systemMaterial()` 是 **API 26** 的接口，而 HDS 里接受 `SystemMaterialParams` 的
-只有两处：标题栏（`TitleBarStyleOptions.systemMaterialEffect`）和 `HdsTabs` 的浮动页签栏
-（`HdsTabsFloatingStyle.systemMaterialEffect`），加上半模态 —— 底部导航栏之所以有材质，
-是因为它是"底部页签栏"这个平台认可的表面。内容区里的普通按钮拿不到。
+`uiMaterial` / `.systemMaterial()` 是 **API 26（鸿蒙7）** 的接口。生效范围上，HDS 里接受
+`SystemMaterialParams` 的只有两处：标题栏（`TitleBarStyleOptions.systemMaterialEffect`）和
+`HdsTabs` 的浮动页签栏（`HdsTabsFloatingStyle.systemMaterialEffect`），加上半模态 ——
+底部导航栏之所以有材质，是因为它是「底部页签栏」这个平台认可的表面。
 
-代码里仍然保留这条路（`immersiveMaterialFor()` + `.systemMaterial()`，能力位不支持时返回
-`undefined`），能生效就生效，不生效就落在上面那层自绘玻璃上 —— 但**不要指望它**，
-界面的观感是照着派音那套调的。
+**版本红线（这一条是踩过闪退的）**：本工程 `compatibleSdkVersion = 6.1.0(23)`，
+也就是**鸿蒙6 必须能跑**。而下面这一批全是 API 26 专有、鸿蒙6 上**根本不存在**的接口：
 
-### 悬浮控件的玻璃：走系统材质，和底部导航栏同一套
+| 接口 | 在哪儿 |
+| --- | --- |
+| `uiMaterial` 命名空间 / `ImmersiveStyle` / `ImmersiveMaterial` | `ui/Glass.ets` |
+| 组件的 `.systemMaterial()` | 圆钮、下拉框、搜索框、提示条 |
+| **`Tabs.barFloatingStyle` + `FloatingTabBarStyle` / `FloatingTabBarWidth`** | 歌单详情 / 在线详情 / 四个面板页（`PanePage`）|
+| `SheetOptions.systemMaterial` | 半模态（半模态是弹窗类，全页面可用）|
+
+编译器对这些调用只给一句**警告**（不是错误）：
+
+```
+The 'barFloatingStyle' API is supported since SDK version 26.0.0. However, the current
+compatible SDK version is 6.1.0(23). It is recommended to use apiAvailable to safeguard
+API compatibility.
+```
+
+构建照样过，坑全留在运行时。**实测的现场是「主页能开，点进歌单就闪退」**：主页那条底部栏
+走的是 HDS 的 `HdsTabs.barFloatingStyle`（API 18 起，低版本也有），而三个子页面走的是
+ArkUI 原生的 `Tabs.barFloatingStyle`（API 26），低版本上这个方法不存在，一进页面就崩。
+
+所以每一个鸿蒙7 调用点都必须自己守：
+
+- **属性/组件层面**过 `harmony7ApiReady()`（`ui/Glass.ets`）—— 它要求
+  `deviceInfo.sdkApiVersion >= 26`（API 等级）**与** `distributionOSApiVersion >= 70000`
+  （发行版本，6.1.0 = 60100、7.0.0 = 70000）同时成立。两个条件都要，是因为判断错了的
+  后果不对称：判成 `false` 只是观感退回老一套，判成 `true` 而机器其实是鸿蒙6 就是闪退，
+  所以取保守的一侧；
+- **材质对象层面**过 `isGlassMaterialSupported()`（多一道设备能力位）。
+
+`Glass.ets` 的 `probe()` 也**先判版本再去碰 `uiMaterial`** —— 早期版本直接
+`try { uiMaterial.isImmersiveMaterialSupported() } catch`，虽然不崩，但等于每次启动都拿异常
+当探测用，低版本上还白抛一次。
+
+### 悬浮控件的玻璃：三层，按系统版本降级
 
 底部导航栏那种「流光溢彩」是**系统沉浸材质**画的（折射、随底下内容提亮、按压形变、
-光感反馈都在材质滤镜里）。`systemMaterial` 是 API 26 起的**通用属性**
-（`uiMaterial.ImmersiveMaterial`），任何组件都能挂 —— 不是只能用在标题栏 / 底部 TabBar /
-弹窗上，那是早先版本的限制，之前照那条限制自己手画磨砂，所以看着「粗糙」。
+光感反馈都在材质滤镜里）。`systemMaterial` 是 API 26 起的**通用属性**，
+任何组件都能挂 —— 不是只能用在标题栏 / 底部 TabBar / 弹窗上。
 
-`ui/Glass.ets` 的 `GlassModifier` 现在分三层，一层层降级：
+`ui/Glass.ets` 的 `GlassModifier` 分三层，一层层降级：
 
-1. **系统材质**（首选，能力位在就挂）：
+1. **系统材质**（首选，鸿蒙7 + 能力位在就挂）：
    `ImmersiveMaterial({ style, interactive: true, lightEffect: { color: 主题色 }, applyShadow: true })`
    - `style` 跟随外观设置的档位（`immersiveStyleOf`，跟随系统时问 `getGlobalMaterialLevel()`）；
    - `interactive` = 按压形变反馈；`lightEffect` = 光感交互反馈（动感光效的来源）。
-2. **轮廓点光**（可选，`withPointLight()`）：HDS 的 `pointLight` 着色器（`SOFT` 柔光 +
-   `BORDER` 只照亮轮廓），给悬浮控件边沿加一圈光，让它们「立」起来。
-   圆钮、两个下拉框都开了。
-3. **自绘兜底**：毛玻璃模糊 + **上亮下暗的轻渐变**（纯色底太死）+ 1vp 系统玻璃描边 +
-   轻阴影。只有在设备没有材质能力位、或材质构造失败时才是唯一的一层；
-   支持时它仍然先画上去 —— 材质生效会接管底色 / 描边 / 阴影，
-   万一某个机型上材质在内容区不渲染，控件也不会变成一片透明。
+2. **轮廓点光**（鸿蒙6 的「普通光效」）：材质不可用时，材质那份 `lightEffect` 就整段没了 ——
+   用 HDS 的 `pointLight` 着色器补回来（`SOFT` 柔光 + `BORDER` 只照亮轮廓，
+   **API 20 起就有，鸿蒙6 全量支持**），让悬浮控件边沿「立」起来。
+   接口是 `glassLight()`（`ui/Glass.ets`），底层是 `ui/Hds.ets` 的 `hdsPointLight()`；
+   挂法 `.visualEffect(glassLight())`，**与 `.systemMaterial()` 成对出现**。
+   它**只能挂在组件上**，别塞进 AttributeModifier —— 两份官方文档在这一点上打架：
+   《属性修改器》把 `CommonAttribute.visualEffect` 列进「不支持 attributeModifier 的范围」
+   （告警 `is not callable`），《视效设置》却写「从 API version 20 开始，该接口支持在
+   attributeModifier 中调用」。有分歧就别赌，挂组件上是两边都认可的写法。
+   链式属性又没法按条件把这一行摘掉，所以 `glassLight()` 是「**永远挂一层**」：
+   鸿蒙7 返回空效果（`uiEffect.createEffect()`，材质自己在发光，不叠第二遍），
+   鸿蒙6 才返回那个轮廓点光。
+3. **自绘兜底**：毛玻璃模糊 + 半透明白底 + 1vp 系统玻璃描边 + 轻阴影。
+   材质不可用时它就是唯一的底色层（鸿蒙6 上这一层 + 第 2 层的点光就是全部观感）。
 
 走这一套的控件（改档位时一起变厚变薄）：顶栏圆钮（搜索…）、
 **两个下拉框**（首页来源、「推荐歌单」栏的排序）、搜索框、提示条。
-（页内那条悬浮迷你栏**不在**这一套里：它是 Tabs 的悬浮栏、材质由框架画，见下面「页内迷你栏」。）
+（页内那条悬浮迷你栏**不在**这一套里：鸿蒙7 上是 Tabs 的悬浮栏、材质由框架画，
+见下面「页内迷你栏」；鸿蒙6 上退回自绘胶囊 + 点光。）
+
+### 页内迷你栏（歌单详情 / 在线详情 / 面板页）
+
+这几页是压在路由栈上的 `HdsNavDestination`，把壳层那条带迷你栏的 `HdsTabs` 盖住了，
+所以要自己挂一条。**两条路，按系统版本切**：
+
+- **鸿蒙7**：`Tabs` + `.barFloatingStyle({ systemMaterial })` —— 胶囊的圆角、边距、位置、
+  材质全由框架画，页面只提供栏里的内容（`MiniBarView` / 多选那条 `SelectionActions`）。
+  **别往栏里再叠自绘玻璃**：材质层级在 `backgroundColor` / `backgroundBlurStyle` 之下。
+- **鸿蒙6**：`barFloatingStyle` 不存在，退回改造前那套 —— 自己挂一条胶囊
+  （`fallbackMiniBar()`，几何与鸿蒙7 那条同一口径：左右边距 `barSideMarginFor()`、
+  离底 `手势条 + 10`、栏高 `HDS_BAR_HEIGHT`），表面是自绘玻璃 + 轮廓点光。
+
+页面结构上，主体一律抽成 `pageBody()` builder，`build()` 里只按版本包一层
+`if (harmony7ApiReady())` —— 主体两种系统完全一样，不复制成两份。
 
 ### 材质档位（标题栏 / 页签栏 / 半模态 + 全部自绘玻璃层）
 

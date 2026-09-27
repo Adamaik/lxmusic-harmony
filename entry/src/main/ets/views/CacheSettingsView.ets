@@ -1,7 +1,9 @@
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { I_CACHE, IconGlyph } from '../ui/Icons';
 import { AudioCache, K_CACHE_AUTO_DOWNLOAD, K_CACHE_VERSION } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /**
  * 缓存设置
@@ -42,6 +44,17 @@ export struct CacheSettingsView {
    */
   @State autoSwitchOn: boolean = false;
   @StorageLink(K_CACHE_VERSION) @Watch('refresh') cacheVersion: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下两组（播放缓存 / 元数据缓存）并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     this.syncAutoDownload();
@@ -396,40 +409,63 @@ export struct CacheSettingsView {
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 两组的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每组 48% 宽（见 ui/Layout.ets 的 cardWidthOf）。
+         * 每一组（小标题 + 卡 + 卡下面那几行说明）包在一个 Column 里当**一个单元**：
+         * 说明文字本身铺满宽度，不包起来会把换行打断，两组就并不到一排去。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          // 两组高度差得远（元数据那组只有一张卡），居中的话短的那组会飘在半空
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
-          this.sectionTitle('播放缓存', sizeText(this.audioBytes))
-          this.audioCard()
-          Text('边听边把整首下到应用沙箱，下次播放直接读本地：不联网、不受源脚本影响。'
-            + '上限设 0 即关闭缓存。开了「缓存时自动下载」则改为下到「下载」文件夹，'
-            + '文件在「我的 - 下载管理」里可见可删（那时这个上限不生效）。'
-            + '开启之前已经缓存在沙箱里的歌不会自动搬过去，想清掉点上面的「清空」。')
-            .fontSize(11.5)
-            .fontColor(C_TEXT_WEAK)
-            .width('100%')
-            .padding({ left: 4, right: 4 })
-            .textAlign(TextAlign.Start)
-          Text('下载永远给播放让路：正在听的那首缓冲不够时缓存会停下来等（网络就那么多，'
-            + '先把声音喂饱），够用了再接着下；断在半路的会留着，下次接着下，不从头重来。'
-            + '上一首还在播时也会提前取下下一首，切歌时直接读本地文件。')
-            .fontSize(11.5)
-            .fontColor(C_TEXT_WEAK)
-            .width('100%')
-            .padding({ left: 4, right: 4 })
-            .textAlign(TextAlign.Start)
 
-          this.sectionTitle('元数据缓存', '')
-          this.metaCard()
-          Text('播放地址、歌词、封面地址都会缓存一份（对应洛雪的 @music_url / @lyric）：'
-            + '播放过的歌再次播放不必重新解析，歌词不会因为源抽风而忽然没有，'
-            + '封面也不必每次启动都为整张列表重新查一遍。')
-            .fontSize(11.5)
-            .fontColor(C_TEXT_WEAK)
-            .width('100%')
-            .padding({ left: 4, right: 4 })
-            .textAlign(TextAlign.Start)
+          // ------------------------------------------------ 播放缓存（标题 + 卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            this.sectionTitle('播放缓存', sizeText(this.audioBytes))
+            this.audioCard()
+            Text('边听边把整首下到应用沙箱，下次播放直接读本地：不联网、不受源脚本影响。'
+              + '上限设 0 即关闭缓存。开了「缓存时自动下载」则改为下到「下载」文件夹，'
+              + '文件在「我的 - 下载管理」里可见可删（那时这个上限不生效）。'
+              + '开启之前已经缓存在沙箱里的歌不会自动搬过去，想清掉点上面的「清空」。')
+              .fontSize(11.5)
+              .fontColor(C_TEXT_WEAK)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+            Text('下载永远给播放让路：正在听的那首缓冲不够时缓存会停下来等（网络就那么多，'
+              + '先把声音喂饱），够用了再接着下；断在半路的会留着，下次接着下，不从头重来。'
+              + '上一首还在播时也会提前取下下一首，切歌时直接读本地文件。')
+              .fontSize(11.5)
+              .fontColor(C_TEXT_WEAK)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 元数据缓存（标题 + 卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            this.sectionTitle('元数据缓存', '')
+            this.metaCard()
+            Text('播放地址、歌词、封面地址都会缓存一份（对应洛雪的 @music_url / @lyric）：'
+              + '播放过的歌再次播放不必重新解析，歌词不会因为源抽风而忽然没有，'
+              + '封面也不必每次启动都为整张列表重新查一遍。')
+              .fontSize(11.5)
+              .fontColor(C_TEXT_WEAK)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+          }
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 16 })

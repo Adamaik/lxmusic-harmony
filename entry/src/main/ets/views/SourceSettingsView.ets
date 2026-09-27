@@ -11,6 +11,8 @@ import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
 import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
+import { LengthMetrics } from '@kit.ArkUI';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SourceSettingsView';
@@ -50,6 +52,17 @@ export struct SourceSettingsView {
   @State logs: string[] = [];
   @State testUrl: string = '';
   private logListener: ((log: SourceLog) => void) | null = null;
+  /**
+   * 窗口宽度（vp）：宽屏下这几段并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     const engine = SourceEngine.getInstance();
@@ -195,7 +208,21 @@ export struct SourceSettingsView {
     Column() {
       // 标题栏与返回键由 HdsNavDestination 提供，这里不再自绘头部
       Scroll() {
-        Column({ space: 16 }) {
+        /**
+         * 各段的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 16，与原来的 `Column({ space: 16 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每段 48% 宽（见 ui/Layout.ets 的 cardWidthOf），
+         * 自动一行两段。每段（小标题 + 它的卡）包在一个 Column 里当**一个单元**：
+         * 不包的话小标题会跟别段的卡排在一格上。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          // 各段高矮差得多（已导入音源可能好几条、日志几十行），居中的话短的会飘在半空
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(16), cross: LengthMetrics.vp(16) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
@@ -207,180 +234,192 @@ export struct SourceSettingsView {
             .padding({ left: 4 })
 
           // ------------------------------------------------ 导入音源
-          this.sectionCard('导入音源')
           Column({ space: 10 }) {
-            TextArea({
-              text: this.sourceInput,
-              placeholder: '粘贴音源脚本链接，例如 https://example.com/lx-source.js',
-            })
-              .height(72)
-              .width('100%')
-              .fontSize(12.5)
-              .backgroundColor(C_FILL_SOFT)
-              .borderRadius(10)
-              .onChange((value: string) => {
-                this.sourceInput = value;
+            this.sectionCard('导入音源')
+            Column({ space: 10 }) {
+              TextArea({
+                text: this.sourceInput,
+                placeholder: '粘贴音源脚本链接，例如 https://example.com/lx-source.js',
               })
-            Row({ space: 10 }) {
-              Button(this.busy ? '处理中…' : '导入并加载')
-                .fontSize(14)
-                .height(40)
-                .layoutWeight(1)
-                .backgroundColor(C_RED)
-                .enabled(!this.busy)
-                .onClick(() => {
-                  this.importAndLoad();
+                .height(72)
+                .width('100%')
+                .fontSize(12.5)
+                .backgroundColor(C_FILL_SOFT)
+                .borderRadius(10)
+                .onChange((value: string) => {
+                  this.sourceInput = value;
                 })
-              Button('导入音源文件')
-                .fontSize(14)
-                .height(40)
-                .layoutWeight(1)
-                .backgroundColor(C_FILL_SOFT_STRONG)
-                .fontColor(C_TEXT)
-                .enabled(!this.busy)
-                .onClick(() => {
-                  this.pickSourceFile();
-                })
-            }
-            .width('100%')
-          }
-          .width('100%')
-          .padding(14)
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
-
-          // ------------------------------------------------ 已导入音源
-          this.sectionCard('已导入音源')
-          Column({ space: 10 }) {
-            if (this.sources.length === 0) {
-              Text('还没有导入任何音源')
-                .fontSize(F_SUB)
-                .fontColor(C_TEXT_WEAK)
-                .padding(16)
-            }
-            ForEach(this.sources, (item: SourceInfo) => {
-              Column({ space: 8 }) {
-                // 一条音源就是一张 HDS 列表卡：官方符号图标 + 名称/版本，
-                // 点卡片即加载；右侧「已就绪」用 HDS 的 SuffixText。
-                // 白卡底由外层自绘容器给（HdsListItemCard 的 cardWidth/cardBackgroundColor
-                // 会破坏它内部的宽度测量，导致整行文字消失，别用）。
-                Column() {
-                  HdsListItemCard({
-                    prefixItem: new PrefixIcon({
-                      iconSize: IconSize.SYSTEM_ICON,
-                      iconValue: { symbol: I_DISC },
-                    }),
-                    textItem: {
-                      primaryText: { text: item.name },
-                      secondaryText: {
-                        text: `${this.versionText(item.version)}　${item.author.length > 0 ? item.author : '未知作者'}`,
-                      },
-                    },
-                    suffixItem: this.loadedId === item.id
-                      ? new SuffixText({ text: '已就绪' })
-                      : new SuffixArrow({ color: C_CHEVRON }),
-                    cardHeight: 68,
-                    onClick: () => {
-                      this.loadSource(item.id);
-                    },
+              Row({ space: 10 }) {
+                Button(this.busy ? '处理中…' : '导入并加载')
+                  .fontSize(14)
+                  .height(40)
+                  .layoutWeight(1)
+                  .backgroundColor(C_RED)
+                  .enabled(!this.busy)
+                  .onClick(() => {
+                    this.importAndLoad();
                   })
-                }
-                .width('100%')
-                .borderRadius(R_CARD)
-                .backgroundColor(C_CARD)
-                .clip(true)
-
-                Row({ space: 10 }) {
-                  Button('加载')
-                    .fontSize(13)
-                    .height(34)
-                    .layoutWeight(1)
-                    .backgroundColor(C_FILL_SOFT_STRONG)
-                    .fontColor(C_TEXT)
-                    .onClick(() => {
-                      this.loadSource(item.id);
-                    })
-                  Button('删除')
-                    .fontSize(13)
-                    .height(34)
-                    .layoutWeight(1)
-                    .backgroundColor(C_RED_TINT)
-                    .fontColor(C_RED)
-                    .onClick(() => {
-                      this.removeSource(item.id);
-                    })
-                }
-                .width('100%')
+                Button('导入音源文件')
+                  .fontSize(14)
+                  .height(40)
+                  .layoutWeight(1)
+                  .backgroundColor(C_FILL_SOFT_STRONG)
+                  .fontColor(C_TEXT)
+                  .enabled(!this.busy)
+                  .onClick(() => {
+                    this.pickSourceFile();
+                  })
               }
               .width('100%')
-            }, (item: SourceInfo) => item.id)
-          }
-          .width('100%')
-
-          // ------------------------------------------------ 运行状态
-          this.sectionCard('运行状态')
-          Column({ space: 10 }) {
-            this.infoLine('已声明平台', this.supportedText)
-            Divider().strokeWidth(0.6).color(C_DIVIDER)
-            this.infoLine('沙箱环境', `lx.env = ${this.sandboxEnv}`)
-            Divider().strokeWidth(0.6).color(C_DIVIDER)
-            Row({ space: 10 }) {
-              Button('切换兼容模式')
-                .fontSize(13)
-                .height(36)
-                .layoutWeight(1)
-                .backgroundColor(C_FILL_SOFT_STRONG)
-                .fontColor(C_TEXT)
-                .onClick(() => {
-                  this.toggleSandboxEnv();
-                })
-              Button(this.busy ? '自检中…' : '一键离线自检')
-                .fontSize(13)
-                .height(36)
-                .layoutWeight(1)
-                .backgroundColor(C_FILL_SOFT_STRONG)
-                .fontColor(C_TEXT)
-                .enabled(!this.busy)
-                .onClick(() => {
-                  this.runSelfTest();
-                })
             }
             .width('100%')
-            if (this.testUrl.length > 0) {
-              Text(this.testUrl)
-                .fontSize(11.5)
-                .fontColor(C_ICON_GREEN)
-                .width('100%')
-                .textAlign(TextAlign.Start)
-                .copyOption(CopyOptions.LocalDevice)
-            }
+            .padding(14)
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
           }
-          .width('100%')
-          .padding(14)
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 已导入音源
+          Column({ space: 10 }) {
+            this.sectionCard('已导入音源')
+            Column({ space: 10 }) {
+              if (this.sources.length === 0) {
+                Text('还没有导入任何音源')
+                  .fontSize(F_SUB)
+                  .fontColor(C_TEXT_WEAK)
+                  .padding(16)
+              }
+              ForEach(this.sources, (item: SourceInfo) => {
+                Column({ space: 8 }) {
+                  // 一条音源就是一张 HDS 列表卡：官方符号图标 + 名称/版本，
+                  // 点卡片即加载；右侧「已就绪」用 HDS 的 SuffixText。
+                  // 白卡底由外层自绘容器给（HdsListItemCard 的 cardWidth/cardBackgroundColor
+                  // 会破坏它内部的宽度测量，导致整行文字消失，别用）。
+                  Column() {
+                    HdsListItemCard({
+                      prefixItem: new PrefixIcon({
+                        iconSize: IconSize.SYSTEM_ICON,
+                        iconValue: { symbol: I_DISC },
+                      }),
+                      textItem: {
+                        primaryText: { text: item.name },
+                        secondaryText: {
+                          text: `${this.versionText(item.version)}　${item.author.length > 0 ? item.author : '未知作者'}`,
+                        },
+                      },
+                      suffixItem: this.loadedId === item.id
+                        ? new SuffixText({ text: '已就绪' })
+                        : new SuffixArrow({ color: C_CHEVRON }),
+                      cardHeight: 68,
+                      onClick: () => {
+                        this.loadSource(item.id);
+                      },
+                    })
+                  }
+                  .width('100%')
+                  .borderRadius(R_CARD)
+                  .backgroundColor(C_CARD)
+                  .clip(true)
+
+                  Row({ space: 10 }) {
+                    Button('加载')
+                      .fontSize(13)
+                      .height(34)
+                      .layoutWeight(1)
+                      .backgroundColor(C_FILL_SOFT_STRONG)
+                      .fontColor(C_TEXT)
+                      .onClick(() => {
+                        this.loadSource(item.id);
+                      })
+                    Button('删除')
+                      .fontSize(13)
+                      .height(34)
+                      .layoutWeight(1)
+                      .backgroundColor(C_RED_TINT)
+                      .fontColor(C_RED)
+                      .onClick(() => {
+                        this.removeSource(item.id);
+                      })
+                  }
+                  .width('100%')
+                }
+                .width('100%')
+              }, (item: SourceInfo) => item.id)
+            }
+            .width('100%')
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 运行状态
+          Column({ space: 10 }) {
+            this.sectionCard('运行状态')
+            Column({ space: 10 }) {
+              this.infoLine('已声明平台', this.supportedText)
+              Divider().strokeWidth(0.6).color(C_DIVIDER)
+              this.infoLine('沙箱环境', `lx.env = ${this.sandboxEnv}`)
+              Divider().strokeWidth(0.6).color(C_DIVIDER)
+              Row({ space: 10 }) {
+                Button('切换兼容模式')
+                  .fontSize(13)
+                  .height(36)
+                  .layoutWeight(1)
+                  .backgroundColor(C_FILL_SOFT_STRONG)
+                  .fontColor(C_TEXT)
+                  .onClick(() => {
+                    this.toggleSandboxEnv();
+                  })
+                Button(this.busy ? '自检中…' : '一键离线自检')
+                  .fontSize(13)
+                  .height(36)
+                  .layoutWeight(1)
+                  .backgroundColor(C_FILL_SOFT_STRONG)
+                  .fontColor(C_TEXT)
+                  .enabled(!this.busy)
+                  .onClick(() => {
+                    this.runSelfTest();
+                  })
+              }
+              .width('100%')
+              if (this.testUrl.length > 0) {
+                Text(this.testUrl)
+                  .fontSize(11.5)
+                  .fontColor(C_ICON_GREEN)
+                  .width('100%')
+                  .textAlign(TextAlign.Start)
+                  .copyOption(CopyOptions.LocalDevice)
+              }
+            }
+            .width('100%')
+            .padding(14)
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           // ------------------------------------------------ 日志
-          this.sectionCard('引擎日志')
-          Column({ space: 3 }) {
-            if (this.logs.length === 0) {
-              Text('暂无日志')
-                .fontSize(11.5)
-                .fontColor(C_TEXT_WEAK)
+          Column({ space: 10 }) {
+            this.sectionCard('引擎日志')
+            Column({ space: 3 }) {
+              if (this.logs.length === 0) {
+                Text('暂无日志')
+                  .fontSize(11.5)
+                  .fontColor(C_TEXT_WEAK)
+              }
+              ForEach(this.logs, (line: string, i: number) => {
+                Text(line)
+                  .fontSize(11)
+                  .fontColor(C_TEXT_SUB)
+                  .width('100%')
+                  .textAlign(TextAlign.Start)
+                  .copyOption(CopyOptions.LocalDevice)
+              }, (line: string, i: number) => `${i}_${line}`)
             }
-            ForEach(this.logs, (line: string, i: number) => {
-              Text(line)
-                .fontSize(11)
-                .fontColor(C_TEXT_SUB)
-                .width('100%')
-                .textAlign(TextAlign.Start)
-                .copyOption(CopyOptions.LocalDevice)
-            }, (line: string, i: number) => `${i}_${line}`)
+            .width('100%')
+            .padding(14)
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
           }
-          .width('100%')
-          .padding(14)
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, bottom: this.bottomInset + 20 })

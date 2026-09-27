@@ -8,8 +8,7 @@ import { hdsEffect, hdsMaterial, SystemMaterialParams } from '@kit.UIDesignKit';
  *    这是**通用属性**路径：`HdsEffectBuilder().shaderEffect({...}).buildEffect()`
  *    产出一个 `VisualEffect`（即 `uiEffect.VisualEffect`，API 12 起的通用属性），
  *    挂在任意组件的 `.visualEffect()` 上即可，不需要任何现成控件当载体。
- *      - `UV_BACKGROUND_FLOW_LIGHT`：整片背景流光，挂在全屏 Stack 上就是「首页流光」；
- *      - `DUAL_EDGE_FLOW_LIGHT`：轮廓流光，挂在一块圆角容器上。
+ *      - `DUAL_EDGE_FLOW_LIGHT`：轮廓流光，挂在一块圆角容器上（见 HdsEdgeFlowLight）。
  *    之前这里走的是 `HdsVisualComponent` + `HdsSceneType` 那一套（场景组件），
  *    它必须有个现成控件可挂，底栏换成 HDS 悬浮页签后就没有落点了 —— 那条路已删掉。
  *
@@ -173,53 +172,60 @@ export function hdsMaterialType(): string {
 
 // ------------------------------------------------------------------ 光效
 
-/** 流光完整循环一圈的时长（ms）：10 秒一圈是系统首页流光的默认观感，慢到不抢内容 */
+/** 流光完整循环一圈的时长（ms）：10 秒一圈，慢到不抢内容 */
 export const FLOW_LIGHT_DURATION_MS: number = 10000;
-/** 流光层不透明度：压在页面底色之上、内容之下，避免喧宾夺主 */
-export const FLOW_LIGHT_OPACITY: number = 0.5;
+
+// ------------------------------------------------------------------ 轮廓点光
 
 /**
- * 背景流光层
+ * 轮廓点光的取值
  *
- * 用法：
- *   Stack({ alignContent: Alignment.TopStart }) {
- *     HdsFlowLightBackground()        // 首个子节点：画在底色之上、内容之下
- *     Column() { ...页面内容... }
- *   }
- *   .backgroundColor(页面底色)         // 底色必须挂在这一层 Stack 上
- *
- * 底色一定要给外层 Stack：如果把不透明底色留在内容那一层，流光会被整片盖掉，
- * 看上去就是「加了没效果」。
- *
- * 布局与交互都不受影响：铺满父容器、不拦触摸（HitTestMode.Transparent）、
- * 本身没有子节点，不参与测量。
+ * `SOFT` 柔光 + `BORDER` 只照亮轮廓，这是官方给悬浮控件配的那一套（边沿「立」起来，
+ * 而不是整块发亮成霓虹灯）。intensity 的默认值是 0（等于不亮），必须显式给；
+ * height 决定光晕的范围。三个值都是观感参数，实机上调这三个数就够了。
  */
-@Component
-export struct HdsFlowLightBackground {
-  @Prop lightOpacity: number = FLOW_LIGHT_OPACITY;
-  @Prop durationMs: number = FLOW_LIGHT_DURATION_MS;
-  private controller: hdsEffect.ShaderEffectController = new hdsEffect.ShaderEffectController();
+const POINT_LIGHT_INTENSITY: number = 1;
+const POINT_LIGHT_HEIGHT: number = 12;
+const POINT_LIGHT_BLOOM: number = 0.3;
 
-  build() {
-    if (hdsEffectSupported()) {
-      Stack()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.Transparent)
-        .opacity(this.lightOpacity)
-        .visualEffect(new hdsEffect.HdsEffectBuilder()
-          .shaderEffect({
-            effectType: hdsEffect.EffectType.UV_BACKGROUND_FLOW_LIGHT,
-            animation: {
-              duration: this.durationMs,
-              // -1 = 无限循环
-              iterations: -1,
-              autoPlay: true
-            },
-            controller: this.controller
-          })
-          .buildEffect())
-    }
+/**
+ * 轮廓点光 —— **沉浸材质不可用时的「普通光效」**
+ *
+ * 鸿蒙7（API 26）的悬浮控件靠沉浸材质的 `lightEffect` 出光感（按压 / 交互时边沿那圈光），
+ * 那是材质滤镜里的东西，手画不出来。鸿蒙6（API 23）上没有材质，这份光感就整段丢了 ——
+ * 这里用 HDS 的 pointLight 着色器把它补回来：**光效从 API 20（6.0.0）起就有**，
+ * 鸿蒙6 全量支持，所以它是「低版本能用的那个普通光效」，而不是鸿蒙7 专属的材质。
+ *
+ * 挂法：`.visualEffect(hdsPointLight(color))`（通用属性，API 12 起）。
+ * **挂组件上，别塞进 AttributeModifier**：两份官方文档在这一点上是打架的 ——
+ * 《属性修改器》把 `CommonAttribute.visualEffect` 列进「不支持 attributeModifier 的范围」
+ * （告警 `is not callable`），而《视效设置》写「从 API version 20 开始，该接口支持在
+ * attributeModifier 中调用」。链式属性又没法按条件整条跳过，所以调用方走
+ * ui/Glass.ets 的 `glassLight()` —— 那里用「永远挂一层、鸿蒙7 挂空效果」绕开这个限制。
+ *
+ * 取不到 HDS 能力位时返回 `undefined`：调用方**不要**去挂（`.visualEffect()` 的参数
+ * 不是可选的，传 undefined 编译过不了）。
+ */
+export function hdsPointLight(color: ResourceColor, intensity: number = POINT_LIGHT_INTENSITY,
+  height: number = POINT_LIGHT_HEIGHT): VisualEffect | undefined {
+  if (!hdsEffectSupported()) {
+    return undefined;
+  }
+  try {
+    return new hdsEffect.HdsEffectBuilder()
+      .pointLight({
+        sourceType: hdsEffect.PointLightSourceType.SOFT,
+        illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER,
+        options: {
+          color: color,
+          intensity: intensity,
+          height: height,
+          bloom: POINT_LIGHT_BLOOM,
+        },
+      })
+      .buildEffect();
+  } catch (e) {
+    return undefined;
   }
 }
 
@@ -228,9 +234,6 @@ export struct HdsFlowLightBackground {
  *
  * 需要「一块有圆角的容器自己在发光」时用：垫在内容下面当光底（圆钮、播放胶囊），
  * 或者盖在封面这类整块图片上。铺满父容器，不拦触摸。
- *
- * 与背景流光的区别：`UV_BACKGROUND_FLOW_LIGHT` 是整片背景流光，这个是沿轮廓走的
- * 两条光带，观感更「贴边」，两者不要叠在同一层上。
  */
 @Component
 export struct HdsEdgeFlowLight {

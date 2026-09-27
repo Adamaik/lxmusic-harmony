@@ -2,9 +2,9 @@ import { LIST_PLATFORMS, LxBoardItem, LxPlaylistItem, LxSortItem, OnlineRoute, g
 import { C_BG, C_CHEVRON, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_MIC, I_PLAY, IconGlyph } from '../ui/Icons';
 import { CoverArt, SectionTitle, TopFade } from '../ui/Widgets';
-import { HdsFlowLightBackground } from '../ui/Hds';
-import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
-import { K_FLOW_LIGHT, K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /** 在线排行榜卡片 */
 @Component
@@ -184,10 +184,14 @@ export struct RecommendView {
   };
   /** 当前推荐来源，切走再回来保持上次选的平台（改值的是标题栏里那颗来源胶囊） */
   @StorageLink(K_RECOMMEND_SOURCE) @Watch('onPlatformChanged') platform: string = 'kw';
-  /** 首页是否挂 HDS 背景流光（外观设置里可关，关掉就不挂这一层） */
-  @StorageLink(K_FLOW_LIGHT) flowLight: boolean = true;
   /** 玻璃厚度档位（外观设置）：两个下拉框的玻璃跟着它变 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
+  /**
+   * 窗口宽度（vp）：决定推荐歌单那一栏一屏放几列（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），本页只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
   @State sorts: LxSortItem[] = sortListOf('kw');
   @State sortIndex: number = 0;
   @State boards: LxBoardItem[] = [];
@@ -337,6 +341,26 @@ export struct RecommendView {
     return parts.join(' · ');
   }
 
+  /**
+   * 推荐歌单那一栏一屏放几列（宽屏多列，窄屏 1 列 = 改之前的样子）
+   *
+   * 口径在 ui/Layout.ets 的 contentColumnsFor：按窗口宽度算，一列至少 360vp、最多 4 列。
+   * 窗口宽度由壳层写进 AppStorage，旋转 / 折叠 / 分屏后重算一次。
+   */
+  private columns(): number {
+    return contentColumnsFor(this.windowWidth);
+  }
+
+  /**
+   * 榜单卡片宽度（顶部那一排横滑卡片）
+   *
+   * 宽屏给宽一点：那一排本来就是「露半截、可横滑」的画法（照华为音乐首页顶部那排），
+   * 手机上 180 刚好、平板上 180 就显得又小又空。
+   */
+  private rankCardWidth(): number {
+    return this.columns() > 1 ? 216 : 180;
+  }
+
   // ------------------------------------------------------------ 构建
 
   /**
@@ -437,19 +461,151 @@ export struct RecommendView {
     .padding({ left: 32, right: 32, top: 40, bottom: 30 })
   }
 
-  build() {
-    /**
-     * 首页底色之上、内容之下铺一层 HDS 背景流光（着色器，10 秒一圈无限循环）。
-     *
-     * 底色必须留在这层 Stack 上：如果把不透明底色写在内容那一层，流光会被整片盖住，
-     * 看上去就是「加了没效果」——这一点是这套光效唯一容易踩的坑。
-     * 流光层本身铺满、不拦触摸，不影响原有布局与交互。
-     */
-    Stack({ alignContent: Alignment.TopStart }) {
-      if (this.flowLight) {
-        HdsFlowLightBackground()
+  /**
+   * 列表头部：在线榜单（标题 + 横滑卡片）与推荐歌单的标题行
+   *
+   * 这三行原来是三个独立的 ListItem，现在收进一个 @Builder 交给 ListItemGroup 当 header ——
+   * 原因见 build() 里的说明：分栏（lanes）列表里只有「组」能整行铺满，普通条目会被
+   * 当成一列内容，宽屏下标题和卡片就只剩 1/N 宽。
+   */
+  @Builder
+  listHeader() {
+    Column() {
+      if (this.boards.length > 0) {
+        // -------------------------------------------- 在线榜单
+        Row({ space: 8 }) {
+          SectionTitle({ text: '在线榜单' })
+          Text(platformName(this.platform))
+            .fontSize(12)
+            .fontColor(C_RED)
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+            .borderRadius(9)
+            .backgroundColor(C_RED_TINT)
+          Blank()
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8, bottom: 12 })
+
+        List({ space: 12 }) {
+          ForEach(this.boards, (board: LxBoardItem, index: number) => {
+            ListItem() {
+              RankCard({
+                title: board.name,
+                subtitle: '在线排行榜',
+                platform: platformName(board.source),
+                colorA: boardColors(index)[0],
+                colorB: boardColors(index)[1],
+                cardWidth: this.rankCardWidth(),
+                cardHeight: 212,
+                onTap: () => {
+                  this.openBoard(board);
+                },
+              })
+            }
+          }, (board: LxBoardItem) => board.id)
+        }
+        .scrollBar(BarState.Off)
+        .listDirection(Axis.Horizontal)
+        .width('100%')
+        .height(212)
+        // 左右都留 16：与下面多列列表、标题行的左右边距同一口径（原来只留左边，
+        // 是让卡片从右边缘"切"出去；宽屏下那样会与上面的标题不对齐）
+        .padding({ left: 16, right: 16 })
       }
 
+      // -------------------------------------------- 推荐歌单（标题行）
+      Row({ space: 8 }) {
+        SectionTitle({ text: '推荐歌单' })
+        Blank()
+        if (this.loadingMore) {
+          Text('加载中…')
+            .fontSize(12)
+            .fontColor(C_TEXT_WEAK)
+        }
+        /**
+         * 排序（推荐 / 最热 / 最新 / 收藏 / 攀升…）
+         *
+         * 原来是标题下面另一排横滑胶囊，现在并到这一栏、靠右做成下拉框：
+         * 它管的就是这一栏的内容，和标题挨在一起比单独占一行更好理解。
+         * 各平台给了几个就用几个，只有一个时不显示（没什么可选的）。
+         */
+        if (this.sorts.length > 1) {
+          Row({ space: 3 }) {
+            Text(this.currentSortName())
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(C_RED)
+              .maxLines(1)
+            IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 13, color: C_RED })
+          }
+          .height(30)
+          .padding({ left: 12, right: 8 })
+          .attributeModifier(thinGlass(15, false, '', this.materialLevel))
+          .systemMaterial(immersiveMaterialFor(this.materialLevel))
+          // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+          .visualEffect(glassLight())
+          .bindMenu(this.sortMenu())
+          .accessibilityText(`排序：${this.currentSortName()}，点按切换`)
+          .accessibilityLevel('yes')
+        }
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: this.boards.length > 0 ? 22 : 4, bottom: 10 })
+    }
+    .width('100%')
+  }
+
+  /**
+   * 列表尾部：空态 / 加载失败 / 「上拉加载更多」那一行 + 底部让位
+   *
+   * 与头部同理，交给 ListItemGroup 当 footer —— 宽屏下它跟正文一样是通栏的
+   * （不然「没有更多了」会挤在第一列里）。
+   */
+  @Builder
+  listFooter() {
+    Column() {
+      if (this.playlists.length === 0) {
+        this.statusBlock()
+      } else if (this.error.length > 0) {
+        Column({ space: 8 }) {
+          Text(this.error)
+            .fontSize(13)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text('点击重试')
+            .fontSize(13.5)
+            .fontColor(C_RED)
+            .onClick(() => {
+              this.error = '';
+              void this.loadMore();
+            })
+        }
+        .width('100%')
+        .padding({ top: 14, bottom: 14 })
+      } else {
+        Text(this.loadingMore ? '正在加载更多…' : (this.noMore ? '没有更多了' : '上拉加载更多'))
+          .fontSize(13)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .padding({ top: 16, bottom: 16 })
+      }
+
+      // 底部让位：悬浮页签栏 + 迷你栏压在这里，最后一行不该被它们盖住
+      Column().height(this.bottomInset + 12).width('100%')
+    }
+    .width('100%')
+  }
+
+  build() {
+    /**
+     * 页面底色之上只压两层：内容（Refresh + List）与顶栏渐隐。
+     *
+     * 底色必须是纯 C_BG（和其他页面同一档浅灰 / 深色），挂在这层 Stack 上 ——
+     * 早先这里还铺过一层 HDS 背景流光，看着与别的页面不是同一种底，已去掉。
+     */
+    Stack({ alignContent: Alignment.TopStart }) {
       Column() {
       // 页头（大标题 + 来源胶囊 + 搜索钮）搬到了壳层的 HdsNavigation 标题栏里，
       // 见 pages/Index.ets 的 homeHeader：沉浸光感只在标题栏 / 底部 TabBar 里生效，
@@ -457,95 +613,19 @@ export struct RecommendView {
       // 标题栏那一段的高度（topInset 由壳层传来的是「状态栏 + 标题栏」）。
       // ---------------------------------------------------- 内容
       Refresh({ refreshing: $$this.refreshing }) {
+        /**
+         * 整页只有**一个 ListItemGroup**：组头是榜单与标题（{@link listHeader}），
+         * 组内每一条是一张歌单，组尾是空态 / 加载提示（{@link listFooter}）。
+         *
+         * 为什么套一层组：宽屏要一屏多列（见 columns()），而 List 的 `lanes` 是**按条目**
+         * 分的 —— 把顶部那三行当普通条目丢进去，它们也会被当成"一列内容"，宽屏下标题与
+         * 横滑卡片就只剩 1/N 宽。ListItemGroup 在分栏模式下自己占满整行、组内条目再按
+         * `lanes` 排，于是「顶部通栏 + 歌单多列」一次成型。
+         *
+         * 窄屏 `lanes` 是 1，与改之前逐像素一样。
+         */
         List({ space: 0 }) {
-          if (this.boards.length > 0) {
-            // -------------------------------------------- 在线榜单
-            ListItem() {
-              Row({ space: 8 }) {
-                SectionTitle({ text: '在线榜单' })
-                Text(platformName(this.platform))
-                  .fontSize(12)
-                  .fontColor(C_RED)
-                  .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-                  .borderRadius(9)
-                  .backgroundColor(C_RED_TINT)
-                Blank()
-              }
-              .width('100%')
-              .padding({ left: 16, right: 16, top: 8, bottom: 12 })
-            }
-
-            ListItem() {
-              List({ space: 12 }) {
-                ForEach(this.boards, (board: LxBoardItem, index: number) => {
-                  ListItem() {
-                    RankCard({
-                      title: board.name,
-                      subtitle: '在线排行榜',
-                      platform: platformName(board.source),
-                      colorA: boardColors(index)[0],
-                      colorB: boardColors(index)[1],
-                      cardWidth: 180,
-                      cardHeight: 212,
-                      onTap: () => {
-                        this.openBoard(board);
-                      },
-                    })
-                  }
-                }, (board: LxBoardItem) => board.id)
-              }
-              .scrollBar(BarState.Off)
-              .listDirection(Axis.Horizontal)
-              .width('100%')
-              .height(212)
-              .padding({ left: 16 })
-            }
-          }
-
-          // -------------------------------------------- 推荐歌单
-          ListItem() {
-            Row({ space: 8 }) {
-              SectionTitle({ text: '推荐歌单' })
-              Blank()
-              if (this.loadingMore) {
-                Text('加载中…')
-                  .fontSize(12)
-                  .fontColor(C_TEXT_WEAK)
-              }
-              /**
-               * 排序（推荐 / 最热 / 最新 / 收藏 / 攀升…）
-               *
-               * 原来是标题下面另一排横滑胶囊，现在并到这一栏、靠右做成下拉框：
-               * 它管的就是这一栏的内容，和标题挨在一起比单独占一行更好理解。
-               * 各平台给了几个就用几个，只有一个时不显示（没什么可选的）。
-               */
-              if (this.sorts.length > 1) {
-                Row({ space: 3 }) {
-                  Text(this.currentSortName())
-                    .fontSize(13)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor(C_RED)
-                    .maxLines(1)
-                  IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 13, color: C_RED })
-                }
-                .height(30)
-                .padding({ left: 12, right: 8 })
-                .attributeModifier(thinGlass(15, false, '', this.materialLevel))
-                .systemMaterial(immersiveMaterialFor(this.materialLevel))
-                .bindMenu(this.sortMenu())
-                .accessibilityText(`排序：${this.currentSortName()}，点按切换`)
-                .accessibilityLevel('yes')
-              }
-            }
-            .width('100%')
-            .padding({ left: 16, right: 16, top: this.boards.length > 0 ? 22 : 4, bottom: 10 })
-          }
-
-          if (this.playlists.length === 0) {
-            ListItem() {
-              this.statusBlock()
-            }
-          } else {
+          ListItemGroup({ header: this.listHeader(), footer: this.listFooter() }) {
             LazyForEach(this.playlistSource, (item: LxPlaylistItem) => {
               ListItem() {
                 // 行与行之间不画分隔线：封面 + 两行字自己就能分开，多一条浅色横线
@@ -553,42 +633,10 @@ export struct RecommendView {
                 this.playlistRow(item)
               }
             }, (item: LxPlaylistItem) => `${item.id}_${item.name}`)
-
-            if (this.error.length > 0) {
-              ListItem() {
-                Column({ space: 8 }) {
-                  Text(this.error)
-                    .fontSize(13)
-                    .fontColor(C_TEXT_WEAK)
-                    .maxLines(2)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text('点击重试')
-                    .fontSize(13.5)
-                    .fontColor(C_RED)
-                    .onClick(() => {
-                      this.error = '';
-                      void this.loadMore();
-                    })
-                }
-                .width('100%')
-                .padding({ top: 14, bottom: 14 })
-              }
-            } else {
-              ListItem() {
-                Text(this.loadingMore ? '正在加载更多…' : (this.noMore ? '没有更多了' : '上拉加载更多'))
-                  .fontSize(13)
-                  .fontColor(C_TEXT_WEAK)
-                  .width('100%')
-                  .textAlign(TextAlign.Center)
-                  .padding({ top: 16, bottom: 16 })
-              }
-            }
-          }
-
-          ListItem() {
-            Column().height(this.bottomInset + 12).width('100%')
           }
         }
+        // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+        .lanes(this.columns())
         .scrollBar(BarState.Off)
         .width('100%')
         .height('100%')
@@ -622,7 +670,7 @@ export struct RecommendView {
     }
     .width('100%')
     .height('100%')
-    // 底色挂在外层 Stack（流光层之上、内容之下），别挪回内容那一层
+    // 与其他页面同一档底色（resources 里 base / dark 各一份）
     .backgroundColor(C_BG)
   }
 }

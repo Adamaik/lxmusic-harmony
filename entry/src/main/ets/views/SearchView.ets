@@ -4,11 +4,12 @@ import { platformName } from '../core/music/MusicList';
 import { PlaySession, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { K_PLAY_QUALITY } from '../core/settings/PlaySettings';
 import { C_BG, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SUB } from '../ui/Theme';
-import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { I_CHEVRON_DOWN, I_CLOSE, I_SEARCH, IconGlyph } from '../ui/Icons';
 import { EmptyState, SectionTitle } from '../ui/Widgets';
 import { SongListPane } from './SongListPane';
+import { CONTENT_MAX_WIDTH, contentColumnsFor, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED } from '../ui/Layout';
 
 /** 平台筛选项里「不筛」的那一项 */
 const FILTER_ALL: string = '';
@@ -55,6 +56,17 @@ export struct SearchView {
   @State searched: boolean = false;
   /** 玻璃厚度档位（外观设置）：搜索框的毛玻璃跟着它变 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下搜索结果一屏多列（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 一屏几列（宽屏多列，窄屏 1 列 = 改之前的样子，见 ui/Layout.ets） */
+  private columns(): number {
+    return contentColumnsFor(this.windowWidth);
+  }
 
   // ------------------------------------------------------------ 数据
 
@@ -236,6 +248,8 @@ export struct SearchView {
     .padding({ left: 14, right: 12 })
     .attributeModifier(thinGlass(23, false, '', this.materialLevel))
     .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+    .visualEffect(glassLight())
   }
 
   /** 结果栏右端那个筛选胶囊：自己画 + 系统下拉菜单（与推荐页的两个下拉框同款） */
@@ -258,6 +272,8 @@ export struct SearchView {
     .padding({ left: 12, right: 8 })
     .attributeModifier(thinGlass(15, false, '', this.materialLevel))
     .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+    .visualEffect(glassLight())
     .bindMenu(this.filterMenu())
     .accessibilityText(`搜索来源：${this.filterLabel()}，点按切换`)
     .accessibilityLevel('yes')
@@ -280,6 +296,9 @@ export struct SearchView {
           .accessibilityLevel('yes')
       }
       .width('100%')
+      // 宽屏下搜索框不跟着铺满：1400vp 宽的一条输入框又长又扁，看着不像能打字的地方
+      // （限宽口径与设置页的表单一致，见 ui/Layout.ets 的 CONTENT_MAX_WIDTH）
+      .constraintSize({ maxWidth: this.columns() > 1 ? CONTENT_MAX_WIDTH : LAYOUT_UNBOUNDED })
       .padding({ left: 16, right: 16, top: 8, bottom: 10 })
 
       // ---------------------------------------------------- 结果栏：标题 + 平台筛选
@@ -339,6 +358,8 @@ export struct SearchView {
     }
     .width('100%')
     .height('100%')
+    // 靠左排：宽屏下搜索栏是「限宽后还剩一截」，居中的话左边空一截、与结果列对不上
+    .alignItems(HorizontalAlign.Start)
     /**
      * 让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）
      *

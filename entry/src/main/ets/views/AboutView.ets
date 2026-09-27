@@ -1,9 +1,11 @@
 import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_DIVIDER, C_ICON_BLUE, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { HintText } from '../ui/SettingWidgets';
 import { I_CHECK_CIRCLE, I_COPY, I_EXTERNAL, I_GROUP, IconGlyph } from '../ui/Icons';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AboutView';
@@ -49,6 +51,17 @@ export struct AboutView {
   /** 群号刚复制过（给一个短暂的「已复制」反馈） */
   @State copied: boolean = false;
   private copiedTimer: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下这几张卡并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     this.version = readVersionName();
@@ -277,17 +290,40 @@ export struct AboutView {
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每张卡 48% 宽（见 ui/Layout.ets 的 cardWidthOf）。
+         * 卡下面那行说明跟它的卡包在一个 Column 里当**一个单元**：说明文字本身铺满宽度，
+         * 不包起来会把换行打断，两张卡就并不到一排去。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
-          this.appCard()
 
-          this.aboutCard()
-          HintText({ text: '该软件在 GitHub 上以阿帕奇 2.0 协议开源，欢迎 Star、提 Issue 或提 PR。' })
+          Column({ space: 14 }) {
+            this.appCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
 
-          this.feedbackCard()
-          HintText({ text: '有改进建议或者功能需求，欢迎向作者反馈：在 GitHub 仓库里提 Issue，或加入用户群聊一聊。' })
+          Column({ space: 14 }) {
+            this.aboutCard()
+            HintText({ text: '该软件在 GitHub 上以阿帕奇 2.0 协议开源，欢迎 Star、提 Issue 或提 PR。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          Column({ space: 14 }) {
+            this.feedbackCard()
+            HintText({ text: '有改进建议或者功能需求，欢迎向作者反馈：在 GitHub 仓库里提 Issue，或加入用户群聊一聊。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 20 })

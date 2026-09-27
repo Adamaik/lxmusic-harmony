@@ -39,7 +39,7 @@ export default class EntryAbility extends UIAbility {
     // 播放设置（音质 / 歌词 / 音频焦点）要读回上次的选择，而且必须早于界面创建：
     // 界面用 @StorageLink 订阅它发布的值，晚了第一帧会拿到默认值。
     PlaySettings.getInstance().init(this.context);
-    // 外观设置（材质档位 / 首页流光 / 封面圆角）：同样要早于界面创建，
+    // 外观设置（材质档位 / 封面圆角 / 深浅模式）：同样要早于界面创建，
     // 界面用 @StorageLink 订阅它发布的值。
     AppearanceSettings.getInstance().init(this.context);
     // 下载：设置要先读回来（文件名格式 / 保存位置），管理器的索引也要在界面（我的页）

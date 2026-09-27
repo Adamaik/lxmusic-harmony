@@ -15,7 +15,6 @@ const SETTINGS_VERSION: number = 1;
  * 对应界面上这几项：
  *   玻璃材质档位（跟随系统 / 弱 / 均衡 / 强）
  *   深浅模式（跟随系统 / 浅色 / 深色）
- *   首页流光（HDS 背景流光）
  *   播放页封面圆角
  *
  * 深浅模式是**真的能切**的：界面颜色已经全部迁到资源 token
@@ -36,7 +35,6 @@ const SETTINGS_VERSION: number = 1;
 
 /** 界面订阅这些 key 就能拿到最新设置（@StorageLink） */
 export const K_MATERIAL_LEVEL: string = 'cfg_material_level';
-export const K_FLOW_LIGHT: string = 'cfg_flow_light';
 export const K_COVER_RADIUS: string = 'cfg_cover_radius';
 export const K_COLOR_MODE: string = 'cfg_color_mode';
 
@@ -73,7 +71,6 @@ function clampCoverRadius(value: number): number {
 interface AppearanceSettingsData {
   version?: number;
   materialLevel?: number;
-  flowLight?: boolean;
   coverRadius?: number;
   colorMode?: number;
 }
@@ -94,12 +91,6 @@ export class AppearanceSettings {
   // ---------------------------------------------------------------- 默认值
   /** 材质档位默认「跟随系统」：不替用户拍板，想更厚自己去外观页调 */
   private materialLevel: number = 0;
-  /**
-   * 首页流光默认开：这是 HDS 的常驻背景视效，慢速（10 秒一圈）、半透明，
-   * 不影响文字对比度；不看光效的用户可以在外观页关掉（关掉就不挂这一层，
-   * 省一份着色器开销）。
-   */
-  private flowLight: boolean = true;
   /** 播放页封面圆角：默认 12，与改动前一致；0 是直角，40 接近圆形 */
   private coverRadius: number = COVER_RADIUS_DEFAULT;
   /** 深浅模式默认「跟随系统」 */
@@ -145,7 +136,6 @@ export class AppearanceSettings {
     const data: AppearanceSettingsData = {
       version: SETTINGS_VERSION,
       materialLevel: this.materialLevel,
-      flowLight: this.flowLight,
       coverRadius: this.coverRadius,
       colorMode: this.colorMode,
     };
@@ -169,9 +159,6 @@ export class AppearanceSettings {
     if (level !== undefined) {
       this.materialLevel = clampMaterialLevel(level);
     }
-    if (data.flowLight !== undefined) {
-      this.flowLight = data.flowLight;
-    }
     const radius: number | undefined = data.coverRadius;
     if (radius !== undefined) {
       this.coverRadius = clampCoverRadius(radius);
@@ -186,7 +173,6 @@ export class AppearanceSettings {
   private publish(): void {
     try {
       AppStorage.setOrCreate(K_MATERIAL_LEVEL, this.materialLevel);
-      AppStorage.setOrCreate(K_FLOW_LIGHT, this.flowLight);
       AppStorage.setOrCreate(K_COVER_RADIUS, this.coverRadius);
       AppStorage.setOrCreate(K_COLOR_MODE, this.colorMode);
     } catch (e) {
@@ -200,10 +186,6 @@ export class AppearanceSettings {
 
   getMaterialLevel(): number {
     return this.materialLevel;
-  }
-
-  isFlowLight(): boolean {
-    return this.flowLight;
   }
 
   getCoverRadius(): number {
@@ -248,15 +230,6 @@ export class AppearanceSettings {
     }
     this.materialLevel = next;
     AppStorage.setOrCreate(K_MATERIAL_LEVEL, next);
-    this.write();
-  }
-
-  setFlowLight(value: boolean): void {
-    if (value === this.flowLight) {
-      return;
-    }
-    this.flowLight = value;
-    AppStorage.setOrCreate(K_FLOW_LIGHT, value);
     this.write();
   }
 

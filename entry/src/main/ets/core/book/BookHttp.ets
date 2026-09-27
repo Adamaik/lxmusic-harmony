@@ -100,11 +100,31 @@ function decodeDataUrl(url: string): string {
   }
 }
 
+/** 不区分大小写地找一个请求头 */
+function headerOf(headers: Record<string, string>, name: string): string {
+  const lower: string = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) {
+      return headers[key];
+    }
+  }
+  return '';
+}
+
 /**
  * 发一次书源请求
  *
  * 复用音源那套 `lxRequest`（同一份 UA / Content-Type / 表单处理逻辑），
  * 只是这里一律要**原始文本**（书源要自己按 HTML / XML 解析，不能被 JSON 化）。
+ *
+ * 但音源的两个默认值对书源是错的，这里显式改掉：
+ *
+ * - `lxRequest` 默认发 `Accept: application/json`。书源抓的是 HTML / XML / RSS，
+ *   而且有些站按 `Accept` 给不同的东西（书源作者写的规则是按浏览器抓包来的）。
+ * - POST 的正文在书源里是**一段原样字符串**（`keyboard={{key}}&show=...`）。
+ *   源里没写 Content-Type 时 `lxRequest` 会套用音源的 `application/json`，
+ *   站点于是拿 JSON 去解表单串（书音FM 这种 EmpireCMS 站直接回一张错误页），
+ *   搜索就变成「0 条」。阅读对 POST 的默认也是表单。
  */
 export function bookRequest(req: BookNetRequest, cookie: string): Promise<BookResponse> {
   return new Promise<BookResponse>((resolve, reject) => {
@@ -117,10 +137,16 @@ export function bookRequest(req: BookNetRequest, cookie: string): Promise<BookRe
     for (const key of Object.keys(req.headers)) {
       headers[key] = req.headers[key];
     }
-    if (cookie.length > 0 && headers['Cookie'] === undefined) {
-      headers['Cookie'] = cookie;
+    if (headerOf(headers, 'accept').length === 0) {
+      headers['Accept'] = '*/*';
     }
     const method: string = req.method.length > 0 ? req.method : 'GET';
+    if (method === 'POST' && headerOf(headers, 'content-type').length === 0) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    if (cookie.length > 0 && headerOf(headers, 'cookie').length === 0) {
+      headers['Cookie'] = cookie;
+    }
     lxRequest(
       url,
       {

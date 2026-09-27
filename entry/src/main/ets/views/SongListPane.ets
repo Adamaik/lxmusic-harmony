@@ -11,6 +11,7 @@ import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
 import { isWebDavSong } from '../core/webdav/WebDavLibrary';
+import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /**
  * 「我的」页与搜索结果共用的歌曲列表（懒加载：只建可见的行）
@@ -64,7 +65,19 @@ export struct SongListPane {
   @State candidates: PlaylistSummary[] = [];
   /** 封面懒解析好后版本号会变，订阅它把列表重画一遍 */
   @StorageLink(K_COVER_VERSION) coverVersion: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下这个列表一屏多列（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   * 用它的三页（最近播放 / 本地音乐 / 云端音乐）都是「一列歌曲」，宽屏下正是该多列的那类。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
   private source: SongListSource = new SongListSource();
+
+  /** 一屏几列（宽屏多列，窄屏 1 列 = 改之前的样子，见 ui/Layout.ets） */
+  private columns(): number {
+    return contentColumnsFor(this.windowWidth);
+  }
 
   aboutToAppear(): void {
     this.source.setItems(this.items);
@@ -365,6 +378,8 @@ export struct SongListPane {
             }
           }, (item: SongItem, index: number) => `${index}_${item.id}`)
         }
+        // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+        .lanes(this.columns())
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Off)

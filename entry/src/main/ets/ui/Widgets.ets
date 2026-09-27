@@ -1,23 +1,25 @@
 import { C_BG, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, C_TOP_FADE, C_TOP_FADE_END,
   F_ITEM, F_SECTION, F_SUB, R_COVER } from './Theme';
-import { immersiveMaterialFor, materialFirstGlass, thinGlass } from './Glass';
+import { glassLight, immersiveMaterialFor, materialFirstGlass, thinGlass } from './Glass';
 import { I_CHEVRON_RIGHT, I_DOC, I_HEART, I_HEART_FILLED, I_MORE, I_TRASH, I_VOLUME, IconGlyph } from './Icons';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
-import { LAYOUT_UNBOUNDED } from './Layout';
 
 /**
  * 通用小组件：封面、圆形图标按钮、歌曲行
  */
 
 /**
- * 宽屏内容列（平板 / 折叠屏展开态）
+ * 页面外壳（平板 / 折叠屏展开态适配的落点）
  *
- * 手机（< 600vp）铺满整屏，与改之前一模一样；宽屏把内容收成居中一列（最大
- * CONTENT_MAX_WIDTH），两侧留白 —— 否则列表与设置项会从屏幕左边缘一直拉到右边缘，
- * 一行的封面和文字隔着半个屏幕，读起来很散。
- *
- * maxWidth 传 0 表示「不限宽」（窄屏，或窗口宽度还没量到），见 ui/Layout.ets。
+ * **铺满窗口，不再收窄。** 之前这里是「宽屏把内容收成居中的 720 一列」，平板上就成了
+ * 中间一条、两侧一大片白，列表一行从屏左拉到屏右 —— 那正是被用户吐槽的一版。
+ * 现在宽屏的版面由各页自己排：
+ *   - 列表页用 `List.lanes(contentColumnsFor(windowWidth))` 一屏多列
+ *     （歌单详情 / 在线详情 / 搜索结果 / 最近播放 / 本地 / 下载 / 云端 / 听书…）；
+ *   - 设置类页面用 `cardWidthOf(windowWidth)` 让卡片并排（见各设置页的 Flex）；
+ *   - 表单类控件（输入框、按钮）自己限宽到 CONTENT_MAX_WIDTH，别横着拉满。
+ * 所以这一层只剩两件事：**铺满 + 子页面那条顶栏渐隐**。
  *
  * `fadeTop` 给子页面用：> 0 时在这层内容上方压一条「底色 → 全透明」的渐隐，高度就是
  * 传进来的值。子页面的标题栏和首页一样是纯透明的，内容会从它底下滑过去，不给渐隐
@@ -27,26 +29,19 @@ import { LAYOUT_UNBOUNDED } from './Layout';
  */
 @Component
 export struct WidePane {
-  @Prop maxWidth: number = 0;
   /** 渐隐蒙版高度（vp）：0 = 不加（页签页内容自带渐隐，不需要这层） */
   @Prop fadeTop: number = 0;
   @BuilderParam content: () => void;
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      Row() {
-        Column() {
-          this.content()
-        }
-        .width('100%')
-        .height('100%')
-        .constraintSize({ maxWidth: this.maxWidth > 0 ? this.maxWidth : LAYOUT_UNBOUNDED })
+      Column() {
+        this.content()
       }
       .width('100%')
       .height('100%')
-      .justifyContent(FlexAlign.Center)
-      // 收窄后两侧的留白也跟着页面底色走：子页面（设置类）本身就是这个底色，
-      // 不给底色的话两侧会露出 HdsNavDestination 的默认底，中间一条灰、两边一条白
+      // 铺满后两侧不再有留白，但底色仍旧留在这里：子页面（设置类）本身就是这个底色，
+      // 不给的话会露出 HdsNavDestination 的默认底
       .backgroundColor(C_BG)
 
       // 子页面（fadeTop > 0）：内容从透明标题栏底下滑过去时靠近顶部淡出，别把标题顶穿。
@@ -285,7 +280,7 @@ export struct RoundIconButton {  @Prop icon: Resource;
     }
     .width(this.boxSize)
     .height(this.boxSize)
-    // 派音那颗悬浮圆钮的配方：极淡的白底 + 纯白 1vp 描边，没有阴影、没有光效。
+    // 派音那颗悬浮圆钮的配方：极淡的白底 + 纯白 1vp 描边，没有阴影。
     // 玻璃感来自「透出背后的内容」这一件事，而不是加阴影或者描边发亮。
     .attributeModifier(this.materialFirst
       ? materialFirstGlass(this.boxSize / 2, this.materialLevel)
@@ -294,6 +289,8 @@ export struct RoundIconButton {  @Prop icon: Resource;
     // 属性修改器里能调哪些接口有讲究，直接挂更稳。设备没有能力位时这里是 undefined，
     // 等于不设材质，界面就落在上面那层自绘玻璃上。
     .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质的 lightEffect），鸿蒙6 落成 HDS 轮廓点光
+    .visualEffect(glassLight())
     .onClick(() => {
       this.onTap();
     })

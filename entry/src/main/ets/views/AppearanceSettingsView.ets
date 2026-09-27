@@ -1,10 +1,12 @@
 import { common } from '@kit.AbilityKit';
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
-import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { HintText, OptionSetting, SliderSetting } from '../ui/SettingWidgets';
 import { hdsEffectSupported, hdsMaterialType, isEmulatorDevice, MATERIAL_LEVEL_LABELS } from '../ui/Hds';
-import { isGlassMaterialSupported } from '../ui/Glass';
+import { harmony7ApiReady, isGlassMaterialSupported } from '../ui/Glass';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { AppearanceSettings, COLOR_MODE_LABELS, COVER_RADIUS_DEFAULT, COVER_RADIUS_MAX,
-  COVER_RADIUS_MIN, K_COLOR_MODE, K_COVER_RADIUS, K_FLOW_LIGHT, K_MATERIAL_LEVEL }
+  COVER_RADIUS_MIN, K_COLOR_MODE, K_COVER_RADIUS, K_MATERIAL_LEVEL }
   from '../core/settings/AppearanceSettings';
 
 /**
@@ -14,7 +16,7 @@ import { AppearanceSettings, COLOR_MODE_LABELS, COVER_RADIUS_DEFAULT, COVER_RADI
  *   一、深浅模式：跟随系统 / 浅色 / 深色 —— 界面颜色都是 base / dark 同名资源，
  *      这一档改的是应用级 colorMode（见 core/settings/AppearanceSettings.ets）；
  *   二、玻璃材质档位：跟随系统 / 弱 / 均衡 / 强 —— 标题栏、底部页签栏、半模态三处共用；
- *   三、光效与圆角：首页流光（HDS 背景流光）、播放页封面圆角；
+ *   三、圆角：播放页封面圆角；
  *   四、底部把 HDS 能力的实际生效情况摊开（能力位 / 材质类型 / 是否模拟器），
  *      效果对不上时先看这一行，不用猜。
  *
@@ -28,12 +30,21 @@ export struct AppearanceSettingsView {
   @Prop bottomInset: number = 0;
   /** 材质档位：0 跟随系统 / 1 弱 / 2 均衡 / 3 强 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
-  /** 首页流光 */
-  @StorageLink(K_FLOW_LIGHT) flowLight: boolean = true;
   /** 播放页封面圆角 */
   @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
   /** 深浅模式：0 跟随系统 / 1 浅色 / 2 深色 */
   @StorageLink(K_COLOR_MODE) colorMode: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下这几张卡并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   /** 「跟随系统」时才说明这一档的实际含义：选了浅色 / 深色就是钉死的 */
   private colorModeHint(): string {
@@ -45,15 +56,24 @@ export struct AppearanceSettingsView {
     return '这一档会覆盖系统设置：无论手机是什么模式，应用都用这一档的深浅。';
   }
 
-  /** 这一行是给「效果对不上」时看的：能力位、材质类型、模拟器都要摆出来 */
+  /** 这一行是给「效果对不上」时看的：系统版本、能力位、材质类型、模拟器都要摆出来 */
   private capabilityText(): string {
     const device: string = isEmulatorDevice() ? '模拟器' : '真机';
     const effect: string = hdsEffectSupported() ? '已挂载' : '当前设备无此能力位';
-    const glass: string = isGlassMaterialSupported() ? '系统材质可用' : '毛玻璃兜底';
+    // 三档要说清楚，别把「系统版本不够」和「设备没能力位」混成一句「不支持」：
+    // 前者是鸿蒙6（API 23），整条材质路径都不存在，走的是 HDS 轮廓点光；后者是鸿蒙7。
+    const glass: string = isGlassMaterialSupported()
+      ? '系统材质'
+      : (harmony7ApiReady() ? '设备无材质能力位，用点光兜底' : '鸿蒙7 以下，材质不可用，用点光兜底');
     return `HDS 能力位：${effect}　材质类型：${hdsMaterialType()}（玻璃：${glass}，${device}）`;
   }
 
   private materialHint(): string {
+    if (!harmony7ApiReady()) {
+      return '当前系统低于鸿蒙7（API 26），沉浸式系统材质这条接口在本机根本不存在，'
+        + '所以这一档不生效：悬浮控件的玻璃走自绘（模糊 + 半透明白 + 亮边），'
+        + '边沿那圈光改由 HDS 的轮廓点光出（普通光效）。升级到鸿蒙7 后会自动切回系统材质。';
+    }
     if (!isGlassMaterialSupported()) {
       return '当前设备没有沉浸光感材质，这一档不影响自绘的毛玻璃层（那几层走的是模糊 + 半透明白兜底）。';
     }
@@ -61,23 +81,23 @@ export struct AppearanceSettingsView {
       + '机型之间差别较大（有的会把玻璃压得很淡，看上去像没生效）——这时手工选一档「均衡」或「强」。';
   }
 
-  private flowLightHint(): string {
-    const base: string = '首页底色之上、内容之下铺一层 HDS 着色器流光（10 秒一圈，无限循环，'
-      + '半透明），慢速扫过所以不抢文字。关掉就不挂这一层，省一份着色器开销。';
-    if (!hdsEffectSupported()) {
-      return base + '当前设备没有 HDS 能力位，开关不会有实际效果。';
-    }
-    if (isEmulatorDevice()) {
-      return base + '注意：官方文档写明模拟器不支持 HDS 沉浸视效（点光源、按压阴影、'
-        + '双边边缘流光、背景流光、沉浸光感材质），所以模拟器上看不到这层光是正常的，真机上会出来。';
-    }
-    return base;
-  }
-
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每张卡 48% 宽（见 ui/Layout.ets 的 cardWidthOf），
+         * 自动一行两张。这一页每张卡的说明文字都在卡里面，所以不必再包一层单元。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          // 三张卡高矮差得多（圆角那张六行、深浅模式两行），居中的话短的会飘在半空
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
@@ -94,7 +114,7 @@ export struct AppearanceSettingsView {
             })
             HintText({ text: this.colorModeHint() })
           }
-          .width('100%')
+          .width(cardWidthOf(this.windowWidth))
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
@@ -111,22 +131,13 @@ export struct AppearanceSettingsView {
             })
             HintText({ text: this.materialHint() })
           }
-          .width('100%')
+          .width(cardWidthOf(this.windowWidth))
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)
 
-          // ------------------------------------------------ 光效
+          // ------------------------------------------------ 圆角
           Column({ space: 8 }) {
-            ToggleSetting({
-              label: '首页流光',
-              value: this.flowLight,
-              onPick: (next: boolean) => {
-                AppearanceSettings.getInstance().setFlowLight(next);
-              },
-            })
-            HintText({ text: this.flowLightHint() })
-
             // 封面圆角：拖动实时变（播放页封面跟着走），松手才落盘
             SliderSetting({
               label: '播放页封面圆角',
@@ -142,7 +153,7 @@ export struct AppearanceSettingsView {
                 + '列表里的封面不受影响（那是列表自己的排版）。',
             })
           }
-          .width('100%')
+          .width(cardWidthOf(this.windowWidth))
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
           .borderRadius(R_CARD)
           .backgroundColor(C_CARD)

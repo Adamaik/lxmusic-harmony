@@ -4,12 +4,14 @@ import { BookEngine } from '../core/book/BookEngine';
 import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
 import { BookChapter, BookDetail, BookHit, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE,
   parseBookPayload } from '../core/book/BookTypes';
+import { DownloadManager, DownloadItem } from '../core/download/DownloadManager';
 import { PlaySession, SongItem } from '../core/player/PlaySession';
 import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION,
   F_SUB, R_COVER } from '../ui/Theme';
-import { I_CLOCK, I_DOC, I_HEART, I_HEART_FILLED, I_PLAY, I_REFRESH, I_VOLUME,
+import { I_CLOCK, I_DOC, I_DOWNLOAD, I_HEART, I_HEART_FILLED, I_PLAY, I_REFRESH, I_VOLUME,
   IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, SectionTitle } from '../ui/Widgets';
+import { contentColumnsFor } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'BookDetailView';
@@ -212,6 +214,108 @@ export struct BookDetailView {
     };
   }
 
+  // ------------------------------------------------------------ 下载
+
+  /**
+   * 下载一集
+   *
+   * 与播放走同一套解析（下载器里有声书那条分支直接调 `BookEngine.resolveAudioOf`），
+   * 所以「能放的一定能下」。下载器把有声书**串行 + 集间留间隔**（见 DownloadManager）：
+   * 点「下载整本」不会把几十集的规则解析同时打给站点。
+   */
+  private downloadChapter(chapter: BookChapter): void {
+    const manager = DownloadManager.getInstance();
+    if (!manager.isReady()) {
+      this.status = '下载管理还没准备好，稍后再试';
+      return;
+    }
+    const item: SongItem = this.toSongItem(chapter);
+    const state: DownloadItem | null = manager.stateOf(item.id);
+    if (state !== null && state.status === 'done') {
+      this.status = `「${chapter.name}」已经下载过了`;
+      return;
+    }
+    if (state !== null && (state.status === 'waiting' || state.status === 'downloading')) {
+      this.status = `「${chapter.name}」正在下载中`;
+      return;
+    }
+    this.status = manager.enqueue(item) !== null
+      ? `已加入下载：${chapter.name}`
+      : `「${chapter.name}」没法下载（缺书籍信息）`;
+  }
+
+  /** 删掉这一集的下载（文件与记录一起清） */
+  private removeDownload(chapter: BookChapter): void {
+    DownloadManager.getInstance().remove(this.toSongItem(chapter).id);
+    this.status = `已删除下载：${chapter.name}`;
+  }
+
+  /**
+   * 下载整本
+   *
+   * **先问一句再下**（与歌单详情 / 在线详情那颗「下载全部」同一个规矩）：一本有声书
+   * 几十上百集，一集要跑一遍书源规则，点一下全排进去太莽 —— 而且下载器串行跑完
+   * 整本要挺久，得让用户知道自己在等什么。
+   */
+  private downloadAll(): void {
+    if (this.chapters.length === 0) {
+      this.status = '目录还没读到，稍后再试';
+      return;
+    }
+    const count: number = this.chapters.length;
+    this.getUIContext().showAlertDialog({
+      title: '下载整本',
+      message: `确定要下载《${this.displayName()}》的全部 ${count} 集吗？` +
+        `有声书是一集一集解析的，会慢一些；进度在「我的 - 下载管理」里看。`,
+      autoCancel: true,
+      buttons: [
+        { value: '取消', action: () => { } },
+        {
+          value: '下载',
+          fontColor: C_RED,
+          action: () => {
+            this.enqueueAllChapters();
+          },
+        },
+      ],
+    });
+  }
+
+  /** 确认之后的真排队（已在列表里的不重复排） */
+  private enqueueAllChapters(): void {
+    const songs: SongItem[] = [];
+    for (const chapter of this.chapters) {
+      songs.push(this.toSongItem(chapter));
+    }
+    const added: number = DownloadManager.getInstance().enqueueMany(songs);
+    this.status = added > 0
+      ? `已加入下载 ${added} 集（共 ${this.chapters.length} 集）`
+      : '整本都已经在下载列表里了';
+  }
+
+  /** 长按一集的菜单：下载 / 删除下载（没下过就不显示删除） */
+  @Builder
+  chapterMenu(chapter: BookChapter) {
+    Menu() {
+      MenuItem({ content: '下载本集' })
+        .onClick(() => {
+          this.downloadChapter(chapter);
+        })
+      if (this.isDownloaded(chapter)) {
+        MenuItem({ content: '删除下载' })
+          .onClick(() => {
+            this.removeDownload(chapter);
+          })
+      }
+    }
+  }
+
+  private isDownloaded(chapter: BookChapter): boolean {
+    const state: DownloadItem | null =
+      DownloadManager.getInstance().stateOf(this.toSongItem(chapter).id);
+    return state !== null && state.status === 'done';
+  }
+
   // ------------------------------------------------------------ 界面片段
 
   @Builder
@@ -352,6 +456,7 @@ export struct BookDetailView {
     .onClick(() => {
       this.playFrom(chapter.index);
     })
+    .bindContextMenu(this.chapterMenu(chapter), ResponseType.LongPress)
     .accessibilityGroup(true)
     .accessibilityText(`第 ${chapter.index + 1} 集，${chapter.name}`)
     .accessibilityLevel('yes')
@@ -360,62 +465,24 @@ export struct BookDetailView {
   build() {
     Column() {
       List() {
-        ListItem() {
-          this.headerCard()
-        }
-
-        ListItem() {
-          Row({ space: 8 }) {
-            SectionTitle({ text: '目录' })
-            Blank()
-            if (this.status.length > 0) {
-              Text(this.status)
-                .fontSize(F_SUB - 1)
-                .fontColor(C_TEXT_WEAK)
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .constraintSize({ maxWidth: '58%' })
-            }
-            IconGlyph({ symbol: I_REFRESH, iconSize: 19, color: C_ICON })
-              .onClick(() => {
-                void this.load();
-              })
-              .accessibilityText('重新读取目录')
-              .accessibilityLevel('yes')
-          }
-          .width('100%')
-          .padding({ left: 16, right: 16, top: 6, bottom: 6 })
-        }
-
-        if (this.loading) {
-          ListItem() {
-            Column() {
-              LoadingProgress().width(38).height(38).color(C_RED)
-            }
-            .width('100%')
-            .padding({ top: 40 })
-          }
-        } else if (this.chapters.length === 0) {
-          ListItem() {
-            EmptyState({
-              icon: I_DOC,
-              text: '没有读到目录',
-              hint: this.status.length > 0 ? this.status : '这本书的书源规则可能已经失效，换一个书源试试。',
-              topPadding: 32,
-            })
-          }
-        } else {
+        /**
+         * 整页只有一个 ListItemGroup：组头是书籍信息卡与「目录」标题行，组内每集一行，
+         * 组尾是空态与底部让位。
+         *
+         * 套一层组是为了宽屏多列 —— List 的 `lanes` 是按条目分的，头部当普通条目丢进去
+         * 宽屏下会被挤进一列（见 ui/Layout.ets 的 contentColumnsFor）；ListItemGroup 在
+         * 分栏模式下自己占满整行，组内条目再按 `lanes` 排。窄屏 `lanes` 是 1，与改之前一样。
+         */
+        ListItemGroup({ header: this.listHeader(), footer: this.listFooter() }) {
           ForEach(this.chapters, (chapter: BookChapter) => {
             ListItem() {
               this.chapterRow(chapter)
             }
           }, (chapter: BookChapter) => `${chapter.index}_${chapter.url}`)
         }
-
-        ListItem() {
-          Column().height(this.bottomInset + 96)
-        }
       }
+      // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+      .lanes(contentColumnsFor(this.windowWidth))
       .width('100%')
       .height('100%')
       .scrollBar(BarState.Off)
@@ -425,5 +492,65 @@ export struct BookDetailView {
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)
+  }
+
+  /** 列表头部：书籍信息卡 + 「目录」标题行（宽屏通栏，见 build 的说明） */
+  @Builder
+  listHeader() {
+    Column() {
+      this.headerCard()
+
+      Row({ space: 8 }) {
+        SectionTitle({ text: '目录' })
+        Blank()
+        if (this.status.length > 0) {
+          Text(this.status)
+            .fontSize(F_SUB - 1)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: '58%' })
+        }
+        IconGlyph({ symbol: I_DOWNLOAD, iconSize: 19, color: C_ICON })
+          .onClick(() => {
+            this.downloadAll();
+          })
+          .accessibilityText('下载整本')
+          .accessibilityLevel('yes')
+        IconGlyph({ symbol: I_REFRESH, iconSize: 19, color: C_ICON })
+          .onClick(() => {
+            void this.load();
+          })
+          .accessibilityText('重新读取目录')
+          .accessibilityLevel('yes')
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 6, bottom: 6 })
+    }
+    .width('100%')
+  }
+
+  /** 列表尾部：读取中 / 没读到目录的空态 + 底部让位 */
+  @Builder
+  listFooter() {
+    Column() {
+      if (this.loading) {
+        Column() {
+          LoadingProgress().width(38).height(38).color(C_RED)
+        }
+        .width('100%')
+        .padding({ top: 40 })
+      } else if (this.chapters.length === 0) {
+        EmptyState({
+          icon: I_DOC,
+          text: '没有读到目录',
+          hint: this.status.length > 0 ? this.status : '这本书的书源规则可能已经失效，换一个书源试试。',
+          topPadding: 32,
+        })
+      }
+
+      Column().height(this.bottomInset + 96).width('100%')
+    }
+    .width('100%')
   }
 }

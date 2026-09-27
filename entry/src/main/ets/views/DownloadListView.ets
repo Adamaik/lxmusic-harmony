@@ -6,6 +6,7 @@ import { CoverStore } from '../core/music/CoverStore';
 import { PlaySession } from '../core/player/PlaySession';
 import { DownloadItem, DownloadManager, K_DOWNLOAD_VERSION } from '../core/download/DownloadManager';
 import { allSelectedOf, pruneSelected, selectActionsOf, SelectAction, SelectSession, toggleSelected } from '../ui/Selection';
+import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /** 下载管理的多选能做什么 */
 const DOWNLOAD_ACTIONS: string[] = ['重新下载'];
@@ -50,6 +51,17 @@ export struct DownloadListPane {
   @State selecting: boolean = false;
   /** 勾选一变就往全局会话里发布一次（顶栏与底栏都听它，见 ui/Selection.ets） */
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  /**
+   * 窗口宽度（vp）：宽屏下这个列表一屏多列（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 一屏几列（宽屏多列，窄屏 1 列 = 改之前的样子，见 ui/Layout.ets） */
+  private columns(): number {
+    return contentColumnsFor(this.windowWidth);
+  }
 
   aboutToAppear(): void {
     this.refresh();
@@ -446,6 +458,8 @@ export struct DownloadListPane {
               }
             }, (item: DownloadItem) => `${item.key}_${item.status}_${item.received}`)
           }
+          // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+          .lanes(this.columns())
           .width('100%')
           .layoutWeight(1)
           .borderRadius(R_CARD)

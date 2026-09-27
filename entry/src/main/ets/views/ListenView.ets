@@ -7,15 +7,19 @@ import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
 import { BookHit, BookSourceInfo } from '../core/book/BookTypes';
 import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
   F_SUB, R_CARD } from '../ui/Theme';
-import { immersiveMaterialFor, thinGlass } from '../ui/Glass';
+import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { CapsuleSegment } from '../ui/CapsuleSegment';
 import { I_BOOK, I_BOOKSHELF, I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_CLOSE, I_IMPORT, I_REFRESH,
   I_SEARCH, I_TRASH, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, SectionTitle } from '../ui/Widgets';
+import { CONTENT_MAX_WIDTH, contentColumnsFor, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'ListenView';
+
+/** 分段选择器（书架 / 搜索 / 书源）在宽屏下的最大宽度：拉满整屏会变成一条又长又扁的带子 */
+const SEGMENT_MAX_WIDTH: number = 560;
 
 /** 三个分段：书架（我的书）/ 搜索（找书）/ 书源（导入与管理） */
 const PANE_SHELF: number = 0;
@@ -113,6 +117,12 @@ export struct ListenView {
   onOpenBook: (hit: BookHit) => void = () => {
   };
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
+  /**
+   * 窗口宽度（vp）：三个分段里的列表按它算一屏几列（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），本页只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
 
   @State pane: number = PANE_SHELF;
   @State sources: BookSourceInfo[] = [];
@@ -140,6 +150,27 @@ export struct ListenView {
   private refresh(): void {
     this.sources = BookEngine.getInstance().listSources();
     this.shelf = BookShelf.getInstance().list();
+  }
+
+  /**
+   * 一屏放几列（宽屏多列，窄屏 1 列 = 改之前的样子）
+   *
+   * 口径在 ui/Layout.ets 的 contentColumnsFor：按窗口宽度算，一列至少 360vp、最多 4 列。
+   * 书架、搜索结果、书源三张列表都用它。
+   */
+  private columns(): number {
+    return contentColumnsFor(this.windowWidth);
+  }
+
+  /**
+   * 表单类内容（导入书源那一段）在宽屏下的最大宽度
+   *
+   * 列表可以多列，表单不行：窗口宽到 1400vp 还把粘贴框拉满，就是一条又长又扁的带子、
+   * 两个按钮各占半个屏幕。所以这里收成与设置类页面同一个口径（CONTENT_MAX_WIDTH），
+   * 窄屏不限宽。
+   */
+  private formMaxWidth(): number {
+    return this.columns() > 1 ? CONTENT_MAX_WIDTH : LAYOUT_UNBOUNDED;
   }
 
   /** 能不能搜：至少有一个带搜索能力的源 */
@@ -243,11 +274,9 @@ export struct ListenView {
       this.busy = true;
       this.sourceStatus = '正在读取书源文件…';
       try {
-        const text: string = BookEngine.getInstance().importFromUri(uris[0]) !== undefined ? '' : '';
-        // importFromUri 已经完成导入，这里只刷新与提示
+        const imported: BookSourceInfo[] = BookEngine.getInstance().importFromUri(uris[0]);
         this.refresh();
-        this.sourceStatus = '书源文件已导入';
-        void text;
+        this.sourceStatus = `已导入 ${imported.length} 个书源：${imported[0].name}${imported.length > 1 ? ' 等' : ''}`;
       } catch (e) {
         this.sourceStatus = `导入失败：${(e as Error).message}`;
       } finally {
@@ -305,6 +334,8 @@ export struct ListenView {
     .padding({ left: 14, right: 12 })
     .attributeModifier(thinGlass(23, false, '', this.materialLevel))
     .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+    .visualEffect(glassLight())
   }
 
   /** 书源筛选胶囊（全部 / 某个源） */
@@ -327,6 +358,8 @@ export struct ListenView {
     .padding({ left: 12, right: 8 })
     .attributeModifier(thinGlass(15, false, '', this.materialLevel))
     .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+    .visualEffect(glassLight())
     .bindMenu(this.sourceFilterMenu())
     .accessibilityText(`搜索范围：${this.filterLabel()}，点按切换`)
     .accessibilityLevel('yes')
@@ -388,6 +421,7 @@ export struct ListenView {
           Column().height(this.bottomInset + 96)
         }
       }
+      .lanes(this.columns())
       .width('100%')
       .layoutWeight(1)
       .scrollBar(BarState.Off)
@@ -429,6 +463,8 @@ export struct ListenView {
           .accessibilityLevel('yes')
       }
       .width('100%')
+      // 宽屏下搜索框不跟着铺满（与「搜索」页同一条口径）：1400vp 宽的一条输入框又长又扁
+      .constraintSize({ maxWidth: this.formMaxWidth() })
       .padding({ left: 16, right: 16, top: 4, bottom: 8 })
 
       Row({ space: 8 }) {
@@ -484,6 +520,7 @@ export struct ListenView {
             Column().height(this.bottomInset + 96)
           }
         }
+        .lanes(this.columns())
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Off)
@@ -513,48 +550,58 @@ export struct ListenView {
       .width('100%')
       .padding({ left: 16, right: 16, top: 4, bottom: 8 })
 
-      TextArea({ text: this.pasteText, placeholder: '把阅读（Legado）书源的 JSON 粘在这里' })
-        .placeholderColor(C_TEXT_WEAK)
-        .placeholderFont({ size: 14 })
-        .fontSize(13)
-        .height(110)
-        .width('100%')
-        .backgroundColor(C_CARD)
-        .borderRadius(R_CARD)
-        .padding(12)
-        .onChange((value: string) => {
-          this.pasteText = value;
-        })
+      /**
+       * 导入区（粘贴框 + 两个按钮 + 结果提示）
+       *
+       * 宽屏下这三样收成一条（见 formMaxWidth）：列表可以多列，表单拉满整屏就不好用了。
+       * 外面套一层容器而不是给每个控件各加一处约束，是因为「限宽」这件事只该写一遍。
+       */
+      Column() {
+        TextArea({ text: this.pasteText, placeholder: '把阅读（Legado）书源的 JSON 粘在这里' })
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 14 })
+          .fontSize(13)
+          .height(110)
+          .width('100%')
+          .backgroundColor(C_CARD)
+          .borderRadius(R_CARD)
+          .padding(12)
+          .onChange((value: string) => {
+            this.pasteText = value;
+          })
 
-      Row({ space: 10 }) {
-        Button(this.busy ? '处理中…' : '导入 JSON')
-          .fontSize(14)
-          .height(36)
-          .layoutWeight(1)
-          .enabled(!this.busy)
-          .onClick(() => {
-            this.importText(this.pasteText);
-          })
-        Button('导入文件')
-          .fontSize(14)
-          .height(36)
-          .layoutWeight(1)
-          .enabled(!this.busy)
-          .onClick(() => {
-            void this.pickSourceFile();
-          })
+        Row({ space: 10 }) {
+          Button(this.busy ? '处理中…' : '导入 JSON')
+            .fontSize(14)
+            .height(36)
+            .layoutWeight(1)
+            .enabled(!this.busy)
+            .onClick(() => {
+              this.importText(this.pasteText);
+            })
+          Button('导入文件')
+            .fontSize(14)
+            .height(36)
+            .layoutWeight(1)
+            .enabled(!this.busy)
+            .onClick(() => {
+              void this.pickSourceFile();
+            })
+        }
+        .width('100%')
+        .padding({ top: 10, bottom: 6 })
+
+        if (this.sourceStatus.length > 0) {
+          Text(this.sourceStatus)
+            .fontSize(F_SUB)
+            .fontColor(C_TEXT_SUB)
+            .width('100%')
+            .padding({ bottom: 6 })
+            .textAlign(TextAlign.Start)
+        }
       }
       .width('100%')
-      .padding({ top: 10, bottom: 6 })
-
-      if (this.sourceStatus.length > 0) {
-        Text(this.sourceStatus)
-          .fontSize(F_SUB)
-          .fontColor(C_TEXT_SUB)
-          .width('100%')
-          .padding({ bottom: 6 })
-          .textAlign(TextAlign.Start)
-      }
+      .constraintSize({ maxWidth: this.formMaxWidth() })
 
       Row({ space: 8 }) {
         SectionTitle({ text: `已导入（${this.sources.length}）` })
@@ -620,6 +667,7 @@ export struct ListenView {
             Column().height(this.bottomInset + 96)
           }
         }
+        .lanes(this.columns())
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Off)
@@ -658,6 +706,8 @@ export struct ListenView {
         })
       }
       .width('100%')
+      // 宽屏下分段选择器不跟着铺满：三个选项拉过整屏就成了一条又长又扁的带子（限宽见 SEGMENT_MAX_WIDTH）
+      .constraintSize({ maxWidth: this.columns() > 1 ? SEGMENT_MAX_WIDTH : LAYOUT_UNBOUNDED })
       .padding({ left: 16, right: 16, top: 6, bottom: 10 })
 
       if (this.pane === PANE_SHELF) {
@@ -670,6 +720,9 @@ export struct ListenView {
     }
     .width('100%')
     .height('100%')
+    // 靠左排：宽屏下分段选择器与导入区都是「限宽后还剩一截」，居中的话左边会空出一大段，
+    // 与下面列表的左缩进对不上（列表本来就是靠左铺满的）
+    .alignItems(HorizontalAlign.Start)
     .padding({ top: this.topInset })
     .backgroundColor(C_BG)
   }

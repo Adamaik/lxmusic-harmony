@@ -14,6 +14,7 @@ import { I_CHEVRON_RIGHT, I_CLOCK, I_CLOUD, I_DOWNLOAD, I_FOLDER, I_GEAR, I_HEAR
 import { CoverArt, TopFade } from '../ui/Widgets';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { ImportPlaylistSheet } from './ImportPlaylistSheet';
+import { isWideWindow, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /**
  * 「我的」页那一排快捷入口
@@ -122,9 +123,26 @@ export struct MineView {
   @StorageLink(K_WEBDAV_VERSION) @Watch('refresh') webdavVersion: number = 0;
   /** 收藏歌单在别处被改了（推荐页的爱心 / 多选）时重读一次那一段 */
   @StorageLink(K_COLLECTED_VERSION) @Watch('refresh') collectedVersion: number = 0;
+  /**
+   * 窗口宽度（vp）：宽屏下三张卡换一种排法（见 isWide）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），本页只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
 
   aboutToAppear(): void {
     this.refresh();
+  }
+
+  /**
+   * 是不是宽屏（平板 / 折叠屏展开态）
+   *
+   * 这一页的内容是**卡片**（快捷入口 / 歌单 / 设置），不是一列歌曲行 —— 所以宽屏下
+   * 不是"一行放几列"，而是把「歌单卡」与「设置卡」并排：歌单卡里是一张张歌单、
+   * 需要更宽，设置卡只有两行、窄一点就够（见 build 里的分栏）。
+   */
+  private isWide(): boolean {
+    return isWideWindow(this.windowWidth);
   }
 
   private refresh(): void {
@@ -695,8 +713,32 @@ export struct MineView {
             Column().height(this.topInset + 6).width('100%')
 
             this.quickCard()
-            this.playlistCard()
-            this.linksCard()
+            /**
+             * 宽屏：歌单卡与设置卡**并排**；窄屏照旧一上一下
+             *
+             * 这一页不像推荐页那样是"一列歌曲行"，而是三张卡 —— 所以宽屏下要排的是卡片的
+             * 位置：快捷入口那一排横着铺满，剩下两张中歌单卡占宽的一份（里面是一张张歌单，
+             * 行更长），设置卡只有两行、窄一点就够。2:1 的比例照华为音乐平板上的版式。
+             */
+            if (this.isWide()) {
+              Row({ space: 14 }) {
+                Column() {
+                  this.playlistCard()
+                }
+                .layoutWeight(2)
+
+                Column() {
+                  this.linksCard()
+                }
+                .layoutWeight(1)
+              }
+              .width('100%')
+              // 顶对齐：两张卡高度差得远（歌单卡可能几十行），居中的话设置卡会飘在半空
+              .alignItems(VerticalAlign.Top)
+            } else {
+              this.playlistCard()
+              this.linksCard()
+            }
           }
           .width('100%')
           .padding({ left: 16, right: 16, bottom: this.bottomInset + 16 })

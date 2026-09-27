@@ -1245,13 +1245,6 @@ export class PlaySession {
       this.notify(message);
       return;
     }
-    const source = BookEngine.getInstance().getSource(payload.sourceId);
-    if (source === null) {
-      const message: string = `这本书用的书源（${payload.sourceId}）已经被删掉了，请重新导入后再听`;
-      this.setStatus('error', message);
-      this.notify(message);
-      return;
-    }
 
     this.currentCacheKey = item.id;
     this.currentCacheQuality = BOOK_QUALITY;
@@ -1261,6 +1254,35 @@ export class PlaySession {
     this.pushQueueState();
     // 听书记一下「听到第几集」，下次打开这本书直接续播
     BookShelf.getInstance().updateProgress(bookShelfId(payload), payload.chapterIndex);
+
+    // 0) 用户主动下载过的这一集：优先放本地文件。
+    //    下载是明确的用户意图，比「现解析」更该被优先使用：不联网、也不用再跑一遍
+    //    书源规则，所以**书源被删掉、站点改版、断网都照样能听**（这与在线歌那条
+    //    「已下载优先」是同一个道理，见 playOnlineItem）。放在书源检查之前，
+    //    就是因为「书源没了」不该影响下载过的内容。
+    const downloaded: string = downloadedFile(item.id);
+    if (downloaded.length > 0) {
+      try {
+        this.currentLocalPath = downloaded;
+        this.setStatus('loading', '正在读取已下载文件…');
+        await LxPlayer.getInstance().playLocal(downloaded);
+        return;
+      } catch (e) {
+        // 打不开就往下走（联网重解析）：下载到用户目录的文件是「会话级」授权，
+        // 重启后可能已经读不到，不该让整集直接失败
+        this.currentLocalPath = '';
+        hilog.warn(DOMAIN, TAG, 'play downloaded book failed, fallback to source: %{public}s',
+          (e as Error).message);
+      }
+    }
+
+    const source = BookEngine.getInstance().getSource(payload.sourceId);
+    if (source === null) {
+      const message: string = `这本书用的书源（${payload.sourceId}）已经被删掉了，请重新导入后再听`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
 
     this.setStatus('loading', `正在解析「${item.name}」…`);
     try {

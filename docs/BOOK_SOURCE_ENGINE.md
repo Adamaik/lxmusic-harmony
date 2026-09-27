@@ -35,6 +35,11 @@
 | `views/ListenView.ets` | 听书页：书架 / 搜索 / 书源 三个分段 |
 | `views/BookDetailView.ets` | 一本书的详情 + 目录，点一集即播 |
 | `tools/book_engine_selftest.js` | 无设备自检（jsdom 顶替沙箱 + 真实书源联网跑通） |
+| `tools/book_import_test.js` | 无设备自检：**导入那一段**（应用算法的复刻 + 作业拼装 + 静态守卫） |
+
+> 两份自检分工：`book_engine_selftest.js` 验规则求值，它把书源当**已解析好的对象**喂进去；
+> `book_import_test.js` 验「一份 JSON 文件怎么变成一条能搜的书源」，并复刻
+> `BookEngine.buildJob` 的字符串拼接（宿主与沙箱的接口）。改导入 / 请求头时跑后者。
 
 ---
 
@@ -111,6 +116,10 @@
 自检脚本：`node tools/book_engine_selftest.js`（离线夹具 28 项）；
 联网：`node tools/book_engine_selftest.js --live <源名关键字> <关键词>`
 
+导入那一段另有一份：`node tools/book_import_test.js`（离线 16 项，含静态守卫）；
+联网：`node tools/book_import_test.js --live <关键词>` —— 它走的是应用真正拼出来的作业。
+注意本机若挂代理又没开，联网项会「0 条 + 请求成功 0 次」，那是网络不是规则。
+
 | 书源 | 搜索 | 详情 | 目录 | 音频直链 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | 六月听书网 | ✅ | ✅ | ✅ | ✅ 实测 200 | 纯 CSS 规则；该书库没有的书会「搜到 0 条」，是站点本身没有 |
@@ -132,8 +141,54 @@
 2. **目录一次拉全**：阅读是滚动懒加载，这里一次拉完（上限 60 页）；超大专辑会慢。
 3. **XPath 只实现了常用子集**：这批 7 个源一个都没用 XPath，所以没做全。
 4. **没有预取下一集**：每一集都要现跑书源规则（可能多次网络往返），
-   所以切到下一集时会重新「解析」一次；播放缓存也没有接入（`BOOK_QUALITY` 只是占位）。
+   所以切到下一集时会重新「解析」一次。播放缓存（边听边下）没有接入 ——
+   `BOOK_QUALITY` 只是占位；**离线靠「下载」这条路**（见第 8 节），
+   听过但没下载的集不会落盘。
 5. **`bookSourceType` 只当有声书用**：文本小说（type 0）的 `ruleContent.content`
    返回的是正文而不是音频地址，界面没有阅读器，会表现为「没解析出地址」。
 6. **预览器不可用**：与音源同样，DevEco Previewer 的 `Web` 是残缺桩，
    听书沙箱在预览器里注入失败（会给出明确提示），请在模拟器/真机上验证。
+
+---
+
+## 7. 宿主侧的两个坑（2026-09-27 修的，见 `docs/DEFECTS.md` D-005 / D-006）
+
+规则引擎没问题，但「导入」与「请求」这两段宿主代码一开始踩了两个坑，表现都是
+**「导入进去解析不了」** —— 一个是文件进不来，一个请求发错了。都很容易再踩：
+
+1. **Picker 的 URI 只能 `openSync`，不能 `readTextSync`**。`BookEngine.importFromUri()`
+   原先把 `file://docs/...` 直接交给 `readTextSync`，报 `No such file or directory`。
+   正确写法照 `LocalMusic.importOne()`：`fs.openSync(uri, OpenMode.READ_ONLY)` 拿 fd，
+   读字节再按 UTF-8 解（这个 SDK 的 `readTextSync` 连 fd 都不收）。
+2. **书源请求不能套用音源的默认头**。`bookRequest` 复用音源的 `lxRequest`，而后者
+   默认 `Accept: application/json`、POST 无 Content-Type 时按 JSON 序列化正文；
+   书源抓的是 HTML / XML，POST 正文是原样表单串，于是书音FM 的搜索必然 0 条。
+   现在 `bookRequest` 自己兜底 `Accept: */*` 与 `application/x-www-form-urlencoded`
+   （`options.headers` 会覆盖 `lxRequest` 的默认值，音源那份没动）。
+
+这两条都有静态守卫在 `tools/book_import_test.js` 里，改坏了会变红。
+
+---
+
+## 8. 下载（接进 `DownloadManager`）
+
+2026-09-27 接入。听书是**第三条下载链路**，与平台歌 / 洛雪音源并列：
+
+| 环节 | 做法 |
+| --- | --- |
+| 解析 | `DownloadManager.resolveUrl` 按 `item.source === BOOK_SOURCE` 分支到 `resolveBookUrl`，它调的是**播放用的同一个** `BookEngine.resolveAudioOf` —— 能放的一定能下、能下的一定能放 |
+| 请求头 | 解析结果连请求头一起返回（`ResolvedAudio`），下载请求用 `requestInStream(..., { header })` 带上书源的 `audioHeaders`（有声书 CDN 常校验 Referer） |
+| 键 | `downloadKeyOf` 退回**条目 id**（书载荷算不出 `mediaKey`）。这个 id 就是 `book_<书目id>_<集号>`，与播放链路同一个 —— `downloadedFile(item.id)` 才对得上 |
+| 文件名 | 固定 `书名-章节名`，不套「歌曲名 / 艺术家-标题」那三种格式，也不缀音质（`-book` 没意义） |
+| 标签 | **不写**：ID3 / flac 元数据是音乐那套（歌名/歌手/歌词），书这边没东西可写；m4a 写标签见 `docs/DOWNLOAD_TAGS.md`（记为暂不做）。所以不调 `collectDownloadTags`（否则还会拿书名去平台白搜一轮） |
+| 扩展名 | 先认链接后缀（m4a/mp3 都在 `KNOWN_EXTS` 里），认不出按 `EXT_BY_QUALITY['book'] = m4a` |
+| 限速 | 有声书**串行**（`nextWaiting` 里一次只放一集进并发位）+ 集间 `BOOK_TASK_GAP_MS`。下一集要抓页面 + 跑一遍规则，整本几十集并发就是对站点的扫描 |
+| 离线播放 | `PlaySession.playBookItem` **先查 `downloadedFile(item.id)`**，命中就 `playLocal`；这一步放在「书源还在不在」的检查**之前**，所以书源删了、站点改版、断网，下载过的照听 |
+| 整本 | 详情页目录行那颗下载键 → 先弹确认（照歌单详情「下载全部」的规矩）→ `enqueueMany` 整本排队 |
+| 自动下载 | 有声书**不参与**「缓存时自动下载」：那条设置是给播放缓存配套的，书没有播放缓存；真按它排就是听一集偷偷下一集。手动下载不受影响 |
+
+界面入口：书籍详情页长按某一集 → 「下载本集」/「已下载的显示删除下载」；
+目录行右侧 → 「下载整本」。进度都在「我的 - 下载管理」里看。
+
+守卫：`node tools/book_import_test.js` 里的「契约：有声书条目的下载键与载荷」与
+「静态守卫：接线留在哪几处」两节（下载键必须等于播放 id、已下载必须优先于书源检查等）。

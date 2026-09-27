@@ -58,6 +58,37 @@ function createSandbox() {
 
 const UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
 
+/**
+ * 还原 ArkWeb `runJavaScript` 的返回值。
+ *
+ * 设备上 runJavaScript 会把脚本返回值**再做一次 JSON 序列化**：脚本返回字符串
+ * `{"status":"ok"…}` 时，宿主拿到的是 `"{\"status\":\"ok\"…}"`（多一层引号）。
+ * jsdom 直接返回原字符串 —— 不补这一层，自检就会「比设备好」，
+ * 设备上「多引号一层导致 JSON.parse 出字符串」的坑在自检里永远看不到。
+ * 规则与 `core/source/SourceEngine.ets` 的 `unwrapJsonString` 一致。
+ */
+function unwrapJsonString(result) {
+  if (result.length === 0 || result === 'null' || result === 'undefined') return '';
+  try {
+    const parsed = JSON.parse(result);
+    if (typeof parsed === 'string') return parsed;
+    if (parsed !== null && typeof parsed === 'object') return JSON.stringify(parsed);
+    return result;
+  } catch (e) {
+    return result;
+  }
+}
+
+/** 在沙箱里跑 `__book_run__`，返回值按 ArkWeb 的口径还原（见上） */
+function runInSandbox(win, jobJson) {
+  return unwrapJsonString(JSON.stringify(win.__book_run__(jobJson)));
+}
+
+/** 同上，跑 `__book_ping__` */
+function pingInSandbox(win) {
+  return unwrapJsonString(JSON.stringify(win.__book_ping__()));
+}
+
 async function fetchBody(spec) {
   const url = spec.url;
   if (/^data:/i.test(url)) {
@@ -88,7 +119,7 @@ async function runJob(win, job, fetchImpl = fetchBody, maxRounds = 220) {
   let lastLogs = [];
   for (let round = 0; round < maxRounds; round++) {
     const payload = Object.assign({}, job, { netCache });
-    const raw = win.__book_run__(JSON.stringify(payload));
+    const raw = runInSandbox(win, JSON.stringify(payload));
     const res = JSON.parse(raw);
     lastLogs = res.logs || [];
     if (res.status === 'net') {
@@ -389,7 +420,7 @@ async function liveCase(win, sourceName, keyword) {
 (async () => {
   const args = process.argv.slice(2);
   const win = createSandbox();
-  const ping = JSON.parse(win.__book_ping__());
+  const ping = JSON.parse(pingInSandbox(win));
   console.log('沙箱：', JSON.stringify(ping));
   check('沙箱可跑规则（DOMParser 可用）', ping.ok === true && ping.hasDom === true, JSON.stringify(ping));
 

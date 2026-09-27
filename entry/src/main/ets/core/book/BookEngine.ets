@@ -18,7 +18,8 @@ import {
 } from './BookTypes';
 import { BookCookieJar, BookResponse, bookRequest } from './BookHttp';
 import { BookSourceStore, sourceText } from './BookSourceStore';
-import { utf8Bytes } from '../music/LxCrypto';
+import { bytesToUtf8, utf8Bytes } from '../music/LxCrypto';
+import { unwrapJsonString } from '../source/SourceEngine';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'BookEngine';
@@ -580,17 +581,21 @@ export class BookEngine {
     } catch (e) {
       throw new Error(`书源沙箱执行失败：${(e as Error).message}`);
     }
-    // ArkWeb 的坑：脚本执行失败时返回 null 而不是 reject
-    if (raw === null || raw === undefined || raw === '' || raw === 'null') {
+    // ArkWeb 的坑之一：脚本执行失败时返回 null 而不是 reject；
+    // 之二是它把返回值**又做了一次 JSON 序列化** —— 规则引擎返回的是字符串，
+    // 于是宿主拿到的是 `"{\"status\":\"ok\"...}"`（带引号）。不还原的话
+    // `JSON.parse` 出来是字符串，`result.status` 永远是 undefined，表现就是「搜到 0 条」。
+    const text: string = unwrapJsonString(raw !== null && raw !== undefined ? raw : '');
+    if (text.length === 0) {
       throw new Error(
         '书源沙箱没有返回结果（脚本可能执行失败，或 book_preload.js 没读到）。' +
           '预览器里沙箱不可用，请在模拟器/真机上跑。'
       );
     }
     try {
-      return JSON.parse(raw) as BookRunResult;
+      return JSON.parse(text) as BookRunResult;
     } catch (e) {
-      throw new Error(`书源沙箱返回了无法解析的内容：${raw.substring(0, 120)}`);
+      throw new Error(`书源沙箱返回了无法解析的内容：${text.substring(0, 120)}`);
     }
   }
 
@@ -640,10 +645,14 @@ export class BookEngine {
     }
     try {
       const raw: string = await controller.runJavaScript('typeof window.__book_ping__ === "function" ? window.__book_ping__() : ""');
-      if (raw === null || raw === undefined || raw === '' || raw === '""') {
+      // 这里同样要吃 `unwrapJsonString`：设备上 runJavaScript 会把返回值序列化一次，
+      // 不还原就 `JSON.parse` 成字符串，`parsed['ok']` 永远是 undefined ——
+      // 引擎明明注入成功了，却报「注入失败」。
+      const text: string = unwrapJsonString(raw !== null && raw !== undefined ? raw : '');
+      if (text.length === 0) {
         return false;
       }
-      const parsed: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+      const parsed: Record<string, Object> = JSON.parse(text) as Record<string, Object>;
       return parsed['ok'] === true;
     } catch (e) {
       return false;
@@ -684,9 +693,39 @@ export class BookEngine {
     return this.rawOf(sourceId);
   }
 
-  /** 从文件导入（选择器给的沙箱 URI） */
+  /**
+   * 从文件导入（选择器给的沙箱 URI）
+   *
+   * 两个坑叠在一起，所以不能一句 `readTextSync(uri)` 了事：
+   *   1. `readTextSync` 只认**沙箱路径**，把 Picker 给的 `file://docs/...` 传进去
+   *      会报 "No such file or directory"（URI 只有 `openSync` 认）；
+   *   2. 这个 SDK 的 `readTextSync` 声明只收 string，按 fd 读也不行。
+   * 所以照本地音乐导入那套：先 `openSync(uri)` 拿 fd，读字节，再自己按 UTF-8 解。
+   */
   importFromUri(uri: string): BookSourceInfo[] {
-    const text: string = fs.readTextSync(uri);
-    return this.importSources(text);
+    let file: fs.File | null = null;
+    try {
+      file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      const size: number = fs.statSync(file.fd).size;
+      if (size <= 0) {
+        throw new Error('书源文件是空的');
+      }
+      const buffer: ArrayBuffer = new ArrayBuffer(size);
+      const read: number = fs.readSync(file.fd, buffer);
+      const view: Uint8Array = new Uint8Array(buffer, 0, read);
+      const bytes: number[] = [];
+      for (let i = 0; i < read; i++) {
+        bytes.push(view[i]);
+      }
+      return this.importSources(bytesToUtf8(bytes));
+    } finally {
+      if (file !== null) {
+        try {
+          fs.closeSync(file);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'failed to close source file: %{public}s', JSON.stringify(e));
+        }
+      }
+    }
   }
 }

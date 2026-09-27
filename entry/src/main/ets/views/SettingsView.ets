@@ -1,7 +1,9 @@
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
   I_VOLUME, IconGlyph } from '../ui/Icons';
 import { TopFade } from '../ui/Widgets';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /** 设置项 */
 interface SettingRowDef {
@@ -120,6 +122,17 @@ export struct SettingsView {
   onNavigate: (action: string) => void = () => {
   };
   @State keyword: string = '';
+  /**
+   * 窗口宽度（vp）：宽屏下这一页的卡并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   /** 按搜索词过滤一组设置项 */
   private filter(rows: SettingRowDef[]): SettingRowDef[] {
@@ -164,7 +177,21 @@ export struct SettingsView {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
         Scroll() {
-          Column({ space: 14 }) {
+          /**
+           * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+           *
+           * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+           * 逐像素一样；宽屏换成 `Row` + 换行，每张卡 48% 宽（见 cardWidthOf），自动一行两张。
+           * 每张「卡 + 它下面那行说明」包在一个 Column 里当**一个单元**：不包的话两张卡之间
+           * 会插进别人家的说明文字（并排时它们各自成一个格子）。
+           */
+          Flex({
+            direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+            wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+            // 卡片高度差得远（一行的 vs 四行的），居中的话短卡会飘在半空
+            alignItems: ItemAlign.Start,
+            space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+          }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走，
           // 所以往下滚时下面的设置项能进到标题栏底下并透出来
           // （用容器内边距就会把内容整块裁在标题栏下边缘，看着像"被顶栏挡住"）
@@ -176,6 +203,7 @@ export struct SettingsView {
             .placeholderFont({ size: 15 })
             .textFont({ size: 15 })
             .height(48)
+            .width('100%')
             .backgroundColor(C_CARD)
             .onChange((value: string) => {
               this.keyword = value;
@@ -232,23 +260,38 @@ export struct SettingsView {
           })
 
           // ------------------------------------------------ 音源
-          this.cardGroup(GROUP_SOURCE)
-          this.hint(`当前音源：${this.sourceSummary}`)
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_SOURCE)
+            this.hint(`当前音源：${this.sourceSummary}`)
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           // ------------------------------------------------ 同步
-          this.cardGroup(GROUP_SYNC)
-          this.hint('与洛雪同步服务连接后，试听列表 / 收藏 / 歌单 / 不喜欢的歌曲可与其它设备互通')
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_SYNC)
+            this.hint('与洛雪同步服务连接后，试听列表 / 收藏 / 歌单 / 不喜欢的歌曲可与其它设备互通')
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           // ------------------------------------------------ 播放 / 下载
-          this.cardGroup(GROUP_PLAY)
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_PLAY)
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           // ------------------------------------------------ 外观
-          this.cardGroup(GROUP_THEME)
-          this.hint('玻璃材质档位、首页流光、封面取色、深浅模式都在这一页；'
-            + '标题栏与底部页签栏用的是同一档材质')
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_THEME)
+            this.hint('玻璃材质档位、封面取色、深浅模式都在这一页；'
+              + '标题栏与底部页签栏用的是同一档材质')
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           // ------------------------------------------------ 关于
-          this.cardGroup(GROUP_ABOUT)
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_ABOUT)
+          }
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, bottom: this.bottomInset + 16 })

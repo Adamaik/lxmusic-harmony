@@ -1,5 +1,7 @@
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
 import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_RESUME_AFTER_INTERRUPT,
@@ -96,6 +98,17 @@ export struct PlaySettingsView {
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
+  /**
+   * 窗口宽度（vp）：宽屏下两张卡并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     const service = PlaybackService.getInstance();
@@ -166,144 +179,165 @@ export struct PlaySettingsView {
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每张卡 48% 宽（见 ui/Layout.ets 的 cardWidthOf），
+         * 自动一行两张。每张「卡 + 它下面那行说明」包在一个 Column 里当**一个单元**：
+         * 说明文字本身就是铺满宽度的，不包起来的话它会把换行打断，两张卡就并不到一排去。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          // 两张卡高度差得远（音质那张四行、歌词那张十几行），居中的话短卡会飘在半空
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
-          // ------------------------------------------------ 音质
-          Column({ space: 8 }) {
-            OptionSetting({
-              label: '播放音质',
-              options: MAIN_QUALITY_LABELS,
-              activeIndex: this.qualityIndex(),
-              onPick: (index: number) => {
-                PlaySettings.getInstance().setQuality(MAIN_QUALITYS[index]);
-              },
-            })
 
-            ExtendQualitySetting({
-              label: '拓展音质',
-              on: this.extend,
-              options: EXTEND_QUALITY_LABELS,
-              activeIndex: this.extendIndex(),
-              hint: '这几档多数平台要会员，且要有支持它的音源；拿不到时自动退回「播放音质」里选的那档。',
-              onToggle: (next: boolean) => {
-                PlaySettings.getInstance().setExtendQuality(next);
-                if (next) {
-                  this.toast(`已开启拓展音质：优先「${EXTEND_QUALITY_LABELS[this.extendIndex()]}」，`
-                    + '平台或音源拿不到时自动退回普通音质');
-                }
-              },
-              onPickOption: (index: number) => {
-                PlaySettings.getInstance().setExtendQualityType(EXTEND_QUALITYS[index]);
-              },
-            })
+          // ------------------------------------------------ 音质（卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            Column({ space: 8 }) {
+              OptionSetting({
+                label: '播放音质',
+                options: MAIN_QUALITY_LABELS,
+                activeIndex: this.qualityIndex(),
+                onPick: (index: number) => {
+                  PlaySettings.getInstance().setQuality(MAIN_QUALITYS[index]);
+                },
+              })
 
-            ToggleSetting({
-              label: '与其他应用同时播放',
-              value: this.playWithOthers,
-              onPick: (next: boolean) => {
-                // 走会话：既改设置，也立刻作用到正在播的播放器
-                PlaySession.getInstance().setPlayWithOthers(next);
-              },
-            })
+              ExtendQualitySetting({
+                label: '拓展音质',
+                on: this.extend,
+                options: EXTEND_QUALITY_LABELS,
+                activeIndex: this.extendIndex(),
+                hint: '这几档多数平台要会员，且要有支持它的音源；拿不到时自动退回「播放音质」里选的那档。',
+                onToggle: (next: boolean) => {
+                  PlaySettings.getInstance().setExtendQuality(next);
+                  if (next) {
+                    this.toast(`已开启拓展音质：优先「${EXTEND_QUALITY_LABELS[this.extendIndex()]}」，`
+                      + '平台或音源拿不到时自动退回普通音质');
+                  }
+                },
+                onPickOption: (index: number) => {
+                  PlaySettings.getInstance().setExtendQualityType(EXTEND_QUALITYS[index]);
+                },
+              })
 
-            ToggleSetting({
-              label: '被其他应用打断结束后自动重新播放',
-              value: this.autoResume,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setAutoResumeAfterInterrupt(next);
-              },
-            })
-            HintText({ text: this.autoResumeHint() })
+              ToggleSetting({
+                label: '与其他应用同时播放',
+                value: this.playWithOthers,
+                onPick: (next: boolean) => {
+                  // 走会话：既改设置，也立刻作用到正在播的播放器
+                  PlaySession.getInstance().setPlayWithOthers(next);
+                },
+              })
+
+              ToggleSetting({
+                label: '被其他应用打断结束后自动重新播放',
+                value: this.autoResume,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setAutoResumeAfterInterrupt(next);
+                },
+              })
+              HintText({ text: this.autoResumeHint() })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({ text: '播放音质是首选档：这首没有该档时会自动往下退，不会因为选高了就放不出来。' })
           }
-          .width('100%')
-          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
+          .width(cardWidthOf(this.windowWidth))
 
-          HintText({ text: '播放音质是首选档：这首没有该档时会自动往下退，不会因为选高了就放不出来。' })
+          // ------------------------------------------------ 歌词（卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            Column({ space: 8 }) {
+              ToggleSetting({
+                label: '播放页显示小歌词',
+                value: this.showMiniLyric,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setShowMiniLyric(next);
+                },
+              })
+              ToggleSetting({
+                label: '歌词页模糊效果',
+                value: this.lyricBlur,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setLyricBlur(next);
+                },
+              })
+              ToggleSetting({
+                label: '歌词居中显示',
+                value: this.lyricCentered,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setLyricCentered(next);
+                },
+              })
+              SliderSetting({
+                label: '歌词字号',
+                value: this.fontSize,
+                min: LYRIC_FONT_MIN,
+                max: LYRIC_FONT_MAX,
+                onPick: (value: number, done: boolean) => {
+                  PlaySettings.getInstance().setLyricFontSize(value, done);
+                },
+              })
+              ToggleSetting({
+                label: '歌词页不熄屏',
+                value: this.keepScreen,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setLyricKeepScreenOn(next);
+                },
+              })
+              ToggleSetting({
+                label: '桌面歌词',
+                value: this.desktopLyric,
+                onPick: (next: boolean) => {
+                  // 走会话：既改设置，也让播控服务立刻重算悬浮窗显隐
+                  PlaySession.getInstance().setDesktopLyric(next);
+                },
+              })
+              HintText({ text: this.desktopLyricHint() })
+              ToggleSetting({
+                label: '车载蓝牙歌词',
+                value: this.bluetoothLyric,
+                onPick: (next: boolean) => {
+                  // 走会话：既改设置，也让播控服务立刻重推（打开当句就上去，关闭立刻清掉）
+                  PlaySession.getInstance().setBluetoothLyric(next);
+                },
+              })
+              HintText({ text: this.bluetoothLyricHint() })
+              ToggleSetting({
+                label: '本地 / 云端自动匹配歌词',
+                value: this.autoMatchLyric,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setAutoMatchLyric(next);
+                },
+              })
+              HintText({
+                text: '本地歌与云端歌（WebDAV）都没有平台身份，只能拿歌名与歌手去平台上搜一首'
+                  + '对应的歌再取词（要联网，每首歌只搜一次）。匹配没把握时宁可不显示 —— '
+                  + '配错的歌词比没有歌词更糟；这时可以在播放页的「更多 - 匹配歌词」里自己搜一次、'
+                  + '选正确的那条。同目录下的同名 .lrc 会一起导入 / 取回，优先用它，不联网也不会配错。',
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
 
-          // ------------------------------------------------ 歌词
-          Column({ space: 8 }) {
-            ToggleSetting({
-              label: '播放页显示小歌词',
-              value: this.showMiniLyric,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setShowMiniLyric(next);
-              },
-            })
-            ToggleSetting({
-              label: '歌词页模糊效果',
-              value: this.lyricBlur,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setLyricBlur(next);
-              },
-            })
-            ToggleSetting({
-              label: '歌词居中显示',
-              value: this.lyricCentered,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setLyricCentered(next);
-              },
-            })
-            SliderSetting({
-              label: '歌词字号',
-              value: this.fontSize,
-              min: LYRIC_FONT_MIN,
-              max: LYRIC_FONT_MAX,
-              onPick: (value: number, done: boolean) => {
-                PlaySettings.getInstance().setLyricFontSize(value, done);
-              },
-            })
-            ToggleSetting({
-              label: '歌词页不熄屏',
-              value: this.keepScreen,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setLyricKeepScreenOn(next);
-              },
-            })
-            ToggleSetting({
-              label: '桌面歌词',
-              value: this.desktopLyric,
-              onPick: (next: boolean) => {
-                // 走会话：既改设置，也让播控服务立刻重算悬浮窗显隐
-                PlaySession.getInstance().setDesktopLyric(next);
-              },
-            })
-            HintText({ text: this.desktopLyricHint() })
-            ToggleSetting({
-              label: '车载蓝牙歌词',
-              value: this.bluetoothLyric,
-              onPick: (next: boolean) => {
-                // 走会话：既改设置，也让播控服务立刻重推（打开当句就上去，关闭立刻清掉）
-                PlaySession.getInstance().setBluetoothLyric(next);
-              },
-            })
-            HintText({ text: this.bluetoothLyricHint() })
-            ToggleSetting({
-              label: '本地 / 云端自动匹配歌词',
-              value: this.autoMatchLyric,
-              onPick: (next: boolean) => {
-                PlaySettings.getInstance().setAutoMatchLyric(next);
-              },
-            })
             HintText({
-              text: '本地歌与云端歌（WebDAV）都没有平台身份，只能拿歌名与歌手去平台上搜一首'
-                + '对应的歌再取词（要联网，每首歌只搜一次）。匹配没把握时宁可不显示 —— '
-                + '配错的歌词比没有歌词更糟；这时可以在播放页的「更多 - 匹配歌词」里自己搜一次、'
-                + '选正确的那条。同目录下的同名 .lrc 会一起导入 / 取回，优先用它，不联网也不会配错。',
+              text: '「歌词页模糊效果」关掉后歌词页用纯深色底（封面页不受影响）；'
+                + '「歌词页不熄屏」只在全屏播放器停在歌词页时生效。',
             })
           }
-          .width('100%')
-          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
-          .borderRadius(R_CARD)
-          .backgroundColor(C_CARD)
-
-          HintText({
-            text: '「歌词页模糊效果」关掉后歌词页用纯深色底（封面页不受影响）；'
-              + '「歌词页不熄屏」只在全屏播放器停在歌词页时生效。',
-          })
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 16 })

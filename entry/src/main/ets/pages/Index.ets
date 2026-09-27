@@ -11,7 +11,7 @@ import { SourceEngine } from '../core/source/SourceEngine';
 import { SourceInfo, SourceLog } from '../core/source/LxTypes';
 import { OnlineRoute, LIST_PLATFORMS, platformName } from '../core/music/MusicList';
 import { C_BG, C_GLASS_SOLID, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, F_SUB } from '../ui/Theme';
-import { immersiveMaterialFor, immersiveMaterialForDialog, isGlassMaterialSupported, materialFirstGlass,
+import { glassLight, immersiveMaterialFor, immersiveMaterialForDialog, isGlassMaterialSupported, materialFirstGlass,
   thinGlass } from '../ui/Glass';
 import { DustLayer } from '../ui/Dust';
 import { SourceSandboxHost } from '../components/SourceSandboxHost';
@@ -19,7 +19,7 @@ import { SyncManager, K_SYNC_STATUS } from '../core/sync/SyncManager';
 import { describeStatus, shouldNotifySyncMessage } from '../core/sync/SyncStatusText';
 import { buildTitleMaterial, HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
-import { contentMaxWidthFor, K_BAR_MINI_WIDTH, publishedMiniBarWidth } from '../ui/Layout';
+import { K_BAR_MINI_WIDTH, K_WINDOW_WIDTH, publishedMiniBarWidth } from '../ui/Layout';
 import { PageTitle, RoundIconButton, WidePane } from '../ui/Widgets';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
 import { AboutView } from '../views/AboutView';
@@ -157,7 +157,7 @@ struct Index {
   /**
    * 窗口宽度（vp）
    *
-   * 底部两条悬浮栏的宽度、内容列的最大宽度都按它算（见 ui/Layout.ets）：
+   * 底部两条悬浮栏的宽度按它算，各页面的列数也按它算（见 ui/Layout.ets）：
    * 旋转、折叠屏展开/折叠、平板分屏与自由窗口都会改这个值，改完界面重排一次。
    * 0 = 还没量到（此时按手机档处理，与改之前的行为一致）。
    */
@@ -285,7 +285,7 @@ struct Index {
         this.readAvoidArea();
       });
       // 窗口尺寸变化：旋转 / 折叠屏展开折叠 / 平板分屏 / 自由窗口拖拽都会触发，
-      // 底部两条栏的宽度与内容列的最大宽度都得跟着重算（见 ui/Layout.ets）
+      // 底部两条栏的宽度与各页面的列数都得跟着重算（见 ui/Layout.ets）
       const onSize = (size: window.Size) => {
         this.windowWidth = this.getUIContext().px2vp(size.width);
         this.publishLayout();
@@ -317,14 +317,17 @@ struct Index {
   /**
    * 把布局量同步给子页面
    *
-   * 只有页内那条迷你栏（歌单详情 / 在线详情，不在页签体系里）需要：
-   * 宽屏下它要跟 HdsTabs 那条迷你栏同宽（0 = 窄屏，照旧铺满）。
+   * 两样东西：
+   *   - 页内那条迷你栏（歌单详情 / 在线详情，不在页签体系里）：宽屏下它要跟 HdsTabs
+   *     那条迷你栏同宽（0 = 窄屏，照旧铺满）；
+   *   - 窗口宽度：首页三个页签按它算一屏几列（见 ui/Layout.ets 的 contentColumnsFor）。
    */
   private publishLayout(): void {
     // 从 AppStorage 读展开态而不是 @StorageLink：HDS 的 onBarStyleChange 里刚写完
     // 这个键就调本方法，此时 @StorageLink 还没同步回来，会读到上一轮的旧值。
     const expanded: boolean = AppStorage.get<boolean>(K_MINI_EXPANDED) ?? false;
     AppStorage.setOrCreate(K_BAR_MINI_WIDTH, publishedMiniBarWidth(this.windowWidth, expanded));
+    AppStorage.setOrCreate(K_WINDOW_WIDTH, this.windowWidth);
   }
 
   /** 读取状态栏 / 手势条的避让高度，读到 0 时退回经验值 */
@@ -483,13 +486,17 @@ struct Index {
   }
 
   /**
-   * 内容列的最大宽度（vp）
+   * 宽屏布局：**所有页面都铺满窗口**，多列由各页自己排
    *
-   * 宽屏（≥ 600vp）收成居中一列，手机返回 0 = 不限宽（WidePane 会翻成「不限」）。
+   * 这里不再有「内容列最大宽度」那套（原来宽屏一律收成居中的 720：平板上两侧各留
+   * 一大片白、列表一行从屏左拉到屏右，正是被吐槽的那一版）。现在：
+   *   - 每个 destination 的 WidePane 都不给 maxWidth（0 = 不限宽，铺满窗口）；
+   *   - 列表页把 `contentColumnsFor(windowWidth)` 喂给 `List.lanes()`，条目自己排成多列
+   *     （歌单详情 / 在线详情 / 搜索结果 / 最近播放 / 本地 / 下载 / 云端 / 听书…）；
+   *   - 页内的头部（封面那一块）整行铺满，表单类控件自己限宽到 CONTENT_MAX_WIDTH。
+   *
+   * 窗口宽度由 publishLayout 写进 AppStorage，页面自己订阅（见 ui/Layout.ets）。
    */
-  private contentMaxWidth(): number {
-    return contentMaxWidthFor(this.windowWidth);
-  }
 
   /** 页签选中态用的强调色 / 未选中态的图标 token */
   private tabColor(index: number): Resource {
@@ -570,7 +577,7 @@ struct Index {
        * 首页要的是华为音乐 / 运动健康那种恒定的纯透明标题栏，所以这里：
        *   1) 关滚动效果（不再随滚动起雾）；
        *   2) 底色透明 + 蒙版高度收成 0（见下面 originalStyle）；
-       *   3) 标题栏自身不做模糊 —— 模糊是「通透」的反面：静止时它把流光糊成一片
+       *   3) 标题栏自身不做模糊 —— 模糊是「通透」的反面：静止时它把底下的内容糊成一片
        *      看着"跟背景一样"，一旦有列表从底下经过就立刻显形成一条灰白。
        *      注意这条只影响标题栏**这层表面**，不影响圆钮上的沉浸光感。
        */
@@ -579,9 +586,9 @@ struct Index {
       /**
        * 栏体**不给**材质：首页只要「透明底 + 不留蒙版」，材质全部留给栏里的自绘钮
        *
-       * 试过给这一项（实测栏体会整条变成一层材质玻璃带，压在首页那层 HDS 背景流光上
+       * 试过给这一项（实测栏体会整条变成一层材质玻璃带，压在首页内容上
        * 挡掉一截，列表滑到栏下也会被模糊），但那样顶栏就成了一整条玻璃栏，而不是
-       * 「两颗玻璃钮浮在流光上」—— 官方那套「标题栏按钮沉浸光感」的观感本来就是后者，
+       * 「两颗玻璃钮浮在页面上」—— 官方那套「标题栏按钮沉浸光感」的观感本来就是后者，
        * 所以材质只挂在钮上（`.systemMaterial(immersiveMaterialFor(...))`），栏体保持透明。
        *
        * 钮的材质是**真的会渲染**的，不是像早先推测的那样被 out of scope：
@@ -714,6 +721,8 @@ struct Index {
     PlayerView({
       topInset: 0,
       bottomInset: this.bottomInset,
+      // 宽屏下播放页走「左封面 + 右歌词」的并排版式（见 PlayerView 的 wideLeftPane）
+      windowWidth: this.windowWidth,
       onClose: () => {
         this.closePlayer();
       },
@@ -997,14 +1006,14 @@ struct Index {
   destination(name: string, param: Object) {
     if (name === PAGE_SEARCH) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           SearchView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('搜索'))
     } else if (name === PAGE_SOURCE) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           SourceSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
@@ -1014,49 +1023,49 @@ struct Index {
       })
     } else if (name === PAGE_SYNC) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           SyncSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('同步设置'))
     } else if (name === PAGE_CACHE) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           CacheSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('缓存'))
     } else if (name === PAGE_PLAY) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           PlaySettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('播放设置'))
     } else if (name === PAGE_DOWNLOAD) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           DownloadSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('下载设置'))
     } else if (name === PAGE_APPEARANCE) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           AppearanceSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('外观'))
     } else if (name === PAGE_WEBDAV) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           WebDavSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
       .titleBar(this.titleBarOptions('WebDAV 云端音乐'))
     } else if (name === PAGE_ABOUT) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           AboutView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
@@ -1065,7 +1074,7 @@ struct Index {
       // 「我的」页那张卡的「设置」：内容就是原来的设置页（它原来是一个页签），
       // 所以让位方式与页签时一样 —— 页面内部自己带顶部占位与渐隐，这里不再套 fadeTop
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           SettingsView({
             topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
             bottomInset: this.bottomInset,
@@ -1079,7 +1088,7 @@ struct Index {
       .titleBar(this.titleBarOptions('设置'))
     } else if (name === PAGE_HISTORY) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           PanePage({
             windowWidth: this.windowWidth,
             bottomInset: this.bottomInset,
@@ -1102,7 +1111,7 @@ struct Index {
       .titleBar(this.pageTitleBar('最近播放'))
     } else if (name === PAGE_LOCAL) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           PanePage({
             windowWidth: this.windowWidth,
             bottomInset: this.bottomInset,
@@ -1131,7 +1140,7 @@ struct Index {
       .titleBar(this.pageTitleBar('本地音乐'))
     } else if (name === PAGE_DOWNLOADS) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           PanePage({
             windowWidth: this.windowWidth,
             bottomInset: this.bottomInset,
@@ -1153,7 +1162,7 @@ struct Index {
       .titleBar(this.pageTitleBar('下载管理'))
     } else if (name === PAGE_CLOUD) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           PanePage({
             windowWidth: this.windowWidth,
             bottomInset: this.bottomInset,
@@ -1185,7 +1194,7 @@ struct Index {
       .titleBar(this.pageTitleBar('云端音乐'))
     } else if (name === PAGE_BOOK) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth() }) {
+        WidePane() {
           // 用 PanePage 而不是裸页面：它底下是「一列内容 + 一条悬浮迷你播放条」，
           // 点一集开始听之后，这一页自己就有一条迷你栏，不必退回首页才看得到进度
           PanePage({
@@ -1217,7 +1226,7 @@ struct Index {
       .titleBar(this.titleBarOptions(''))
     } else if (name === PAGE_ONLINE) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           OnlineListView({
             kind: this.routeOnlineKind,
             source: this.routeOnlineSource,
@@ -1246,7 +1255,7 @@ struct Index {
       .bindToScrollable([this.onlineScroller])
     } else if (name === PAGE_PLAYLIST) {
       HdsNavDestination() {
-        WidePane({ maxWidth: this.contentMaxWidth(), fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           PlaylistDetailView({
             playlistId: this.routePlaylistId,
             playlistName: this.routePlaylistName,
@@ -1276,9 +1285,17 @@ struct Index {
       // ---------------------------------------------------- HDS 导航（主页签 + 子页面）
       HdsNavigation(this.pathStack) {
         HdsTabs({ index: this.activeTab, controller: this.tabsController, barPosition: BarPosition.End }) {
-          // 页签内容是「宽屏收成居中一列、手机铺满」：收窄交给 WidePane，见 ui/Widgets.ets
+          /**
+           * 三个页签的内容**铺满窗口**（WidePane 的 maxWidth 给 0 = 不限宽），多列由各页
+           * 自己按窗口宽度排（见 ui/Layout.ets 的 contentColumnsFor）——
+           * 华为音乐的平板首页就是这样：正文铺到窗口边上，一屏三列。
+           *
+           * 之前这里是 `maxWidth: this.contentMaxWidth()`（宽屏收成居中的 720）：
+           * 平板上两侧各留一大片白，列表一行从屏左拉到屏右，正是被吐槽的那一版。
+           * 收窄那套仍然留给详情页 / 设置页（见 contentMaxWidth 的说明）。
+           */
           TabContent() {
-            WidePane({ maxWidth: this.contentMaxWidth() }) {
+            WidePane() {
               RecommendView({
                 topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
                 bottomInset: this.bottomInset + 96,
@@ -1294,7 +1311,7 @@ struct Index {
           .tabBar(this.tabBarItem(0))
 
           TabContent() {
-            WidePane({ maxWidth: this.contentMaxWidth() }) {
+            WidePane() {
               ListenView({
                 topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
                 bottomInset: this.bottomInset + 96,
@@ -1307,7 +1324,7 @@ struct Index {
           .tabBar(this.tabBarItem(1))
 
           TabContent() {
-            WidePane({ maxWidth: this.contentMaxWidth() }) {
+            WidePane() {
               MineView({
                 topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
                 bottomInset: this.bottomInset + 96,
@@ -1445,6 +1462,8 @@ struct Index {
         // 底色是 token：深色模式下换成深色半透明底，不然白底黑字会一直亮着
         .attributeModifier(thinGlass(18, false, C_GLASS_SOLID, this.materialLevel))
         .systemMaterial(immersiveMaterialFor(this.materialLevel))
+        // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+        .visualEffect(glassLight())
         // 压在底部迷你栏 / 页签栏之上：顶部在子页面里是标题栏与返回键的位置，别挡着
         .align(Alignment.Bottom)
         .margin({ left: 16, right: 16, bottom: this.bottomInset + 92 })

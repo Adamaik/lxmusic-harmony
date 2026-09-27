@@ -1234,8 +1234,11 @@ function debugString(v: Object | undefined): string {
 /**
  * runJavaScript 返回的是结果的 JSON 序列化字符串。
  * 这里把「返回一个字符串」的情况还原成字符串本体。
+ *
+ * 两个引擎都要用（书源那边同样吃亏，见 `docs/DEFECTS.md` D-007），所以导出。
+ * 它对「宿主已经还原过」的输入也安全：拿到对象就吐回 JSON 文本，拿到字符串就吐回本体。
  */
-function unwrapJsonString(result: string): string {
+export function unwrapJsonString(result: string): string {
   if (result.length === 0 || result === 'null' || result === 'undefined') {
     return '';
   }

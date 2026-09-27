@@ -16,6 +16,8 @@ import { AutoDownloadSong, clearDownloadedFiles, removeDownloadedFile, setAutoDo
 import { TagSink } from './TagWriter';
 import { isLocalSong } from '../local/LocalMusic';
 import { isWebDavSong } from '../webdav/WebDavLibrary';
+import { BookEngine } from '../book/BookEngine';
+import { BOOK_SOURCE, BookAudio, BookPlayPayload, parseBookPayload } from '../book/BookTypes';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'DownloadManager';
@@ -41,6 +43,14 @@ const PROGRESS_THROTTLE_MS: number = 400;
  * 与播放缓存那边的 WAIT_DELAY_MS 一个量级：只是回来看一眼，不占网络。
  */
 const AUTO_WAIT_MS: number = 4000;
+/**
+ * 有声书：同一时间只跑一集，集与集之间再留这么久
+ *
+ * 下**一集**要先把这一集的页面抓回来、跑一遍书源规则（可能有多次网络往返），
+ * 比下一首歌贵得多；整本几十上百集连着跑，站点那边就是一波扫描。所以有声书不按
+ * MAX_ACTIVE 并发，而是串行 + 间隔（见 nextWaiting 与 runTask）。
+ */
+const BOOK_TASK_GAP_MS: number = 1000;
 
 /** 音质 -> 扩展名（拿不到链接后缀时用） */
 const EXT_BY_QUALITY: Record<string, string> = {
@@ -52,8 +62,28 @@ const EXT_BY_QUALITY: Record<string, string> = {
   'atmos': 'm4a',
   'atmos_plus': 'm4a',
   'master': 'flac',
+  // 有声书占一个固定档位（BOOK_QUALITY）；真去问站点要的是 m4a / mp3，
+  // 认不出链接后缀时按 m4a（比 mp3 更常见）
+  'book': 'm4a',
 };
 const KNOWN_EXTS: string[] = ['mp3', 'flac', 'm4a', 'aac', 'wav', 'ogg', 'opus', 'ape', 'wma'];
+
+/**
+ * 有声书空标签
+ *
+ * ID3 / flac 元数据那套是给音乐写的；有声书的文件名已经说明是哪本书哪一集，
+ * 再塞「歌手/专辑/歌词」没有意义（m4a 写标签在 `docs/DOWNLOAD_TAGS.md` 里记为暂不做）。
+ */
+const NO_TAGS: DownloadTagData = {
+  title: '',
+  artist: '',
+  album: '',
+  lyric: '',
+  cover: null,
+  coverMime: '',
+  coverWidth: 0,
+  coverHeight: 0,
+};
 
 /** 下载状态 */
 export type DownloadStatus = 'waiting' | 'downloading' | 'done' | 'error';
@@ -113,6 +143,17 @@ interface WriteTarget {
   reason: string;
 }
 
+/**
+ * 解析出来的下载地址
+ *
+ * 与链接一起把请求头带出来：普通歌走音源不需要头，有声书的音频 CDN 常常校验
+ * Referer（六月、悦听这类站都如此），缺了就是 403/404。
+ */
+interface ResolvedAudio {
+  url: string;
+  headers: Record<string, string>;
+}
+
 /** 落盘结构（字段可选：老文件可能缺） */
 interface DownloadIndexData {
   version?: number;
@@ -125,7 +166,9 @@ const INDEX_VERSION: number = 1;
  * 下载记录的唯一键
  *
  * mediaKey（平台_歌曲id_哈希）优先：同一首歌在不同列表里 id 可能不同，
- * 但 musicInfo 是一样的；没有 musicInfo 的条目退回条目 id。
+ * 但 musicInfo 是一样的；没有 musicInfo 的条目退回条目 id —— 有声书就走这一条：
+ * 它的载荷是 BookPlayPayload（算不出 mediaKey），条目 id 形如 `book_<书id>_<集号>`，
+ * 本身稳定唯一，而且与播放链路用的是同一个 id（`downloadedFile(item.id)` 才对得上）。
  */
 export function downloadKeyOf(song: SongItem): string {
   const media: string = mediaKeyOf(song.musicInfoJson);
@@ -186,6 +229,10 @@ export class DownloadManager {
   private inited: boolean = false;
   private items: DownloadItem[] = [];
   private active: number = 0;
+  /** 正在跑的有声书任务数（有声书串行，见 nextWaiting） */
+  private activeBook: number = 0;
+  /** 上一集有声书开工的时刻（用来算集间间隔，见 bookPace） */
+  private bookPacedAt: number = 0;
   /** 正在下载的请求句柄：删除 / 取消时要 destroy 掉 */
   private requests: Map<string, http.HttpRequest> = new Map<string, http.HttpRequest>();
   private lastBumpAt: number = 0;
@@ -305,7 +352,7 @@ export class DownloadManager {
   // ---------------------------------------------------------------- 入队
 
   /**
-   * 下载一首歌
+   * 下载一首歌 / 一集有声书
    *
    * 已经下过 / 正在下的直接返回已有记录（不重复下）；失败过的重新排一次队。
    * 返回 null 表示当前状态没法下（没有音源、条目没有 musicInfo 等）。
@@ -324,6 +371,12 @@ export class DownloadManager {
     // 云端歌（WebDAV）也不走这条队列：它没有音源链接，而是由播放缓存的
     // 「边听边下」自己带认证头下载（见 AudioCache / PlaySession.playWebDavItem）
     if (isWebDavSong(song)) {
+      return null;
+    }
+    // 有声书不参与「缓存时自动下载」：那条设置是给播放缓存配套的（听过的落盘、别再问平台），
+    // 而有声书没有播放缓存；真按它自动排，就是听一集偷偷下一集，还每集都要跑一遍书源规则。
+    // 手动点「下载」（auto = false）照常收。
+    if (auto && song.source === BOOK_SOURCE) {
       return null;
     }
     const key: string = downloadKeyOf(song);
@@ -688,11 +741,19 @@ export class DownloadManager {
    * 下一个该开工的：用户点的下载排在自动下载前面
    *
    * 自动排进来的可以等（就是「边听边下」那批），别让它们把用户正在等的下载堵在后面。
+   *
+   * 有声书另外受一条限制：一次只跑一集。下一集要抓页面 + 跑规则（多次网络往返），
+   * 并发几集就是对站点的并发扫描，整本一起下更甚；串行 + 集间间隔（bookPace）就够了。
+   * 串行只挡有声书自己，歌照旧按 MAX_ACTIVE 跑。
    */
   private nextWaiting(): DownloadItem | null {
+    const bookBusy: boolean = this.activeBook > 0;
     let auto: DownloadItem | null = null;
     for (const item of this.items) {
       if (item.status !== 'waiting') {
+        continue;
+      }
+      if (bookBusy && item.source === BOOK_SOURCE) {
         continue;
       }
       if (!item.auto) {
@@ -724,16 +785,41 @@ export class DownloadManager {
    * 里面所有分支都只是 return —— 不再各自去动 active，避免漏减或重复减。
    */
   private async startTask(item: DownloadItem): Promise<void> {
+    const isBook: boolean = item.source === BOOK_SOURCE;
+    if (isBook) {
+      this.activeBook++;
+    }
     try {
       await this.runTask(item);
     } catch (e) {
       this.fail(item, (e as Error).message);
     } finally {
       this.active--;
+      if (isBook) {
+        this.activeBook--;
+      }
       this.persist();
       this.bump();
       this.pump();
     }
+  }
+
+  /**
+   * 有声书的集间间隔
+   *
+   * 只在有声书任务开头调；因为有声书是串行的（nextWaiting），这里等的就是
+   * 「上一集结束到现在」的时间 —— 连着下整本时每集之间留 BOOK_TASK_GAP_MS，
+   * 免得规则解析把站点连着打一遍。
+   */
+  private async bookPace(): Promise<void> {
+    const elapsed: number = Date.now() - this.bookPacedAt;
+    const wait: number = BOOK_TASK_GAP_MS - elapsed;
+    if (this.bookPacedAt > 0 && wait > 0) {
+      await new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), wait);
+      });
+    }
+    this.bookPacedAt = Date.now();
   }
 
   private async runTask(item: DownloadItem): Promise<void> {
@@ -744,13 +830,24 @@ export class DownloadManager {
     item.total = 0;
     this.bump();
 
+    // 0) 有声书串行 + 集间间隔：下一集要抓页面 + 跑规则，整本连着下就是对站点的扫描
+    if (item.source === BOOK_SOURCE) {
+      await this.bookPace();
+      if (item.status !== 'downloading') {
+        return;
+      }
+    }
+
     // 1) 解析播放链接（要几秒，期间可能被删掉）
-    //    封面与歌词同时开跑：标签必须赶在音频数据落盘之前凑齐（见 TagSink）
-    const tagsTask: Promise<DownloadTagData> =
-      collectDownloadTags(item.name, item.singer, item.musicInfoJson, item.coverUrl);
-    let url: string = '';
+    //    封面与歌词同时开跑：标签必须赶在音频数据落盘之前凑齐（见 TagSink）。
+    //    有声书不凑标签：那是音乐那套（歌名/歌手/歌词），书这边没有可凑的东西，
+    //    硬凑还会拿书名去平台搜一轮，纯属白跑。
+    const tagsTask: Promise<DownloadTagData> = item.source === BOOK_SOURCE
+      ? Promise.resolve(NO_TAGS)
+      : collectDownloadTags(item.name, item.singer, item.musicInfoJson, item.coverUrl);
+    let resolved: ResolvedAudio;
     try {
-      url = await this.resolveUrl(item);
+      resolved = await this.resolveUrl(item);
     } catch (e) {
       this.fail(item, (e as Error).message);
       return;
@@ -758,6 +855,7 @@ export class DownloadManager {
     if (item.status !== 'downloading') {
       return;
     }
+    const url: string = resolved.url;
     const tags: DownloadTagData = await tagsTask;
 
     // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）
@@ -814,6 +912,9 @@ export class DownloadManager {
         method: http.RequestMethod.GET,
         connectTimeout: 20000,
         readTimeout: 300000,
+        // 有声书的音频 CDN 常校验 Referer（六月、悦听这类站都如此）：书源里
+        // 声明的请求头要跟着这一跳带过去，否则直链能解析出来但下不动（403/404）
+        header: resolved.headers,
       });
       // 收尾：开头还攒着的（下载太短、没认出来）补写出去
       sink.finish();
@@ -860,8 +961,15 @@ export class DownloadManager {
     }
   }
 
-  /** 按设置里选的音质协商出链接；拓展音质失败自动退回普通音质 */
-  private async resolveUrl(item: DownloadItem): Promise<string> {
+  /**
+   * 解析出可下载的地址（连带请求头）
+   *
+   * 分两条链路：平台歌 / 洛雪音源走音质协商；有声书走书源规则（见 resolveBookUrl）。
+   */
+  private async resolveUrl(item: DownloadItem): Promise<ResolvedAudio> {
+    if (item.source === BOOK_SOURCE) {
+      return await this.resolveBookUrl(item);
+    }
     const engine = SourceEngine.getInstance();
     if (!engine.isInited()) {
       throw new Error('音源没有加载，先去「设置 - 音源设置」加载一个音源');
@@ -872,7 +980,7 @@ export class DownloadManager {
     const quality: string = pickQuality(item.musicInfoJson, item.source, item.quality);
     item.quality = quality;
     try {
-      return await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+      return { url: await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source), headers: {} };
     } catch (err) {
       const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
       if (retry.length === 0) {
@@ -880,8 +988,41 @@ export class DownloadManager {
       }
       hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s', quality, retry);
       item.quality = retry;
-      return await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source);
+      return { url: await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source), headers: {} };
     }
+  }
+
+  /**
+   * 有声书：跑这一集的书源规则解析音频直链
+   *
+   * 与播放链路（PlaySession.playBookItem）走的是同一套 `resolveAudioOf`，
+   * 所以「能放的一定能下、能下的一定能放」；请求头也从书源里取（`audioHeaders`），
+   * 音频 CDN 校验 Referer 时靠它。
+   *
+   * 载荷里带的就是「哪个书源、哪本书、哪一集」（BookPlayPayload），够解析用了 ——
+   * 不需要用户此刻正在看那本书，也不需要那个书源在界面上被选中。
+   */
+  private async resolveBookUrl(item: DownloadItem): Promise<ResolvedAudio> {
+    const payload: BookPlayPayload | null = parseBookPayload(item.musicInfoJson);
+    if (payload === null) {
+      throw new Error('这条听书记录缺书籍信息（可能是旧版本排进来的），请回到书籍页重新下载');
+    }
+    const engine = BookEngine.getInstance();
+    if (engine.getSource(payload.sourceId) === null) {
+      throw new Error('这本书用的书源已经被删掉了，请重新导入后再下载');
+    }
+    const audio: BookAudio = await engine.resolveAudioOf(
+      payload.sourceId,
+      payload.bookUrl,
+      payload.bookName,
+      payload.chapterUrl,
+      payload.chapterName,
+      payload.chapterIndex
+    );
+    if (audio.url.length === 0) {
+      throw new Error('这一集没解析出音频地址（书源规则可能已失效，或这一集需要登录）');
+    }
+    return { url: audio.url, headers: engine.audioHeaders(payload.sourceId) };
   }
 
   /** 标记失败（只管状态，并发位的收尾在 startTask 的 finally 里） */
@@ -913,8 +1054,16 @@ export class DownloadManager {
    *   格式：歌曲名 / 艺术家-标题 / 标题-艺术家（参考图里的三种）
    *   标注音质：开就把音质缀在名字后面，例如 `夜、萤火虫和你-128k.mp3`
    * 扩展名先从链接里认（很多平台会给 .mp3/.flac），认不出按音质推。
+   *
+   * 有声书不套这套：那三种格式是「歌名 / 艺术家」的组合，书上对应的是
+   * 「书名 / 章节名」，固定按 `书名-章节名` 拼 —— 一集一个文件，整本下完在
+   * 文件管理里按名字就是有序的一摞；也不缀音质（`-book` 没有意义）。
    */
   private buildFileName(item: DownloadItem, ext: string): string {
+    const book: string = this.bookFileBase(item);
+    if (book.length > 0) {
+      return this.clampName(book, ext);
+    }
     const settings = DownloadSettings.getInstance();
     const format: string = settings.getNameFormat();
     let base: string = item.name;
@@ -926,6 +1075,27 @@ export class DownloadManager {
     if (settings.isMarkQuality() && item.quality.length > 0) {
       base = `${base}-${item.quality}`;
     }
+    return this.clampName(base, ext);
+  }
+
+  /** 有声书的文件名主体（`书名-章节名`）；不是有声书返回空串 */
+  private bookFileBase(item: DownloadItem): string {
+    if (item.source !== BOOK_SOURCE) {
+      return '';
+    }
+    const payload: BookPlayPayload | null = parseBookPayload(item.musicInfoJson);
+    // item.singer 装的就是书名（见 BookDetailView.toSongItem），载荷缺了也能拼出来
+    const bookName: string = payload !== null && payload.bookName.length > 0
+      ? payload.bookName
+      : item.singer;
+    if (bookName.length === 0) {
+      return item.name;
+    }
+    return `${bookName}-${item.name}`;
+  }
+
+  /** 洗一遍文件名 + 截到长度上限，再缀扩展名 */
+  private clampName(base: string, ext: string): string {
     let name: string = `${sanitizeFileName(base)}.${ext}`;
     if (name.length > MAX_NAME_LEN) {
       const keep: number = MAX_NAME_LEN - ext.length - 1;

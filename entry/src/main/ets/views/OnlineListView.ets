@@ -11,10 +11,10 @@ import { CoverArt, FavoriteHeart } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
   SelectionActions, SelectSession, toggleSelected } from '../ui/Selection';
-import { immersiveMaterialForBar } from '../ui/Glass';
+import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
-import { K_BAR_MINI_WIDTH, barSideMarginFor } from '../ui/Layout';
+import { K_BAR_MINI_WIDTH, barSideMarginFor, contentColumnsFor } from '../ui/Layout';
 import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
@@ -896,6 +896,152 @@ export struct OnlineListView {
     return style;
   }
 
+  /**
+   * 页面主体：榜单头部 + 歌曲列表
+   *
+   * 单独抽成一个 builder：鸿蒙6 上底部那条悬浮栏要换成自绘的（见 build 的 else 分支），
+   * 主体两种系统上完全一样，抽出来就不会被复制成两份、以后改一处漏一处。
+   */
+  @Builder
+  pageBody() {
+    Column() {
+      List({ scroller: this.scroller }) {
+        /**
+         * 整页只有**一个 ListItemGroup**：组头是榜单封面与那一排动作，组内每首一行，
+         * 组尾是空态 / 加载提示 / 底部让位。
+         *
+         * 套一层组是为了宽屏多列 —— List 的 `lanes` 是按条目分的，把头部当普通条目
+         * 丢进去，宽屏下封面那一块会被挤进一列里（见 ui/Layout.ets 的 contentColumnsFor）；
+         * ListItemGroup 在分栏模式下自己占满整行，组内条目再按 `lanes` 排。
+         * 窄屏 `lanes` 是 1，与改之前逐像素一样。
+         */
+        ListItemGroup({ header: this.listHeader(), footer: this.listFooter() }) {
+          // 懒加载：在线榜单动辄几百首，一次性建完所有行会卡
+          LazyForEach(this.listSource, (item: SongItem, index: number) => {
+            ListItem() {
+              Column() {
+                this.songRow(item, index)
+                if (index < this.songs.length - 1) {
+                  Divider()
+                    .strokeWidth(0.6)
+                    .color(C_DIVIDER)
+                    .margin({ left: 78 })
+                }
+              }
+              .width('100%')
+            }
+          }, (item: SongItem, index: number) => `${index}_${item.id}`)
+        }
+      }
+      // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+      .lanes(contentColumnsFor(this.windowWidth))
+      .scrollBar(BarState.Off)
+      // 内容可以滚进透明标题栏底下（壳层传来的 topInset 就是「状态栏 + 标题栏」）。
+      // 多选时工具条在顶栏里，列表不用让位 —— 一直是同一段偏移。
+      .contentStartOffset(this.topInset + 6)
+      .layoutWeight(1)
+      .width('100%')
+      .onReachEnd(() => {
+        if (this.hasMore() && !this.loadingMore && this.error.length === 0) {
+          void this.load(this.page + 1, true);
+        }
+      })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 列表头部：榜单封面那一块 + 那一排动作（宽屏通栏，见 pageBody 的说明） */
+  @Builder
+  listHeader() {
+    Column() {
+      this.header()
+      this.actionRow()
+    }
+    .width('100%')
+  }
+
+  /**
+   * 列表尾部：空 / 没拉到内容时状态块，拉到之后是「加载更多 / 已到底」那一行，
+   * 末尾再加上给悬浮迷你播放条让位的一段
+   */
+  @Builder
+  listFooter() {
+    Column() {
+      if (this.songs.length === 0) {
+        this.statusBlock()
+      } else if (this.error.length > 0) {
+        Column({ space: 8 }) {
+          Text(this.error)
+            .fontSize(13)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text('点击重试')
+            .fontSize(13.5)
+            .fontColor(C_RED)
+            .onClick(() => {
+              void this.load(this.page + 1, true);
+            })
+        }
+        .width('100%')
+        .padding({ top: 14, bottom: 14 })
+      } else if (this.hasMore()) {
+        Text(this.loadingMore ? '正在加载更多…' : '上拉加载更多')
+          .fontSize(13)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .padding({ top: 14, bottom: 14 })
+      } else {
+        Text(`共 ${this.songs.length} 首`)
+          .fontSize(12.5)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .padding({ top: 14, bottom: 14 })
+      }
+
+      // 给悬浮的迷你播放条让位
+      Column().height(this.bottomInset + HDS_BAR_HEIGHT + 26).width('100%')
+    }
+    .width('100%')
+  }
+
+  /** 迷你栏的宽度：宽屏给壳层算好的最大宽度（与鸿蒙7 那条 `barWidth` 同口径），窄屏铺满 */
+  private fallbackBarWidth(): Length {
+    return this.wideMiniBarWidth > 0 ? this.wideMiniBarWidth : '100%';
+  }
+
+  /**
+   * 鸿蒙6 的迷你栏兜底：自绘一条悬浮胶囊
+   *
+   * `Tabs.barFloatingStyle` 是 API 26（鸿蒙7）才有的，鸿蒙6（compatibleSdkVersion
+   * 6.1.0(23)）上这个方法不存在 —— 直接调就是闪退，实测的现场正是「主页能开，
+   * 点进歌单就闪退」。低版本退回**改造前**那套：自己挂一条胶囊，几何与鸿蒙7 那条对齐
+   * （左右边距、离底距离、栏高都是共享常量），表面是自绘玻璃 + HDS 轮廓点光
+   * （`glassLight()`）—— 鸿蒙7 那份光感来自材质的 `lightEffect`，鸿蒙6 上没有材质，由点光补上。
+   */
+  @Builder
+  fallbackMiniBar() {
+    Column() {
+      Row() {
+        this.miniBarTabBar()
+      }
+      .width(this.fallbackBarWidth())
+      .height(HDS_BAR_HEIGHT)
+      .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2, false, '', this.materialLevel))
+      .visualEffect(glassLight())
+      .clip(true)
+    }
+    .width('100%')
+    .padding({
+      left: barSideMarginFor(this.windowWidth),
+      right: barSideMarginFor(this.windowWidth),
+      bottom: this.bottomInset + PAGE_BAR_BOTTOM_GAP,
+    })
+  }
+
   build() {
     // 迷你播放条浮在列表之上（与歌单详情同一套做法：Tabs 自带的悬浮栏，见 miniBarTabBar）
     Stack({ alignContent: Alignment.Bottom }) {
@@ -910,117 +1056,43 @@ export struct OnlineListView {
        * 运行时只得到一句
        *     `Material inactive: out of scope. Use component in navigation title bar or Tabbar.`
        *
-       * 现在用 Tabs 自带的悬浮栏材质（`barFloatingStyle({ systemMaterial })`）：胶囊的
+       * 鸿蒙7 上用 Tabs 自带的悬浮栏材质（`barFloatingStyle({ systemMaterial })`）：胶囊的
        * 圆角、边距、位置、材质全由框架画，我们只提供栏里的内容，几何与观感和歌单详情页、
        * 以及壳层那条 HdsTabs 悬浮栏是同一套口径。**别在栏里再叠自绘玻璃**：材质层级在
        * backgroundColor / backgroundBlurStyle 之下。
+       *
+       * **鸿蒙6 必须换一条路**：`FloatingTabBarStyle` / `Tabs.barFloatingStyle` 是 API 26
+       * （鸿蒙7）才有的，低版本上这个方法根本不存在，调了就闪退。
        */
-      Tabs({ barPosition: BarPosition.End }) {
-        TabContent() {
-          Column() {
-          List({ scroller: this.scroller }) {
-            ListItem() {
-              this.header()
-            }
-
-            ListItem() {
-              this.actionRow()
-            }
-
-            if (this.songs.length === 0) {
-              ListItem() {
-                this.statusBlock()
-              }
-            } else {
-              // 懒加载：在线榜单动辄几百首，一次性建完所有行会卡
-              LazyForEach(this.listSource, (item: SongItem, index: number) => {
-                ListItem() {
-                  Column() {
-                    this.songRow(item, index)
-                    if (index < this.songs.length - 1) {
-                      Divider()
-                        .strokeWidth(0.6)
-                        .color(C_DIVIDER)
-                        .margin({ left: 78 })
-                    }
-                  }
-                  .width('100%')
-                }
-              }, (item: SongItem, index: number) => `${index}_${item.id}`)
-
-              if (this.error.length > 0) {
-                ListItem() {
-                  Column({ space: 8 }) {
-                    Text(this.error)
-                      .fontSize(13)
-                      .fontColor(C_TEXT_WEAK)
-                      .maxLines(2)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text('点击重试')
-                      .fontSize(13.5)
-                      .fontColor(C_RED)
-                      .onClick(() => {
-                        void this.load(this.page + 1, true);
-                      })
-                  }
-                  .width('100%')
-                  .padding({ top: 14, bottom: 14 })
-                }
-              } else if (this.hasMore()) {
-                ListItem() {
-                  Text(this.loadingMore ? '正在加载更多…' : '上拉加载更多')
-                    .fontSize(13)
-                    .fontColor(C_TEXT_WEAK)
-                    .width('100%')
-                    .textAlign(TextAlign.Center)
-                    .padding({ top: 14, bottom: 14 })
-                }
-              } else {
-                ListItem() {
-                  Text(`共 ${this.songs.length} 首`)
-                    .fontSize(12.5)
-                    .fontColor(C_TEXT_WEAK)
-                    .width('100%')
-                    .textAlign(TextAlign.Center)
-                    .padding({ top: 14, bottom: 14 })
-                }
-              }
-            }
-
-            // 给悬浮的迷你播放条让位
-            ListItem() {
-              Column().height(this.bottomInset + HDS_BAR_HEIGHT + 26).width('100%')
-            }
+      if (harmony7ApiReady()) {
+        Tabs({ barPosition: BarPosition.End }) {
+          TabContent() {
+            this.pageBody()
           }
-          .scrollBar(BarState.Off)
-          // 内容可以滚进透明标题栏底下（壳层传来的 topInset 就是「状态栏 + 标题栏」）。
-          // 多选时工具条在顶栏里，列表不用让位 —— 一直是同一段偏移。
-          .contentStartOffset(this.topInset + 6)
-          .layoutWeight(1)
-          .width('100%')
-          .onReachEnd(() => {
-            if (this.hasMore() && !this.loadingMore && this.error.length === 0) {
-              void this.load(this.page + 1, true);
-            }
-          })
-          }
-          .width('100%')
-          .height('100%')
+          .tabBar(this.miniBarTabBar())
         }
-        .tabBar(this.miniBarTabBar())
+        // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
+        .vertical(false)
+        .barMode(BarMode.Fixed)
+        .scrollable(false)
+        // 悬浮栏压在内容之上：滚动的歌曲从栏下透过，材质才有东西可折射、可模糊
+        .barOverlap(true)
+        .barHeight(HDS_BAR_HEIGHT)
+        // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
+        .barBackgroundColor(Color.Transparent)
+        // 鸿蒙7 专有（API 26）：低版本上没有这个方法，走 else 那条自绘胶囊
+        .barFloatingStyle(this.floatBarStyle())
+        .width('100%')
+        .height('100%')
+      } else {
+        Column() {
+          this.pageBody()
+        }
+        .width('100%')
+        .height('100%')
+
+        this.fallbackMiniBar()
       }
-      // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
-      .vertical(false)
-      .barMode(BarMode.Fixed)
-      .scrollable(false)
-      // 悬浮栏压在内容之上：滚动的歌曲从栏下透过，材质才有东西可折射、可模糊
-      .barOverlap(true)
-      .barHeight(HDS_BAR_HEIGHT)
-      // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
-      .barBackgroundColor(Color.Transparent)
-      .barFloatingStyle(this.floatBarStyle())
-      .width('100%')
-      .height('100%')
     }
     .width('100%')
     .height('100%')

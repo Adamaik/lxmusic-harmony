@@ -1,5 +1,7 @@
+import { uiEffect } from '@kit.ArkGraphics2D';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { uiMaterial } from '@kit.ArkUI';
-import { buildGlassBlur, clampMaterialLevel } from './Hds';
+import { buildGlassBlur, clampMaterialLevel, hdsEffectSupported, hdsPointLight } from './Hds';
 import { C_RED } from './Theme';
 
 /**
@@ -21,14 +23,21 @@ import { C_RED } from './Theme';
  * 视觉层级位于 `backgroundColor` / `backgroundBlurStyle` **之下**，自己画一层半透明底
  * 或毛玻璃就会把材质整片盖住。要材质就走 `materialFirstGlass`，二选一，不能叠加。
  *
- * 所以这里的配方是两层：
- *   1) **真材质**（首选）：`ImmersiveMaterial({ style, interactive, lightEffect, applyShadow })`。
- *      `interactive: true` 是按压形变反馈，`lightEffect` 是光感交互反馈（动感光效的来源），
- *      `style` 是厚度（跟随外观设置里的档位，见 immersiveStyleOf）。
+ * 所以这里的配方是**三层，按系统版本一路降级**：
+ *   1) **真材质**（首选，鸿蒙7 / API 26 起）：`ImmersiveMaterial({ style, interactive,
+ *      lightEffect, applyShadow })`。`interactive: true` 是按压形变反馈，`lightEffect`
+ *      是光感交互反馈（动感光效的来源），`style` 是厚度（跟随外观设置里的档位，
+ *      见 immersiveStyleOf）。
  *   2) **自绘兜底**：毛玻璃模糊 + 半透明白底 + 1vp 亮边 + 轻阴影。
  *      只在设备不支持沉浸材质时才是唯一的一层；支持时它仍然先画上去，
  *      因为材质生效会接管底色 / 描边 / 阴影 —— 万一某个机型上材质在内容区不渲染，
  *      控件不至于变成一片透明（宁可退化，不能消失）。
+ *   3) **普通光效**（鸿蒙6 / API 23 回退）：材质不可用时，材质那份 `lightEffect` 就没有了，
+ *      用 HDS 的轮廓点光补回来（`hdsPointLight` + {@link glassLight}，API 20 起就有，
+ *      鸿蒙6 全量支持）。**这是这次专门补的那个「回退到普通光效」**：鸿蒙7 上挂的是空效果
+ *      （材质自己在发光，叠上去等于画两遍），鸿蒙6 上它是唯一的光源。
+ *      注意它必须**挂在组件上**（`.visualEffect(...)`），不能塞进 AttributeModifier，
+ *      理由见 {@link glassLight} 的说明。
  *
  * 为什么兜底层不用系统玻璃色（sys.color.glass_material_mask_primary）当底：
  * 那个色值是 #0C808080 —— 只有 5% 不透明度（深色模式甚至全透明），系统那条玻璃栏
@@ -36,6 +45,13 @@ import { C_RED } from './Theme';
  * 所以兜底层用半透明白 + 模糊，描边仍取系统的 sys.color.glass_material_outline_primary。
  *
  * 另外：别在同一节点上叠不透明底色 —— 那会把材质与模糊一起盖掉，看着就是一块死白。
+ *
+ * **版本红线（血泪教训）**：上面第 1 层那一整套（`uiMaterial` 命名空间 + 组件的
+ * `.systemMaterial()` + `Tabs.barFloatingStyle`）都是 **API 26 专有**的，而本工程的
+ * `compatibleSdkVersion` 是 6.1.0(23) —— 鸿蒙6 上这些接口**根本不存在，调了就闪退**。
+ * 编译器对它们只给一句警告（不是错误），构建照样过，所以每一个调用点都得自己守：
+ * 组件/属性层面过 {@link harmony7ApiReady}，材质对象层面过
+ * {@link isGlassMaterialSupported}（后者多一道设备能力位）。
  */
 
 export const GLASS_THIN: number = 0;
@@ -59,11 +75,76 @@ const EDGE_HIGHLIGHT_DARK: string = '#66FFFFFF';
 let probed: boolean = false;
 let supported: boolean = false;
 
+/**
+ * 沉浸材质（鸿蒙7）的 API 等级门槛
+ *
+ * `@since 26.0.0` 的那些接口对应的系统 API 等级就是 26，与
+ * build-profile 里 `compatibleSdkVersion: 6.1.0(23)` / `targetSdkVersion: 26.0.0`
+ * 是同一套编号（`deviceInfo.sdkApiVersion`：鸿蒙6.1 = 23，鸿蒙7 = 26）。
+ */
+const IMMERSIVE_API: number = 26;
+
+/**
+ * 鸿蒙7 的发行版本号
+ *
+ * `distributionOSApiVersion` 是「发行方定义的版本」，按 M.S.F 编码：
+ * 6.1.0 = 60100、7.0.0 = 70000（派音也是用 `>= 60100` 判 6.1 的能力，同一套口径）。
+ */
+const HARMONY7_DISTRIBUTION_VERSION: number = 70000;
+
+/** 系统 API 等级是否达到 level（低版本上 deviceInfo 也可能取不到，取不到就当没达到） */
+function apiAtLeast(level: number): boolean {
+  try {
+    return deviceInfo.sdkApiVersion >= level;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 发行版本是否达到 level（同上，取不到就当没达到） */
+function distributionApiAtLeast(level: number): boolean {
+  try {
+    return deviceInfo.distributionOSApiVersion >= level;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 本机系统是不是鸿蒙7（API 26）及以上
+ *
+ * **所有鸿蒙7 专有的接口都要先过这一关。** `uiMaterial` 命名空间、组件的
+ * `.systemMaterial()`、`Tabs.barFloatingStyle` / `FloatingTabBarStyle` 在鸿蒙6（API 23）
+ * 上根本不存在，直接调就是闪退 —— 实测的现场是「主页能开，点进歌单详情就闪退」，
+ * 因为主页那条底部栏走的是 HDS 的 `HdsTabs.barFloatingStyle`（API 18 起，低版本也有），
+ * 而歌单详情 / 在线详情 / 四个面板页走的是 ArkUI 原生的 `Tabs.barFloatingStyle`（API 26）。
+ *
+ * 编译器对这些调用只会给一句
+ *   `The 'xxx' API is supported since SDK version 26.0.0. However, the current
+ *    compatible SDK version is 6.1.0(23). It is recommended to use apiAvailable
+ *    to safeguard API compatibility.`
+ * —— 那是**警告不是错误**，构建照样过，坑全留在运行时，所以必须自己守。
+ *
+ * **为什么两个条件都要求成立**：判断错了的后果是不对称的 —— 判成 `false` 只是观感退回
+ * 老一套（自绘玻璃 + 轮廓点光），判成 `true` 而机器其实是鸿蒙6 就是直接闪退。
+ * 所以宁可保守：`sdkApiVersion`（API 等级）与 `distributionOSApiVersion`（发行版本）
+ * **任一取不到、或任一没到鸿蒙7，都走回退那条路**。两个字段都是 API 10 起就有的老接口。
+ */
+export function harmony7ApiReady(): boolean {
+  return apiAtLeast(IMMERSIVE_API) && distributionApiAtLeast(HARMONY7_DISTRIBUTION_VERSION);
+}
+
 function probe(): void {
   if (probed) {
     return;
   }
   probed = true;
+  // 低版本上**连 uiMaterial 都不能碰**：那个命名空间是 API 26 才有的，
+  // 属性访问本身就抛（早先这里只靠 try/catch，虽然不崩，但等于每次启动都拿异常当探测用）
+  if (!harmony7ApiReady()) {
+    supported = false;
+    return;
+  }
   try {
     supported = uiMaterial.isImmersiveMaterialSupported();
   } catch (e) {
@@ -71,7 +152,13 @@ function probe(): void {
   }
 }
 
-/** 当前设备是否支持沉浸式材质（供设置页展示，也决定走真材质还是纯自绘） */
+/**
+ * 当前设备是否真的能用沉浸式系统材质（版本够 **且** 有材质能力位）
+ *
+ * 供设置页展示，也决定玻璃层走真材质还是「自绘玻璃 + 普通光效」。
+ * 想判断「能不能调鸿蒙7 的接口」用 {@link harmony7ApiReady}，别用这个 ——
+ * 能力位不够时它也是 false，但那种设备上调 API 26 的接口是合法的。
+ */
 export function isGlassMaterialSupported(): boolean {
   probe();
   return supported;
@@ -135,9 +222,9 @@ function dialogStyleOf(level: number): uiMaterial.ImmersiveStyle {
 /**
  * 取一个系统沉浸材质对象（给组件在 build 里直接 `.systemMaterial(...)` 用）
  *
- * 为什么不放在 `GlassModifier.applyNormalAttribute` 里：官方对 visualEffect 明确写过
- * 「API 20 起才允许在 attributeModifier 里调用」，属性修改器里能调哪些接口是有讲究的；
- * 材质这种新接口直接挂在组件上更稳（挂不上也看得见 —— 就是没效果）。
+ * 为什么不放在 `GlassModifier.applyNormalAttribute` 里：属性修改器能调哪些接口是有讲究的
+ * （官方《属性修改器》有一张「不支持 attributeModifier 的范围」表），材质这种新接口直接挂在
+ * 组件上更稳 —— 挂不上也看得见，就是没效果。
  *
  * 设备没有材质能力位时返回 `undefined`：`systemMaterial` 的参数本来就允许 undefined，
  * 等于不设材质，界面回落到自绘那层玻璃。
@@ -359,8 +446,40 @@ export class GlassModifier implements AttributeModifier<CommonAttribute> {
      * 材质生效时会接管底色 / 描边 / 阴影（官方说明：本接口会影响 backgroundColor、
      * borderColor、borderWidth、shadow），所以上面那几项在支持材质时是兜底不是叠加；
      * 万一内容区里材质不渲染，控件仍然是上面那层玻璃，不会变成一片透明。
+     *
+     * 材质那份 `lightEffect`（边沿那圈光）的**低版本替代品**不在这里，而是在组件上单独挂
+     * 一层：`.visualEffect(glassLight())` —— 官方《属性修改器》把 `visualEffect` 列在
+     * 「不支持 attributeModifier 的范围」里（告警 `is not callable`），塞进来只会静默失效。
      */
   }
+}
+
+/**
+ * 玻璃层边沿那一圈光 —— **鸿蒙6 的「普通光效」**
+ *
+ * 挂法：`.visualEffect(glassLight())`，与 `.systemMaterial(...)` 成对出现（配了材质的那几层
+ * 才需要它：圆钮、两个下拉框、搜索框、提示条、页内迷你栏）。
+ *
+ * 为什么是「永远返回一个效果」而不是在链上按条件跳过：ArkUI 的链式属性没法按运行时的条件
+ * 把 `.visualEffect()` 这一行摘掉，而它的参数又不是可选的。所以换个做法 —— **永远挂一层**，
+ * 鸿蒙7 上挂一个**空效果**（`uiEffect.createEffect()` 不往里加任何东西，等于不画）：
+ *   - 鸿蒙7：光感由沉浸材质的 `lightEffect` 出，这层是空的，不叠第二遍；
+ *   - 鸿蒙6：没有材质，这层挂 HDS 的轮廓点光（`SOFT` + `BORDER`，**API 20 起就有**），
+ *     把材质那份光感补回来。
+ *
+ * **别把它塞进 AttributeModifier**：两份官方文档在这里是**打架**的 ——
+ * 《属性修改器》的「不支持 attributeModifier 的范围」表里明确列了 `CommonAttribute.visualEffect`
+ * （告警信息 `is not callable`），而《视效设置》的接口说明写的是「从 API version 20 开始，
+ * 该接口支持在 attributeModifier 中调用」。有分歧就别赌：**挂在组件上**是两份文档都认可的
+ * 写法（通用属性，API 12 起），塞进修改器则可能一边生效一边静默失效。
+ */
+export function glassLight(): VisualEffect {
+  // 材质自己在发光（鸿蒙7），或者设备连 HDS 能力位都没有（点光造不出来）：都退回空效果
+  if (isGlassMaterialSupported() || !hdsEffectSupported()) {
+    return uiEffect.createEffect();
+  }
+  const light: VisualEffect | undefined = hdsPointLight(C_RED);
+  return light !== undefined ? light : uiEffect.createEffect();
 }
 
 /**

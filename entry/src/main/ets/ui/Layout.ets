@@ -49,8 +49,93 @@ const TAB_BAR_COLLAPSED: number = 96;
 /** 两条栏之间的缝 */
 const BAR_GAP: number = 8;
 
-/** 宽屏下内容列的最大宽度：窗口再宽，正文也不跟着拉长 */
+/**
+ * 详情页 / 设置页里**表单类**内容的最大宽度（输入框、按钮、说明文字那几块）
+ *
+ * 列表可以多列，表单不行：窗口宽到 1400vp 还把输入框拉满，就是一条又长又扁的带子、
+ * 两个按钮各占半个屏幕。所以这类控件单独收成这个宽度，**整页不再收窄**
+ * （页面本身铺满窗口，见 contentColumnsFor）。
+ */
 export const CONTENT_MAX_WIDTH: number = 720;
+
+/**
+ * 宽屏下**一行内容至少多宽**（所有铺满窗口的列表页共用）
+ *
+ * 口径照华为音乐的平板首页：那边正文大约 1100vp 宽、一屏三列，每列 ~370vp；
+ * 这里取 360vp —— 一行里要放下封面、歌名、副标题三样，再窄就只剩「歌名…」了。
+ */
+export const HOME_ROW_MIN_WIDTH: number = 360;
+
+/** 最多列数：PC 那种超宽窗口上再分下去，一行会被拉成"细长条"，封在四列 */
+export const HOME_COLUMNS_MAX: number = 4;
+
+/**
+ * 宽屏下一屏放几列（首页三个页签、歌单详情、搜索结果、我的各列表…全部共用）
+ *
+ * 宽屏的内容**不再收成居中的 720 一列**（那是改坏掉的那一版：两侧留一大片白，
+ * 列表一行从屏左拉到屏右），而是铺满窗口、按窗口宽度自动多列 —— 与华为音乐的
+ * 平板版同一套做法。各页把这个值喂给 `List.lanes()`：
+ * 列表条目自己排成多列，页内的头部（歌单封面那一块）则整行铺满。
+ *
+ * 列数 = 能放内容的宽度 ÷ HOME_ROW_MIN_WIDTH，最少 1 列、最多 HOME_COLUMNS_MAX 列。
+ * 窗口宽度 0（还没量到）或窄屏一律 1 列，也就是改之前的样子。
+ */
+export function contentColumnsFor(windowWidth: number): number {
+  // 页面自己左右各留 16 的内边距，算列数要按真正能放内容的宽度算
+  const avail: number = windowWidth - 32;
+  if (windowWidth < BP_MEDIUM || avail <= 0) {
+    return 1;
+  }
+  let columns: number = Math.floor(avail / HOME_ROW_MIN_WIDTH);
+  if (columns < 1) {
+    columns = 1;
+  }
+  return columns > HOME_COLUMNS_MAX ? HOME_COLUMNS_MAX : columns;
+}
+
+/**
+ * 窗口宽度（AppStorage 键）
+ *
+ * 壳层（pages/Index.ets）量到窗口宽度后写进来，各页读它算列数
+ * （{@link contentColumnsFor}）与表单限宽 —— 与 K_BAR_MINI_WIDTH 同一条路子：
+ * 窗口尺寸一变，壳层重写一次，订阅者自己重排。
+ */
+export const K_WINDOW_WIDTH: string = 'layout_window_width';
+
+// ---------------------------------------------------------------- 卡片流（设置类页面）
+
+/**
+ * 并排的一张卡至少要多宽
+ *
+ * 设置类页面不像列表页那样是「一列歌曲行」，而是**一张张卡**（一张卡里往往有
+ * 图标 + 标题 + 说明好几段），比列表行更需要宽度，所以这里给 460vp：
+ * 两列并排至少要 460 × 2 + 间距，窗口再窄就还是一列。
+ */
+const CARD_MIN_WIDTH: number = 460;
+
+/**
+ * 设置类页面宽屏下并排几张卡（1 或 2）
+ *
+ * 与列表页的 {@link contentColumnsFor} 是两个口径：列表一行是「封面 + 歌名」，
+ * 360vp 就够；卡片要放好几段内容，窄了会挤成一团，所以门槛更高、最多两列。
+ */
+export function cardColumnsFor(windowWidth: number): number {
+  const avail: number = windowWidth - 32;
+  if (windowWidth < BP_MEDIUM || avail < CARD_MIN_WIDTH * 2 + 14) {
+    return 1;
+  }
+  return 2;
+}
+
+/**
+ * 并排时每张卡的宽度：宽屏 48%（两份 + 间距正好一行），窄屏铺满
+ *
+ * 用百分比而不是按窗口算出来的 vp：Flex 换行是按子项自己的宽度决定的，
+ * 给 48% 无论窗口多宽都稳（留 4% 给那一列间距）。
+ */
+export function cardWidthOf(windowWidth: number): string {
+  return cardColumnsFor(windowWidth) > 1 ? '48%' : '100%';
+}
 
 /**
  * 「不限宽」的占位值。
@@ -123,18 +208,6 @@ export function barMetricsFor(windowWidth: number, miniExpanded: boolean): BarMe
     tab = Math.min(BAR_WIDTH_MAX, Math.max(TAB_BAR_WIDTH_MIN, avail - reserved));
   }
   return { sideMargin: sideMargin, tabBarWidth: tab, miniBarWidth: mini };
-}
-
-/**
- * 宽屏下内容列的最大宽度；返回 0 表示「不必收窄」（手机铺满 / 窗口宽度未知）。
- *
- * 调用方拿到 0 时用 LAYOUT_UNBOUNDED 当上限（等于不限宽）。
- */
-export function contentMaxWidthFor(windowWidth: number): number {
-  if (windowWidth <= 0 || !isWideWindow(windowWidth)) {
-    return 0;
-  }
-  return Math.min(windowWidth, CONTENT_MAX_WIDTH);
 }
 
 /**

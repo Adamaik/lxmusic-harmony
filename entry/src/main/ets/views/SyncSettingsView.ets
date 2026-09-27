@@ -1,3 +1,4 @@
+import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ICON_GREEN, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { I_CLOSE, I_PLUS, I_REFRESH, I_TRASH, IconGlyph } from '../ui/Icons';
 import { RoundIconButton } from '../ui/Widgets';
@@ -7,6 +8,7 @@ import { K_SYNC_DATA_VERSION, K_SYNC_ENABLE, K_SYNC_MESSAGE, K_SYNC_PROGRESS, K_
 import { SYNC_CODE_AUTH_FAILED, SYNC_CODE_MISSING_AUTH_CODE } from '../core/sync/SyncTypes';
 import { describeStatus } from '../core/sync/SyncStatusText';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
+import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /**
  * 同步设置
@@ -39,6 +41,17 @@ export struct SyncSettingsView {
   @StorageLink(K_SYNC_DATA_VERSION) @Watch('onSyncStateChanged') dataVersion: number = 0;
   @StorageLink(K_SYNC_PROGRESS) @Watch('onSyncStateChanged') progress: number = 0;
   @StorageLink(K_SYNC_STAGE) @Watch('onSyncStateChanged') stage: string = '';
+  /**
+   * 窗口宽度（vp）：宽屏下这几张卡并排（0 = 还没量到，按手机一列）
+   *
+   * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
+   */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
 
   aboutToAppear(): void {
     const manager = SyncManager.getInstance();
@@ -448,14 +461,36 @@ export struct SyncSettingsView {
   build() {
     Column() {
       Scroll() {
-        Column({ space: 14 }) {
+        /**
+         * 卡片的排布用 Flex 而不是 Column：**宽屏并排、窄屏一列**
+         *
+         * 窄屏是 `direction: Column` + 不换行 + main 间距 14，与原来的 `Column({ space: 14 })`
+         * 逐像素一样；宽屏换成 `Row` + 换行，每张卡 48% 宽（见 ui/Layout.ets 的 cardWidthOf），
+         * 自动一行两张。卡下面那些说明跟它的卡包在一个 Column 里当**一个单元**：说明文字
+         * 本身铺满宽度，不包起来会把换行打断，两张卡就并不到一排去。
+         * 「同步中」那张与「服务端历史」那张是条件渲染，连整个单元一起判，免得宽屏下
+         * 留下一格空位把后面的卡挤到下一行去。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
-          this.infoCard()
+
+          Column({ space: 14 }) {
+            this.infoCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           if (this.enable) {
-            this.progressCard()
+            Column({ space: 14 }) {
+              this.progressCard()
+            }
+            .width(cardWidthOf(this.windowWidth))
           }
 
           Column({ space: 6 }) {
@@ -475,13 +510,19 @@ export struct SyncSettingsView {
               .padding({ left: 4, right: 4 })
               .textAlign(TextAlign.Start)
           }
-          .width('100%')
+          .width(cardWidthOf(this.windowWidth))
 
           if (this.hostHistory.length > 0) {
-            this.hostHistoryCard()
+            Column({ space: 14 }) {
+              this.hostHistoryCard()
+            }
+            .width(cardWidthOf(this.windowWidth))
           }
 
-          this.dislikeCard()
+          Column({ space: 14 }) {
+            this.dislikeCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           Text('协议与洛雪官方一致：/hello + /id + /ah 认证、WebSocket 长连接、'
             + '列表与「不喜欢的歌曲」两个模块，均可在设置里选择同步方式。')

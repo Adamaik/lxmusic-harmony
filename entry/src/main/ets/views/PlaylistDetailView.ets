@@ -8,10 +8,10 @@ import { CoverArt, EmptyState, FavoriteHeart } from '../ui/Widgets';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
   SelectionActions, SelectSession, toggleSelected } from '../ui/Selection';
 import { SongListSource } from '../ui/SongListSource';
-import { immersiveMaterialForBar } from '../ui/Glass';
+import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
-import { K_BAR_MINI_WIDTH, barSideMarginFor } from '../ui/Layout';
+import { K_BAR_MINI_WIDTH, barSideMarginFor, contentColumnsFor } from '../ui/Layout';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
@@ -811,94 +811,172 @@ export struct PlaylistDetailView {
     }
   }
 
+  /** 组头：歌单封面那一块 + 「播放全部」（宽屏通栏，见 pageBody 的说明） */
+  @Builder
+  listHeader() {
+    Column() {
+      this.header()
+      this.playAllRow()
+    }
+    .width('100%')
+  }
+
+  /** 组尾：空歌单的空态 + 给悬浮迷你播放条让位的那一段 */
+  @Builder
+  listFooter() {
+    Column() {
+      if (this.songs.length === 0) {
+        EmptyState({
+          text: '这个歌单还没有歌曲',
+          hint: '可以在洛雪桌面端 / 移动端把歌加进来，同步后就会出现',
+          topPadding: 56,
+        })
+      }
+
+      // 给悬浮的迷你播放条让位：最后一行能滚到栏的上方，而不是被它压住
+      Column().height(this.bottomInset + HDS_BAR_HEIGHT + 26).width('100%')
+    }
+    .width('100%')
+  }
+
+  /**
+   * 页面主体：歌单头部 + 歌曲列表
+   *
+   * 单独抽成一个 builder：鸿蒙6 上底部那条悬浮栏要换成自绘的（见 build 的 else 分支），
+   * 主体两种系统上完全一样，抽出来就不会被复制成两份、以后改一处漏一处。
+   *
+   * 整页只有**一个 ListItemGroup**：组头是歌单封面与「播放全部」，组内每一首是一行，
+   * 组尾是空态与底部让位。套一层组是为了宽屏多列 —— List 的 `lanes` 是按条目分的，
+   * 把头部当普通条目丢进去，宽屏下封面那一块会被挤进一列里（见 ui/Layout.ets 的
+   * contentColumnsFor）；ListItemGroup 在分栏模式下自己占满整行，组内条目再按 `lanes`
+   * 排。窄屏 `lanes` 是 1，与改之前逐像素一样。
+   */
+  @Builder
+  pageBody() {
+    Column() {
+      List({ scroller: this.scroller }) {
+        ListItemGroup({ header: this.listHeader(), footer: this.listFooter() }) {
+          // 懒加载：歌单动辄几百首，一次性建完所有行既卡又占内存
+          // （每行还要建封面并解析封面，请求堆多了会闪退）。
+          // 平铺行（不套 CARD 卡片组）：卡片自己还要左右各缩进 16，行内又缩进 16，
+          // 歌曲封面就会比顶部歌单封面、「播放全部」多缩一档，三个左边缘对不齐。
+          LazyForEach(this.source, (item: SongItem, index: number) => {
+            ListItem() {
+              Column() {
+                this.songRow(item, index)
+                if (index < this.songs.length - 1) {
+                  Divider()
+                    .strokeWidth(0.6)
+                    .color(C_DIVIDER)
+                    .margin({ left: 78 })
+                }
+              }
+              .width('100%')
+            }
+          }, (item: SongItem, index: number) => `${index}_${item.id}`)
+        }
+      }
+      // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
+      .lanes(contentColumnsFor(this.windowWidth))
+      .scrollBar(BarState.Off)
+      // 内容可以滚进透明标题栏底下（壳层传来的 topInset 就是「状态栏 + 标题栏」）。
+      // 多选时工具条在顶栏里，列表不用让位 —— 一直是同一段偏移。
+      .contentStartOffset(this.topInset + 6)
+      .layoutWeight(1)
+      .width('100%')
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 迷你栏的宽度：宽屏给壳层算好的最大宽度（与鸿蒙7 那条 `barWidth` 同口径），窄屏铺满 */
+  private fallbackBarWidth(): Length {
+    return this.wideMiniBarWidth > 0 ? this.wideMiniBarWidth : '100%';
+  }
+
+  /**
+   * 鸿蒙6 的迷你栏兜底：自绘一条悬浮胶囊
+   *
+   * `Tabs.barFloatingStyle` 是 API 26（鸿蒙7）才有的，鸿蒙6（compatibleSdkVersion
+   * 6.1.0(23)）上这个方法不存在 —— 直接调就是闪退，实测的现场正是「主页能开，
+   * 点进歌单就闪退」。低版本退回**改造前**那套：自己挂一条胶囊，几何与鸿蒙7 那条对齐
+   * （左右边距、离底距离、栏高都是共享常量），表面是自绘玻璃 + HDS 轮廓点光
+   * （`glassLight()`）—— 鸿蒙7 那份光感来自材质的 `lightEffect`，鸿蒙6 上没有材质，由点光补上。
+   */
+  @Builder
+  fallbackMiniBar() {
+    Column() {
+      Row() {
+        this.miniBarTabBar()
+      }
+      .width(this.fallbackBarWidth())
+      .height(HDS_BAR_HEIGHT)
+      .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2, false, '', this.materialLevel))
+      .visualEffect(glassLight())
+      .clip(true)
+    }
+    .width('100%')
+    .padding({
+      left: barSideMarginFor(this.windowWidth),
+      right: barSideMarginFor(this.windowWidth),
+      bottom: this.bottomInset + PAGE_BAR_BOTTOM_GAP,
+    })
+  }
+
   build() {
     /**
-     * 页面根容器是「只有一个页签的 Tabs」—— 为的是那条**官方认可的底部悬浮栏**
+     * 根容器是 Stack：鸿蒙7 那条悬浮栏由 Tabs 自己画、鸿蒙6 换成自绘的一条（见下面的
+     * else 分支），两条都靠 `Alignment.Bottom` 压在列表之上。
      *
-     * 这一页是压在 HdsNavigation 路由栈上的 NavDestination，把壳层那条带迷你栏的
-     * HdsTabs 整个盖住了，所以迷你播放条得自己挂一条。而沉浸光感有**生效范围**：
-     * 除弹窗类组件外，普通组件只有落在「Navigation/NavDestination 标题栏」或
-     * 「横向 Tabs 中 barPosition 为 BarPosition.End 的底部 TabBar」里才会渲染材质。
-     * 早先把它当普通组件画在内容区，那一行 `.systemMaterial()` 其实是死的 ——
-     * 运行时只得到一句
+     * 「只有一个页签的 Tabs」是为了那条**官方认可的底部悬浮栏** —— 这一页是压在
+     * HdsNavigation 路由栈上的 NavDestination，把壳层那条带迷你栏的 HdsTabs 整个盖住了，
+     * 所以迷你播放条得自己挂一条。而沉浸光感有**生效范围**：除弹窗类组件外，普通组件
+     * 只有落在「Navigation/NavDestination 标题栏」或「横向 Tabs 中 barPosition 为
+     * BarPosition.End 的底部 TabBar」里才会渲染材质。早先把它当普通组件画在内容区，
+     * 那一行 `.systemMaterial()` 其实是死的 —— 运行时只得到一句
      *     `Material inactive: out of scope. Use component in navigation title bar or Tabbar.`
      *
-     * 现在改用 Tabs **自带的悬浮栏材质**（`barFloatingStyle({ systemMaterial })`）：
+     * 鸿蒙7 上走 Tabs **自带的悬浮栏材质**（`barFloatingStyle({ systemMaterial })`）：
      * 胶囊的圆角、边距、位置、材质全由框架画，我们只提供栏里的内容（MiniBarView），
-     * 几何与观感和壳层那条 HdsTabs 悬浮栏是同一套口径。
+     * 几何与观感和壳层那条 HdsTabs 悬浮栏是同一套口径。**别再往栏里叠自绘玻璃**：
+     * 沉浸光感的视觉层级在 backgroundColor / backgroundBlurStyle 之下，自己再画一层
+     * 半透明底或毛玻璃就把材质整片盖住了 —— 栏里只有内容，没有任何底。
      *
-     * **别再往栏里叠自绘玻璃**：沉浸光感的视觉层级在 backgroundColor /
-     * backgroundBlurStyle 之下，自己再画一层半透明底或毛玻璃就把材质整片盖住了 ——
-     * 栏里现在只有内容，没有任何底。
+     * **鸿蒙6 必须换一条路**：`FloatingTabBarStyle` / `Tabs.barFloatingStyle` 是 API 26
+     * （鸿蒙7）才有的，低版本上这个方法根本不存在，调了就闪退（`compatibleSdkVersion`
+     * 是 6.1.0(23)，所以低版本是必须支持的目标平台，不是「理论上有人用」）。
      */
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {
-        Column() {
-          List({ scroller: this.scroller }) {
-            ListItem() {
-              this.header()
-            }
-
-            ListItem() {
-              this.playAllRow()
-            }
-
-            if (this.songs.length === 0) {
-              ListItem() {
-                EmptyState({
-                  text: '这个歌单还没有歌曲',
-                  hint: '可以在洛雪桌面端 / 移动端把歌加进来，同步后就会出现',
-                  topPadding: 56,
-                })
-              }
-            } else {
-              // 懒加载：歌单动辄几百首，一次性建完所有行既卡又占内存
-              // （每行还要建封面并解析封面，请求堆多了会闪退）。
-              // 平铺行（不套 CARD 卡片组）：卡片自己还要左右各缩进 16，行内又缩进 16，
-              // 歌曲封面就会比顶部歌单封面、「播放全部」多缩一档，三个左边缘对不齐。
-              LazyForEach(this.source, (item: SongItem, index: number) => {
-                ListItem() {
-                  Column() {
-                    this.songRow(item, index)
-                    if (index < this.songs.length - 1) {
-                      Divider()
-                        .strokeWidth(0.6)
-                        .color(C_DIVIDER)
-                        .margin({ left: 78 })
-                    }
-                  }
-                  .width('100%')
-                }
-              }, (item: SongItem, index: number) => `${index}_${item.id}`)
-            }
-
-            // 给悬浮的迷你播放条让位：最后一行能滚到栏的上方，而不是被它压住
-            ListItem() {
-              Column().height(this.bottomInset + HDS_BAR_HEIGHT + 26).width('100%')
-            }
+    Stack({ alignContent: Alignment.Bottom }) {
+      if (harmony7ApiReady()) {
+        Tabs({ barPosition: BarPosition.End }) {
+          TabContent() {
+            this.pageBody()
           }
-          .scrollBar(BarState.Off)
-          // 内容可以滚进透明标题栏底下（壳层传来的 topInset 就是「状态栏 + 标题栏」）。
-          // 多选时工具条在顶栏里，列表不用让位 —— 一直是同一段偏移。
-          .contentStartOffset(this.topInset + 6)
-          .layoutWeight(1)
-          .width('100%')
+          .tabBar(this.miniBarTabBar())
+        }
+        // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
+        .vertical(false)
+        .barMode(BarMode.Fixed)
+        .scrollable(false)
+        // 悬浮栏压在内容之上：滚动的歌曲从栏下透过，材质才有东西可折射、可模糊
+        .barOverlap(true)
+        .barHeight(HDS_BAR_HEIGHT)
+        // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
+        .barBackgroundColor(Color.Transparent)
+        // 鸿蒙7 专有（API 26）：低版本上没有这个方法，走 else 那条自绘胶囊
+        .barFloatingStyle(this.floatBarStyle())
+        .width('100%')
+        .height('100%')
+      } else {
+        Column() {
+          this.pageBody()
         }
         .width('100%')
         .height('100%')
+
+        this.fallbackMiniBar()
       }
-      .tabBar(this.miniBarTabBar())
     }
-    // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
-    .vertical(false)
-    .barMode(BarMode.Fixed)
-    .scrollable(false)
-    // 悬浮栏压在内容之上：滚动的歌曲从栏下透过，材质才有东西可折射、可模糊
-    .barOverlap(true)
-    .barHeight(HDS_BAR_HEIGHT)
-    // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
-    .barBackgroundColor(Color.Transparent)
-    .barFloatingStyle(this.floatBarStyle())
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)

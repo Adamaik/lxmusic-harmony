@@ -1,4 +1,4 @@
-import { immersiveMaterialForBar } from '../ui/Glass';
+import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { K_BAR_MINI_WIDTH, barSideMarginFor } from '../ui/Layout';
@@ -82,6 +82,9 @@ export struct PanePage {
    * `systemMaterial` 必须是 `uiMaterial.ImmersiveMaterial` 实例（不能塞 HDS 的
    * `SystemMaterialParams`：那是个普通对象，编译能过但运行时不构成材质）。设备没有
    * 材质能力位时给 `undefined`，悬浮胶囊仍由框架按默认样式画出来，不会变成一条透明带子。
+   *
+   * **只在鸿蒙7 上调**（见 {@link fallbackMiniBar}）：整个 `FloatingTabBarStyle` 都是
+   * API 26 的类型，低版本上连这个方法都不存在。
    */
   private floatBarStyle(): FloatingTabBarStyle {
     const side: number = barSideMarginFor(this.windowWidth);
@@ -107,26 +110,74 @@ export struct PanePage {
     return style;
   }
 
+  /** 迷你栏的宽度：宽屏给壳层算好的最大宽度（与鸿蒙7 那条 `barWidth` 同口径），窄屏铺满 */
+  private fallbackBarWidth(): Length {
+    return this.wideMiniBarWidth > 0 ? this.wideMiniBarWidth : '100%';
+  }
+
+  /**
+   * 鸿蒙6 的迷你栏兜底：自绘一条悬浮胶囊
+   *
+   * `Tabs.barFloatingStyle` 是 API 26（鸿蒙7）才有的，鸿蒙6（compatibleSdkVersion
+   * 6.1.0(23)）上这个方法不存在 —— 直接调就是闪退，实测的现场正是「主页能开，
+   * 点进这一页就闪退」（主页那条底部栏走的是 HDS 的 `HdsTabs.barFloatingStyle`，
+   * API 18 起就有，所以不受影响）。
+   *
+   * 低版本退回**改造前**那套：自己挂一条胶囊，几何与鸿蒙7 那条对齐（左右边距、
+   * 离底距离、栏高都是共享常量），表面是自绘玻璃 + HDS 轮廓点光（`glassLight()`）——
+   * 鸿蒙7 上那份光感来自材质的 `lightEffect`，鸿蒙6 上没有材质，由点光补上。
+   */
+  @Builder
+  fallbackMiniBar() {
+    Column() {
+      Row() {
+        this.miniBarTabBar()
+      }
+      .width(this.fallbackBarWidth())
+      .height(HDS_BAR_HEIGHT)
+      .attributeModifier(thinGlass(HDS_BAR_HEIGHT / 2, false, '', this.materialLevel))
+      .visualEffect(glassLight())
+      .clip(true)
+    }
+    .width('100%')
+    .padding({
+      left: barSideMarginFor(this.windowWidth),
+      right: barSideMarginFor(this.windowWidth),
+      bottom: this.bottomInset + PAGE_BAR_BOTTOM_GAP,
+    })
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      Tabs({ barPosition: BarPosition.End }) {
-        TabContent() {
+      if (harmony7ApiReady()) {
+        Tabs({ barPosition: BarPosition.End }) {
+          TabContent() {
+            this.content()
+          }
+          .tabBar(this.miniBarTabBar())
+        }
+        // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
+        .vertical(false)
+        .barMode(BarMode.Fixed)
+        .scrollable(false)
+        // 悬浮栏压在内容之上：列表从栏下透过，材质才有东西可折射、可模糊
+        .barOverlap(true)
+        .barHeight(HDS_BAR_HEIGHT)
+        // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
+        .barBackgroundColor(Color.Transparent)
+        // 鸿蒙7 专有（API 26）：低版本上没有这个方法，走 else 那条自绘胶囊
+        .barFloatingStyle(this.floatBarStyle())
+        .width('100%')
+        .height('100%')
+      } else {
+        Column() {
           this.content()
         }
-        .tabBar(this.miniBarTabBar())
+        .width('100%')
+        .height('100%')
+
+        this.fallbackMiniBar()
       }
-      // 横向 + 底部页签：这两个同样是沉浸光感生效范围的条件（见上面的说明）
-      .vertical(false)
-      .barMode(BarMode.Fixed)
-      .scrollable(false)
-      // 悬浮栏压在内容之上：列表从栏下透过，材质才有东西可折射、可模糊
-      .barOverlap(true)
-      .barHeight(HDS_BAR_HEIGHT)
-      // 栏体那一条不要自己的底色（默认是一条灰白带）：观感全交给悬浮胶囊本身
-      .barBackgroundColor(Color.Transparent)
-      .barFloatingStyle(this.floatBarStyle())
-      .width('100%')
-      .height('100%')
     }
     .width('100%')
     .height('100%')

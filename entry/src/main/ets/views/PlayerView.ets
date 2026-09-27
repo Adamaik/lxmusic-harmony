@@ -23,6 +23,7 @@ import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/Appearanc
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
 import { LOCAL_QUALITY_MARK, isFileQuality, qualityLabel, switchableQualitys } from '../core/music/Quality';
+import { isWideWindow } from '../ui/Layout';
 
 function formatTime(seconds: number): string {
   const total: number = Math.max(0, Math.floor(seconds));
@@ -55,11 +56,21 @@ const TRACK_ANIM_MS: number = 260;
  *
  * 洛雪的播放页是一张「封面 / 歌词」双页可横滑的深色页：背景是当前封面的高斯模糊，
  * 顶部只有下拉箭头、页码指示和分享；底部是进度条 + 播放控制 + 一排功能入口。
+ *
+ * **宽屏（平板 / 折叠屏展开态）不分页**：改成左右并排 —— 左边是封面、歌名与全部控件，
+ * 右边是歌词（照华为音乐的平板播放页）。宽屏上两边本来就看得全，再让人左右翻页是多余的，
+ * 所以页码指示在宽屏下也不显示。窄屏一切照旧（Swiper 双页 + 页码点）。
  */
 @Component
 export struct PlayerView {
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
+  /**
+   * 窗口宽度（vp）：决定是不是走「左封面 + 右歌词」的宽屏版式
+   *
+   * 由壳层传进来（pages/Index.ets 里有这个值），与 topInset / bottomInset 同一条路。
+   */
+  @Prop windowWidth: number = 0;
   onClose: () => void = () => {
   };
   onOpenQueue: () => void = () => {
@@ -183,9 +194,30 @@ export struct PlayerView {
    *
    * 只有「全屏播放器停在歌词页」时才要求常亮：翻回封面页、关掉设置、
    * 播放器收起，三种情况都要还原，所以每次页码/设置变化都重算一遍。
+   * 宽屏下歌词一直摆在右边，等于「一直在歌词页」。
    */
   private syncKeepScreenOn(): void {
-    this.onKeepScreenOn(this.lyricKeepScreen && this.pageIndex === 1);
+    this.onKeepScreenOn(this.lyricKeepScreen && (this.wide() || this.pageIndex === 1));
+  }
+
+  /** 宽屏（≥ 600vp）：播放页走「左封面 + 右歌词」的并排版式，不分页 */
+  private wide(): boolean {
+    return isWideWindow(this.windowWidth);
+  }
+
+  /**
+   * 封面边长（vp）
+   *
+   * 窄屏 252 是手机上试出来的尺寸（要能塞进一屏还能露出歌名与控件）；
+   * 宽屏左边那一栏宽度富余得多，按窗口宽度的两成放大一点（封顶 300），
+   * 免得在平板上一大栏里孤零零摆一张小图。
+   */
+  private coverBoxSize(): number {
+    if (!this.wide()) {
+      return 252;
+    }
+    const sized: number = Math.round(this.windowWidth * 0.2);
+    return Math.max(252, Math.min(300, sized));
   }
 
   private toast(message: string): void {
@@ -891,10 +923,15 @@ export struct PlayerView {
     }
   }
 
+  /**
+   * 封面块：封面 + 歌名/歌手/爱心（窄屏的封面页与宽屏左栏共用这一块）
+   *
+   * 抽出来是因为宽屏下它要跟控件一起落在左栏里，而封面页（Swiper 的第一页）里它
+   * 是靠上下两个 Blank 撑在正中的 —— 两块内容必须一模一样，不能各写一份。
+   */
   @Builder
-  coverPage() {
+  coverBlock() {
     Column({ space: 26 }) {
-      Blank()
       Stack() {
         CoverArt({
           url: this.cover,
@@ -902,15 +939,15 @@ export struct PlayerView {
           art: this.art,
           // 没有歌 / 没有封面 / 封面失效：兜底给聆听的应用图标（见 ui/Widgets.ets 的 CoverArt）
           appIcon: true,
-          boxSize: 252,
+          boxSize: this.coverBoxSize(),
           // 圆角来自外观设置（默认 12）
           radius: this.coverRadius,
           // 还在解析/缓冲时封面可能没到：先给深色底，别闪一张默认封面
           pending: this.status === 'loading',
         })
       }
-      .width(252)
-      .height(252)
+      .width(this.coverBoxSize())
+      .height(this.coverBoxSize())
       .borderRadius(this.coverRadius)
       .shadow({ radius: 40, color: '#66000000', offsetX: 0, offsetY: 18 })
       // 播放/暂停时的弹簧缩放（缩放中心放在封面正中，别从左上角放大）
@@ -957,14 +994,51 @@ export struct PlayerView {
       .width('100%')
       .padding({ left: 4, right: 4 })
 
-      // 小歌词：跟着进度走的当前一句（可在「设置 - 播放设置」里关掉）
-      this.miniLyricBlock()
+      // 小歌词：跟着进度走的当前一句（可在「设置 - 播放设置」里关掉）。
+      // 宽屏不显示 —— 右边整栏就是歌词，再在封面下面重复一句是多余的。
+      if (!this.wide()) {
+        this.miniLyricBlock()
+      }
+    }
+    .width('100%')
+    .padding({ left: 30, right: 30 })
+  }
 
+  @Builder
+  coverPage() {
+    Column({ space: 26 }) {
+      Blank()
+      this.coverBlock()
       Blank()
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 30, right: 30 })
+  }
+
+  /**
+   * 宽屏左栏：封面 + 歌名在上，进度条与全部控件在下
+   *
+   * 与华为音乐的平板播放页同一个版式：左边这一栏自己就是一台完整的播放器，
+   * 右边那一栏专门放歌词，两边同时看得见，不需要再左右翻页。
+   * 封面那一块装在 `layoutWeight(1)` 的区域里居中 —— 窗口矮的时候先压缩封面区，
+   * 控件不会被顶出屏幕。
+   */
+  @Builder
+  wideLeftPane() {
+    Column() {
+      // 封面区占满控件以上的全部高度，封面靠上下两个 Blank 居中（与封面页同一套）
+      Column({ space: 26 }) {
+        Blank()
+        this.coverBlock()
+        Blank()
+      }
+      .width('100%')
+      .layoutWeight(1)
+
+      this.controlBar()
+    }
+    .width('100%')
+    .height('100%')
   }
 
   /** 一行歌词：点一下跳到那一句（字号/对齐来自设置 - 播放设置） */
@@ -1374,7 +1448,10 @@ export struct PlayerView {
               this.onClose();
             })
           Blank()
-          this.pageIndicator()
+          // 页码指示只在窄屏有意义：宽屏是左右并排，没有"第几页"这回事
+          if (!this.wide()) {
+            this.pageIndicator()
+          }
           Blank()
           Stack({ alignContent: Alignment.Center }) {
             Circle().width(36).height(36).fill('#26FFFFFF')
@@ -1395,25 +1472,53 @@ export struct PlayerView {
         .height(56 + this.topInset)
         .padding({ left: 18, right: 18, top: this.topInset })
 
-        // 封面 / 歌词
-        Swiper(this.controller) {
-          this.coverPage()
-          this.lyricPage()
-        }
-        .index(this.pageIndex)
-        .loop(false)
-        .indicator(false)
-        .duration(280)
-        .curve(Curve.Friction)
-        .layoutWeight(1)
-        .width('100%')
-        .onChange((index: number) => {
-          this.pageIndex = index;
-          this.syncKeepScreenOn();
-        })
+        /**
+         * 封面 / 歌词
+         *
+         * 窄屏：Swiper 双页左右翻（封面页 ↔ 歌词页），页码点由顶栏那两粒小药丸表示，
+         * 一切与改之前一模一样。
+         *
+         * 宽屏（平板 / 折叠屏展开态）：**不分页**，左边封面与全部控件、右边整栏歌词
+         * —— 照华为音乐的平板播放页。两边同时看得全，左右翻页在这里是多余的交互。
+         * 歌词那一栏直接用同一个 lyricPage()：它的滚动、当前行居中、字号、对齐
+         * （都来自设置）在两种版式下是同一套。
+         */
+        if (this.wide()) {
+          Row() {
+            Column() {
+              this.wideLeftPane()
+            }
+            .layoutWeight(1)
+            .height('100%')
 
-        // 控制区
-        this.controlBar()
+            Column() {
+              this.lyricPage()
+            }
+            .layoutWeight(1)
+            .height('100%')
+          }
+          .width('100%')
+          .layoutWeight(1)
+        } else {
+          Swiper(this.controller) {
+            this.coverPage()
+            this.lyricPage()
+          }
+          .index(this.pageIndex)
+          .loop(false)
+          .indicator(false)
+          .duration(280)
+          .curve(Curve.Friction)
+          .layoutWeight(1)
+          .width('100%')
+          .onChange((index: number) => {
+            this.pageIndex = index;
+            this.syncKeepScreenOn();
+          })
+
+          // 控制区（窄屏时整条铺在双页下面）
+          this.controlBar()
+        }
       }
       .width('100%')
       .height('100%')

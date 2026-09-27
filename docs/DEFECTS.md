@@ -255,6 +255,173 @@ hdc 截图证据见提交说明。
 
 ---
 
+## D-005 · 书源「从文件导入」必然失败：Picker 的 URI 被直接交给 `readTextSync`
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-09-27） |
+| 优先级 | P0（导入是听书的唯一入库口，坏了整栏不可用） |
+| 发现日期 | 2026-09-27 |
+| 发现方式 | 用户真机操作：在「听书 - 书源」里选下载目录中的书源 `.json`，直接提示 `No such file or directory` |
+
+### 影响面
+
+「导入书源」有两个入口：**粘贴 JSON** 与**选文件**。粘贴那条一直是好的
+（`tools/book_import_test.js` 里 7 个真实源逐个验过），选文件这条**必然失败** ——
+书源根本进不来，后面的搜索 / 目录 / 播放全都无从谈起。**与规则引擎无关**：
+同一批源在 `book_engine_selftest.js` 里离线 28 项全过、联网也能搜出结果。
+
+### 根因
+
+`BookEngine.importFromUri()` 把 Picker 返回的 `file://docs/...` 直接喂给 `fs.readTextSync`。
+`readTextSync` 的第一个参数只认**沙箱路径**（本 SDK 的声明只收 `string`，连 fd 都不收），
+URI 只有 `fs.openSync` 认 —— 于是报 `No such file or directory`。
+
+工程里本地音乐导入（`core/local/LocalMusic.ets` 的 `importOne`）用的就是正确写法
+（`fs.openSync(uri, fs.OpenMode.READ_ONLY)` 拿 fd 再读），只有书源这一处写错了。
+
+### 证据
+
+```bash
+node tools/book_import_test.js
+# 静态守卫两行：
+#   ✓ 没有把 Picker URI 直接传给 readTextSync
+#   ✓ importFromUri 用 openSync(uri, READ_ONLY) 打开再读
+```
+
+把守卫指向修复前的写法（`readTextSync(uri)`）会立刻变红，可当回归用。
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/book/BookEngine.ets` · `importFromUri()` | 修复点：`openSync(uri)` → 读字节 → `bytesToUtf8()` 解码 |
+| `views/ListenView.ets` · `pickSourceFile()` | 结果提示原本写成 `!== undefined ? '' : ''`，改成如实报「已导入 N 个书源：…」 |
+
+### 验收标准
+
+- [ ] 真机：从下载目录选一个书源 `.json`，提示「已导入 1 个书源：…」且书源列表出现该源。
+- [ ] 导入后在同页「搜索」分段能搜出结果。
+- [x] 静态守卫通过（见上）。2026-09-27
+
+---
+
+## D-006 · 书源请求被套用音源的 `application/json` 默认头：书音FM 的 POST 搜索拿不到结果
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-09-27，站点本机不可达，**待真机回归**） |
+| 优先级 | P1（只影响用 POST / 挑 `Accept` 的源；这批 7 个源里是书音FM） |
+| 发现日期 | 2026-09-27 |
+| 发现方式 | 读代码比对：应用侧 `BookHttp.bookRequest` → `LxHttp.lxRequest` 的默认头，与自检脚本的宿主代理不一致 |
+
+### 影响面
+
+`bookRequest` 复用音源的 `lxRequest`，而后者为音源写死了两个默认头（`LxHttp.ets:149-150`、`177`）：
+
+| 默认 | 对音源 | 对书源 |
+| --- | --- | --- |
+| `Accept: application/json` | 对 | 错 —— 书源抓的是 HTML / XML / RSS，且有些站按 `Accept` 给不同内容 |
+| POST 无 Content-Type 时按 `application/json` 且 `JSON.stringify(body)` | 对 | 错 —— 书源的 POST 正文是**原样字符串**（`keyboard={{key}}&show=…`）|
+
+这批 7 个源里只有**书音FM** 用 POST（`searchUrl` 里的 `{"method":"POST","body":"keyboard=…"}`），
+且**没有一个源写 Content-Type** —— 也就是它的表单正文会被标成 JSON 发出去，
+EmpireCMS 站直接回一张错误页，搜索表现为「0 条」（`docs/BOOK_SOURCE_ENGINE.md`
+里记的「书音FM ⚠️ 要先给 cookie 才回结果页」，至少有一部分是这里）。
+
+### 证据
+
+```bash
+# 只有书音用 POST，且 7 个源都没有 Content-Type：
+node -e "const fs=require('fs');for(const f of fs.readdirSync('D:/harmony/听书的源').filter(x=>x.endsWith('.json'))){const s=JSON.parse(fs.readFileSync('D:/harmony/听书的源/'+f,'utf8'));const b=JSON.stringify(s);console.log(f,'POST',b.includes('POST'),'CT',/content-type/i.test(b));}"
+```
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/book/BookHttp.ets` · `bookRequest()` | 修复点：缺 `Accept` 时补 `*/*`；POST 缺 `Content-Type` 时补 `application/x-www-form-urlencoded`（`options.headers` 会覆盖 `lxRequest` 的默认值，所以不用改音源那份）|
+| `core/source/LxHttp.ets` | **未改动** —— 音源的行为一个字没变 |
+
+### 验收标准
+
+- [ ] 真机 / 联网：书音FM 搜一个常见书名能返回结果（书音本身还要求先带 cookie，见书源引擎文档）。
+- [x] 静态守卫：`tools/book_import_test.js` 里两条请求头守卫通过。2026-09-27
+- [x] `book_engine_selftest.js` 离线 28 项无回归。2026-09-27
+
+---
+
+## D-007 · 听书没接进下载系统：下载菜单对书集照样显示，点了必然失败
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-09-27，接入完成；真机回归见「验收标准」） |
+| 优先级 | P1（不是「没入口」，而是**入口在、必然失败**，报的还是音源的消息） |
+| 发现日期 | 2026-09-27 |
+| 发现方式 | 排查播放链路时顺着 `BOOK_SOURCE` 的引用点找出来的：下载侧一处都没有 |
+
+### 影响面
+
+「听书」只接到了播放链路（`PlaySession` 有 4 处显式分支：播放 / 不预取 / 封面 / 无歌词），
+下载与播放缓存都没接：
+
+1. `DownloadManager.resolveUrl` 只有一条路 —— `SourceEngine.getMusicUrl(...)`，
+   把书的载荷当歌去问洛雪音源；
+2. 下载入口的拦截只认本地歌与云端歌（`isLocalSong` / `isWebDavSong`），**没有书的对应守卫**，
+   所以队列 / 播放页 / 播放列表里书集的长按菜单**照样显示「下载」**；
+3. 点下去 `downloadKeyOf` 退回 `song.id`（形如 `book_<书目id>_<集号>`，非空）→ `enqueue` 收下 →
+   真正开工时抛「音源没有加载，先去『设置 - 音源设置』加载一个音源」或
+   「这首歌没有可解析的歌曲信息（不是平台搜索结果）」→ 下载列表里凭空一条失败记录。
+
+也就是说：**书集能点下载、必然失败、失败原因指向音源**，这三件事叠在一起最容易让人误判成
+「音源坏了」。
+
+### 处理方式（2026-09-27 接入）
+
+按第三条下载链路接进去（与平台歌 / 洛雪音源并列），细节与取舍见
+`docs/BOOK_SOURCE_ENGINE.md` 第 8 节。要点：
+
+| 环节 | 做法 |
+| --- | --- |
+| 解析 | `resolveUrl` 加 `BOOK_SOURCE` 分支 → `resolveBookUrl`，调用**播放用的同一个** `BookEngine.resolveAudioOf` |
+| 请求头 | 解析结果带出 `audioHeaders`，`requestInStream(..., { header })` 带上（CDN 校验 Referer） |
+| 键 | 退回条目 id（书载荷算不出 mediaKey），与播放链路同一个 id |
+| 文件名 | `书名-章节名`，不缀音质 |
+| 标签 | 不写（音乐那套对书没有意义；m4a 本来就写不了） |
+| 限速 | 有声书串行 + 集间 1s（下一集要抓页面 + 跑规则） |
+| 离线 | `playBookItem` 先查 `downloadedFile(item.id)`，命中就播本地；**放在书源检查之前** |
+| 自动下载 | 有声书不参与「缓存时自动下载」（那条设置是给播放缓存配套的，书没有播放缓存） |
+| 界面 | 长按某集 → 下载本集 / 删除下载；目录行 → 下载整本（先确认） |
+
+### 证据
+
+```bash
+node tools/book_import_test.js
+# 「契约：有声书条目的下载键与载荷」与「静态守卫：接线留在哪几处」两节
+# 结果：42 通过 / 0 失败
+```
+
+下载键必须等于播放 id 这一条是**真的**行为检查（脚本里按 `mediaKeyOf` / `downloadKeyOf`
+的原口径复算了一遍），断了就是「下完了播放却找不到文件」。
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/download/DownloadManager.ets` | `resolveUrl` 分流 + `resolveBookUrl`、`ResolvedAudio`（带请求头）、`runTask` 带 header / 不凑标签 / `bookPace`、`nextWaiting` 串行、`buildFileName` 书名-章节名、`EXT_BY_QUALITY['book']` |
+| `core/player/PlaySession.ets` | `playBookItem` 加「已下载优先」（在书源检查之前） |
+| `views/BookDetailView.ets` | 长按菜单「下载本集 / 删除下载」、目录行「下载整本」（`showAlertDialog` 先确认） |
+
+### 验收标准
+
+- [ ] 真机：书籍详情页长按某一集 →「下载本集」→ 「我的 - 下载管理」里出现该集，下完能在文件管理里看到 `书名-章节名.m4a`。
+- [ ] 下完的集**断网**也能播（或把书源删掉再播，应走本地文件）。
+- [ ] 「下载整本」先弹确认；确认后是一集一集来（同时只有一集在跑），不是一次性并发。
+- [ ] 播放页 / 队列里书集的长按菜单，点了下载不再出现「音源没有加载」那类失败记录。
+- [x] `tools/book_import_test.js` 的下载契约与静态守卫通过。2026-09-27
+
+---
+
 ## 其他待办（不是缺陷，按需排期）
 
 - **歌词逐字（`lxlyric`）**：洛雪的富文本歌词（逐字时间轴）目前未使用，
