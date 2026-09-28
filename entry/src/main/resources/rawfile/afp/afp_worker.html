@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AFP Worker</title>
+</head>
+<body>
+<script src="./afp.wasm.js"></script>
+<script src="./afp.js"></script>
+<script>
+  // 接收 base64(Float32 LE PCM @8kHz)，运行网易云 AFP WASM 指纹，通过 javaScriptProxy 回调返回 base64 指纹
+  window.afpStart = function(base64Pcm) {
+    try {
+      var bytes = window.b64decode(base64Pcm);
+      var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      var n = bytes.byteLength / 4;
+      var floatArr = new Float32Array(n);
+      for (var i = 0; i < n; i++) {
+        floatArr[i] = dv.getFloat32(i * 4, true);
+      }
+      GenerateFP(floatArr).then(function(fp) {
+        window.afpBridge.onResult(fp);
+      }, function(err) {
+        window.afpBridge.onResult('ERROR:' + err);
+      });
+    } catch (e) {
+      window.afpBridge.onResult('ERROR:' + e);
+    }
+    return 'started';
+  };
+  window.afpReady = function() {
+    return typeof GenerateFP === 'function' && typeof window.afpBridge !== 'undefined';
+  };
+</script>
+</body>
+</html>

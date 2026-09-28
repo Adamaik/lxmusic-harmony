@@ -17,9 +17,9 @@ import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
  * AVPlayer 没有流式缓存，所以这里是「边播边把整首下到沙箱」，上限由我们自己的
  * LRU 淘汰执行（详见 core/music/AudioCache.ets）。
  *
- * 「缓存时自动下载」是这里多出来的一个开关：打开后边听边存改由下载器做，
- * 文件直接落到下载文件夹（「我的 - 下载管理」里能看见、能删），上限随之失效。
- * 开关打开时会弹一次确认 —— 这几件事和「缓存」的直觉不一样，得先讲清楚。
+ * 「缓存时自动下载」是这里多出来的一个开关：打开后播放时**另外**把整首下到下载文件夹
+ * （「我的 - 下载管理」里能看见、能删、不受上限约束），沙箱里那份播放缓存照旧存在、
+ * 照旧受这里的上限约束。两份各管一段，所以开关打开时会弹一次确认把代价讲清楚。
  */
 @Component
 export struct CacheSettingsView {
@@ -82,16 +82,16 @@ export struct CacheSettingsView {
   /**
    * 拨开「缓存时自动下载」：先把代价讲清楚，点了「开启」才真的落盘
    *
-   * 这条开关与「缓存」的直觉不一样（文件不在沙箱里、上限不生效、删了就得重新下），
-   * 所以不能一拨就算开：弹窗里点「取消」就把滑块拨回去，什么都不改。
+   * 这条开关的效果不止「多存一份」（还多占一份空间、多走一路网络），所以不能一拨
+   * 就算开：弹窗里点「取消」就把滑块拨回去，什么都不改。
    */
   private confirmAutoDownload(): void {
     this.getUIContext().showAlertDialog({
       title: '开启「缓存时自动下载」',
-      message: '播放过的歌会自动下载到「下载」文件夹，不再放进应用沙箱的缓存目录。\n\n'
-        + '· 缓存上限对这个模式不生效：文件会一直留着，直到你在「我的 - 下载管理」里删掉；\n'
-        + '· 删掉下载的音乐，本地这份就没了，下次播放要重新下载；\n'
-        + '· 边听边下会和播放一起占网络（播放卡顿时会先等一等再下）。\n\n'
+      message: '播放过的歌会另外整份下载到「下载」文件夹，同时照旧留在应用内播放缓存里。\n\n'
+        + '· 「下载」文件夹那份不受缓存上限约束：一直留着，直到你在「我的 - 下载管理」里删掉；\n'
+        + '· 应用内那份照旧受上面的「缓存上限」约束，满了按最少使用的先淘汰；\n'
+        + '· 同一首歌会占两处空间，播放时也会多走一路网络（播放卡顿时下载会先等一等）。\n\n'
         + '开启后，这些歌会出现在「我的 - 下载管理」里，可以单独删。',
       autoCancel: true,
       buttons: [
@@ -119,12 +119,12 @@ export struct CacheSettingsView {
     });
   }
 
-  /** 关掉：不用弹窗（回到「文件在沙箱、受上限约束」而已），但把排队中的缓存任务重排一遍 */
+  /** 关掉：不用弹窗（不再往下载文件夹多下那一份而已），把状态同步回界面 */
   private turnOffAutoDownload(): void {
     AudioCache.getInstance().setAutoDownload(false);
     this.syncAutoDownload();
     this.refresh();
-    this.toast('已关闭：播放时不再自动下载');
+    this.toast('已关闭：播放时不再自动下载到「下载」文件夹');
   }
 
   /** 把输入框回填成已保存的上限（进页面 / 提交后调用） */
@@ -139,8 +139,8 @@ export struct CacheSettingsView {
     const text: string = this.limitText.trim();
     if (text.length === 0) {
       AudioCache.getInstance().setLimitMb(0);
-      // 开着「缓存时自动下载」时上限本来就不生效，别报成「已关闭播放缓存」（缓存其实还在下）
-      this.toast(this.autoDownload ? '上限已设为 0（当前模式下不生效）' : '已关闭播放缓存');
+      // 上限对应用内那份缓存一直生效（「缓存时自动下载」那份在下载文件夹里，不受它管）
+      this.toast(this.autoDownload ? '已关闭播放缓存（下载文件夹里那份还在）' : '已关闭播放缓存');
       this.syncLimitText();
       this.refresh();
       return;
@@ -257,9 +257,9 @@ export struct CacheSettingsView {
             .fontColor(C_TEXT)
             .width('100%')
             .textAlign(TextAlign.Start)
-          Text(this.autoDownload
-            ? '「缓存时自动下载」开着，这个上限暂不生效'
-            : (this.limitMb > 0 ? '超过上限会淘汰最早播放的' : '当前未开启，播放时不会缓存到本地'))
+          Text(this.limitMb > 0
+            ? '超过上限会淘汰最早播放的（下载文件夹里那份不受它管）'
+            : '当前未开启，播放时不会缓存到本地')
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
             .width('100%')
@@ -303,8 +303,8 @@ export struct CacheSettingsView {
             .width('100%')
             .textAlign(TextAlign.Start)
           Text(this.autoDownload
-            ? '已开启：文件在「下载」文件夹，缓存上限不生效'
-            : '播放时自动下载到「下载」文件夹（无上限，在下载管理里删）')
+            ? '已开启：另下一份到「下载」文件夹（不受上限约束）；应用内缓存照旧受上限约束'
+            : '播放时另下一份整首到「下载」文件夹长期保留（应用内缓存照旧）')
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
             .width('100%')
@@ -433,9 +433,9 @@ export struct CacheSettingsView {
             this.sectionTitle('播放缓存', sizeText(this.audioBytes))
             this.audioCard()
             Text('边听边把整首下到应用沙箱，下次播放直接读本地：不联网、不受源脚本影响。'
-              + '上限设 0 即关闭缓存。开了「缓存时自动下载」则改为下到「下载」文件夹，'
-              + '文件在「我的 - 下载管理」里可见可删（那时这个上限不生效）。'
-              + '开启之前已经缓存在沙箱里的歌不会自动搬过去，想清掉点上面的「清空」。')
+              + '上限设 0 即关闭缓存。开了「缓存时自动下载」会另外整份下到「下载」文件夹'
+              + '（文件在「我的 - 下载管理」里可见可删、不受上限约束），沙箱这一份照旧存在、'
+              + '照旧受上限约束。')
               .fontSize(11.5)
               .fontColor(C_TEXT_WEAK)
               .width('100%')

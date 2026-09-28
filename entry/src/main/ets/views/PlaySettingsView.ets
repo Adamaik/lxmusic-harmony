@@ -88,7 +88,7 @@ export struct PlaySettingsView {
   @StorageLink(K_LYRIC_CENTERED) lyricCentered: boolean = true;
   @StorageLink(K_LYRIC_FONT_SIZE) fontSize: number = 19;
   @StorageLink(K_LYRIC_KEEP_SCREEN) keepScreen: boolean = true;
-  @StorageLink(K_DESKTOP_LYRIC) desktopLyric: boolean = true;
+  @StorageLink(K_DESKTOP_LYRIC) desktopLyric: boolean = false;
   /** 车载蓝牙歌词：往 AVMetadata.singleLyricText 写当前这一句，由系统蓝牙模块送给车机 */
   @StorageLink(K_BLUETOOTH_LYRIC) bluetoothLyric: boolean = false;
   /** 本地音乐 / 云端（WebDAV）音乐自动匹配歌词（要联网搜一次，所以给了开关） */

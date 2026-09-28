@@ -50,6 +50,16 @@ export struct SongListPane {
   @Prop coverSize: number = 52;
   /** 列表底部要留出的空间（悬浮页签栏 / 手势条），由调用方给 */
   @Prop bottomInset: number = 0;
+  /**
+   * 列表尾部那一行的文案（'' = 不画）
+   *
+   * 只有能翻页的列表（搜索结果）用它显示「上拉加载更多 / 正在加载更多 / 共 N 首」；
+   * 歌单、历史这些一次性拿全的列表不设，列表尾部与改之前一模一样。
+   */
+  @Prop footerStatus: string = '';
+  /** 列表滚到底的回调（配合 footerStatus 用；不设就是什么都不做） */
+  onReachEnd: () => void = () => {
+  };
   onPick: (index: number) => void = () => {
   };
   /**
@@ -323,60 +333,88 @@ export struct SongListPane {
     }
   }
 
+  /**
+   * 组尾：翻页状态行（「上拉加载更多」/ 平台失败提示…）
+   *
+   * 只对设了 footerStatus 的列表（搜索结果）出现；当组尾挂在 ListItemGroup 上，
+   * 所以宽屏分栏时它是**通栏**的，不再缩在第一列里。
+   */
+  @Builder
+  statusFooter() {
+    if (this.footerStatus.length > 0) {
+      Text(this.footerStatus)
+        .fontSize(12.5)
+        .fontColor(C_TEXT_WEAK)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 14, bottom: 14 })
+    }
+  }
+
   build() {
     Column() {
       if (this.items.length === 0) {
         EmptyState({ text: this.emptyText, topPadding: 82 })
       } else {
         List() {
-          LazyForEach(this.source, (item: SongItem, index: number) => {
-            ListItem() {
-              Column() {
-                if (this.selectable) {
-                  // 我的页的列表：长按进多选（右键菜单还在行尾「更多」上，没丢）
-                  Row({ space: 8 }) {
-                    this.songRowContent(item, index)
+          /**
+           * 整页只有一个 ListItemGroup：组内是歌曲行，组尾是翻页状态行
+           *
+           * 为什么要套一层组：宽屏要一屏多列（List.lanes），而 lanes 是**按条目**分的 ——
+           * 把状态行当普通条目丢进去，它只会占**一列**，一屏四列时缩在最左边那列里居中，
+           * 看着就是错位。ListItemGroup 在分栏模式下自己占满整行，组尾（footer）也就通栏了，
+           * 与其余几个列表页是同一套写法（见 RecommendView 的 listHeader/listFooter）。
+           */
+          ListItemGroup({ footer: this.statusFooter() }) {
+            LazyForEach(this.source, (item: SongItem, index: number) => {
+              ListItem() {
+                Column() {
+                  if (this.selectable) {
+                    // 我的页的列表：长按进多选（右键菜单还在行尾「更多」上，没丢）
+                    Row({ space: 8 }) {
+                      this.songRowContent(item, index)
+                    }
+                    .width('100%')
+                    .height(this.coverSize + 22)
+                    .padding({ left: 16, right: 14 })
+                    .onClick(() => {
+                      if (this.selecting) {
+                        this.onToggleSelect(item);
+                        return;
+                      }
+                      this.onPick(index);
+                    })
+                    .gesture(LongPressGesture().onAction(() => {
+                      if (!this.selecting) {
+                        this.onRequestSelect(item, index);
+                      }
+                    }))
+                  } else {
+                    Row({ space: 8 }) {
+                      this.songRowContent(item, index)
+                    }
+                    .width('100%')
+                    .height(this.coverSize + 22)
+                    .padding({ left: 16, right: 14 })
+                    .onClick(() => {
+                      if (this.selecting) {
+                        this.onToggleSelect(item);
+                        return;
+                      }
+                      this.onPick(index);
+                    })
+                    .bindContextMenu(this.rowMenu(item, index), ResponseType.LongPress)
                   }
-                  .width('100%')
-                  .height(this.coverSize + 22)
-                  .padding({ left: 16, right: 14 })
-                  .onClick(() => {
-                    if (this.selecting) {
-                      this.onToggleSelect(item);
-                      return;
-                    }
-                    this.onPick(index);
-                  })
-                  .gesture(LongPressGesture().onAction(() => {
-                    if (!this.selecting) {
-                      this.onRequestSelect(item, index);
-                    }
-                  }))
-                } else {
-                  Row({ space: 8 }) {
-                    this.songRowContent(item, index)
-                  }
-                  .width('100%')
-                  .height(this.coverSize + 22)
-                  .padding({ left: 16, right: 14 })
-                  .onClick(() => {
-                    if (this.selecting) {
-                      this.onToggleSelect(item);
-                      return;
-                    }
-                    this.onPick(index);
-                  })
-                  .bindContextMenu(this.rowMenu(item, index), ResponseType.LongPress)
-                }
 
-                Divider()
-                  .strokeWidth(0.6)
-                  .color(C_DIVIDER)
-                  .margin({ left: this.coverSize + 28 })
+                  Divider()
+                    .strokeWidth(0.6)
+                    .color(C_DIVIDER)
+                    .margin({ left: this.coverSize + 28 })
+                }
+                .width('100%')
               }
-              .width('100%')
-            }
-          }, (item: SongItem, index: number) => `${index}_${item.id}`)
+            }, (item: SongItem, index: number) => `${index}_${item.id}`)
+          }
         }
         // 宽屏一屏多列（每列至少 360vp、最多 4 列），窄屏恒为 1 列
         .lanes(this.columns())
@@ -387,6 +425,9 @@ export struct SongListPane {
         .padding({ bottom: this.bottomInset })
         // 多缓存几屏，快速滑动时不至于白屏
         .cachedCount(3)
+        .onReachEnd(() => {
+          this.onReachEnd();
+        })
       }
     }
     .width('100%')

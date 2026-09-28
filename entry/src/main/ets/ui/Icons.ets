@@ -30,6 +30,12 @@ export const I_GEAR: Resource = $r('sys.symbol.gearshape');
 export const I_GEAR_FILL: Resource = $r('sys.symbol.gearshape_fill');
 /** 搜索 */
 export const I_SEARCH: Resource = $r('sys.symbol.magnifyingglass');
+/**
+ * 听歌识曲（推荐页标题栏里那颗钮，排在「来源胶囊」与「搜索」之间）
+ *
+ * 用官方的「识别歌曲」符号：一个音符落在取景框里，语义与洛雪的识曲图标一致。
+ */
+export const I_IDENTIFY: Resource = $r('sys.symbol.identify_song');
 /** 唱片 / 音源 */
 export const I_DISC: Resource = $r('sys.symbol.record_circle');
 /** 排序 */

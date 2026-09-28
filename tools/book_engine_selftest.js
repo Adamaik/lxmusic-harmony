@@ -89,6 +89,44 @@ function pingInSandbox(win) {
   return unwrapJsonString(JSON.stringify(win.__book_ping__()));
 }
 
+/**
+ * 宿主侧的 Cookie 罐（照 `core/book/BookHttp.ets` 的 `BookCookieJar`）。
+ *
+ * 书源的很多站（275听书就是）每个响应都 `Set-Cookie: PHPSESSID=...`，播放接口必须
+ * 带上这个 cookie 才认。没有罐时本脚本会报「解析不出音频」，而设备上是好的 ——
+ * 这种「测试比设备差」的假失败同样会误导人。
+ */
+const cookieJar = {};
+
+function jarHost(url) {
+  const m = String(url).match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]+)/);
+  return m ? m[1].toLowerCase() : '';
+}
+
+function jarHeader(url) {
+  const jar = cookieJar[jarHost(url)];
+  if (!jar) return '';
+  return Object.keys(jar).map((k) => `${k}=${jar[k]}`).join('; ');
+}
+
+function jarAbsorb(url, resp) {
+  const host = jarHost(url);
+  if (!host) return;
+  let list = [];
+  try { if (typeof resp.headers.getSetCookie === 'function') list = resp.headers.getSetCookie(); } catch (e) { /* ignore */ }
+  if (list.length === 0) {
+    const raw = resp.headers.get('set-cookie');
+    if (raw) list = [raw];
+  }
+  for (const line of list) {
+    const pair = String(line).split(';')[0].trim();
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    cookieJar[host] = cookieJar[host] || {};
+    cookieJar[host][pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+}
+
 async function fetchBody(spec) {
   const url = spec.url;
   if (/^data:/i.test(url)) {
@@ -98,10 +136,24 @@ async function fetchBody(spec) {
     if (/;base64/i.test(head)) return Buffer.from(payload, 'base64').toString('utf8');
     return decodeURIComponent(payload);
   }
+  // 这一段必须与 `BookHttp.bookRequest` 一致：Accept 兜底 */*、POST 没写
+  // Content-Type 时按表单发、按 host 带上 Cookie 罐。不一致时本脚本就会
+  // 「比设备好」或「比设备差」，两种都会漏掉真问题。
   const headers = Object.assign({ 'User-Agent': UA, Accept: '*/*' }, spec.headers || {});
-  const init = { method: spec.method || 'GET', headers, redirect: 'follow' };
-  if (init.method !== 'GET' && init.method !== 'HEAD' && spec.body) init.body = spec.body;
+  const method = (spec.method || 'GET').toUpperCase();
+  if (method === 'POST') {
+    const hasCt = Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');
+    if (!hasCt) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+  }
+  const cookie = jarHeader(url);
+  if (cookie.length > 0) {
+    const hasCookie = Object.keys(headers).some((k) => k.toLowerCase() === 'cookie');
+    if (!hasCookie) headers['Cookie'] = cookie;
+  }
+  const init = { method, headers, redirect: 'follow' };
+  if (method !== 'GET' && method !== 'HEAD' && spec.body) init.body = spec.body;
   const resp = await fetch(url, init);
+  jarAbsorb(url, resp);
   const buf = Buffer.from(await resp.arrayBuffer());
   // 简单判定编码：GBK 站点（这批源没有，留个兜底）
   const ctype = resp.headers.get('content-type') || '';

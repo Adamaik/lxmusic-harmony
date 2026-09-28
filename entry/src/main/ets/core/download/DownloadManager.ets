@@ -11,8 +11,8 @@ import { SourceEngine } from '../source/SourceEngine';
 import { LxQuality } from '../source/LxTypes';
 import { DownloadSettings } from './DownloadSettings';
 import { DownloadTagData, collectDownloadTags, tagSummary } from './DownloadTags';
-import { AutoDownloadSong, clearDownloadedFiles, removeDownloadedFile, setAutoDownloadHandler,
-  setDownloadedFile } from './DownloadIndex';
+import { AutoDownloadSong, clearDownloadedFiles, downloadedFile, removeDownloadedFile,
+  setAutoDownloadHandler, setDownloadedFile } from './DownloadIndex';
 import { TagSink } from './TagWriter';
 import { isLocalSong } from '../local/LocalMusic';
 import { isWebDavSong } from '../webdav/WebDavLibrary';
@@ -51,6 +51,32 @@ const AUTO_WAIT_MS: number = 4000;
  * MAX_ACTIVE 并发，而是串行 + 间隔（见 nextWaiting 与 runTask）。
  */
 const BOOK_TASK_GAP_MS: number = 1000;
+/**
+ * 等系统保存对话框（拿保存位置）最多等这么久
+ *
+ * 这一步以前没有超时：`DocumentViewPicker.save()` 万一不返回（后台、系统忙），
+ * 这个任务就永远不结束、**一直占着一个并发位**，两个位都卡住之后后面所有下载都停在
+ * 「排队中…」再也不动 —— 看起来就是「听了两三首之后不再下载」。
+ * 超时就退回应用内目录（歌照样下得来、能播，只是文件管理里看不到）。
+ */
+const PICKER_TIMEOUT_MS: number = 8000;
+/**
+ * 下载途中「多久没收到数据就认定卡死」
+ *
+ * `requestInStream` 的 readTimeout 是 300 秒，靠它兜底意味着一首卡住的歌能霸占一个
+ * 并发位 5 分钟（两首就是 10 分钟，期间其它自动下载全在排队）。这里自己看数据心跳：
+ * 超过这个时间一个字节都没来，就掐断这次请求按失败处理（可以重试）。
+ */
+const STALL_LIMIT_MS: number = 30000;
+/** 检查数据心跳的间隔 */
+const STALL_CHECK_MS: number = 5000;
+/**
+ * 失败后自动重试几次
+ *
+ * 只对「重试有可能变好」的失败（超时、5xx、连接被断、下载停滞）重试；4xx 这类
+ * 明确被拒的（链接过期也会给 403/404）不重试 —— 那只会白跑一遍。
+ */
+const MAX_RETRY: number = 1;
 
 /** 音质 -> 扩展名（拿不到链接后缀时用） */
 const EXT_BY_QUALITY: Record<string, string> = {
@@ -119,6 +145,8 @@ export interface DownloadItem {
    * 只影响调度：自动排进来的在播放挨饿时不抢网络（见 pump），用户点的立即开工。
    */
   auto: boolean;
+  /** 已经自动重试过几次（见 MAX_RETRY）：到上限就不再自动重试，等用户手点 */
+  retries: number;
   createdAt: number;
 }
 
@@ -187,6 +215,44 @@ function asNumber(value: Object | undefined): number {
 }
 
 /**
+ * 解析播放链接失败时，值不值得再试一次
+ *
+ * 「音源没加载 / 不支持这个平台 / 这条记录缺歌曲信息 / 书源被删了」这类是**配置问题**，
+ * 重试一百次也是同一个结果，只会白占队列；超时、被限流、脚本报错这些是网络或服务端的
+ * 临时状态，重试有意义。
+ */
+function retryableResolveFailure(message: string): boolean {
+  const permanent: string[] = [
+    '音源没有加载',
+    '音源未加载',
+    '不支持平台',
+    '未实现 musicUrl',
+    '没有可解析的歌曲信息',
+    '缺书籍信息',
+    '书源已经被删掉',
+    '书源规则可能已失效',
+    '这一集需要登录',
+  ];
+  for (const one of permanent) {
+    if (message.includes(one)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 下载请求本身抛出来的错误值不值得重试
+ *
+ * 错误消息里出现 4xx（多是被拒、链接过期）就不重试；其余（连接被断、超时、被掐断）
+ * 当作网络抖动，重试一次。用词边界匹配，免得把「2300499」这类端口/错误码里的数字
+ * 当成 HTTP 404。
+ */
+function retryableNetworkFailure(message: string): boolean {
+  return !/\b4\d{2}\b/.test(message);
+}
+
+/**
  * 老索引文件里没有的字段补成空串
  *
  * 下载记录是 JSON 落盘的，加了新字段（如 tagNote）之后，升级前写下的文件里
@@ -194,6 +260,41 @@ function asNumber(value: Object | undefined): number {
  */
 function orEmpty(value: string | undefined): string {
   return value !== undefined && value !== null ? value : '';
+}
+
+/**
+ * 给一个 Promise 加超时（超时就 reject）
+ *
+ * 与 DownloadTags 里那个同名函数不一样：那个超时返回兜底值（标签没有就算了），
+ * 这里的超时必须走**失败**分支 —— 调用方据此退回应用内目录。若把超时当成正常结果，
+ * 会拿到一个没有句柄的「保存位置」。
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve: (value: T) => void, reject: (reason: Error) => void) => {
+    let settled: boolean = false;
+    const timer: number = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(new Error(`等待超过 ${Math.round(ms / 1000)} 秒`));
+    }, ms);
+    promise.then((value: T) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, (err: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
 }
 
 /** 文件名不能带路径分隔符与系统保留字符，统一洗一遍 */
@@ -387,10 +488,20 @@ export class DownloadManager {
     if (existed !== null) {
       // 用户点的那一下比自动排的更急：本来是自动排的，现在就当成手动下载（立即开工）
       existed.auto = existed.auto && auto;
-      if (existed.status === 'error') {
+      // 「已下载，但这次启动读不到」：公共下载目录给的是会话级授权（见 loadIndex），
+      // 重启后系统就收了回去。再走一遍保存对话框会重新拿到授权，文件重写一遍就能读了 ——
+      // 这是唯一能让它自己好起来的办法，不然「下载过 = 离线能放」在重启后永远不成立。
+      const unreadable: boolean = existed.status === 'done'
+        && existed.uri.startsWith(PUBLIC_URI_PREFIX)
+        && downloadedFile(existed.key).length === 0;
+      if (unreadable) {
+        hilog.info(DOMAIN, TAG, 're-download to renew dir grant: %{public}s', existed.name);
+      }
+      if (existed.status === 'error' || unreadable) {
         existed.status = 'waiting';
         existed.error = '';
         existed.tagNote = '';
+        existed.retries = 0;
         existed.received = 0;
         existed.total = 0;
         this.persist();
@@ -417,6 +528,7 @@ export class DownloadManager {
       note: '',
       tagNote: '',
       auto: auto,
+      retries: 0,
       createdAt: Date.now(),
     };
     this.items.push(item);
@@ -453,6 +565,8 @@ export class DownloadManager {
     item.auto = false;
     item.received = 0;
     item.total = 0;
+    // 用户主动重来一次：自动重试的次数也归零
+    item.retries = 0;
     this.persist();
     this.pump();
   }
@@ -693,7 +807,10 @@ export class DownloadManager {
       // DOWNLOAD 模式下只认 pickerMode，别的选项（含 newFileNames）都不生效，
       // 所以文件名不在这里给：拿到目录之后自己拼。
       options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
-      const uris: string[] = await new picker.DocumentViewPicker(context).save(options);
+      // 加超时：这一步不返回的话这个任务会永远占着一个并发位（见 PICKER_TIMEOUT_MS），
+      // 超时按失败走 -> 调用方退回应用内目录，歌照样下得来
+      const uris: string[] = await withTimeout(
+        new picker.DocumentViewPicker(context).save(options), PICKER_TIMEOUT_MS);
       if (uris.length === 0) {
         return { target: null, reason: '系统保存对话框没有返回可用地址' };
       }
@@ -703,7 +820,10 @@ export class DownloadManager {
       // 只是失败被静默吞掉、直接落到了应用内目录。
       const dirUri: string = uris[0];
       const path: string = new fileUri.FileUri(`${dirUri}/${fileName}`).path;
-      const handle: fs.File = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE);
+      // TRUNC：同名文件（重下同一首、或两首歌撞了同一个文件名）要从头写。不截断的话
+      // 新内容比旧文件短时，尾巴上会留着上一次的字节，拼出一个坏文件。
+      const handle: fs.File = fs.openSync(path,
+        fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
       this.learnDirOf(dirUri);
       return { target: { path: path, part: '', handle: handle, fallback: false, reason: '' },
         reason: '' };
@@ -728,11 +848,20 @@ export class DownloadManager {
       // 自动排进来的给播放让路：播放器正等着数据（起播 / 卡顿 / 缓冲不够）就先不开工，
       // 过几秒回来看一眼。用户自己点的下载不受这条约束 —— 那是用户正在等的活儿
       // （同一套判断见 LxPlayer.canUseBandwidthForCache 与 AudioCache 的让路调度）。
+      //
+      // 这条日志是排查「边听边下不下了」的关键：它说明歌**已经排在队列里**、只是没轮到
+      // 开工。如果连这条都没有，问题在播放层（没排进来），不在这里。
       if (next.auto && !LxPlayer.getInstance().canUseBandwidthForCache()) {
+        const player = LxPlayer.getInstance();
+        hilog.info(DOMAIN, TAG,
+          'auto task defers (playback busy): %{public}s, player %{public}s buffering=%{public}s active=%{public}d',
+          next.name, player.getStatus(), player.isBuffering() ? 'yes' : 'no', this.active);
         this.schedulePump();
         return;
       }
       this.active++;
+      hilog.info(DOMAIN, TAG, 'task start: %{public}s (%{public}s, auto=%{public}s, active=%{public}d)',
+        next.name, next.source, next.auto ? 'yes' : 'no', this.active);
       void this.startTask(next);
     }
   }
@@ -783,21 +912,28 @@ export class DownloadManager {
    * 外面这层只管「一个任务占一个并发位、结束时一定还回去」：不管中途成功、失败、
    * 被取消，还是抛了没预料到的异常，finally 里统一收尾。真正的下载逻辑在 runTask，
    * 里面所有分支都只是 return —— 不再各自去动 active，避免漏减或重复减。
+   *
+   * 失败会在这里决定要不要自动重试：可重试的（超时 / 5xx / 停滞）放回 waiting，
+   * 由 finally 里的 pump 再排一次（retries 记账，到 MAX_RETRY 为止）。这样
+   * 「网络抖一下就永久变成失败、要用户手点」这件事不会发生。
    */
   private async startTask(item: DownloadItem): Promise<void> {
     const isBook: boolean = item.source === BOOK_SOURCE;
+    const startedAt: number = Date.now();
     if (isBook) {
       this.activeBook++;
     }
     try {
       await this.runTask(item);
     } catch (e) {
-      this.fail(item, (e as Error).message);
+      this.failOrRetry(item, (e as Error).message, true);
     } finally {
       this.active--;
       if (isBook) {
         this.activeBook--;
       }
+      hilog.info(DOMAIN, TAG, 'task end: %{public}s -> %{public}s (%{public}dms, active=%{public}d)',
+        item.name, item.status, Date.now() - startedAt, this.active);
       this.persist();
       this.bump();
       this.pump();
@@ -849,7 +985,7 @@ export class DownloadManager {
     try {
       resolved = await this.resolveUrl(item);
     } catch (e) {
-      this.fail(item, (e as Error).message);
+      this.failOrRetry(item, (e as Error).message, retryableResolveFailure((e as Error).message));
       return;
     }
     if (item.status !== 'downloading') {
@@ -889,6 +1025,9 @@ export class DownloadManager {
     this.requests.set(item.key, request);
     // 封面 / 歌词跟着音频一起写进文件：mp3 写 ID3v2、flac 写元数据块（见 TagSink）
     const sink: TagSink = new TagSink(file.fd, tags);
+    // 数据心跳：每收到一块就记一下，看门狗据此判断这次连接是不是已经死了
+    let lastDataAt: number = Date.now();
+    let stalled: boolean = false;
 
     request.on('headersReceive', (header: Object) => {
       const length: number = asNumber((header as Record<string, Object>)['content-length']);
@@ -898,6 +1037,7 @@ export class DownloadManager {
       }
     });
     request.on('dataReceive', (data: ArrayBuffer) => {
+      lastDataAt = Date.now();
       try {
         sink.write(data);
         item.received += data.byteLength;
@@ -906,6 +1046,23 @@ export class DownloadManager {
         hilog.warn(DOMAIN, TAG, 'write chunk failed: %{public}s', JSON.stringify(e));
       }
     });
+
+    // 看门狗：readTimeout 是 5 分钟，靠它兜底等于让一首卡死的歌霸占一个并发位 5 分钟
+    //（两个位都这样就是 10 分钟不下任何东西）。这里自己盯着数据心跳，卡死就掐断，
+    // 让这次任务尽快收尾（还能自动重试一次）。
+    const watchdog: number = setInterval(() => {
+      if (Date.now() - lastDataAt < STALL_LIMIT_MS) {
+        return;
+      }
+      stalled = true;
+      hilog.warn(DOMAIN, TAG, 'download stalled, aborting: %{public}s (%{public}d bytes)',
+        item.name, item.received);
+      try {
+        request.destroy();
+      } catch (e) {
+        // 已经结束
+      }
+    }, STALL_CHECK_MS);
 
     try {
       const code: number = await request.requestInStream(url, {
@@ -916,6 +1073,7 @@ export class DownloadManager {
         // 声明的请求头要跟着这一跳带过去，否则直链能解析出来但下不动（403/404）
         header: resolved.headers,
       });
+      clearInterval(watchdog);
       // 收尾：开头还攒着的（下载太短、没认出来）补写出去
       sink.finish();
       this.closeQuietly(file);
@@ -925,9 +1083,19 @@ export class DownloadManager {
         this.cleanupFailed(part, target);
         return;
       }
-      if (code !== 200 || item.received === 0) {
+      if (stalled) {
+        this.failOrRetry(item, `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）`, true);
+        return;
+      }
+      if (code !== 200) {
+        // 4xx 多半是链接过期 / 被拒（重试没用），5xx 与 0 是服务端或连接问题（值得再来一次）
         this.cleanupFailed(part, target);
-        this.fail(item, `下载失败（HTTP ${code}）`);
+        this.failOrRetry(item, `下载失败（HTTP ${code}）`, code >= 500 || code === 0);
+        return;
+      }
+      if (item.received === 0) {
+        this.cleanupFailed(part, target);
+        this.failOrRetry(item, '下载失败（没收到数据）', true);
         return;
       }
       item.tagNote = this.tagNoteOf(sink, tags, ext);
@@ -946,13 +1114,18 @@ export class DownloadManager {
         this.fail(item, `写入文件失败：${(e as BusinessError).message}`);
       }
     } catch (e) {
+      clearInterval(watchdog);
       this.closeQuietly(file);
       this.cleanupFailed(part, target);
       this.requests.delete(item.key);
       if (item.status === 'downloading') {
-        this.fail(item, (e as BusinessError).message);
+        // 看门狗掐断的那次：错误消息是「请求被中止」这类，按可重试处理（本来也是网络问题）
+        const message: string = (e as BusinessError).message;
+        this.failOrRetry(item, stalled ? `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）` : message,
+          stalled || retryableNetworkFailure(message));
       }
     } finally {
+      clearInterval(watchdog);
       try {
         request.destroy();
       } catch (e) {
@@ -1031,6 +1204,35 @@ export class DownloadManager {
     item.error = message;
     item.received = 0;
     item.total = 0;
+  }
+
+  /**
+   * 失败收尾：能重试的放回队列再排一次（最多 MAX_RETRY 次），否则如实标成失败
+   *
+   * 为什么要自动重试一次：解析链接（音源沙箱）和下载都走网络，快速切歌时音源沙箱
+   * 容易被抢、CDN 也会抖一下。以前这类失败直接变成「下载失败」，用户得手点重试 ——
+   * 表现就是「听着听着就不下了，列表里一串失败」。重试只是把同一件事再试一次，
+   * 真到上限时显示的是最后一次的真实原因。
+   *
+   * 放回 waiting 之后由 startTask 的 finally 里那次 pump 接着排；自动排进来的那批
+   * 仍然要过「给播放让路」那道闸，所以不会和播放抢网络。
+   */
+  private failOrRetry(item: DownloadItem, message: string, retryable: boolean): void {
+    if (item.status !== 'downloading') {
+      // 期间被取消 / 从列表里删掉了：调用方已经收过尾，别再动它
+      return;
+    }
+    if (retryable && item.retries < MAX_RETRY) {
+      item.retries++;
+      item.status = 'waiting';
+      item.error = '';
+      item.received = 0;
+      item.total = 0;
+      hilog.info(DOMAIN, TAG, 'retry %{public}d/%{public}d: %{public}s (%{public}s)',
+        item.retries, MAX_RETRY, item.name, message);
+      return;
+    }
+    this.fail(item, retryable ? `${message}（已自动重试 ${item.retries} 次）` : message);
   }
 
   /**
@@ -1203,10 +1405,11 @@ export class DownloadManager {
       const kept: DownloadItem[] = [];
       for (const raw of data.items) {
         const item: DownloadItem = raw;
-        // 老文件可能没有这几个字段（tagNote / auto 都是后加的）
+        // 老文件可能没有这几个字段（tagNote / auto / retries 都是后加的）
         item.note = orEmpty(item.note);
         item.tagNote = orEmpty(item.tagNote);
         item.auto = item.auto === true;
+        item.retries = asNumber(item.retries);
         // 重启时正在下的那些没法接着下（链接带时效），标成可重试
         if (item.status === 'downloading' || item.status === 'waiting') {
           item.status = 'error';
@@ -1214,12 +1417,22 @@ export class DownloadManager {
           item.received = 0;
         }
         if (item.status === 'done') {
-          // 文件被用户删了 / 目录不可访问就当作没下过
-          if (item.uri.length === 0 || !this.exists(item.uri)) {
+          if (item.uri.length === 0) {
+            item.status = 'error';
+            item.error = '这条下载记录没有文件路径（可能是很旧的版本留下的），可以重新下载';
+          } else if (this.exists(item.uri)) {
+            setDownloadedFile(item.key, item.uri);
+          } else if (item.uri.startsWith(PUBLIC_URI_PREFIX)) {
+            // 公共下载目录里的文件：系统保存对话框给的是**会话级**授权（module.json5 里
+            // 特意没声明 FILE_ACCESS_PERSIST 那个受限权限），重启后 App 就读不到它了。
+            // 这跟「被清理工具删了」是两回事：文件还在「文件管理」里，只是这次启动没权限，
+            // 所以留着 done、把情况写进 note，别标成失败冤枉用户（也免得他重复下载）。
+            item.note = '文件在下载目录里，但本次启动系统没给读取授权（重启后要重新联网播）';
+            hilog.info(DOMAIN, TAG, 'downloaded file not readable this session: %{public}s', item.uri);
+          } else {
+            // 应用内目录那份：读不到就是真没了
             item.status = 'error';
             item.error = '文件找不到了（可能被清理过）';
-          } else {
-            setDownloadedFile(item.key, item.uri);
           }
         }
         kept.push(item);

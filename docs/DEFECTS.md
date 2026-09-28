@@ -422,6 +422,186 @@ node tools/book_import_test.js
 
 ---
 
+## D-008 · 按歌手搜索：同一首歌重复一大堆，同时真正该看到的歌又少一大堆
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-09-28，改成洛雪那套「合并 → 去重 → 相关度排序 → 翻页」；真机回归见「验收标准」） |
+| 优先级 | P1（搜索页是主入口，用户能直接看到重复与缺失） |
+| 发现日期 | 2026-09-28 |
+| 发现方式 | 用真实酷我接口跑了一遍搜索结果，把「改之前」的交错合并与「改之后」的合并结果对出来 |
+
+### 影响面
+
+搜索页把五个平台的结果**按「每个平台轮流取一条」交错拼接**，既不排序也不去重，
+而且只拉第一页：
+
+1. **重复**：同一首歌在五个平台各有一条，交错后连着出现五遍。搜「周杰伦」时列表
+   前五行是「夜曲 / 夜曲 / 夜曲 / 夜曲 / 夜曲」。
+2. **缺失**：每平台只取 30 条、没有翻页。酷我给「周杰伦」报的 `TOTAL` 是 **3295**，
+   也就是能看到 30 首、看不到 3265 首。
+3. 顺带：`songFromSearch` 对缺 songmid 的条目用**递增序号**当 id，而搜索页切平台筛选 /
+   翻页都会重新转换一遍，同一首歌每转一次 id 就变一个，在播高亮与爱心会跟着飘。
+
+### 处理方式（2026-09-28）
+
+照洛雪 `store/search/music/action.js` 的 `setLists` + `utils/common.js` 重做：
+
+| 环节 | 做法 | 洛雪对应 |
+| --- | --- | --- |
+| 合并 | 各平台这一页的结果合成一份列表 | `arrPush` |
+| 去重 | 先按稳定 id（同平台重复返回的同一条），再按「歌名 + 歌手集合（时长 ±5 秒）」——同一首歌在几个平台都有时只留先问的那个平台那一份 | `deduplicationList`（洛雪只按 id；跨平台那一层是本次多做的，见下） |
+| 排序 | 按 `similar(关键词, "歌名 歌手")` 二分插入后降序 | `handleSortList` / `sortInsert` / `similar` |
+| 翻页 | 各平台连 `total`/`allPage` 一起回，列表滚到底拉下一页，页与页往后接不重排 | `listInfos[source].maxPage` / `OnlineList.onLoadMore` |
+
+跨平台那一层去重是**有意多做的**：洛雪的聚合列表里同一首歌在几个平台就是几条
+（它要用户自己挑一个能解析的源）。聆听的播放链路会自动换源
+（`PlaySession.ensurePlayable` → `resolveItem`：条目所在平台解析不了就按「歌名 + 歌手」
+在音源支持且有内置搜索的平台上重搜），所以留一条就够，多留的只会把列表塞满重复行。
+内置音源（`resources/rawfile/lx_preload.js`）对 kw/kg/tx/wy/mg 都声明了 `musicUrl`，
+留下的任一条都能直接解析。
+
+### 证据（2026-09-28 实测）
+
+```bash
+node tools/search_merge_probe.js 周杰伦     # 真实酷我接口 + 新合并规则的 JS 复刻
+node tools/search_merge_probe.js 晴天
+```
+
+```
+关键词「周杰伦」
+
+1) 翻页：
+  ok   接口报出总数与总页数 -> TOTAL=3295 allPage=110
+  ok   第 2 页与第 1 页不重合 -> page1=30 条, page2=30 条
+
+2) 改之前的「交错合并且不去重」：
+  ok   同一首歌连着占满前几行（这就是「重复一大堆」） -> 夜曲 | 夜曲 | 夜曲 | 夜曲 | 夜曲
+
+3) 新的「合并 + 去重」：
+  ok   150 条聚合后不再有跨平台重复 -> 150 -> 30
+  ok   留下的是先问的平台那一份（kw） -> 非 kw 的条数=0
+
+4) 相关度排序：
+  ok   相似度单调不升
+  ok   最像的排在最前面 -> 0.600
+   前 8 条：
+     0.600  枫 - 周杰伦 [04:35]
+     0.500  夜曲 - 周杰伦 [03:46]
+     ...
+
+全部通过
+```
+
+搜「晴天」时还看到平台自己就重复返回了两条《晴天 - 周杰伦》（mid 228908 与 385945441，
+时长 269 / 268 秒），合并规则把多余的那条也并掉了（150 -> 29）；这说明跨平台那层去重
+是有效的，不是只把「五个平台各一条」压成一条。
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/music/MusicSearch.ets` | `similar` / `sortInsert` / `sortByRelevance`（照洛雪）、`searchIdOf` / `songKeyOf` / `dedupeSongs`、`searchMusicPage`（带 total/allPage）、`searchMusicAll` 改为返回 `LxSearchOutcome`（去重 + 排序 + maxPage）；各平台 `search*` 改为返回 `LxSearchPage`；删掉 `interleave` |
+| `views/SearchView.ets` | 存原始 musicInfo、逐平台累计、`loadMore`（滚到底拉下一页）、尾部状态行；空态与提示文案 |
+| `views/SongListPane.ets` | 新增 `footerStatus` / `onReachEnd`（不设就与改之前一模一样，其余三个列表不受影响） |
+| `core/music/MusicId.ets` | `musicIdOf` 转调 `MusicSearch.searchIdOf`（id 规则只留一处） |
+| `core/player/PlaySession.ets` | `songFromSearch` 缺 songmid 时改用「平台 + 歌名 + 歌手」当 id（不再用递增序号） |
+
+### 验收标准
+
+- [ ] 真机：搜索页搜一个歌手名（如「周杰伦」），列表里**没有连着重复的同一首歌**。
+- [ ] 真机：结果列表滚到底会自动加载下一页，首数从 30 一路往上涨（而不是停在 30）。
+- [ ] 真机：最像关键词的歌排在最前面（搜「晴天」时《晴天》在第一名附近）。
+- [ ] 真机：切「酷我 / 酷狗 / …」筛选后继续下拉，看到的是该平台的第一页 + 第二页…。
+- [ ] 真机：点任意一条能出声（留下的那份来自酷我，若音源解析不了会按歌名 + 歌手自动换源）。
+- [x] 算法在真实接口数据上验证（`tools/search_merge_probe.js`，见「证据」）。2026-09-28
+
+---
+
+## D-009 · 「缓存时自动下载」听两三首之后不再下载；下载那份重启后读不到
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-09-29：改成「下载目录一份 + 应用内缓存一份」两条链路，并补上超时 / 重试 / 心跳 / 日志 / 授权提示；真机回归见「验收标准」） |
+| 优先级 | P0（开关开着却在静默失效，且原设计把缓存那份删了，等于两份都保不住） |
+| 发现日期 | 2026-09-29 |
+| 发现方式 | 用户反馈「一边播一边下，一开始会下，播了 2 首之后又不会了；而且下载下来的真能当缓存吗」。逐行读链路 + 顺着两处「没有超时的等待」定位 |
+
+### 影响面
+
+1. **播两三首之后不再下载**。自动下载走 `DownloadManager`，并发位只有 2 个
+   （`MAX_ACTIVE`），而自动排进来的条目开工前要过 `LxPlayer.canUseBandwidthForCache()`
+   这道让路闸。三处会让它**永久**卡住：
+   - `openViaPicker()` 里的 `picker.save()` **没有超时**：不返回就永远占着一个并发位，
+     两个位都被占住之后后面所有自动下载都停在「排队中…（边听边存）」；
+   - 下载体只有 `readTimeout: 300000`（5 分钟）兜底：一个卡死的连接能霸占并发位 5 分钟；
+   - 让路判断只看 `buffering` 这个标志，而真机上 `BUFFERING_END` 会漏
+     （`docs/PLAYBACK_BUFFER.md` 里有实测记录）：一漏整首歌都不让路，这首歌就不下了 ——
+     表现正是「有时下、有时不下」。
+2. **失败不重试**。解析链接（音源沙箱，60 秒超时）或下载非 200 直接标成 error，
+   要用户手点重试。快速切歌时音源沙箱容易被抢，很容易撞上。
+3. **这段链路几乎没有日志**：`DownloadManager` 全文件只有 ready / done 两条 info，
+   让路跳过与任务开工都不打，没法从日志区分「没排上 / 在让路 / 卡死」。
+4. **下载那份重启后读不到，而且被误报成「文件找不到了」**。公共目录给的是会话级授权
+   （`module.json5` 里特意没声明 `FILE_ACCESS_PERSIST`），重启后 `loadIndex` 用
+   `fs.accessSync` 判定，读不到就把记录标成 error『文件找不到了（可能被清理过）』——
+   文件明明还在「文件管理」里。
+5. **原设计只有一份**：交给下载器时 `AudioCache.dropKey()` 把沙箱那份删掉，于是
+   第 4 条一旦发生，**离线那一份就一起没了**（沙箱备份已删）。
+
+### 处理方式（2026-09-29）
+
+**一、改成两份并存（用户明确要求）**
+
+| | 关（默认） | 开 |
+| --- | --- | --- |
+| 沙箱 `files/lx_media_audio/` | 有，受「缓存上限」LRU 约束 | **照旧有**，同样受上限约束（上限设 0 一样关掉并清空） |
+| 下载文件夹 `Download/<应用名>/` | 无 | 另有一份整首：不受上限约束、长期保留、在下载管理里删 |
+
+- `PlaySession` 的播放 / 预取路径：`isAutoDownload()` 时先 `queueAutoDownload()`，
+  **不再 return**，接着照旧 `cacheSong()` / `prefetchSong()`（`PlaySession.autoDownload`
+  改名 `queueAutoDownload`，去掉 `dropKey`）。
+- `AudioCache`：`isEnabled` / `enforceLimit` / 单首上限全部回到「只看缓存上限」，
+  `dropKey()` 删除（它的唯一理由就是「只留一份」）。
+
+**二、稳健性**
+
+| 问题 | 做法 |
+| --- | --- |
+| picker 不返回占死并发位 | `withTimeout(picker.save(), 8000)`：超时按失败走 → 退回应用内目录，歌照样下得来 |
+| 连接卡死占位 5 分钟 | 数据心跳看门狗（`STALL_LIMIT_MS = 30s`，每 5s 查一次）：没数据就 `request.destroy()` 掐断，正常收尾 |
+| 抖动即永久失败 | `failOrRetry()`：可重试的失败放回 `waiting` 再排一次（`MAX_RETRY = 1`）；4xx / 配置类错误不重试 |
+| 让路闸被卡住的 `buffering` 挡住 | `canUseBandwidthForCache()` 改以**播放进度**为准（进度还在走就不算挨饿） |
+| 重启后误报「文件找不到了」 | `loadIndex` 区分：公共目录那条留 `done` + note 说明「本次启动没读取授权」；应用内目录那条读不到才是真没了 |
+| 看不到发生了什么 | 补日志：`auto task defers`（让路，带播放器状态与 active）、`task start` / `task end`（带耗时与 active，保证成对）、`retry n/N` |
+| 重下同名文件留尾巴 | 打开保存目标时带 `TRUNC`（新内容比旧文件短时会拼出坏文件） |
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/download/DownloadManager.ets` | `PICKER_TIMEOUT_MS` / `STALL_LIMIT_MS` / `STALL_CHECK_MS` / `MAX_RETRY`、`withTimeout`、`retryableResolveFailure` / `retryableNetworkFailure`、`failOrRetry`、看门狗、`pump` / `startTask` 日志、`openViaPicker` 超时 + TRUNC、`loadIndex` 授权提示、`retries` 字段 |
+| `core/music/AudioCache.ets` | 上限恢复对沙箱缓存常态生效（`isEnabled` / `enforceLimit` / 单首上限）；删除 `dropKey` |
+| `core/player/LxPlayer.ets` | `canUseBandwidthForCache()` 以播放进度为准 |
+| `core/player/PlaySession.ets` | `autoDownload` → `queueAutoDownload`（不再删沙箱缓存、不再 return），播放与预取两条路径都「两份并存」 |
+| `views/CacheSettingsView.ets` | 确认弹窗 / 开关副标题 / 上限行 / 底部说明按「两份」重写 |
+
+### 验收标准
+
+- [ ] 真机：开着开关连听 5 首以上，5 首都出现在「我的 - 下载管理」里并下完
+      （不再停在「排队中…（边听边存）」）；`task start` 与 `task end` 条数相等，
+      `task end` 里的 `active` 最后回到 0。
+- [ ] 真机：边听边下时正在听的那首不卡顿（让路那批日志能解释「为什么还没开工」）。
+- [ ] 真机：断网 / 弱网下失败的条目会自己再试一次（`retry 1/1`），不是立刻变「下载失败」。
+- [ ] 真机：同一首歌下载后，沙箱缓存里也有一份（缓存设置的占用与条数会涨）；
+      把缓存上限调小到装不下时会淘汰它，而下载文件夹那份还在。
+- [ ] 真机：把缓存上限设 0 → 沙箱那份被清空，下载文件夹那份不受影响。
+- [ ] 真机：重启应用后，「下载管理」里公开目录那条显示「已下载」+ 授权说明（不再是
+      「文件找不到了」），且**本次会话点它能播放**（重启后首次会联网，第二次起读本地）。
+- [ ] 真机：下载目录不可用时（拒绝授权等），自动退回应用内目录并给出 note。
+
+---
+
 ## 其他待办（不是缺陷，按需排期）
 
 - **歌词逐字（`lxlyric`）**：洛雪的富文本歌词（逐字时间轴）目前未使用，

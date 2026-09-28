@@ -44,6 +44,64 @@ export class BookSourceStore {
     return `${this.dir}/source_${id}.json`;
   }
 
+  private loginPath(id: string): string {
+    return `${this.dir}/login_${id}.json`;
+  }
+
+  /**
+   * 某个书源保存的登录信息（登录弹窗填的 Cookie / 账号等）
+   *
+   * 与书源正文分开存：书源重新导入（`replace`）时登录状态不该被冲掉。
+   * 缺失或坏了都返回空对象，让上层按「未登录」处理。
+   */
+  getLoginInfo(id: string): Record<string, string> {
+    const path: string = this.loginPath(id);
+    if (!this.ready || !fs.accessSync(path)) {
+      return {};
+    }
+    try {
+      return JSON.parse(fs.readTextSync(path)) as Record<string, string>;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to read login info %{public}s', id);
+      return {};
+    }
+  }
+
+  /** 登录信息里是否真有内容（全是空串就当没登录） */
+  hasLoginInfo(id: string): boolean {
+    const info: Record<string, string> = this.getLoginInfo(id);
+    for (const key of Object.keys(info)) {
+      const value: string = info[key];
+      if (value !== undefined && value !== null && value.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  saveLoginInfo(id: string, info: Record<string, string>): void {
+    if (!this.ready) {
+      return;
+    }
+    const file = fs.openSync(this.loginPath(id), fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    try {
+      fs.writeSync(file.fd, JSON.stringify(info));
+    } finally {
+      fs.closeSync(file);
+    }
+  }
+
+  clearLoginInfo(id: string): void {
+    try {
+      const path: string = this.loginPath(id);
+      if (fs.accessSync(path)) {
+        fs.unlinkSync(path);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to clear login info %{public}s', id);
+    }
+  }
+
   list(): BookSourceInfo[] {
     if (!this.ready || !fs.accessSync(this.indexFile)) {
       return [];
@@ -139,6 +197,7 @@ export class BookSourceStore {
         } catch (e) {
           hilog.warn(DOMAIN, TAG, 'failed to delete source file %{public}s', id);
         }
+        this.clearLoginInfo(id);
       } else {
         remains.push(item);
       }

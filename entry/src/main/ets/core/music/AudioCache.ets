@@ -111,13 +111,16 @@ export class AudioCache {
   /**
    * 「缓存时自动下载」
    *
-   * 开着的时候，边听边存这件事改由下载器做（文件进下载文件夹、出现在「我的 - 下载管理」），
-   * 于是这里的三件事跟着变：
-   *   1. 缓存的上限不再生效（见 enforceLimit / isEnabled）—— 那份占用从此由用户自己在
-   *      下载管理里管，再设一个上限只会让人以为文件被删了；
-   *   2. 上限设成 0 也不清空缓存（否则「开着自动下载」和「上限为 0」一起用会把沙箱清空）；
-   *   3. 单首不再有「比上限大就不下」的约束。
-   * 缓存本身没被废掉：下载器不收的（WebDAV 云端歌、没有 musicInfo 的条目）照旧走缓存。
+   * 开着的时候，播放过的歌**另外**再整份下一遍到下载文件夹（DownloadManager 那条链路），
+   * 于同一首歌会有两份落盘：
+   *
+   *   1. **下载文件夹那份**（系统 `Download/<应用名>/`）：用户看得见、能在「我的 - 下载管理」
+   *      里单独删，**不受这里的上限约束**，长期留着；
+   *   2. **这里的沙箱缓存**：照旧边播边存，照旧受「缓存上限」的 LRU 约束。
+   *
+   * 两份是**两条独立链路**：上限那一份随听随淘汰（弱网下先保正在听的），下载那一份是
+   * 用户明确要留的。所以这个开关只影响「要不要多下一份」，不再改变缓存的任何规则 ——
+   * 缓存上限、上限设 0 即关闭、单首不超上限，全都照旧生效。
    */
   private autoDownload: boolean = false;
   private entries: Record<string, AudioCacheEntry> = {};
@@ -175,8 +178,9 @@ export class AudioCache {
   }
 
   isEnabled(): boolean {
-    // 开着「缓存时自动下载」就算缓存开着：上限为 0 也不影响（上限这时本来就不生效）
-    return this.ready && (this.limitMb > 0 || this.autoDownload);
+    // 上限设 0 就是关掉播放缓存（与「缓存时自动下载」无关：那个开关只管
+    // 要不要另外往下载文件夹下一份，见 autoDownload 的说明）
+    return this.ready && this.limitMb > 0;
   }
 
   /** 「缓存时自动下载」开着没有？ */
@@ -185,10 +189,10 @@ export class AudioCache {
   }
 
   /**
-   * 开 / 关「缓存时自动下载」（弹窗确认之后才调这里，代价见字段上的说明）
+   * 开 / 关「缓存时自动下载」
    *
-   * 关掉时按现有上限先淘汰一轮：开着的时候没淘汰过，关掉就该立刻回到有上限的状态，
-   * 否则那堆文件会一直留在沙箱里没人管。
+   * 只记这个选择本身：上限、淘汰、单首大小都不受它影响（两份落盘的分工见 autoDownload）。
+   * 关掉不需要「按上限淘汰一轮」—— 上限一直在生效，沙箱里那份本来就是受约束的。
    */
   setAutoDownload(value: boolean): void {
     if (value === this.autoDownload) {
@@ -197,8 +201,6 @@ export class AudioCache {
     this.autoDownload = value;
     AppStorage.setOrCreate(K_CACHE_AUTO_DOWNLOAD, value);
     this.scheduleSaveIndex();
-    this.enforceLimit();
-    this.pump();
     this.bumpVersion();
     hilog.info(DOMAIN, TAG, 'auto download %{public}s', value ? 'on' : 'off');
   }
@@ -276,66 +278,13 @@ export class AudioCache {
   }
 
   /**
-   * 丢掉某首歌的缓存（不分音质）
-   *
-   * 「缓存时自动下载」把这首歌交给下载器之后调用，两个理由：
-   *   1. 同一首歌别占两处地方 —— 文件马上要落到下载文件夹，沙箱里再留一份是白占空间，
-   *      而开着这个开关时缓存本来就不淘汰（没有上限），留着就永远留着；
-   *   2. 用户把下载删掉时「本地这份就没了」这条承诺才成立：缓存里留一份的话照样能离线放。
-   *
-   * 正在播的那一份不删（文件一删播放就断），等切歌后再收；正在下的那个任务一并作废 ——
-   * 它写的正是马上要删掉的 `.part`，接着下只会拼出一个坏文件。
-   */
-  dropKey(key: string): void {
-    if (!this.ready || key.length === 0) {
-      return;
-    }
-    if (this.active !== null && this.active.key === key) {
-      this.active = null;
-    }
-    if (this.pendingPlaying !== null && this.pendingPlaying.key === key) {
-      this.pendingPlaying = null;
-    }
-    if (this.pendingNext !== null && this.pendingNext.key === key) {
-      this.pendingNext = null;
-    }
-    const prefix: string = `${key}_`;
-    let removed: number = 0;
-    for (const name of Object.keys(this.entries)) {
-      if (!name.startsWith(prefix)) {
-        continue;
-      }
-      const path: string = `${this.dir}/${name}`;
-      if (path === this.playingPath) {
-        continue;
-      }
-      unlinkQuietly(path);
-      this.removeEntry(name);
-      removed++;
-    }
-    // 没下完的半截也扫掉：没人会再接着下它，留着只是占地方
-    try {
-      for (const name of fs.listFileSync(this.dir)) {
-        if (name.startsWith(prefix) && name.endsWith(PART_SUFFIX)) {
-          unlinkQuietly(`${this.dir}/${name}`);
-        }
-      }
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'scan cache dir failed: %{public}s', JSON.stringify(e));
-    }
-    this.dropProgressOf(prefix);
-    if (removed > 0) {
-      hilog.info(DOMAIN, TAG, 'dropped %{public}d cache file(s) of %{public}s', removed, key);
-      this.bumpVersion();
-    }
-  }
-
-  /**
    * 边播边缓存：把这首歌下到本地，下完下次就直接读本地
    *
    * 优先级最高的一类任务（正在听的就是它），会顶掉排在前面的同类任务。
-   * 注意「缓存时自动下载」开着时这条链路不走这里 —— 播放层会把它交给下载器
-   * （文件进下载文件夹），见 PlaySession.autoDownload。
+   *
+   * 「缓存时自动下载」开着时这条路照走 —— 沙箱这一份是给播放用的（受上限约束、
+   * 切歌时读它），下载文件夹那一份由下载器另外下一遍（见 PlaySession.queueAutoDownload）。
+   * 两份各管一段：沙箱这份会被 LRU 淘汰，下载那份是用户要长期留的。
    */
   cacheSong(key: string, quality: string, url: string, headers?: Record<string, string>): void {
     this.enqueue(key, quality, url, false, headers);
@@ -544,11 +493,9 @@ export class AudioCache {
     const part: string = `${target}${PART_SUFFIX}`;
     // 进度表的键：文件名去掉后缀（同一首歌换地址也共用一条进度）
     const progressKey: string = this.baseName(task.key, task.quality);
-    // 单首上限就按总上限来：比上限还大的文件缓存下来也会立刻被淘汰。
-    // 开着「缓存时自动下载」时没有上限（上限不生效），单首也就不设限。
-    const singleLimit: number = this.autoDownload
-      ? Number.MAX_SAFE_INTEGER
-      : this.limitMb * 1024 * 1024;
+    // 单首上限就按总上限来：比上限还大的文件缓存下来也会立刻被淘汰
+    //（「缓存时自动下载」那份走下载器，不在这里，所以不受这条约束）
+    const singleLimit: number = this.limitMb * 1024 * 1024;
     const request = http.createHttp();
     let offset: number = fileSizeOf(part);
     let started: boolean = offset === 0;
@@ -727,12 +674,8 @@ export class AudioCache {
     if (!this.ready) {
       return;
     }
-    if (this.autoDownload) {
-      // 「缓存时自动下载」开着就没有上限这回事：不淘汰，也不因为上限是 0 而清空
-      return;
-    }
     if (this.limitMb <= 0) {
-      // 关掉缓存：清空
+      // 关掉缓存：清空（「缓存时自动下载」那份在下载文件夹里，不受这条影响）
       const names: string[] = Object.keys(this.entries);
       for (const name of names) {
         unlinkQuietly(`${this.dir}/${name}`);

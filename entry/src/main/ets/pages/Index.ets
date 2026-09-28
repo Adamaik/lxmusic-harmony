@@ -24,8 +24,9 @@ import { PageTitle, RoundIconButton, WidePane } from '../ui/Widgets';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
 import { AboutView } from '../views/AboutView';
 import { WebDavSettingsView } from '../views/WebDavSettingsView';
-import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_HOME, I_HOME_FILL, I_PERSON, I_PERSON_FILL,
-  I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
+import { ListenSettingsView } from '../views/ListenSettingsView';
+import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_HOME, I_HOME_FILL, I_IDENTIFY, I_PERSON,
+  I_PERSON_FILL, I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
 import { MiniBarView } from '../views/MiniBar';
 import { BookSandboxHost } from '../components/BookSandboxHost';
 import { BookDetailView } from '../views/BookDetailView';
@@ -42,7 +43,10 @@ import { HistoryView } from '../views/HistoryView';
 import { LocalMusicPane } from '../views/LocalMusicView';
 import { DownloadListPane } from '../views/DownloadListView';
 import { WebDavPane } from '../views/WebDavView';
-import { K_RECOMMEND_SOURCE, RecommendView } from '../views/RecommendView';
+import { K_RECOMMEND_SOURCE, RecommendSettings } from '../core/settings/RecommendSettings';
+import { K_HIDE_LISTEN_TAB } from '../core/settings/ListenSettings';
+import { RecommendView } from '../views/RecommendView';
+import { RecognizeView } from '../views/RecognizeView';
 import { SearchView } from '../views/SearchView';
 import { SettingsView } from '../views/SettingsView';
 import { SourceSettingsView } from '../views/SourceSettingsView';
@@ -57,6 +61,8 @@ import { K_SELECT_ACTIVE, K_SELECT_ALL, K_SELECT_COUNT, SelectSession } from '..
 /** 主界面 / 子页面 */
 const PAGE_MAIN: string = 'main';
 const PAGE_SEARCH: string = 'search';
+/** 听歌识曲（推荐页标题栏那颗钮压的就是它） */
+const PAGE_RECOGNIZE: string = 'recognize';
 const PAGE_SOURCE: string = 'source';
 const PAGE_SYNC: string = 'sync';
 const PAGE_PLAYLIST: string = 'playlist';
@@ -67,6 +73,8 @@ const PAGE_PLAY: string = 'play';
 const PAGE_DOWNLOAD: string = 'download';
 /** 外观设置（材质档位 / 光效 / 深浅模式） */
 const PAGE_APPEARANCE: string = 'appearance';
+/** 听书设置（是否隐藏「听书」页签） */
+const PAGE_LISTEN: string = 'listen';
 /** 在线歌单 / 在线榜单详情 */
 const PAGE_ONLINE: string = 'online';
 /** WebDAV 云端音乐设置（服务器地址 / 账号密码 / 曲库管理） */
@@ -86,8 +94,17 @@ const PAGE_CLOUD: string = 'cloud';
 /** 听书：一本书的详情 + 目录 */
 const PAGE_BOOK: string = 'book';
 
-/** 底部悬浮页签的页签 */
+/**
+ * 底部悬浮页签的页签
+ *
+ * `key` 是这一栏的**身份**（推荐 / 听书 / 我的），与「第几栏」无关：听书可以在设置里隐藏，
+ * 一藏栏位就整体前移（我的从第 2 栏变第 1 栏）。所以「这是哪一栏」一律用 key 判断；
+ * 栏位下标只在要交给 HdsTabs 时由 key 现算（见 tabIndexOf）—— 下标是**位置**、会随听书
+ * 的显隐变，把它当身份交给按值传递的 @Builder 迟早对不上（之前那版就是这么把「我的」
+ * 那一栏显示成「推荐」的）。
+ */
 interface TabDef {
+  key: string;
   icon: Resource;
   iconActive: Resource;
   label: string;
@@ -104,12 +121,27 @@ interface TabDef {
  * 的 JSON 规则，与音源完全不同的一套协议，见 core/book/book_preload.js），
  * 混进推荐页会让「音乐」那一栏的语义变糊；而它又是使用频率很高的主功能，
  * 藏在「我的」的二级入口里不合适，所以给它一个并列的一级页签。
+ *
+ * 「听书」可以在「设置 - 听书」里隐藏：整块 TabContent 一起不摆，导航栏只剩「推荐」与「我的」。
  */
-const TABS: TabDef[] = [
-  { icon: I_HOME, iconActive: I_HOME_FILL, label: '推荐' },
-  { icon: I_BOOK, iconActive: I_BOOK_FILL, label: '听书' },
-  { icon: I_PERSON, iconActive: I_PERSON_FILL, label: '我的' },
-];
+const TAB_KEY_HOME: string = 'home';
+const TAB_KEY_LISTEN: string = 'listen';
+const TAB_KEY_MINE: string = 'mine';
+
+const TAB_HOME: TabDef = { key: TAB_KEY_HOME, icon: I_HOME, iconActive: I_HOME_FILL, label: '推荐' };
+const TAB_LISTEN: TabDef = { key: TAB_KEY_LISTEN, icon: I_BOOK, iconActive: I_BOOK_FILL, label: '听书' };
+const TAB_MINE: TabDef = { key: TAB_KEY_MINE, icon: I_PERSON, iconActive: I_PERSON_FILL, label: '我的' };
+
+const TABS: TabDef[] = [TAB_HOME, TAB_LISTEN, TAB_MINE];
+
+/**
+ * 悬浮页签栏里每颗页签占的宽度（中档 / 大档）
+ *
+ * HDS 官方的档位（284 / 328）对三颗页签给出的是 216 / 240，摊到每颗就是 72 / 80。
+ * 按页签署数算，藏掉「听书」只剩两颗时页签栏会自己收窄（见 barWidth）。
+ */
+const TAB_SLOT_MEDIUM: number = 72;
+const TAB_SLOT_LARGE: number = 80;
 
 /**
  * 应用壳层
@@ -126,7 +158,14 @@ const TABS: TabDef[] = [
 @Entry
 @Component
 struct Index {
-  @State activeTab: number = 0;
+  /**
+   * 当前选中的页签（用**身份** key 记，不记第几栏）
+   *
+   * 听书能在设置里隐藏，一藏栏位就整体前移。把「第几栏」当状态存的话，隐藏时得手工平移、
+   * 还容易跟框架的下标打架；存 key 之后，栏位下标每次渲染由 key 现算（见 tabIndexOf），
+   * 隐藏 / 显示都不需要搬移，当前页永远是同一页。
+   */
+  @State activeTabKey: string = TAB_KEY_HOME;
   @State playerOpen: boolean = false;
   @State queueOpen: boolean = false;
   @State topInset: number = 0;
@@ -174,6 +213,14 @@ struct Index {
    */
   @StorageLink(K_RECOMMEND_SOURCE) recommendSource: string = 'kw';
   /**
+   * 是否隐藏「听书」页签（设置 - 听书）
+   *
+   * 存法在 core/settings/ListenSettings.ets（沙箱 JSON + AppStorage）。改值的是设置页，
+   * 壳层订阅后重排导航栏：隐藏时不再摆那一栏 TabContent。当前页是按**身份**记的
+   * （见 activeTabKey），栏位下标每次渲染现算，所以隐藏 / 显示都不需要搬移选中项。
+   */
+  @StorageLink(K_HIDE_LISTEN_TAB) hideListenTab: boolean = false;
+  /**
    * 多选：顶栏整条换成「取消 + 已选中 N 项 + 全选」
    *
    * 多选的宿主是各个列表页（它的勾选状态在自己身上），而顶栏是壳层画的
@@ -198,6 +245,14 @@ struct Index {
   private mainWindow: window.Window | null = null;
   /** 窗口尺寸变化（旋转 / 折叠 / 分屏 / 自由窗口）的监听，销毁时摘掉 */
   private sizeListener: ((size: window.Size) => void) | null = null;
+  /**
+   * 音源引擎的日志流
+   *
+   * 只负责刷新摘要 + 转交「值得打断」的那几条：引擎的 warn/error 大多是自检与回退的
+   * 过程留痕（自动恢复失败还能手动选音源、脚本重试、某个接口报错但脚本自己兜住了），
+   * 全弹提示条的话一进应用就是一串失败提醒。是否打断由日志自己声明（见 SourceLog.alert），
+   * 其余照旧进日志面板，在「设置 → 音源设置」里能查到。
+   */
   private logListener: ((log: SourceLog) => void) | null = null;
   /** 播放会话的提示（缺音源 / 解析失败 / 播放错误），统一走 HDS 提示条 */
   private noticeListener: ((text: string) => void) | null = null;
@@ -218,7 +273,7 @@ struct Index {
     this.refreshSourceSummary();
     this.logListener = (log: SourceLog) => {
       this.refreshSourceSummary();
-      if (log.type === 'error' || log.type === 'warn') {
+      if (log.alert === true) {
         this.showToast(log.message);
       }
     };
@@ -498,9 +553,55 @@ struct Index {
    * 窗口宽度由 publishLayout 写进 AppStorage，页面自己订阅（见 ui/Layout.ets）。
    */
 
-  /** 页签选中态用的强调色 / 未选中态的图标 token */
-  private tabColor(index: number): Resource {
-    return this.activeTab === index ? C_RED : C_ICON;
+  /**
+   * 当前挂在导航栏上的页签（「听书」可以在设置里隐藏）
+   *
+   * 顺序必须与 build() 里 TabContent 的出现顺序**一致**：页签下标是位置决定的，
+   * 隐藏听书之后「我的」就顶到第 1 个。所以栏里的图标 / 文字 / 选中态一律用 {@link tabDefOf}
+   * 按 key 取（key 不随显隐变），绝不把下标当身份传来传去。
+   */
+  private visibleTabDefs(): TabDef[] {
+    return this.hideListenTab ? [TAB_HOME, TAB_MINE] : TABS;
+  }
+
+  /** 某个身份（key）对应的页签定义 */
+  private tabDefOf(key: string): TabDef {
+    const defs: TabDef[] = this.visibleTabDefs();
+    for (let i = 0; i < defs.length; i++) {
+      if (defs[i].key === key) {
+        return defs[i];
+      }
+    }
+    return defs[0];
+  }
+
+  /** 当前选中那一页的下标（交给 HdsTabs 用；每次渲染由 key 现算） */
+  private tabIndexOf(key: string): number {
+    const defs: TabDef[] = this.visibleTabDefs();
+    for (let i = 0; i < defs.length; i++) {
+      if (defs[i].key === key) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 页签被点了：按下标认出是哪一栏，记下它的**身份**
+   *
+   * 下标只在这里出现一次（进来的是框架给的位置），出去立刻换成 key，之后所有判断都用 key。
+   */
+  private onTabChanged(index: number): void {
+    const defs: TabDef[] = this.visibleTabDefs();
+    if (index < 0 || index >= defs.length) {
+      return;
+    }
+    this.activeTabKey = defs[index].key;
+  }
+
+  /** 页签选中态用的强调色 / 未选中态的图标 token（比的是身份，不是下标） */
+  private tabColorOf(key: string): Resource {
+    return this.activeTabKey === key ? C_RED : C_ICON;
   }
 
   /**
@@ -509,18 +610,23 @@ struct Index {
    * 悬浮页签栏的样式下 `tabBar` 只认官方 BottomTabBarStyle 或自定义构建器，
    * 这里用后者，好和派音保持同一套字号与间距：图标 22、文字 11、间距 4，
    * 选中态换实心变体 + 主题红，未选中走图标 token（深浅模式各一份）。
+   *
+   * 参数是**身份 key**（推荐 / 听书 / 我的），不是下标：@Builder 的参数按值传递、
+   * 状态改完不会重刷（见 ui/SettingWidgets.ets 开头那条），传下标的话隐藏听书时
+   * 参数会留在旧值上，跟 builder 体内重新读到的定义表对不上 —— 之前「我的」显示成
+   * 「推荐」就是这么来的。
    */
   @Builder
-  tabBarItem(index: number) {
+  tabBarItem(key: string) {
     Column({ space: 4 }) {
-      SymbolGlyph(this.activeTab === index ? TABS[index].iconActive : TABS[index].icon)
+      SymbolGlyph(this.activeTabKey === key ? this.tabDefOf(key).iconActive : this.tabDefOf(key).icon)
         .fontSize(22)
         .fontWeight(FontWeight.Regular)
         .height(22)
-        .fontColor([this.tabColor(index)])
-      Text(TABS[index].label)
+        .fontColor([this.tabColorOf(key)])
+      Text(this.tabDefOf(key).label)
         .fontSize(11)
-        .fontColor(this.tabColor(index))
+        .fontColor(this.tabColorOf(key))
     }
     .justifyContent(FlexAlign.Center)
     .alignItems(HorizontalAlign.Center)
@@ -622,9 +728,13 @@ struct Index {
   /**
    * 首页各页签的页头：大标题 + 该页签的动作
    *
-   * 动作按页签给：只有「推荐」有（来源 + 搜索）。「我的」页的动作（新建歌单 / 导入 /
-   * 设置）都在页面自己的卡片里，标题栏这一行不再挂东西 —— 与华为音乐的「我的」一致，
-   * 那边标题栏也只有标题（外加它自己的会员 / 消息钮，那两样我们没有）。
+   * 动作按页签给：只有「推荐」有（来源 + 听歌识曲 + 搜索）。「我的」页的动作（新建歌单 /
+   * 导入 / 设置）都在页面自己的卡片里，标题栏这一行不再挂东西 —— 与华为音乐的「我的」
+   * 一致，那边标题栏也只有标题（外加它自己的会员 / 消息钮，那两样我们没有）。
+   *
+   * 推荐页右侧三样从左到右是「来源胶囊 → 听歌识曲 → 搜索」：来源是这一页的数据口径，
+   * 另外两颗是「找歌」的两种路子（听周围在放什么 / 自己敲关键词），所以识曲紧挨着搜索、
+   * 排在它左边，而来源留在最左、与自己管着的那一页内容离得最近。
    *
    * 画在标题栏里的钮走 `materialFirstGlass`：材质可用时不叠自绘底（沉浸光感的视觉层级在
    * backgroundColor / backgroundBlurStyle 之下，自己再画一层磨砂就把材质整片盖住了），
@@ -633,10 +743,16 @@ struct Index {
   @Builder
   homeHeader() {
     Row({ space: 10 }) {
-      PageTitle({ text: TABS[this.activeTab].label })
+      PageTitle({ text: this.tabDefOf(this.activeTabKey).label })
       Blank()
-      if (this.activeTab === 0) {
+      if (this.activeTabKey === TAB_KEY_HOME) {
         this.sourcePicker()
+        RoundIconButton({
+          icon: I_IDENTIFY, boxSize: 40, iconSize: 21, label: '听歌识曲', materialFirst: true,
+          onTap: () => {
+            this.go(PAGE_RECOGNIZE);
+          },
+        })
         RoundIconButton({
           icon: I_SEARCH, boxSize: 40, iconSize: 21, label: '搜索', materialFirst: true,
           onTap: () => {
@@ -677,14 +793,14 @@ struct Index {
     .accessibilityLevel('yes')
   }
 
-  /** 来源下拉菜单：改的是 AppStorage 里的推荐来源，推荐页订阅它重新取数 */
+  /** 来源下拉菜单：改的是 RecommendSettings 里的推荐来源（落沙箱，下次进页面还是它），推荐页订阅它重新取数 */
   @Builder
   sourceMenu() {
     Menu() {
       ForEach(LIST_PLATFORMS, (id: string) => {
         MenuItem({ content: platformName(id) })
           .onClick(() => {
-            AppStorage.setOrCreate(K_RECOMMEND_SOURCE, id);
+            RecommendSettings.getInstance().setSource(id);
           })
       }, (id: string) => id)
     }
@@ -824,6 +940,10 @@ struct Index {
     }
     if (action === 'appearance') {
       this.go(PAGE_APPEARANCE);
+      return;
+    }
+    if (action === 'listen') {
+      this.go(PAGE_LISTEN);
       return;
     }
     if (action === 'webdav') {
@@ -1011,6 +1131,15 @@ struct Index {
         }
       }
       .titleBar(this.titleBarOptions('搜索'))
+    } else if (name === PAGE_RECOGNIZE) {
+      // 听歌识曲：可滚动的内容页，给一条顶栏渐隐（同各设置页），
+      // 内容自己用一段会跟着滚走的顶部占位让开标题栏
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          RecognizeView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+        }
+      }
+      .titleBar(this.titleBarOptions('听歌识曲'))
     } else if (name === PAGE_SOURCE) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
@@ -1056,6 +1185,13 @@ struct Index {
         }
       }
       .titleBar(this.titleBarOptions('外观'))
+    } else if (name === PAGE_LISTEN) {
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          ListenSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+        }
+      }
+      .titleBar(this.titleBarOptions('听书'))
     } else if (name === PAGE_WEBDAV) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
@@ -1284,7 +1420,7 @@ struct Index {
     Stack({ alignContent: Alignment.Bottom }) {
       // ---------------------------------------------------- HDS 导航（主页签 + 子页面）
       HdsNavigation(this.pathStack) {
-        HdsTabs({ index: this.activeTab, controller: this.tabsController, barPosition: BarPosition.End }) {
+        HdsTabs({ index: this.tabIndexOf(this.activeTabKey), controller: this.tabsController, barPosition: BarPosition.End }) {
           /**
            * 三个页签的内容**铺满窗口**（WidePane 的 maxWidth 给 0 = 不限宽），多列由各页
            * 自己按窗口宽度排（见 ui/Layout.ets 的 contentColumnsFor）——
@@ -1308,20 +1444,33 @@ struct Index {
               })
             }
           }
-          .tabBar(this.tabBarItem(0))
+          .tabBar(this.tabBarItem(TAB_KEY_HOME))
 
-          TabContent() {
-            WidePane() {
-              ListenView({
-                topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
-                bottomInset: this.bottomInset + 96,
-                onOpenBook: (hit: BookHit) => {
-                  this.openBook(hit);
-                },
-              })
+          /**
+           * 听书这一栏可以在「设置 - 听书」里隐藏（见 hideListenTab）
+           *
+           * 整块 TabContent 一起不摆：栏里的那一项与它的内容一起没掉，导航栏只剩推荐与我的。
+           * 栏位的下标会跟着前移，但那一栏的图标 / 文字是按**身份**取的（tabBarItem 的入参
+           * 是 TAB_KEY_*，不是下标），所以「我的」照样显示成「我的」。
+           */
+          if (!this.hideListenTab) {
+            TabContent() {
+              WidePane() {
+                ListenView({
+                  topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
+                  bottomInset: this.bottomInset + 96,
+                  // 网页登录是整屏覆盖层（bindContentCover），不经过标题栏，所以另给一份
+                  // 纯状态栏 / 手势条的高度，它自己补留白
+                  safeTop: this.topInset,
+                  safeBottom: this.bottomInset,
+                  onOpenBook: (hit: BookHit) => {
+                    this.openBook(hit);
+                  },
+                })
+              }
             }
+            .tabBar(this.tabBarItem(TAB_KEY_LISTEN))
           }
-          .tabBar(this.tabBarItem(1))
 
           TabContent() {
             WidePane() {
@@ -1344,7 +1493,7 @@ struct Index {
               })
             }
           }
-          .tabBar(this.tabBarItem(2))
+          .tabBar(this.tabBarItem(TAB_KEY_MINE))
         }
         // 悬浮页签栏：贴底、横向、固定宽度档、页签悬浮在内容之上（照派音）
         .barPosition(BarPosition.End)
@@ -1373,9 +1522,10 @@ struct Index {
             smallWidth: this.floatingBarSmallWidthVp(),
             // 中 / 大档按**页签署数**给：284 / 328 是 HDS 对四个页签的档位值
             // （官方文档里的分档只按窗口宽度给，不管页签署数），照那个宽度画就是一条
-            // 空落落的宽胶囊，所以按每颗页签 ~72vp 收窄：三个页签 = 216 / 240。
-            mediumWidth: 216,
-            largeWidth: 240,
+            // 空落落的宽胶囊，所以按每颗页签 ~72 / 80vp 收窄：三个页签 = 216 / 240，
+            // 「听书」在设置里藏掉之后只剩两颗，自动变成 144 / 160。
+            mediumWidth: TAB_SLOT_MEDIUM * this.visibleTabDefs().length,
+            largeWidth: TAB_SLOT_LARGE * this.visibleTabDefs().length,
           },
           barBottomMargin: this.homeTabBarBottomMarginVp(),
           // 与标题栏、半模态共用同一个材质档位（外观设置里改一处，三处一起变）
@@ -1390,7 +1540,8 @@ struct Index {
           },
         })
         .onChange((index: number) => {
-          this.activeTab = index;
+          // 框架给的是「第几栏」，这里立刻换成身份存下来（见 onTabChanged）
+          this.onTabChanged(index);
         })
         .width('100%')
         .height('100%')

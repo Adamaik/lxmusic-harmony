@@ -292,24 +292,35 @@ export class LxPlayer {
   }
 
   /**
-   * 现在能不能把带宽让给后台的播放缓存下载
+   * 现在能不能把带宽让给后台的播放缓存 / 自动下载
    *
    * 顺序上「播放优先」，但只看**真的**说明播放器在挨饿的信号，不设固定门槛：
-   *   - 播放器正在等数据（`buffering`，声音是断的）→ 不让；
    *   - 正在起播 / 切歌（`loading`）→ 不让，它要抢首屏缓冲；
-   *   - 正在播、但进度已经 STALL_MS 没动 → 不让（自己测出来的卡顿）；
-   *   - 其余（正常播 / 暂停 / 停止 / 空闲 / 出错）→ 让，缓存按网络能给的速度下。
+   *   - 播放器在等数据（`buffering`）、且进度确实没往前走 → 不让；
+   *   - 在播、但进度已经 STALL_MS 没动 → 不让（自己测出来的卡顿）；
+   *   - 其余（正常播 / 暂停 / 停止 / 空闲 / 出错）→ 让，后台按网络能给的速度下。
    *
-   * 曾经这里有过两版"人工节奏"，都删了：一是「缓冲区余量 ≥ 30 秒才让」——
+   * 判断以**播放进度**为准，不信 `buffering` 这个标志本身：真机上
+   * `BUFFERING_START` 会上报、`BUFFERING_END` 会漏（见 docs/PLAYBACK_BUFFER.md 里
+   * 缓冲水位那段的实测），一漏 `buffering` 就整首歌停在 true —— 那时进度明明在走，
+   * 却把整首歌的后台下载全挡住了，表现就是「听了两首之后不再下载」。进度在走就说明
+   * 没卡，让路不该再拦。
+   *
+   * 曾经这里还有过两版"人工节奏"，都删了：一是「缓冲区余量 ≥ 30 秒才让」——
    * 真机只报到 13 秒，那条线永远不成立，结果是整首都不下缓存；二是「起播后先让 4 秒」——
    * 表现为进度条那条灰段开头干等几秒，像坏了。缓存该多快就多快，只在播放挨饿时让路。
    */
   canUseBandwidthForCache(): boolean {
-    if (this.buffering || this.status === 'loading') {
+    if (this.status === 'loading') {
       return false;
     }
-    if (this.status === 'playing' && this.lastProgressAt !== 0
-      && Date.now() - this.lastProgressAt >= STALL_MS) {
+    // 进度最近还在往前走（= 真的在出声），就不认为播放器在挨饿
+    const progressing: boolean = this.lastProgressAt !== 0
+      && Date.now() - this.lastProgressAt < STALL_MS;
+    if (this.buffering && !progressing) {
+      return false;
+    }
+    if (this.status === 'playing' && !progressing) {
       return false;
     }
     return true;

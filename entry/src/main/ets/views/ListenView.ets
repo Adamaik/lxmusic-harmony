@@ -5,6 +5,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BookEngine } from '../core/book/BookEngine';
 import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
 import { BookHit, BookSourceInfo } from '../core/book/BookTypes';
+import { BookLoginWeb } from '../components/BookLoginWeb';
 import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
   F_SUB, R_CARD } from '../ui/Theme';
 import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
@@ -114,6 +115,10 @@ export struct ListenView {
   @Prop topInset: number = 0;
   /** 让出底部页签栏 + 手势条 */
   @Prop bottomInset: number = 0;
+  /** 纯状态栏高度（网页登录那种整屏覆盖层要自己补，不经过标题栏） */
+  @Prop safeTop: number = 0;
+  /** 纯手势条高度 */
+  @Prop safeBottom: number = 0;
   onOpenBook: (hit: BookHit) => void = () => {
   };
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
@@ -126,6 +131,14 @@ export struct ListenView {
 
   @State pane: number = PANE_SHELF;
   @State sources: BookSourceInfo[] = [];
+  /**
+   * 已经登录过的书源 id
+   *
+   * 单独存一份 @State 而不是每次 build 里去读引擎：`ForEach` 按 id 做 diff，
+   * 登录状态变了但 id 没变时**不会重建条目** —— 只读引擎的话按钮文案就永远停在
+   * 「登录」。这份状态既参与渲染，也被拼进 ForEach 的 key，状态一变条目必重建。
+   */
+  @State loggedIds: string[] = [];
   @State shelf: ShelvedBook[] = [];
   /** 搜索 */
   @State keyword: string = '';
@@ -138,6 +151,18 @@ export struct ListenView {
   @State busy: boolean = false;
   @State sourceStatus: string = '';
   @State pasteText: string = '';
+  /** 书源登录弹窗（只有声明了 loginUrl/loginUi 的源才用得上） */
+  @State loginOpen: boolean = false;
+  @State loginSourceId: string = '';
+  @State loginSourceName: string = '';
+  @State loginStatus: string = '';
+  @State loginBusy: boolean = false;
+  /** 网页登录（应用内浏览器打开站点登录页，登录后抓 Cookie） */
+  @State loginWebOpen: boolean = false;
+  @State loginWebSourceId: string = '';
+  @State loginWebTitle: string = '';
+  @State loginWebUrl: string = '';
+  @State loginWebSite: string = '';
 
   aboutToAppear(): void {
     const engine = BookEngine.getInstance();
@@ -148,7 +173,15 @@ export struct ListenView {
   }
 
   private refresh(): void {
-    this.sources = BookEngine.getInstance().listSources();
+    const engine = BookEngine.getInstance();
+    this.sources = engine.listSources();
+    const logged: string[] = [];
+    for (const info of this.sources) {
+      if (engine.hasLoginInfo(info.id)) {
+        logged.push(info.id);
+      }
+    }
+    this.loggedIds = logged;
     this.shelf = BookShelf.getInstance().list();
   }
 
@@ -296,6 +329,84 @@ export struct ListenView {
     }
     this.refresh();
     this.sourceStatus = '已删除该书源';
+  }
+
+  // ------------------------------------------------------------ 书源登录
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
+  /** 打开应用内浏览器，让用户在站点自己的登录页上登录 */
+  private openWebLogin(): void {
+    const engine = BookEngine.getInstance();
+    const url: string = engine.loginPageUrl(this.loginSourceId);
+    if (!/^https?:/i.test(url)) {
+      this.loginStatus = '这个书源没有可打开的登录页（缺 loginUrl / bookSourceUrl）';
+      return;
+    }
+    const info: BookSourceInfo | null = engine.getSource(this.loginSourceId);
+    this.loginWebSourceId = this.loginSourceId;
+    this.loginWebTitle = this.loginSourceName;
+    this.loginWebUrl = url;
+    this.loginWebSite = info !== null ? info.url : '';
+    this.loginOpen = false;
+    this.loginWebOpen = true;
+  }
+
+  /** 应用内浏览器关闭：把抓到的 Cookie 存进登录信息 */
+  private onWebLoginClosed(cookie: string): void {
+    this.loginWebOpen = false;
+    const text: string = cookie !== undefined && cookie !== null ? cookie.trim() : '';
+    if (text.length === 0) {
+      this.loginStatus = '没抓到 Cookie（可能还没登录成功）';
+      return;
+    }
+    BookEngine.getInstance().saveWebLogin(this.loginWebSourceId, text);
+    this.loginStatus = `已抓取本站 Cookie（${text.length} 字符）并保存`;
+    this.refresh();
+    this.toast('登录信息已保存');
+  }
+
+  private isLoggedIn(info: BookSourceInfo): boolean {
+    return this.loggedIds.includes(info.id);
+  }
+
+  /** 打开某个书源的登录弹窗（只做网页登录，不再有手填表单） */
+  private openLogin(info: BookSourceInfo): void {
+    this.loginSourceId = info.id;
+    this.loginSourceName = info.name;
+    this.loginStatus = this.isLoggedIn(info) ? '已保存登录信息，可直接重新登录或清除' : '';
+    this.loginBusy = false;
+    this.loginOpen = true;
+  }
+
+  /** 跑 `loginCheckJs` 看是否真的登录上了 */
+  private async checkLoginNow(): Promise<void> {
+    const engine = BookEngine.getInstance();
+    this.loginBusy = true;
+    try {
+      const text: string = await engine.checkLogin(this.loginSourceId);
+      if (text.length === 0) {
+        this.loginStatus = '这个书源没有提供登录检查';
+      } else if (text === 'false' || text === '0') {
+        this.loginStatus = '还没登录（检查未通过）';
+      } else {
+        this.loginStatus = `登录检查：${text}`;
+      }
+      this.refresh();
+    } catch (e) {
+      this.loginStatus = `检查失败：${(e as Error).message}`;
+    } finally {
+      this.loginBusy = false;
+    }
+  }
+
+  private clearLoginNow(): void {
+    BookEngine.getInstance().clearLoginInfo(this.loginSourceId);
+    this.loginStatus = '已清除登录信息';
+    this.refresh();
+    this.toast('已清除登录信息');
   }
 
   // ------------------------------------------------------------ 片段构建
@@ -630,7 +741,8 @@ export struct ListenView {
                       .maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                       .layoutWeight(1)
-                    if (info.needLogin) {
+                    // 「需登录」只在**还没登录**时提示；登录后由右侧按钮的「重新登录」表达状态
+                    if (info.needLogin && !this.isLoggedIn(info)) {
                       Text('需登录')
                         .fontSize(10.5)
                         .fontColor(C_TEXT_SUB)
@@ -651,6 +763,25 @@ export struct ListenView {
                 .layoutWeight(1)
                 .alignItems(HorizontalAlign.Start)
 
+                if (info.needLogin) {
+                  // 按登录状态切换：没登录时是「登录」（强调色，提示还有一步），
+                  // 登录后变「重新登录」（弱化，但仍可点，换号 / Cookie 过期要能重来）
+                  Text(this.isLoggedIn(info) ? '重新登录' : '登录')
+                    .fontSize(12.5)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.isLoggedIn(info) ? C_TEXT_SUB : C_RED)
+                    .padding({ left: 11, right: 11, top: 5, bottom: 5 })
+                    .backgroundColor($r('app.color.c_fill_soft_strong'))
+                    .borderRadius(14)
+                    .onClick(() => {
+                      this.openLogin(info);
+                    })
+                    .accessibilityText(this.isLoggedIn(info)
+                      ? `已登录书源 ${info.name}，点按可重新登录`
+                      : `登录书源 ${info.name}`)
+                    .accessibilityLevel('yes')
+                }
+
                 IconGlyph({ symbol: I_TRASH, iconSize: 20, color: C_TEXT_WEAK })
                   .padding({ left: 6, right: 6, top: 6, bottom: 6 })
                   .onClick(() => {
@@ -662,7 +793,7 @@ export struct ListenView {
               .width('100%')
               .padding({ left: 16, right: 12, top: 12, bottom: 12 })
             }
-          }, (info: BookSourceInfo) => info.id)
+          }, (info: BookSourceInfo) => `${info.id}|${this.isLoggedIn(info) ? 'in' : 'out'}`)
           ListItem() {
             Column().height(this.bottomInset + 96)
           }
@@ -676,6 +807,11 @@ export struct ListenView {
     }
     .width('100%')
     .layoutWeight(1)
+    // 网页登录挂在书源分段自己的节点上：登录弹窗（bindSheet）已经在最外层节点上，
+    // 同一节点再叠一个覆盖层会互相干扰
+    .bindContentCover($$this.loginWebOpen, this.loginWebCover(), {
+      modalTransition: ModalTransition.NONE,
+    })
   }
 
   private sourceLine(info: BookSourceInfo): string {
@@ -688,6 +824,93 @@ export struct ListenView {
     }
     const suffix: string = caps.length > 0 ? caps.join('/') : '无搜索';
     return `${info.group.length > 0 ? info.group + ' · ' : ''}${suffix} · ${info.url}`;
+  }
+
+  /**
+   * 书源登录弹窗
+   *
+   * 只有一种登录方式：**应用内打开站点自己的登录页**（扫码 / 短信 / 跳转都能走），
+   * 登录完成后抓 Cookie。之前那套按 `loginUi` 手填表单已经去掉 —— 大多数源要么
+   * 根本没有 `loginUi`，要么填了也不对（要的是站点的真实会话）。
+   */
+  @Builder
+  loginSheet() {
+    Column({ space: 12 }) {
+      Text(this.loginSourceName)
+        .fontSize(F_ITEM)
+        .fontColor(C_TEXT)
+        .fontWeight(FontWeight.Medium)
+        .width('100%')
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+      Button('网页登录')
+        .fontSize(15)
+        .height(44)
+        .width('100%')
+        .enabled(!this.loginBusy)
+        .onClick(() => {
+          this.openWebLogin();
+        })
+      Text('在应用内打开该站点的登录页，登录成功后点右上角「完成」，应用会自动抓取本站 Cookie。')
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_SUB)
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      if (this.loginStatus.length > 0) {
+        Text(this.loginStatus)
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+
+      Row({ space: 10 }) {
+        Button(this.loginBusy ? '处理中…' : '检查登录')
+          .fontSize(14)
+          .height(38)
+          .layoutWeight(1)
+          .enabled(!this.loginBusy)
+          .onClick(() => {
+            void this.checkLoginNow();
+          })
+        Button('清除登录')
+          .fontSize(14)
+          .height(38)
+          .layoutWeight(1)
+          .enabled(!this.loginBusy)
+          .onClick(() => {
+            this.clearLoginNow();
+          })
+      }
+      .width('100%')
+
+      Column().height(this.bottomInset + 12)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 4 })
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  /**
+   * 网页登录：整屏的应用内浏览器（书源自己的登录页）
+   *
+   * 用 `bindContentCover` 而不是半模态：登录页要占满屏、要能滚动、还要弹系统键盘，
+   * 半模态高度受限会很难用。关掉时把抓到的 Cookie 交回来落盘。
+   */
+  @Builder
+  loginWebCover() {
+    BookLoginWeb({
+      title: this.loginWebTitle,
+      loginUrl: this.loginWebUrl,
+      siteUrl: this.loginWebSite,
+      safeTop: this.safeTop,
+      safeBottom: this.safeBottom,
+      onClose: (cookie: string) => {
+        this.onWebLoginClosed(cookie);
+      },
+    })
   }
 
   build() {
@@ -725,5 +948,13 @@ export struct ListenView {
     .alignItems(HorizontalAlign.Start)
     .padding({ top: this.topInset })
     .backgroundColor(C_BG)
+    .bindSheet($$this.loginOpen, this.loginSheet(), {
+      preferType: SheetType.BOTTOM,
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      detentSelection: SheetSize.MEDIUM,
+      dragBar: true,
+      showClose: true,
+      title: { title: '书源登录' },
+    })
   }
 }

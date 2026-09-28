@@ -210,6 +210,20 @@ export const SYNC_CODE_LOW_SERVICE_VERSION: string =
   'Sync server version too low, please upgrade server to latest';
 export const SYNC_CODE_HIGH_SERVICE_VERSION: string =
   'Sync server version too high, please upgrade app to latest';
+/**
+ * 宿主侧（WebSocket / HTTP / 加密）抛出来的失败，**不是**服务端协议里的状态。
+ *
+ * 这些异常的 message 是系统原文（英文，如 `Operation timeout`），直接当状态发出去
+ * 会以一句裸英文弹到用户面前 —— 看起来像应用坏了，其实下一轮重连就接上了。
+ * 统一归到这一条：原文只进 hilog，界面上给中文。
+ */
+export const SYNC_CODE_CONNECT_FAILED: string = 'Connect failed';
+/** describeStatus 认识的全部码（其余一律按未知处理，不再原样透出） */
+export const SYNC_KNOWN_CODES: string[] = [
+  SYNC_CODE_AUTH_FAILED, SYNC_CODE_MISSING_AUTH_CODE, SYNC_CODE_GET_SERVICE_ID_FAILED,
+  SYNC_CODE_CONNECT_SERVICE_FAILED, SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_FAILED,
+  SYNC_CODE_LOW_SERVICE_VERSION, SYNC_CODE_HIGH_SERVICE_VERSION,
+];
 
 export const SYNC_CLOSE_NORMAL: number = 1000;
 export const SYNC_CLOSE_FAILED: number = 4100;

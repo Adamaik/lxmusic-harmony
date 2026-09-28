@@ -10,6 +10,8 @@ import {
   BookDetail,
   BookExploreCategory,
   BookHit,
+  BookLoginResult,
+  BookLoginUiItem,
   BookNetRequest,
   BookRunResult,
   BookRunStats,
@@ -45,6 +47,45 @@ export const BOOK_SANDBOX_UNAVAILABLE: string =
 /** 一个源被删除 / 替换时要能中断它的在途请求 */
 interface ActiveRequest {
   cancelled: boolean;
+}
+
+/**
+ * 站点 -> 真实登录页
+ *
+ * 书源里的 `loginUrl` 大多**不是登录页**：喜马拉雅的源写的是站址
+ * （`https://www.ximalaya.com/`，会跳到手机版首页），播客聚合那个源写的是
+ * `https://passport.ximalaya.com/` —— 那只是一台 Tengine 的默认页
+ * （「Welcome to tengine!」）。直接打开就会出现「网页登录打开的不是登录页」。
+ * 这几条是实测过的真实登录页；命中不到就退回源里写的地址 / 站址，让用户自己在页面上找登录入口。
+ */
+const LOGIN_PAGES: Record<string, string> = {
+  'ximalaya.com': 'https://passport.ximalaya.com/page/web/login',
+  'bilibili.com': 'https://passport.bilibili.com/login',
+};
+
+/** URL 的 host（小写，不含端口后的路径） */
+function hostOfUrl(url: string): string {
+  const m: RegExpMatchArray | null = url.match(/^https?:\/\/([^/?#]+)/i);
+  return m !== null ? m[1].toLowerCase() : '';
+}
+
+/** 命不命中内置的登录页表（含子域） */
+function mappedLoginPage(url: string): string {
+  const host: string = hostOfUrl(url);
+  if (host.length === 0) {
+    return '';
+  }
+  for (const key of Object.keys(LOGIN_PAGES)) {
+    if (host === key || host.endsWith('.' + key)) {
+      return LOGIN_PAGES[key];
+    }
+  }
+  return '';
+}
+
+/** 地址本身像不像登录页 */
+function looksLikeLoginPage(url: string): boolean {
+  return /(^|[/.?#])(login|signin|sign_in|passport|auth)([/.?#]|$)/i.test(url);
 }
 
 export class BookEngine {
@@ -433,6 +474,242 @@ export class BookEngine {
     return out;
   }
 
+  // ------------------------------------------------------------ 登录
+
+  /** 是否已经填过登录信息（界面据此显示「已登录 / 需登录」） */
+  hasLoginInfo(sourceId: string): boolean {
+    return this.store.hasLoginInfo(sourceId);
+  }
+
+  getLoginInfo(sourceId: string): Record<string, string> {
+    return this.store.getLoginInfo(sourceId);
+  }
+
+  saveLoginInfo(sourceId: string, info: Record<string, string>): void {
+    this.store.saveLoginInfo(sourceId, info);
+  }
+
+  clearLoginInfo(sourceId: string): void {
+    this.store.clearLoginInfo(sourceId);
+  }
+
+  /**
+   * 网页登录要打开的地址
+   *
+   * 顺序：内置的「站点 → 真实登录页」表 → 源里写的地址本身就像登录页 → 源里写的地址 →
+   * 站址。书源的 `loginUrl` 常常只是站址或一个空的服务页（见 `LOGIN_PAGES` 的注释），
+   * 直接信它就会出现「打开的不是登录页」。
+   */
+  loginPageUrl(sourceId: string): string {
+    let raw: string = '';
+    try {
+      raw = this.rawOf(sourceId);
+    } catch (e) {
+      return '';
+    }
+    let loginUrl: string = '';
+    let siteUrl: string = '';
+    try {
+      const parsed: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+      loginUrl = this.textOf(parsed, 'loginUrl');
+      siteUrl = this.textOf(parsed, 'bookSourceUrl');
+    } catch (e) {
+      return '';
+    }
+    const mapped: string = mappedLoginPage(loginUrl).length > 0
+      ? mappedLoginPage(loginUrl) : mappedLoginPage(siteUrl);
+    if (mapped.length > 0) {
+      return mapped;
+    }
+    if (looksLikeLoginPage(loginUrl)) {
+      return loginUrl;
+    }
+    if (/^https?:/i.test(loginUrl)) {
+      return loginUrl;
+    }
+    return siteUrl;
+  }
+
+  /**
+   * 保存「网页登录」抓到的 Cookie
+   *
+   * 用应用内的真实网页登录后，从 WebView 的 Cookie 罐里把该站的 Cookie 整串取回来，
+   * 这里落盘。写进登录信息表的作用有三层，缺一层就有源用不了：
+   *   1. 固定键 `Cookie` / `cookie`：宿主发请求时直接当 Cookie 头带上（普通请求就带登录态）；
+   *   2. 书源 `loginUi` 里凡是名字/标题含「cookie」的字段：像喜马拉雅那样在规则里
+   *      读 `infoMap['喜马拉雅Cookie']` 自己拼签名请求的源，得能在那个键下拿到；
+   *   3. 规则里 `source.getLoginInfoMap()` 拿到的就是这张表，所以上面两条一次都覆盖到。
+   */
+  saveWebLogin(sourceId: string, cookie: string): void {
+    const trimmed: string = cookie.trim();
+    if (trimmed.length === 0) {
+      return;
+    }
+    const info: Record<string, string> = this.store.getLoginInfo(sourceId);
+    info['Cookie'] = trimmed;
+    info['cookie'] = trimmed;
+    for (const item of this.getLoginUi(sourceId)) {
+      if (item.type === 'button' || item.isHint) {
+        continue;
+      }
+      const key: string = item.name.toLowerCase();
+      const title: string = item.title.toLowerCase();
+      if (key.includes('cookie') || title.includes('cookie')) {
+        info[item.name] = trimmed;
+      }
+    }
+    this.store.saveLoginInfo(sourceId, info);
+  }
+
+  /** 宿主发请求时要带的登录 Cookie（网页登录抓来的那一串） */
+  private loginCookieOf(sourceId: string): string {
+    const info: Record<string, string> = this.store.getLoginInfo(sourceId);
+    const c: string | undefined = info['Cookie'];
+    if (c !== undefined && c !== null && c.length > 0) {
+      return c;
+    }
+    const lower: string | undefined = info['cookie'];
+    return lower !== undefined && lower !== null ? lower : '';
+  }
+
+  /**
+   * 书源的登录界面（`loginUi`）规整成能直接渲染的项
+   *
+   * 阅读里 `loginUi` 是一段 JSON，有的源写成字符串、有的直接是数组，两种都吃。
+   * 字段语义见 `BookLoginUiItem`。没有 `loginUi` 的源（如哔哩哔哩）返回空数组 ——
+   * 那种源靠站内 Cookie，界面上不给填表单。
+   */
+  getLoginUi(sourceId: string): BookLoginUiItem[] {
+    const out: BookLoginUiItem[] = [];
+    let raw: string = '';
+    try {
+      raw = this.rawOf(sourceId);
+    } catch (e) {
+      return out;
+    }
+    let items: Object | undefined = undefined;
+    try {
+      const parsed: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+      items = parsed['loginUi'];
+    } catch (e) {
+      return out;
+    }
+    if (items === undefined || items === null) {
+      return out;
+    }
+    let list: Object[] = [];
+    if (typeof items === 'string') {
+      const text: string = (items as string).trim();
+      if (text.length === 0) {
+        return out;
+      }
+      try {
+        const arr: Object = JSON.parse(text) as Object;
+        list = Array.isArray(arr) ? arr as Object[] : [];
+      } catch (e) {
+        return out;
+      }
+    } else if (Array.isArray(items)) {
+      list = items as Object[];
+    } else {
+      return out;
+    }
+    for (const entry of list) {
+      if (entry === null || entry === undefined || typeof entry !== 'object') {
+        continue;
+      }
+      const item: Record<string, Object> = entry as Record<string, Object>;
+      const title: string = this.textOf(item, 'title');
+      const name: string = this.textOf(item, 'name');
+      const type: string = this.textOf(item, 'type');
+      const action: string = this.textOf(item, 'action');
+      const value: string = this.textOf(item, 'value');
+      const placeholder: string = this.textOf(item, 'placeholder');
+      // 没有 name、只有一段长文本的 text 项是「使用说明」，渲染成一段灰字而不是输入框
+      const isHint: boolean = type !== 'button' && name.length === 0 && action.length === 0 && value.length >= 24;
+      out.push({
+        name: name.length > 0 ? name : title,
+        title: title,
+        type: type.length > 0 ? type : 'text',
+        value: value,
+        action: action,
+        placeholder: placeholder,
+        isHint: isHint,
+      });
+    }
+    return out;
+  }
+
+  /** `loginCheckJs`（可能没有） */
+  private loginCheckRule(sourceId: string): string {
+    let raw: string = '';
+    try {
+      raw = this.rawOf(sourceId);
+    } catch (e) {
+      return '';
+    }
+    try {
+      const parsed: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+      const rule: Object | undefined = parsed['loginCheckJs'];
+      if (rule === undefined || rule === null) {
+        return '';
+      }
+      return typeof rule === 'string' ? rule as string : String(rule);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /**
+   * 跑一次登录动作（登录弹窗里的按钮，或 `loginCheckJs`）
+   *
+   * 规则里可能 `java.connect` 发请求，所以走完整回放循环、是 async。
+   * 结果里带回「保存后的登录信息表」，界面负责落盘（见 `saveLoginInfo`）。
+   */
+  async runLoginAction(sourceId: string, rule: string): Promise<BookLoginResult> {
+    const data: Object = await this.run(sourceId, 'login', { 'rule': rule });
+    return this.toLoginResult(data);
+  }
+
+  /** 检查登录状态：跑 `loginCheckJs`，返回它算出来的字符串（没有规则就空串） */
+  async checkLogin(sourceId: string): Promise<string> {
+    const rule: string = this.loginCheckRule(sourceId);
+    if (rule.trim().length === 0) {
+      return '';
+    }
+    const result: BookLoginResult = await this.runLoginAction(sourceId, rule);
+    return result.result;
+  }
+
+  private toLoginResult(data: Object): BookLoginResult {
+    const out: BookLoginResult = { result: '', login: {}, toasts: [], openUrl: '' };
+    let record: Record<string, Object>;
+    try {
+      record = JSON.parse(JSON.stringify(data)) as Record<string, Object>;
+    } catch (e) {
+      return out;
+    }
+    if (record === null || record === undefined) {
+      return out;
+    }
+    out.result = this.textOf(record, 'result');
+    out.openUrl = this.textOf(record, 'openUrl');
+    const login: Object | undefined = record['login'];
+    if (login !== null && login !== undefined && typeof login === 'object') {
+      const map: Record<string, Object> = login as Record<string, Object>;
+      for (const key of Object.keys(map)) {
+        out.login[key] = this.textOf(map, key);
+      }
+    }
+    const toasts: Object | undefined = record['toasts'];
+    if (Array.isArray(toasts)) {
+      for (const line of toasts as Object[]) {
+        out.toasts.push(line === null || line === undefined ? '' : String(line));
+      }
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------ 回放循环（核心）
 
   private bookParam(hit: BookHit, tocUrl?: string): Record<string, Object> {
@@ -500,10 +777,17 @@ export class BookEngine {
     params: Record<string, Object>
   ): Promise<Object> {
     const raw: string = this.rawOf(sourceId);
+    // 登录信息随每一个作业下发（沙箱里 `source.getLoginInfoMap()` 取的就是它）：
+    // 喜马拉雅的音频、需要 Cookie 的站点都靠这个才解析得出来。
+    const login: Record<string, string> = this.store.getLoginInfo(sourceId);
+    // 网页登录抓来的 Cookie 也要加到宿主请求上（书源自己只发得动规则里的请求）
+    const loginCookie: string = this.loginCookieOf(sourceId);
     const started: number = Date.now();
     let rounds: number = 0;
     let requests: number = 0;
     const netCache: Record<string, string> = {};
+    // 响应头与正文一起缓存：`java.post(...).headers()` 要读 Location 之类的头
+    const netHeaders: Record<string, string> = {};
     const token: ActiveRequest = { cancelled: false };
     this.active = token;
 
@@ -513,7 +797,7 @@ export class BookEngine {
           throw new Error('解析超时：这本书的规则请求太多或站点响应太慢');
         }
         rounds++;
-        const job: string = this.buildJob(action, raw, params, netCache);
+        const job: string = this.buildJob(action, raw, params, netCache, netHeaders, login);
         const result: BookRunResult = await this.runInSandbox(job, token);
         for (const line of (result.logs !== undefined ? result.logs : [])) {
           this.log(`[${sourceId}] ${line}`);
@@ -525,7 +809,7 @@ export class BookEngine {
             throw new Error('沙箱报告缺网络数据但没有给出地址');
           }
           requests += urls.length;
-          await this.fetchAll(urls, netCache);
+          await this.fetchAll(urls, netCache, netHeaders, loginCookie);
           continue;
         }
         if (status === 'error') {
@@ -550,12 +834,16 @@ export class BookEngine {
     action: string,
     sourceRaw: string,
     params: Record<string, Object>,
-    netCache: Record<string, string>
+    netCache: Record<string, string>,
+    netHeaders: Record<string, string>,
+    login: Record<string, string>
   ): string {
     const parts: string[] = [
       `"action":${JSON.stringify(action)}`,
       `"source":${sourceRaw}`,
+      `"login":${JSON.stringify(login)}`,
       `"netCache":${JSON.stringify(netCache)}`,
+      `"netHeaders":${JSON.stringify(netHeaders)}`,
     ];
     parts.push(`"bookSourceName":""`);
     for (const key of Object.keys(params)) {
@@ -660,23 +948,37 @@ export class BookEngine {
   }
 
   /** 一轮里把缺失的地址抓回来（限量并发） */
-  private async fetchAll(urls: BookNetRequest[], netCache: Record<string, string>): Promise<void> {
+  private async fetchAll(
+    urls: BookNetRequest[],
+    netCache: Record<string, string>,
+    netHeaders: Record<string, string>,
+    loginCookie: string
+  ): Promise<void> {
     for (let i = 0; i < urls.length; i += FETCH_CONCURRENCY) {
       const slice: BookNetRequest[] = urls.slice(i, i + FETCH_CONCURRENCY);
       const tasks: Promise<void>[] = [];
       for (const req of slice) {
-        tasks.push(this.fetchOne(req, netCache));
+        tasks.push(this.fetchOne(req, netCache, netHeaders, loginCookie));
       }
       await Promise.all(tasks);
     }
   }
 
-  private async fetchOne(req: BookNetRequest, netCache: Record<string, string>): Promise<void> {
-    const cookie: string = this.jar.headerFor(req.url);
+  private async fetchOne(
+    req: BookNetRequest,
+    netCache: Record<string, string>,
+    netHeaders: Record<string, string>,
+    loginCookie: string
+  ): Promise<void> {
+    // 网页登录抓来的 Cookie 优先（它是真实会话）；没有就退回站点 Set-Cookie 攒的那个罐
+    const jarCookie: string = this.jar.headerFor(req.url);
+    const cookie: string = loginCookie.length > 0 ? loginCookie : jarCookie;
     try {
       const resp: BookResponse = await bookRequest(req, cookie);
       this.jar.absorb(req.url, resp.headers);
       netCache[req.key] = resp.body;
+      // 头一起回灌（`java.post(...).headers()` 读 Location 用）
+      netHeaders[req.key] = JSON.stringify(resp.headers);
       if (resp.statusCode >= 400) {
         this.log(`请求 ${req.url} 返回 HTTP ${resp.statusCode}`);
       }
@@ -685,6 +987,7 @@ export class BookEngine {
       // 但不该让整本书都打不开（一个封面 404 不该毁掉整个搜索）
       this.log(`请求失败 ${req.url}：${(e as Error).message}`);
       netCache[req.key] = '';
+      netHeaders[req.key] = '{}';
     }
   }
 

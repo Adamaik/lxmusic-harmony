@@ -5,8 +5,13 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 const DOMAIN: number = 0x0001;
 const TAG: string = 'PlaySettings';
 const FILE_NAME: string = 'play_settings.json';
-/** 落盘结构变了就 +1，读到不认识的版本按默认值处理 */
-const SETTINGS_VERSION: number = 1;
+/**
+ * 落盘结构变了就 +1，读到更新的版本按默认值处理
+ *
+ * v2：桌面歌词默认由「开」改成「关」（见 desktopLyric 的说明），
+ * 因此 v1 存档里的 desktopLyric 不再可信、按新默认处理（见 apply）。
+ */
+const SETTINGS_VERSION: number = 2;
 
 /**
  * 播放设置（设置 - 播放设置）
@@ -151,10 +156,14 @@ export class PlaySettings {
   private lyricFontSize: number = LYRIC_FONT_DEFAULT;
   private lyricKeepScreenOn: boolean = true;
   /**
-   * 桌面歌词（系统歌词悬浮窗）默认开，与改动前的行为一致：
-   * 以前这个能力一接上就是「有词就显示」，没有开关；现在用户能关掉。
+   * 桌面歌词（系统歌词悬浮窗）默认关。
+   *
+   * 它是压在别的应用（甚至桌面）之上的悬浮窗，还可能要用户授权悬浮窗权限 ——
+   * 这种「盖住别人、还要授权」的能力不该默认替用户打开，想用去设置里自己开。
+   * 关着时 PlaybackService 不会去 enableDesktopLyric（见那边 setupDesktopLyric 的说明）；
+   * 播控中心里的歌词显示不受影响，只是不弹那个悬浮窗。
    */
-  private desktopLyric: boolean = true;
+  private desktopLyric: boolean = false;
   /** 本地歌自动匹配歌词默认开，见 K_AUTO_MATCH_LYRIC 的说明 */
   private autoMatchLyric: boolean = true;
   /**
@@ -238,10 +247,21 @@ export class PlaySettings {
     }
   }
 
+  /**
+   * 读回落盘值。
+   *
+   * desktopLyric 的版本迁移：v1 里它默认就是「开」，而用户只要改过任意一项播放设置
+   * （哪怕没碰桌面歌词），整个文件都会被写一遍 —— 于是「默认开」也被当作用户的选择存了下来。
+   * 这次默认改成「关」之后，v1 的 desktopLyric 一律丢弃、按新默认（关）处理，其余字段照旧
+   * 读回；从 v2 起 desktopLyric 才真正代表用户的选择。
+   */
   private apply(data: PlaySettingsData): void {
-    if (data.version !== SETTINGS_VERSION) {
+    const version: number = data.version === undefined ? 0 : data.version;
+    if (version > SETTINGS_VERSION) {
+      // 比本版更新：字段含义可能已经变了，整份按默认处理
       return;
     }
+    const trustDesktopLyric: boolean = version >= 2;
     const quality: string | undefined = data.quality;
     if (quality !== undefined && MAIN_QUALITYS.includes(quality)) {
       this.quality = quality;
@@ -268,7 +288,7 @@ export class PlaySettings {
     if (data.lyricKeepScreenOn !== undefined) {
       this.lyricKeepScreenOn = data.lyricKeepScreenOn;
     }
-    if (data.desktopLyric !== undefined) {
+    if (data.desktopLyric !== undefined && trustDesktopLyric) {
       this.desktopLyric = data.desktopLyric;
     }
     if (data.autoMatchLyric !== undefined) {

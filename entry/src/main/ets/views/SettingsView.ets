@@ -1,6 +1,6 @@
 import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
-import { I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
+import { I_BOOK, I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
   I_VOLUME, IconGlyph } from '../ui/Icons';
 import { TopFade } from '../ui/Widgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
@@ -31,6 +31,16 @@ const GROUP_PLAY: SettingRowDef[] = [
 
 const GROUP_THEME: SettingRowDef[] = [
   { icon: I_BRUSH, title: '外观', action: 'appearance' },
+];
+
+/**
+ * 听书
+ *
+ * 目前一项：隐藏「听书」页签。**它必须留在设置里** —— 页签一藏，听书页就没入口了，
+ * 这一页是把它找回来的唯一地方（我的 → 设置 → 听书）。
+ */
+const GROUP_LISTEN: SettingRowDef[] = [
+  { icon: I_BOOK, title: '听书', action: 'listen' },
 ];
 
 /**
@@ -284,6 +294,14 @@ export struct SettingsView {
             this.cardGroup(GROUP_THEME)
             this.hint('玻璃材质档位、封面取色、深浅模式都在这一页；'
               + '标题栏与底部页签栏用的是同一档材质')
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 听书
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_LISTEN)
+            this.hint('可以在这里把「听书」页签从底部导航栏里隐藏掉；'
+              + '页签隐藏之后，这一页就是把它找回来的入口')
           }
           .width(cardWidthOf(this.windowWidth))
 

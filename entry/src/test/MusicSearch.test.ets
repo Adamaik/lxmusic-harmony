@@ -4,6 +4,7 @@ import {
   LxMusicInfo,
   createMgSignature,
   decodeName,
+  dedupeSongs,
   formatPlayTime,
   formatSingerName,
   hasQuality,
@@ -11,7 +12,10 @@ import {
   parseKwResult,
   parseMgResult,
   pickQuality,
+  searchIdOf,
+  similar,
   sizeFormate,
+  sortByRelevance,
 } from '../main/ets/core/music/MusicSearch';
 
 /** 酷我搜索响应片段 */
@@ -112,6 +116,18 @@ function recordOf(v: Object | undefined): Record<string, Object> {
   return (v !== null && v !== undefined && typeof v === 'object') ? v as Record<string, Object> : {};
 }
 
+/** 造一条 kw 结果（只带排序/去重需要的字段），再把 source 改成要测的平台 */
+function makeInfo(mid: string, name: string, artist: string, duration: number,
+  source: string = 'kw'): LxMusicInfo {
+  const row: string =
+    `{"MUSICRID":"MUSIC_${mid}","SONGNAME":"${name}","ARTIST":"${artist}",` +
+    `"DURATION":"${duration}","N_MINFO":"level:h,bitrate:128,format:mp3,size:3.00M"}`;
+  const parsed: LxMusicInfo[] = parseKwResult(JSON.parse(`[${row}]`) as Object[]);
+  const info: LxMusicInfo = parsed[0];
+  info.source = source;
+  return info;
+}
+
 export default function musicSearchTest() {
   describe('musicSearchTest', () => {
     it('md5MatchesKnownVectors', 0, () => {
@@ -197,7 +213,8 @@ export default function musicSearchTest() {
       expect(info.name).assertEqual('晴天');
       expect(info.singer).assertEqual('周杰伦');
       expect(info.songmid).assertEqual('6009');
-      expect(info.img).assertEqual('http://d.musicapp.migu.cn/img/cover.jpg');
+      // 咪咕给的是相对路径，要补成绝对地址，且跟宿主 d.musicapp.migu.cn 一样用 https
+      expect(info.img).assertEqual('https://d.musicapp.migu.cn/img/cover.jpg');
       expect(hasQuality(info, '128k')).assertTrue();
       expect(hasQuality(info, 'flac')).assertTrue();
       expect(hasQuality(info, '320k')).assertFalse();
@@ -218,6 +235,81 @@ export default function musicSearchTest() {
       expect(pickQuality('flac24bit', ['128k'], info)).assertEqual('128k');
       // 期望 128k -> 128k
       expect(pickQuality('128k', supported, info)).assertEqual('128k');
+    });
+
+    // ------------------------------------------------ 聚合搜索：排序与去重（D-008）
+
+    it('similarRanksIdenticalHighestAndEmptyLowest', 0, () => {
+      // 与洛雪 utils/common.js 的 similar 同口径：1 - 编辑距离 / 长串长度
+      expect(similar('晴天 周杰伦', '晴天 周杰伦')).assertEqual(1);
+      expect(similar('晴天 周杰伦', '等晴天 周深')).assertEqual(0.5);
+      expect(similar('', '晴天')).assertEqual(0);
+      expect(similar('晴天', '')).assertEqual(0);
+    });
+
+    it('sortsSearchResultByRelevance', 0, () => {
+      const items: LxMusicInfo[] = [
+        makeInfo('3', '雨', '某人', 200),
+        makeInfo('1', '晴天', '周杰伦', 269),
+        makeInfo('2', '等晴天', '周深', 240),
+      ];
+      const ranked: LxMusicInfo[] = sortByRelevance(items, '晴天 周杰伦');
+      expect(ranked.length).assertEqual(3);
+      expect(ranked[0].name).assertEqual('晴天');
+      expect(ranked[1].name).assertEqual('等晴天');
+      expect(ranked[2].name).assertEqual('雨');
+    });
+
+    it('dedupesSameSongAcrossPlatforms', 0, () => {
+      // 同一首歌在五个平台各一条：只留先问的那个平台那一份（酷我）
+      const items: LxMusicInfo[] = [
+        makeInfo('1', '晴天', '周杰伦', 269, 'kw'),
+        makeInfo('9', '晴天', '周杰伦', 270, 'tx'),
+        makeInfo('7', '晴天', '周杰伦', 271, 'mg'),
+      ];
+      const kept: LxMusicInfo[] = dedupeSongs(items);
+      expect(kept.length).assertEqual(1);
+      expect(kept[0].source).assertEqual('kw');
+      expect(kept[0].songmid).assertEqual('1');
+    });
+
+    it('dedupesSameSongWithReorderedSingers', 0, () => {
+      // 歌手顺序 / 分隔符不同也要认成同一首歌（洛雪的 singersRxp + sortSingle）
+      const items: LxMusicInfo[] = [
+        makeInfo('1', '晴天', '周杰伦&方文山', 269, 'kw'),
+        makeInfo('9', '晴天', '方文山/周杰伦', 269, 'tx'),
+      ];
+      expect(dedupeSongs(items).length).assertEqual(1);
+    });
+
+    it('keepsDifferentVersionsOfSameName', 0, () => {
+      // 同名同歌手但时长差得多 = 不是同一条录音（现场版 / 伴奏），都要留着
+      const items: LxMusicInfo[] = [
+        makeInfo('1', '晴天', '周杰伦', 269, 'kw'),
+        makeInfo('2', '晴天', '周杰伦', 370, 'kw'),
+        makeInfo('3', '晴天 (Live)', '周杰伦', 269, 'kw'),
+      ];
+      const kept: LxMusicInfo[] = dedupeSongs(items);
+      expect(kept.length).assertEqual(3);
+    });
+
+    it('dedupesSamePlatformSameId', 0, () => {
+      // 同一平台把同一条返回两遍（同一 id）也要去掉
+      const items: LxMusicInfo[] = [
+        makeInfo('1', '晴天', '周杰伦', 269, 'kw'),
+        makeInfo('1', '晴天', '周杰伦', 269, 'kw'),
+      ];
+      expect(dedupeSongs(items).length).assertEqual(1);
+    });
+
+    it('buildsStableIdLikeSyncStructure', 0, () => {
+      // 与 MusicId.musicIdOf / SyncConvert 同一套规则：酷狗多带一节 hash
+      expect(searchIdOf(makeInfo('1', '晴天', '周杰伦', 269, 'kw'))).assertEqual('kw_1');
+      expect(searchIdOf(makeInfo('1', '晴天', '周杰伦', 269, 'tx'))).assertEqual('tx_1');
+      const kg: LxMusicInfo = makeInfo('1', '晴天', '周杰伦', 269, 'kg');
+      expect(searchIdOf(kg)).assertEqual('1_');
+      kg.hash = 'HASH';
+      expect(searchIdOf(kg)).assertEqual('1_HASH');
     });
   });
 }

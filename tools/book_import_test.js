@@ -29,6 +29,12 @@ const DOWNLOAD_MANAGER = path.join(ROOT, 'entry/src/main/ets/core/download/Downl
 const PLAY_SESSION = path.join(ROOT, 'entry/src/main/ets/core/player/PlaySession.ets');
 const BOOK_DETAIL = path.join(ROOT, 'entry/src/main/ets/views/BookDetailView.ets');
 const MEDIA_CACHE = path.join(ROOT, 'entry/src/main/ets/core/music/MediaCache.ets');
+const BOOK_STORE = path.join(ROOT, 'entry/src/main/ets/core/book/BookSourceStore.ets');
+const BOOK_TYPES = path.join(ROOT, 'entry/src/main/ets/core/book/BookTypes.ets');
+const LISTEN_VIEW = path.join(ROOT, 'entry/src/main/ets/views/ListenView.ets');
+const LOGIN_WEB = path.join(ROOT, 'entry/src/main/ets/components/BookLoginWeb.ets');
+const INDEX_PAGE = path.join(ROOT, 'entry/src/main/ets/pages/Index.ets');
+const BOOK_PRELOAD = path.join(ROOT, 'entry/src/main/resources/rawfile/book_preload.js');
 const SOURCE_DIRS = [
   path.resolve(ROOT, '..', '听书的源'),
   'C:/Users/Lenovo/Downloads',
@@ -110,11 +116,13 @@ function importSources(text, store) {
  * BookEngine.buildJob 的复刻：源正文**原样字符串拼接**进作业，不是嵌套对象。
  * 这里最容易出事 —— 拼坏了就是「沙箱收到一个残缺的书源」。
  */
-function buildJob(action, sourceRaw, params, netCache) {
+function buildJob(action, sourceRaw, params, netCache, netHeaders, login) {
   const parts = [
     `"action":${JSON.stringify(action)}`,
     `"source":${sourceRaw}`,
+    `"login":${JSON.stringify(login || {})}`,
     `"netCache":${JSON.stringify(netCache)}`,
+    `"netHeaders":${JSON.stringify(netHeaders || {})}`,
   ];
   parts.push(`"bookSourceName":""`);
   for (const key of Object.keys(params)) {
@@ -487,11 +495,104 @@ async function liveCase(win, imported, keyword) {
   }
 }
 
-// ------------------------------------------------------------ main
+/**
+ * 书源登录（2026-09-28）：登录信息要从弹窗一路流到沙箱
+ *
+ * 这条链最容易断在中间：界面填了、也存了，但 `buildJob` 没把 `login` 下发，
+ * 沙箱里 `source.getLoginInfoMap()` 就是空的 —— 表现为「明明登录了还是解析不出音频」。
+ * 所以把每一段的接线都钉住。
+ */
+function guardLoginWiring() {
+  console.log('\n== 静态守卫：书源登录的接线 ==');
+  let engine = '';
+  let store = '';
+  let types = '';
+  let view = '';
+  let preload = '';
+  try {
+    engine = stripComments(fs.readFileSync(ENGINE, 'utf8'));
+    store = stripComments(fs.readFileSync(BOOK_STORE, 'utf8'));
+    types = stripComments(fs.readFileSync(BOOK_TYPES, 'utf8'));
+    view = stripComments(fs.readFileSync(LISTEN_VIEW, 'utf8'));
+    preload = fs.readFileSync(BOOK_PRELOAD, 'utf8');
+  } catch (e) {
+    check('读得到登录相关的源文件', false, e.message);
+    return;
+  }
+  // 作业里必须带 login，否则沙箱拿不到登录信息
+  check('buildJob 把 login 下发进作业', /"login":\$\{JSON\.stringify\(login\)\}/.test(engine));
+  check('run 每次都读该源的登录信息', /getLoginInfo\(sourceId\)/.test(engine));
+  // 弹窗：读 loginUi、跑动作、落盘
+  check('BookEngine 解析 loginUi', /parsed\['loginUi'\]/.test(engine));
+  check('BookEngine 有 runLoginAction', /runLoginAction\s*\(/.test(engine));
+  check('BookEngine 有 checkLogin', /async checkLogin\s*\(/.test(engine));
+  check('登录结果带回登录信息表', /out\.login\[key\]\s*=/.test(engine));
+  // 沙箱侧
+  check('沙箱支持 login 动作', /action === 'login'/.test(preload));
+  check('沙箱有 source.putLoginInfo', /putLoginInfo: function/.test(preload));
+  check('沙箱有 java.toast', /toast: function/.test(preload));
+  check('沙箱把 infoMap 绑给登录脚本', /infoMap: CUR_LOGIN/.test(preload));
+  // 持久化：与书源正文分开存，重导书源不冲掉登录
+  check('登录信息单独落盘', /loginPath/.test(store) && /saveLoginInfo/.test(store));
+  check('删除书源时清掉登录信息', /clearLoginInfo\(id\)/.test(store));
+  // 界面：需登录的源有登录入口 + 弹窗
+  check('书源列表给 needLogin 的源一个登录钮', /info\.needLogin/.test(view) && /openLogin\(info\)/.test(view));
+  // 文案随登录状态切换；并且状态要进 @State + ForEach key，否则按 id diff 不会重建条目
+  check('登录钮按登录状态切换文案（登录 / 重新登录）',
+    /重新登录/.test(view) && /'重新登录' : '登录'/.test(view));
+  check('登录状态用 @State 驱动并进 ForEach key',
+    /loggedIds/.test(view) && /\$\{info\.id\}\|\$\{this\.isLoggedIn\(info\)/.test(view));
+  check('已登录后不再显示「需登录」角标',
+    /info\.needLogin && !this\.isLoggedIn\(info\)/.test(view));
+  check('登录弹窗只有「网页登录」，没有再手填表单',
+    /@Builder\s*\n?\s*loginSheet/.test(view) && /网页登录/.test(view)
+      && !/this\.loginItems/.test(view) && !/runLoginButton/.test(view));
+  // 书源的 loginUrl 常常不是登录页（喜马拉雅写的是站址、播客写的是 Tengine 默认页），
+  // 所以要有一张实测过的「站点 -> 真实登录页」表兜底
+  check('登录页解析：内置真实登录页表 + 像登录页才直接用 loginUrl',
+    /LOGIN_PAGES/.test(engine) && /mappedLoginPage/.test(engine) && /looksLikeLoginPage/.test(engine));
+  check('喜马拉雅 / 哔哩哔哩 的真实登录页在表里',
+    /passport\.ximalaya\.com\/page\/web\/login/.test(engine) && /passport\.bilibili\.com\/login/.test(engine));
+  // 类型
+  check('BookTypes 定义了登录界面项与结果', /BookLoginUiItem/.test(types) && /BookLoginResult/.test(types));
 
+  // 网页登录：应用内打开站点登录页 → 抓 Cookie → 落盘 + 宿主请求带上
+  let web = '';
+  try {
+    web = stripComments(fs.readFileSync(LOGIN_WEB, 'utf8'));
+  } catch (e) {
+    check('读得到 BookLoginWeb.ets', false, e.message);
+    return;
+  }
+  check('网页登录用 WebCookieManager 抓 Cookie',
+    /WebCookieManager\.fetchCookieSync/.test(web) && /WebCookieManager\.saveCookieSync/.test(web));
+  check('BookEngine 提供网页登录入口与保存',
+    /loginPageUrl\s*\(/.test(engine) && /saveWebLogin\s*\(/.test(engine));
+  check('抓来的 Cookie 会写进登录信息表的 Cookie 键',
+    /info\['Cookie'\]\s*=/.test(engine));
+  check('宿主请求带上登录 Cookie（loginCookieOf 用在 fetchOne）',
+    /loginCookieOf\(sourceId\)/.test(engine) && /loginCookieOf/.test(engine) && /loginCookie\.length > 0 \? loginCookie/.test(engine));
+  check('沙箱 java.getCookie 读登录 Cookie',
+    /getCookie: function \(domain, name\)/.test(preload) && /loginCookieString\(\)/.test(preload));
+  check('界面用整屏 cover 打开登录页',
+    /bindContentCover/.test(view) && /openWebLogin\(\)/.test(view) && /onWebLoginClosed/.test(view));
+  // 整屏覆盖层铺满窗口、不经过标题栏，顶栏必须自己避开状态栏（否则「完成」被压在状态栏下）
+  check('网页登录顶栏避开状态栏', /safeTop/.test(web) && /this\.safeTop \+ 6/.test(web));
+  check('覆盖层底部避开手势条', /safeBottom/.test(web) && /this\.safeBottom \+ 6/.test(web));
+  let indexSrc = '';
+  try {
+    indexSrc = stripComments(fs.readFileSync(INDEX_PAGE, 'utf8'));
+  } catch (e) {
+    indexSrc = '';
+  }
+  check('壳层把纯状态栏高度传给听书页', /safeTop: this\.topInset/.test(indexSrc) && /safeBottom: this\.bottomInset/.test(indexSrc));
+}
+
+// ------------------------------------------------------------ main
 (async () => {
   const imported = offlineCases();
   guardFileImport();
+  guardLoginWiring();
   downloadCases();
 
   const args = process.argv.slice(2);

@@ -15,6 +15,10 @@
     {
       "name": "reason_internet",
       "value": "用于下载音源脚本与解析音乐播放链接"
+    },
+    {
+      "name": "reason_microphone",
+      "value": "用于听歌识曲：录一小段环境声音来识别正在播放的歌曲"
     }
   ]
 }

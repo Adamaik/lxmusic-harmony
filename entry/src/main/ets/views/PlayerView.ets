@@ -51,6 +51,22 @@ const TRACK_INSET: number = BLOCK_SIZE / 2;
 /** 进度条宽度变化的过渡时长：缓冲是分块长出来的，加个短过渡看着才像连续走 */
 const TRACK_ANIM_MS: number = 260;
 
+/** 窄屏封面边长（vp）：手机上试出来的尺寸，要能塞进一屏还能露出歌名与控件 */
+const COVER_SIZE_PHONE: number = 252;
+/** 封面边长的下限：窗口再矮也留一个还认得出是封面的尺寸 */
+const COVER_SIZE_MIN: number = 120;
+/** 宽屏（平板 / 折叠屏展开）封面边长的上限 */
+const COVER_SIZE_MAX: number = 300;
+/**
+ * 封面块里除封面本身占掉的高度（vp）
+ *
+ * 封面下面那行歌名 / 歌手（约 58）+ 封面与它之间的间距 26。算「这个高度放得下多大的
+ * 封面」时要先把它刨掉，否则封面会把歌名那行挤出去。
+ */
+const COVER_BLOCK_CHROME: number = 84;
+/** 封面左右的留白（coverBlock 的 padding，宽屏算半栏能放多宽时要用） */
+const COVER_SIDE_PADDING: number = 60;
+
 /**
  * 全屏播放器
  *
@@ -125,6 +141,14 @@ export struct PlayerView {
    * 播放/暂停时封面「弹」一下，是这类播放器最容易被记住的一处细节。
    */
   @State coverSpringScale: number = 1;
+  /**
+   * 量到的「封面区」可用高度（vp，0 = 还没量到）
+   *
+   * 宽屏左栏与窄屏封面页各自把自己那块的高度报上来（见 rememberCoverArea），
+   * 封面按它收缩 —— 横屏 / 折叠屏展开时窗口又宽又矮，写死 252 的封面会整个压到
+   * 下面的进度条与播放钮上（见 coverBoxSize）。
+   */
+  @State coverAreaHeight: number = 0;
   private controller: SwiperController = new SwiperController();
   private lyricScroller: Scroller = new Scroller();
   /** 弹簧的目标值与速度（速度不参与渲染，不需要 @State） */
@@ -140,6 +164,8 @@ export struct PlayerView {
     // 进来时正在播就直接是放大的样子，不要从 1 弹一下（那是给「切播放状态」用的）
     this.coverSpringTarget = this.playing() ? 1.05 : 0.95;
     this.coverSpringScale = this.coverSpringTarget;
+    // 歌词列表也对到当前那句（宽屏下歌词栏一开始就摆着，靠的就是这一次）
+    this.alignLyricScrollSoon();
   }
 
   aboutToDisappear(): void {
@@ -211,13 +237,47 @@ export struct PlayerView {
    * 窄屏 252 是手机上试出来的尺寸（要能塞进一屏还能露出歌名与控件）；
    * 宽屏左边那一栏宽度富余得多，按窗口宽度的两成放大一点（封顶 300），
    * 免得在平板上一大栏里孤零零摆一张小图。
+   *
+   * 但**只看宽度是不够的**：宽屏左栏是「封面区 + 控件条」上下叠，封面区的高度来自窗口
+   * 高度，横屏 / 折叠屏展开这类「宽而矮」的窗口下它比封面本身还矮。封面若是个死数，
+   * 就会整个压到下面的进度条与播放钮上（代码注释里原本写的「窗口矮的时候先压缩封面区」
+   * 也因此没做到）。所以这里再收两次：
+   *   - 按**半栏宽度**收：宽屏左右各半栏，600vp 窗口下半栏只有 300，252 加左右各 30 的
+   *     留白（312）本来就比它宽；
+   *   - 按**量到的封面区高度**收：刨掉歌名那行占的高度，剩下的才是封面能给的最大边长。
    */
   private coverBoxSize(): number {
-    if (!this.wide()) {
-      return 252;
+    let size: number = COVER_SIZE_PHONE;
+    if (this.wide()) {
+      const byWidth: number = Math.round(this.windowWidth * 0.2);
+      size = Math.max(COVER_SIZE_PHONE, Math.min(COVER_SIZE_MAX, byWidth));
+      const paneFit: number = Math.round(this.windowWidth / 2) - COVER_SIDE_PADDING;
+      if (paneFit > 0) {
+        size = Math.min(size, paneFit);
+      }
     }
-    const sized: number = Math.round(this.windowWidth * 0.2);
-    return Math.max(252, Math.min(300, sized));
+    const area: number = this.coverAreaHeight;
+    if (area > 0) {
+      size = Math.min(size, Math.round(area) - COVER_BLOCK_CHROME);
+    }
+    return Math.max(COVER_SIZE_MIN, size);
+  }
+
+  /**
+   * 记下封面区的高度
+   *
+   * `onSizeChange` 是布局过程中同步回调的，官方文档明确提醒：在里面直接改状态会被卷进
+   * 当帧的动画闭包（播放器正好一直在跑封面弹簧与翻页动画），所以推到下一个任务里再改。
+   * 这里不会来回震荡：封面区的尺寸由 layoutWeight / 整页高度定死，跟封面自己多大无关。
+   */
+  private rememberCoverArea(area: SizeOptions): void {
+    const raw = area.height;
+    if (typeof raw !== 'number' || raw <= 0) {
+      return;
+    }
+    setTimeout(() => {
+      this.coverAreaHeight = raw;
+    }, 0);
   }
 
   private toast(message: string): void {
@@ -842,6 +902,39 @@ export struct PlayerView {
     }
   }
 
+  /**
+   * 把歌词列表对到「当前唱到的那一句」
+   *
+   * 进播放器、从封面页滑到歌词页时都要对一次。
+   *
+   * 为什么不能只靠 {@link onProgressChanged}：它只在**行号变化**时才滚，而列表刚挂载
+   * 那一瞬间 `scrollToIndex` 还落不下去（那一滚被丢掉之后行号已经记下了，不会再补）——
+   * 于是歌词页会一直停在开头那几句，当前那句在视口外，看着就像"歌词不跟着走"。
+   * 这里在「页面真正可见」的时刻无条件再对一次，把这个洞补上。
+   */
+  private alignLyricScroll(): void {
+    const index: number = activeLyricIndex(this.lyricLines, this.progress);
+    if (index < 0) {
+      // 没有时间轴（time 全是 -1）：对到第一句，与 onLyricChanged 一致
+      this.scrollToLine(0);
+      return;
+    }
+    this.activeLine = index;
+    this.scrollToLine(index);
+  }
+
+  /**
+   * 晚一帧再对一次歌词位置
+   *
+   * 列表刚挂载时高度还没量出来，`scrollToIndex` 会被丢掉，所以打开播放器时不能只对一次：
+   * 下一帧再补一次（宽屏下歌词栏一开始就摆出来，靠的就是这一次）。
+   */
+  private alignLyricScrollSoon(): void {
+    setTimeout(() => {
+      this.alignLyricScroll();
+    }, 80);
+  }
+
   @Builder
   pageIndicator() {
     Row({ space: 5 }) {
@@ -1013,6 +1106,13 @@ export struct PlayerView {
     }
     .width('100%')
     .height('100%')
+    // 把这一页量到的高度报给封面：够高才放得下 252 的封面，窗口矮时封面要跟着缩，
+    // 不然会溢出到下面的控件上（见 coverBoxSize）
+    .onSizeChange((oldValue: SizeOptions, newValue: SizeOptions) => {
+      this.rememberCoverArea(newValue);
+    })
+    // 兜底：万一还是比这页高，就裁掉而不是压到控件上
+    .clip(true)
   }
 
   /**
@@ -1020,8 +1120,9 @@ export struct PlayerView {
    *
    * 与华为音乐的平板播放页同一个版式：左边这一栏自己就是一台完整的播放器，
    * 右边那一栏专门放歌词，两边同时看得见，不需要再左右翻页。
-   * 封面那一块装在 `layoutWeight(1)` 的区域里居中 —— 窗口矮的时候先压缩封面区，
-   * 控件不会被顶出屏幕。
+   * 封面那一块装在 `layoutWeight(1)` 的区域里居中，并且**这一块的高度也报给封面**：
+   * 窗口矮（横屏 / 折叠屏展开）时封面按量到的高度缩小，控件不会被顶出屏幕，也不会被封面压住
+   * （见 coverBoxSize）；真缩不下的极端尺寸再靠 clip 裁掉，总之不越界。
    */
   @Builder
   wideLeftPane() {
@@ -1034,6 +1135,11 @@ export struct PlayerView {
       }
       .width('100%')
       .layoutWeight(1)
+      .onSizeChange((oldValue: SizeOptions, newValue: SizeOptions) => {
+        this.rememberCoverArea(newValue);
+      })
+      // 兜底：封面区比封面块还矮时裁掉，别压到下面的控件上
+      .clip(true)
 
       this.controlBar()
     }
@@ -1074,52 +1180,69 @@ export struct PlayerView {
    *
    * 用 List + Scroller：当前行由播放进度算出来，scrollToIndex(CENTER) 把它滚到中间；
    * 首尾各垫一个占位行，短歌词也能滚到正中间（否则头尾几句永远贴着边）。
+   *
+   * 背景**不要**写在这一页自己的 Column 上：`.backgroundColor(Color.Transparent)`
+   * 在 Swiper 的页里会连成一层不透明的黑，把播放器背后那层封面模糊整个盖住 ——
+   * 表现就是「歌词页是一整块黑底，别的页面正常透出封面模糊」。所以这里跟封面页
+   * （coverPage，它本来就不设背景）保持同一套写法：
+   *   - 「歌词页模糊效果」开着（默认）时，这一页**不设任何背景**，背后的封面模糊照常透出来；
+   *   - 关掉时才额外压一层纯深色，把背后的封面模糊盖住（这才是那一项的本意）。
    */
   @Builder
   lyricPage() {
-    Column() {
-      if (this.lyricStatus === 'loading') {
-        Column({ space: 10 }) {
-          LoadingProgress().width(28).height(28).color('#8CFFFFFF')
-          Text('正在加载歌词…')
-            .fontSize(13)
-            .fontColor('#8CFFFFFF')
-        }
-      } else if (this.lyricLines.length === 0) {
-        Column({ space: 8 }) {
-          Text('暂无歌词')
-            .fontSize(16)
-            .fontColor('#8CFFFFFF')
-          Text(PlaySession.getInstance().current === null ? '先点一首歌' : '音源和内置平台都没取到这首的歌词')
-            .fontSize(12.5)
-            .fontColor('#59FFFFFF')
-        }
-      } else {
-        List({ scroller: this.lyricScroller }) {
-          ListItem() {
-            Column().width('100%').height(200)
-          }
-          ForEach(this.lyricLines, (line: LyricLine, index: number) => {
-            ListItem() {
-              this.lyricLine(line, index)
-            }
-          }, (line: LyricLine, index: number) => `${index}_${line.time}_${line.text}`)
-          ListItem() {
-            Column().width('100%').height(200)
-          }
-        }
-        .scrollBar(BarState.Off)
-        .edgeEffect(EdgeEffect.Spring)
-        .width('100%')
-        .height('100%')
+    Stack() {
+      // 关掉「歌词页模糊效果」：压一层纯深色底（见上面的说明）
+      if (!this.lyricBlur) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('#0C0C0E')
       }
+
+      Column() {
+        if (this.lyricStatus === 'loading') {
+          Column({ space: 10 }) {
+            LoadingProgress().width(28).height(28).color('#8CFFFFFF')
+            Text('正在加载歌词…')
+              .fontSize(13)
+              .fontColor('#8CFFFFFF')
+          }
+        } else if (this.lyricLines.length === 0) {
+          Column({ space: 8 }) {
+            Text('暂无歌词')
+              .fontSize(16)
+              .fontColor('#8CFFFFFF')
+            Text(PlaySession.getInstance().current === null ? '先点一首歌' : '音源和内置平台都没取到这首的歌词')
+              .fontSize(12.5)
+              .fontColor('#59FFFFFF')
+          }
+        } else {
+          List({ scroller: this.lyricScroller }) {
+            ListItem() {
+              Column().width('100%').height(200)
+            }
+            ForEach(this.lyricLines, (line: LyricLine, index: number) => {
+              ListItem() {
+                this.lyricLine(line, index)
+              }
+            }, (line: LyricLine, index: number) => `${index}_${line.time}_${line.text}`)
+            ListItem() {
+              Column().width('100%').height(200)
+            }
+          }
+          .scrollBar(BarState.Off)
+          .edgeEffect(EdgeEffect.Spring)
+          .width('100%')
+          .height('100%')
+        }
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ left: 26, right: 26 })
     }
     .width('100%')
     .height('100%')
-    .justifyContent(FlexAlign.Center)
-    .padding({ left: 26, right: 26 })
-    // 关掉「歌词页模糊效果」时压一层纯深色底，把这页背后的封面模糊盖住
-    .backgroundColor(this.lyricBlur ? Color.Transparent : '#0C0C0E')
   }
 
   /** 播放钮：圆形白色底 + 居中播放/暂停图形（和迷你播放器里那颗播放钮同一种形状） */
@@ -1514,6 +1637,17 @@ export struct PlayerView {
           .onChange((index: number) => {
             this.pageIndex = index;
             this.syncKeepScreenOn();
+          })
+          /**
+           * 滑到歌词页后把列表对到当前那句
+           *
+           * 用 onAnimationEnd 而不是 onChange：onChange 在翻页动画一开始就回调，
+           * 那一刻新页还没量好高度，滚了也会被丢掉；动画结束（页已经摆好）再滚才有效。
+           */
+          .onAnimationEnd((index: number) => {
+            if (index === 1) {
+              this.alignLyricScroll();
+            }
           })
 
           // 控制区（窄屏时整条铺在双页下面）

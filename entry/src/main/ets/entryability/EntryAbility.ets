@@ -9,10 +9,14 @@ import { WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { WebDavSettings } from '../core/webdav/WebDavSettings';
 import { AudioCache } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
+import { SearchHistory } from '../core/music/SearchHistory';
+import { RecognitionHistory } from '../core/recognize/RecognitionHistory';
 import { SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
 import { PlaySettings } from '../core/settings/PlaySettings';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
+import { RecommendSettings } from '../core/settings/RecommendSettings';
+import { ListenSettings } from '../core/settings/ListenSettings';
 import { DownloadSettings } from '../core/download/DownloadSettings';
 import { DownloadManager } from '../core/download/DownloadManager';
 
@@ -36,12 +40,22 @@ export default class EntryAbility extends UIAbility {
     // 缓存：元数据（播放地址 / 歌词）与播放缓存都要沙箱目录，同样尽早初始化
     MediaCache.getInstance().init(this.context);
     AudioCache.getInstance().init(this.context);
+    // 搜索历史：搜索页第一帧就要显示它（读一次 JSON，很快），也在这里读回来
+    SearchHistory.getInstance().init(this.context);
+    // 听歌识曲的识别历史：识别页第一帧就要显示它，同样在这里读回来
+    RecognitionHistory.getInstance().init(this.context);
     // 播放设置（音质 / 歌词 / 音频焦点）要读回上次的选择，而且必须早于界面创建：
     // 界面用 @StorageLink 订阅它发布的值，晚了第一帧会拿到默认值。
     PlaySettings.getInstance().init(this.context);
     // 外观设置（材质档位 / 封面圆角 / 深浅模式）：同样要早于界面创建，
     // 界面用 @StorageLink 订阅它发布的值。
     AppearanceSettings.getInstance().init(this.context);
+    // 推荐设置（首页推荐来源）：要早于界面创建，标题栏的来源胶囊与推荐页
+    // 用 @StorageLink 订阅它发布的值，晚了第一帧会回到默认的酷我
+    RecommendSettings.getInstance().init(this.context);
+    // 听书设置（是否隐藏「听书」页签）：同样要早于界面创建，壳层按它决定导航栏里
+    // 摆哪几栏（页签栏的序号由 TabContent 的位置决定，晚了第一帧会闪一下）
+    ListenSettings.getInstance().init(this.context);
     // 下载：设置要先读回来（文件名格式 / 保存位置），管理器的索引也要在界面（我的页）
     // 建出来之前恢复好，否则列表第一帧是空的
     DownloadSettings.getInstance().init(this.context);

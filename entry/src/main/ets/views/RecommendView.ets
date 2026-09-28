@@ -4,6 +4,7 @@ import { I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_MIC, I_PLAY, IconGlyph } from '../ui
 import { CoverArt, SectionTitle, TopFade } from '../ui/Widgets';
 import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { K_RECOMMEND_SOURCE } from '../core/settings/RecommendSettings';
 import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /** 在线排行榜卡片 */
@@ -155,13 +156,13 @@ class PlaylistSource implements IDataSource {
 }
 
 /**
- * 推荐来源的持久化键（放在 AppStorage 里，切页签回来还在）
+ * 推荐来源
  *
- * 导出给壳层用：「推荐来源」那个胶囊跟「搜索」钮一起搬进了标题栏 —— 沉浸光感只在
+ * 「推荐来源」那个胶囊跟「搜索」钮一起搬进了标题栏 —— 沉浸光感只在
  * Navigation 标题栏 / 底部 TabBar 里生效（见 ui/Glass.ets 的开头说明），所以改这个值
- * 的人变成了壳层，本页只订阅它、变了就重新取数。
+ * 的人变成了壳层，本页只订阅它、变了就重新取数。这个值由 RecommendSettings 落到
+ * 沙箱（见 core/settings/RecommendSettings.ets），杀进程重进还是上次选的来源。
  */
-export const K_RECOMMEND_SOURCE: string = 'recommend_source';
 
 /**
  * 推荐页

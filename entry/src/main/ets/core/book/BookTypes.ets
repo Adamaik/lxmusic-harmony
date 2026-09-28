@@ -101,6 +101,44 @@ export interface BookAudio {
 }
 
 /**
+ * 书源登录弹窗里的一项（对应阅读书源 JSON 里的 `loginUi`）
+ *
+ * 阅读的 `loginUi` 是一段 JSON（字符串或数组），每项：
+ *   - `{name, title, type:'text'|'password'}` → 一个输入框，key = name || title
+ *   - `{title, type:'text', value:'…说明文字…'}` → 纯说明（没有 name，只有 value）
+ *   - `{title|name, type:'button', action:'@js: …'}` → 一个按钮，点了在沙箱里跑 action
+ * 这里把它规整成固定字段，界面只管渲染。
+ */
+export interface BookLoginUiItem {
+  /** 存进登录信息表的键（没写 name 就用 title） */
+  name: string;
+  /** 显示出来的标题 / 按钮文字 */
+  title: string;
+  /** text / password / button / select */
+  type: string;
+  /** 输入框的默认值；纯说明项里就是说明正文 */
+  value: string;
+  /** 按钮点击要跑的 JS（`@js:` 规则） */
+  action: string;
+  /** 输入框的提示语 */
+  placeholder: string;
+  /** 这一项当「说明文字」渲染而不是输入框 */
+  isHint: boolean;
+}
+
+/** 一次登录动作（按钮 / 检查登录）的结果 */
+export interface BookLoginResult {
+  /** 规则算出来的字符串（「检查登录」时就是判断结果） */
+  result: string;
+  /** 动作跑完后完整的登录信息表（宿主落盘） */
+  login: Record<string, string>;
+  /** 规则里 java.toast 说的话 */
+  toasts: string[];
+  /** 规则里 startBrowser 要打开的地址（登录页） */
+  openUrl: string;
+}
+
+/**
  * 队列条目里 book 类歌曲的载荷
  *
  * 与在线歌用 musicInfoJson 装 musicInfo 是同一个套路：SongItem 没有多余的字段，

@@ -184,14 +184,12 @@ function normalizeName(name: string): string {  let out: string = '';
   return out;
 }
 
-/** 缺 songmid 的条目用的序号（保证列表里的 key 唯一） */
-let itemSeq: number = 0;
-
 /**
  * 两条记录是不是同一首歌
  *
  * 不能用 id 直接比：队列落库再读回来时，条目 id 会变成洛雪新格式的
- * `${source}_${songmid}`（见 SyncConvert.fromLxMusicInfo），跟界面上的 `search_12` 对不上。
+ * `${source}_${songmid}`（见 SyncConvert.fromLxMusicInfo），跟缺 songmid 的条目
+ * 在界面上那个 `search_...` 兜底 id 对不上。
  * 所以按 musicInfo 里的「平台 + 歌曲 id（+ 酷狗的 hash）」比，这才是一首歌的真正身份；
  * 没有 musicInfo 的条目退回「歌名 + 歌手」。
  */
@@ -222,13 +220,12 @@ export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
   // （见 core/music/MusicId），两边不一致会出现「收藏了却查不到」（爱心不亮、重复收藏）。
   const songmid: string =
     info.songmid !== undefined && info.songmid !== null ? String(info.songmid) : '';
-  if (songmid.length === 0) {
-    // 缺 songmid 的条目同步不出去（SyncConvert 判它不可同步），也就不会出现在
-    // 收藏/歌单里，这里退回序号保证列表里的 key 仍然唯一
-    itemSeq++;
-  }
   return {
-    id: songmid.length > 0 ? musicIdOf(info) : `search_${itemSeq}`,
+    // 缺 songmid 的条目同步不出去（SyncConvert 判它不可同步），也就不会出现在收藏/歌单里；
+    // 这里退回「平台 + 歌名 + 歌手」——必须是**同一份 musicInfo 每次算出同一个 id**，
+    // 早先退回递增序号，而搜索页翻页 / 切平台筛选都会重新转换一遍，同一首歌的 id
+    // 每转一次就变一个，在播高亮和爱心会跟着飘。
+    id: songmid.length > 0 ? musicIdOf(info) : `search_${info.source}_${info.name}_${info.singer}`,
     name: info.name,
     singer: info.singer,
     coverUrl: info.img,
@@ -852,10 +849,13 @@ export class PlaySession {
     }
     if (status === 'error') {
       this.setStatus('error', message);
-      this.notify(message);
       // 缓存出了问题才重试一次（源本身有问题时来回重试没有意义）：
       //   - 本地缓存文件放不出来（截断 / 内容不对）：删掉它，改成联网播；
       //   - 缓存的播放地址过期了：丢掉这条地址，重新解析。
+      //
+      // 提示条要等重试也失败之后才弹：这两种错误都是**缓存自己的问题**，丢掉重来一次
+      // 基本都能出声。以前是先提示再重试，于是「啪一下提示播放失败，紧接着音乐响了」——
+      // 用户只看见失败，还会以为是自己点错了。
       if (!this.urlRetried) {
         if (this.currentLocalPath.length > 0) {
           this.urlRetried = true;
@@ -873,6 +873,7 @@ export class PlaySession {
           return;
         }
       }
+      this.notify(message);
       return;
     }
     // idle / stopped 由会话自己管（切歌、清空队列），这里不覆盖
@@ -1500,10 +1501,13 @@ export class PlaySession {
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
       // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支。
-      //    开了「缓存时自动下载」则交给下载器，文件直接落在下载文件夹里（见 autoDownload）
-      if (!(audioCache.isAutoDownload() && this.autoDownload(item, cacheKey, quality))) {
-        audioCache.cacheSong(cacheKey, quality, url);
+      //    开着「缓存时自动下载」时**另外**再整份下一遍到下载文件夹（两份落盘的分工
+      //    见 AudioCache.autoDownload）：沙箱这份受缓存上限约束、会被 LRU 淘汰，
+      //    下载那份是用户在下载管理里能看见、能长期留的。
+      if (audioCache.isAutoDownload()) {
+        this.queueAutoDownload(item, quality);
       }
+      audioCache.cacheSong(cacheKey, quality, url);
       // 4) 预取下一首：切歌时直接读本地文件，不用现场解析 + 缓冲
       void this.prefetchNext(token, index);
     } catch (e) {
@@ -1517,15 +1521,16 @@ export class PlaySession {
   }
 
   /**
-   * 「缓存时自动下载」：把这首歌排给下载器，而不是放进沙箱里的播放缓存
+   * 「缓存时自动下载」：把这首歌排给下载器，整份下到下载文件夹
    *
-   * 返回 false 表示下载器不收 —— 本地歌、云端歌（WebDAV）、没有 musicInfo 的条目，
-   * 或者下载器还没就绪。调用方必须照旧走播放缓存，不能让这首歌既下不了又缓不上。
+   * 与沙箱里的播放缓存**并存**（调用方照旧会 cacheSong）：下载文件夹那份是用户能在
+   * 「我的 - 下载管理」里看见、能单独删、不受缓存上限约束的那一份；沙箱那份随听随淘汰，
+   * 负责切歌时瞬间出声。两份各管一段，所以这里不再去删沙箱那份。
    *
-   * 排进去之后把沙箱里那份缓存删掉（dropKey）：同一首歌不必占两处地方，而且用户
-   * 在下载管理里删掉它时，「本地这份就没了、下次播放要重新下」这条承诺才成立。
+   * 下载器不收是正常的（本地歌、云端歌 WebDAV、没有 musicInfo 的条目、下载器还没就绪），
+   * 不打扰用户：沙箱那份照样在，歌也照样能离线听。
    */
-  private autoDownload(item: SongItem, key: string, quality: string): boolean {
+  private queueAutoDownload(item: SongItem, quality: string): void {
     const song: AutoDownloadSong = {
       id: item.id,
       name: item.name,
@@ -1538,13 +1543,9 @@ export class PlaySession {
       musicInfoJson: item.musicInfoJson,
     };
     if (!requestAutoDownload(song)) {
-      return false;
-    }
-    if (key.length > 0) {
-      AudioCache.getInstance().dropKey(key);
+      return;
     }
     hilog.info(DOMAIN, TAG, 'auto download queued: %{public}s (%{public}s)', item.name, quality);
-    return true;
   }
 
   /**
@@ -1558,8 +1559,9 @@ export class PlaySession {
    *
    * 预取永远不抢当前这首的带宽：真正下载的时机由 AudioCache 按「播放优先」决定
    * （见 LxPlayer.canUseBandwidthForCache），这里只负责把活儿排上去。
-   * 开了「缓存时自动下载」时不走缓存这条路：直接排给下载器（同一个让路判断，
-   * 见 DownloadManager.pump），也就不必在这里先把地址解析一遍。
+   * 开着「缓存时自动下载」时额外再排一遍给下载器（整份进下载文件夹）—— 两条链路并存，
+   * 所以这里不提前 return：地址还是要解析出来给沙箱缓存用。代价是下载器那边会自己再
+   * 解析一次链接（它可能很久以后才开工，链接那时可能已经换了，不能复用我们这份）。
    *
    * 拿不到 musicInfo 的条目跳过：那要先按歌名搜一次，代价比预取本身还大，
    * 留到真正切过去时再解析（走 ensurePlayable 那条路）。
@@ -1602,10 +1604,10 @@ export class PlaySession {
         // 已经是本地文件了，切过去本来就不用联网
         return;
       }
-      // 开了「缓存时自动下载」：直接排给下载器（它自己解析地址，不必在这里先解析一遍），
-      // 文件进下载文件夹，切过去时走「已下载文件」那条分支
-      if (cache.isAutoDownload() && this.autoDownload(item, key, quality)) {
-        return;
+      // 开了「缓存时自动下载」：额外排一份整份下载进下载文件夹（它自己解析地址）。
+      // 这里**不 return** —— 沙箱缓存那份照旧要预取（两条链路并存，见 queueAutoDownload）
+      if (cache.isAutoDownload()) {
+        this.queueAutoDownload(item, quality);
       }
       let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
       if (url.length === 0) {

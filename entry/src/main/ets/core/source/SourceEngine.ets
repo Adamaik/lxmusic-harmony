@@ -498,7 +498,9 @@ export class SourceEngine {
       throw new Error(`源脚本执行失败：${scriptResult.substring(0, 300)}`);
     }
     if (scriptResult.length > 0 && scriptResult !== 'null' && scriptResult !== 'undefined') {
-      this.pushLog('warn', `源脚本执行返回：${scriptResult.substring(0, 300)}`);
+      // 脚本「返回了个值」本身说明不了什么：IIFE 的完成值、最后一句表达式的值都会落到这里，
+      // 大多数正常音源都会带一个。脚本到底跑没跑起来，紧接着的 readDebugState 才说了算。
+      this.pushLog('log', `源脚本执行返回：${scriptResult.substring(0, 300)}`);
     }
     // ArkWeb 的 runJavaScript 在脚本执行失败时返回 null（不是 reject），
     // 所以不能只看返回值，必须问沙箱「脚本跑到哪一步了」。
@@ -1056,7 +1058,7 @@ export class SourceEngine {
       const data = JSON.parse(dataJson) as UpdateAlertData;
       const name: string = data.name !== undefined ? data.name : '';
       const log: string = data.log !== undefined ? data.log : '';
-      this.pushLog('warn', `音源 ${name} 有更新提示：${log}`);
+      this.pushLog('warn', `音源 ${name} 有更新提示：${log}`, true);
     } catch (e) {
       // ignore
     }
@@ -1120,8 +1122,15 @@ export class SourceEngine {
     this.logs = [];
   }
 
-  private pushLog(type: string, message: string): void {
-    const log: SourceLog = { time: Date.now(), type: type, message: message };
+  /**
+   * 记一条日志
+   *
+   * 默认只落日志（面板里能看），不弹提示条 —— 这里的绝大多数条目都是「过程留痕」：
+   * 自动恢复失败可以手动选音源、脚本没注册 handler 会换注入方式重试、某个接口 404
+   * 了脚本自己会兜底。链路既然还能走通，就不该拿提示条打断用户（见 SourceLog.alert）。
+   */
+  private pushLog(type: string, message: string, alert: boolean = false): void {
+    const log: SourceLog = { time: Date.now(), type: type, message: message, alert: alert };
     hilog.info(DOMAIN, TAG, '[%{public}s] %{public}s', type, message);
     this.logs.push(log);
     if (this.logs.length > this.maxLogs) {

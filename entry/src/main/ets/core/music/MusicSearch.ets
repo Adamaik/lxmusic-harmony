@@ -12,6 +12,11 @@ import { aes128EcbPkcs7HexUpper, md5Hex, sha1Hex, toBase64, utf8Bytes } from './
  * 已移植：酷我(kw)、酷狗(kg)、咪咕(mg)、QQ(tx)、网易(wy)。
  * 未移植：喜马拉雅(xm) —— 洛雪里整块被注释掉的死代码。
  *
+ * 聚合搜索（searchMusicAll）也照洛雪 store/search/music/action.js 的 setLists：
+ * 把各平台这一页的结果合起来 → 去重（dedupeSongs）→ 按与关键词的相似度重排
+ * （sortByRelevance），再配合 total/allPage 翻页。以前是「每个平台轮流取一条」交错拼接、
+ * 不排序也不去重、且只取第一页，表现出来就是「按歌手搜索时重复一大堆、同时还少一大堆」。
+ *
  * ⚠️ wy 待复核：2026-09 直接请求网易 eapi 端点（搜索 /api/search/song/list/page 与
  * 歌词 /api/song/lyric/v1）都返回 code:404，本条链路很可能已经不通。
  */
@@ -57,6 +62,43 @@ export const SEARCH_PLATFORMS: string[] = ['kw', 'kg', 'mg', 'tx', 'wy'];
 
 export function isSearchSupported(source: string): boolean {
   return SEARCH_PLATFORMS.includes(source);
+}
+
+/**
+ * 单个平台一页的搜索结果
+ *
+ * total / allPage 是**翻页**的依据：以前只往回带 list，界面就永远只能看到第一页，
+ * 搜一个歌手只能拿到 30 首（酷我给「周杰伦」报的 TOTAL 是 3295）—— 这正是
+ * 「按歌手搜歌，歌少了一大半」的原因，见 docs/DEFECTS.md D-008。
+ */
+export interface LxSearchPage {
+  list: LxMusicInfo[];
+  /** 该平台报的命中总数；接口没给就是 0 */
+  total: number;
+  /** 总页数（永远 >= page，见 pagesOf） */
+  allPage: number;
+  limit: number;
+}
+
+/**
+ * 按总数算总页数；总数拿不到就按「这一页满没满」推。
+ *
+ * 一页返回 0 条 = 这个平台到底了（接口报错在各自的 search* 里抛错，不会走到这），
+ * 把 allPage 钉在 page 上，界面就不会再对着空页反复「上拉加载更多」。
+ */
+function pagesOf(total: number, page: number, got: number, limit: number): number {
+  if (got === 0 && page > 1) {
+    return page;
+  }
+  if (total > 0) {
+    const pages: number = Math.ceil(total / limit);
+    return pages > page ? pages : page;
+  }
+  return got >= limit ? page + 1 : page;
+}
+
+function pageOf(list: LxMusicInfo[], total: number, page: number, limit: number): LxSearchPage {
+  return { list: list, total: total, allPage: pagesOf(total, page, list.length, limit), limit: limit };
 }
 
 // ------------------------------------------------------------------ 基础工具
@@ -367,20 +409,23 @@ function hasQualityEntry(map: Record<string, LxQualityItem>, key: string): boole
   return Object.keys(map).includes(key);
 }
 
-async function searchKw(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+async function searchKw(str: string, page: number, limit: number): Promise<LxSearchPage> {
   const url: string =
     `http://search.kuwo.cn/r.s?client=kt&all=${encodeURIComponent(str)}&pn=${page - 1}&rn=${limit}` +
     '&uid=794762570&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newver=1&ft=music' +
     '&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1&issubtitle=1';
+  let list: LxMusicInfo[] = [];
+  let total: number = 0;
   // 酷我偶发返回 SHOW=0 的空结果，重试一次
   for (let attempt = 0; attempt < 2; attempt++) {
     const body: Record<string, Object> = await httpGetJson(url);
-    const list: LxMusicInfo[] = parseKwResult(asObjectArray(body['abslist']));
+    total = asNumber(body['TOTAL']);
+    list = parseKwResult(asObjectArray(body['abslist']));
     if (list.length > 0) {
-      return list;
+      break;
     }
   }
-  return [];
+  return pageOf(list, total, page, limit);
 }
 
 // ------------------------------------------------------------------ 酷狗 kg
@@ -454,11 +499,13 @@ export function parseKgResult(lists: Object[]): LxMusicInfo[] {
   return out;
 }
 
-async function searchKg(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+async function searchKg(str: string, page: number, limit: number): Promise<LxSearchPage> {
   const url: string =
     `https://songsearch.kugou.com/song_search_v2?keyword=${encodeURIComponent(str)}&page=${page}&pagesize=${limit}` +
     '&userid=0&clientver=&platform=WebFilter&filter=2&iscorrection=1&privilege_filter=0&area_code=1';
   let lastError: number = 0;
+  let list: LxMusicInfo[] = [];
+  let total: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const body: Record<string, Object> = await httpGetJson(url);
     lastError = asNumber(body['error_code']);
@@ -466,16 +513,17 @@ async function searchKg(str: string, page: number, limit: number): Promise<LxMus
       continue;
     }
     const data: Record<string, Object> = asRecord(body['data']);
-    const list: LxMusicInfo[] = parseKgResult(asObjectArray(data['lists']));
+    total = asNumber(data['total']);
+    list = parseKgResult(asObjectArray(data['lists']));
     if (list.length > 0) {
-      return list;
+      break;
     }
   }
   // 接口报错不能当成「没搜到」：聚合搜索要按平台说清楚谁没通
   if (lastError !== 0) {
     throw new Error(`酷狗接口返回 error_code ${lastError}`);
   }
-  return [];
+  return pageOf(list, total, page, limit);
 }
 
 // ------------------------------------------------------------------ 咪咕 mg
@@ -581,7 +629,7 @@ export function parseMgResult(resultList: Object[]): LxMusicInfo[] {
   return out;
 }
 
-async function searchMg(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+async function searchMg(str: string, page: number, limit: number): Promise<LxSearchPage> {
   const time: string = Date.now().toString();
   const sign: string = createMgSignature(str, time);
   const url: string =
@@ -602,7 +650,8 @@ async function searchMg(str: string, page: number, limit: number): Promise<LxMus
     throw new Error(asString(body['info']).length > 0 ? asString(body['info']) : '咪咕搜索失败');
   }
   const songResultData: Record<string, Object> = asRecord(body['songResultData']);
-  return parseMgResult(asObjectArray(songResultData['resultList']));
+  const list: LxMusicInfo[] = parseMgResult(asObjectArray(songResultData['resultList']));
+  return pageOf(list, asNumber(songResultData['totalCount']), page, limit);
 }
 
 // ------------------------------------------------------------------ 封面
@@ -743,22 +792,22 @@ function httpGetJson(
 }
 
 /**
- * 搜索音乐，返回可直接交给源规则解析播放链接的 musicInfo 列表。
+ * 搜单个平台的一页，连 total / allPage 一起返回（翻页要用）。
  *
- * 返回空数组 = 这个平台确实没搜到；接口不通（非 200 / error_code / code != 0）
- * 一律抛错，不再返回空数组 —— 否则界面会把「接口挂了」显示成「没有搜索结果」。
+ * 返回空列表 = 这个平台确实没搜到；接口不通（非 200 / error_code / code != 0）
+ * 一律抛错，不返回空数组 —— 否则界面会把「接口挂了」显示成「没有搜索结果」。
  *
  * @param keyword 关键词
  * @param source  平台：kw / kg / mg / tx / wy
  * @param page    页码，从 1 开始
  * @param limit   每页数量
  */
-export async function searchMusic(
+export async function searchMusicPage(
   keyword: string,
   source: string,
   page: number = 1,
   limit: number = 30,
-): Promise<LxMusicInfo[]> {
+): Promise<LxSearchPage> {
   const str: string = keyword.trim();
   if (str.length === 0) {
     throw new Error('请输入搜索关键词');
@@ -782,76 +831,320 @@ export async function searchMusic(
   throw new Error(`${source} 暂无内置搜索实现（当前支持：${SEARCH_PLATFORMS.join(' / ')}）`);
 }
 
+/** 只要结果列表时用这个（换源 / 歌词匹配等只关心歌本身，不翻页） */
+export async function searchMusic(
+  keyword: string,
+  source: string,
+  page: number = 1,
+  limit: number = 30,
+): Promise<LxMusicInfo[]> {
+  return (await searchMusicPage(keyword, source, page, limit)).list;
+}
+
+// ------------------------------------------------------------------ 排序与去重（照洛雪）
+
+/**
+ * 两个字符串的相似度（0~1，越大越像）
+ *
+ * 照抄洛雪 utils/common.js 的 similar：以短串为基准算编辑距离（Levenshtein），
+ * 再用 `1 - 距离 / 长串长度` 归一化。搜索页用它给「关键词 vs 歌名 + 歌手」打分 ——
+ * 洛雪搜歌手名时靠的就是它把最贴题的那些顶到前面，不然各平台返回顺序一混，
+ * 该排第一的几首全被埋在后头。
+ */
+export function similar(a: string, b: string): number {
+  if (a.length === 0 || b.length === 0) {
+    return 0;
+  }
+  let s: string = a;
+  let l: string = b;
+  if (s.length > l.length) {
+    const swap: string = s;
+    s = l;
+    l = swap;
+  }
+  const sl: number = s.length;
+  const ll: number = l.length;
+  // mp[j] = 「s 的前 i 个字符」与「l 的前 j 个字符」的编辑距离（滚动数组）
+  const mp: number[] = [];
+  for (let j = 0; j <= ll; j++) {
+    mp.push(j);
+  }
+  for (let i = 1; i <= sl; i++) {
+    const ai: string = s.charAt(i - 1);
+    let lt: number = mp[0];
+    mp[0] = mp[0] + 1;
+    for (let j = 1; j <= ll; j++) {
+      const cost: number = ai === l.charAt(j - 1) ? 0 : 1;
+      const tmp: number = Math.min(mp[j] + 1, mp[j - 1] + 1, lt + cost);
+      lt = mp[j];
+      mp[j] = tmp;
+    }
+  }
+  return 1 - (mp[ll] / ll);
+}
+
+/** 排序用的一条：相似度 + 结果本身 */
+interface ScoredMusic {
+  num: number;
+  data: LxMusicInfo;
+}
+
+/**
+ * 二分插入（同分插在已有的同分条目左侧，保持插入的先后）
+ *
+ * 照抄洛雪 utils/common.js 的 sortInsert：用二分找到位置再 splice，比每次整表
+ * sort 稳定 —— 同分的条目不会互相换位，列表翻页时看着不跳。
+ */
+function sortInsert(arr: ScoredMusic[], data: ScoredMusic): void {
+  const key: number = data.num;
+  let left: number = 0;
+  let right: number = arr.length - 1;
+  while (left <= right) {
+    const middle: number = Math.trunc((left + right) / 2);
+    if (key === arr[middle].num) {
+      left = middle;
+      break;
+    }
+    if (key < arr[middle].num) {
+      right = middle - 1;
+    } else {
+      left = middle + 1;
+    }
+  }
+  while (left > 0) {
+    if (arr[left - 1].num !== key) {
+      break;
+    }
+    left--;
+  }
+  arr.splice(left, 0, data);
+}
+
+/**
+ * 按与关键词的相似度重排一页结果（降序）
+ *
+ * 洛雪 store/search/music/action.js 的 handleSortList：逐条打分二分插入，
+ * 再整表反转成「最像的在最前」。
+ */
+export function sortByRelevance(items: LxMusicInfo[], keyword: string): LxMusicInfo[] {
+  const scored: ScoredMusic[] = [];
+  for (const item of items) {
+    sortInsert(scored, { num: similar(keyword, `${item.name} ${item.singer}`), data: item });
+  }
+  const out: LxMusicInfo[] = [];
+  for (let i = scored.length - 1; i >= 0; i--) {
+    out.push(scored[i].data);
+  }
+  return out;
+}
+
+/**
+ * 条目的稳定标识：`${platform}_${songmid}`，酷狗多带一节 hash
+ *
+ * 与 MusicId.musicIdOf / core/sync/SyncConvert 是同一套规则（那边直接转调这里，
+ * 免得三处各写一份慢慢走样）。聚合搜索按它去掉「同一个平台重复返回的同一条」。
+ */
+export function searchIdOf(info: LxMusicInfo): string {
+  const songmid: string =
+    info.songmid !== undefined && info.songmid !== null ? String(info.songmid) : '';
+  if (info.source === 'kg') {
+    const hash: string = info.hash !== undefined ? info.hash : '';
+    return `${songmid}_${hash}`;
+  }
+  return `${info.source}_${songmid}`;
+}
+
+/** 歌手分隔符（洛雪的 singersRxp）："周杰伦、方文山" 与 "方文山/周杰伦" 要认成同一组 */
+const SINGER_SEPARATORS: RegExp = /、|&|;|；|\/|,|，|\|/;
+
+/**
+ * 归一化时丢掉的字符（洛雪 findMusic 的 filterStr）
+ *
+ * 注意「（Live）」里的括号去掉后 Live 还在，所以「晴天(Live)」不会和「晴天」撞上 ——
+ * 去重的粒度宁可保守。
+ */
+const FILTER_CHARS: RegExp = /\s|'|\.|,|，|&|"|、|\(|\)|（|）|`|~|-|<|>|\||\/|\]|\[|!|！/g;
+
+function normalizeText(text: string): string {
+  return text.replace(FILTER_CHARS, '').toLowerCase();
+}
+
+/** 歌手集合归一化：拆开、排序后再拼，避免「A、B」与「B/A」被当成两组人 */
+function normalizeSingers(singer: string): string {
+  if (singer.length === 0) {
+    return '';
+  }
+  if (!SINGER_SEPARATORS.test(singer)) {
+    return normalizeText(singer);
+  }
+  const parts: string[] = singer.split(SINGER_SEPARATORS);
+  const cleaned: string[] = [];
+  for (const part of parts) {
+    const one: string = normalizeText(part);
+    if (one.length > 0) {
+      cleaned.push(one);
+    }
+  }
+  cleaned.sort((a: string, b: string) => a.localeCompare(b));
+  return cleaned.join('、');
+}
+
+/** 「mm:ss」-> 秒；洛雪 findMusic 的 getIntv（认不出来就是 0） */
+function intervalSeconds(interval: string): number {
+  if (interval.length === 0 || interval === '--/--') {
+    return 0;
+  }
+  const parts: string[] = interval.split(':');
+  let total: number = 0;
+  let unit: number = 1;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const value: number = Number.parseInt(parts[i], 10);
+    total += (Number.isNaN(value) ? 0 : value) * unit;
+    unit *= 60;
+  }
+  return total;
+}
+
+/**
+ * 「看起来是同一首歌」的键：歌名 + 歌手集合（不含时长）
+ *
+ * 时长不放进键里，是因为要按 ±5 秒容差比对（见 sameInterval）：各平台报的时长
+ * 常常差一两秒，放进键里两边就永远不在同一个格子里，容差也就无从谈起。
+ */
+function songKeyOf(info: LxMusicInfo): string {
+  const name: string = normalizeText(info.name);
+  if (name.length === 0) {
+    // 连歌名都没有，没法判断是不是同一首：交给 id 去重，别乱并
+    return '';
+  }
+  return `${name}\u0001${normalizeSingers(info.singer)}`;
+}
+
+/** 时长差在 ±5 秒内算同一条录音 */
+function sameInterval(a: string, b: string): boolean {
+  const one: number = intervalSeconds(a);
+  const other: number = intervalSeconds(b);
+  if (one === 0 || other === 0) {
+    return true;
+  }
+  return Math.abs(one - other) <= 5;
+}
+
+/**
+ * 去重：先按稳定 id（同一平台重复返回的同一条），再按「看起来是同一首歌」。
+ *
+ * 洛雪只按「平台 + 歌曲 id」去重（`deduplicationList`），所以它的聚合列表里同一首歌
+ * 在几个平台就是几条。聆听这边**播放链路会自动换源解析**（PlaySession.ensurePlayable：
+ * 条目所在平台解析不了就按歌名 + 歌手在音源支持且有内置搜索的平台上重搜），
+ * 留一条就够用，多留的几条只会把列表塞满重复行、把真正没听过的歌挤到后面去 ——
+ * 按歌手搜索时最明显：五个平台各回 30 条，去重前 150 行里同一首歌能占五遍。
+ *
+ * live / remix 这类版本靠时长区分：名字对不上、或者时长差超过 5 秒，就不并。
+ * 界面翻页时也是拿它把「上一页 + 这一页」拼起来，规则只写在这一处。
+ */
+export function dedupeSongs(items: LxMusicInfo[]): LxMusicInfo[] {
+  const ids: Set<string> = new Set<string>();
+  const songs: Map<string, LxMusicInfo[]> = new Map<string, LxMusicInfo[]>();
+  const out: LxMusicInfo[] = [];
+  for (const item of items) {
+    const id: string = searchIdOf(item);
+    if (ids.has(id)) {
+      continue;
+    }
+    ids.add(id);
+    const key: string = songKeyOf(item);
+    if (key.length === 0) {
+      out.push(item);
+      continue;
+    }
+    // 同一个「歌名 + 歌手 + 时长」的格子只留时长真对得上的那条
+    const kept: LxMusicInfo[] | undefined = songs.get(key);
+    if (kept === undefined) {
+      songs.set(key, [item]);
+      out.push(item);
+      continue;
+    }
+    let duplicate: boolean = false;
+    for (const other of kept) {
+      if (sameInterval(other.interval, item.interval)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) {
+      continue;
+    }
+    kept.push(item);
+    out.push(item);
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ 聚合搜索
 
-/** 单个平台的搜索结果（失败也占一条，界面好把「哪个平台没通」说清楚） */
+/** 单个平台这一页的结果（失败也占一条，界面好把「哪个平台没通」说清楚） */
 export interface LxPlatformSearch {
   source: string;
   items: LxMusicInfo[];
   /** 空串 = 这个平台搜成功 */
   error: string;
+  /** 这个平台一共几页（失败 = 就这一页） */
+  allPage: number;
+  total: number;
 }
 
-/** 聚合搜索结果：逐平台一份（界面自己决定要不要交错合并） */
-export interface LxAggSearchResult {
+/** 聚合搜索一页的结果 */
+export interface LxSearchOutcome {
   keyword: string;
+  page: number;
+  /** 逐平台一份（界面拿它做平台筛选与状态行） */
   platforms: LxPlatformSearch[];
-}
-
-/**
- * 把多份列表交错合并成一份：每个平台轮流取一条。
- *
- * 聚合搜索结果直接拼接是「30 条酷我 + 30 条酷狗」，用户在列表里要滚过一整个
- * 平台才能看到另一个；交错后前几行就能横向比较同一首歌在各平台的结果 ——
- * 这才是「聚合搜索」真正有用的地方。
- *
- * 放在这里而不是界面里：交错规则是搜索语义的一部分（和谁在前、取多少条有关），
- * 哪天要改成按相关度排，也应该只改这一处。
- */
-export function interleave<T>(lists: T[][]): T[] {
-  const merged: T[] = [];
-  let depth: number = 0;
-  let more: boolean = true;
-  while (more) {
-    more = false;
-    for (let i = 0; i < lists.length; i++) {
-      if (depth < lists[i].length) {
-        merged.push(lists[i][depth]);
-        more = true;
-      }
-    }
-    depth++;
-  }
-  return merged;
+  /**
+   * 聚合列表：本页所有平台的结果按相关度排好、去过重（洛雪 setLists 的做法）
+   *
+   * 翻页时由界面往这个列表后面接 —— 洛雪也是「每页各自按相关度排，页与页之间按
+   * 拉的先后往后摞」，而不是每翻一页把整张表重排一遍（那会让已经翻过的内容乱跳）。
+   */
+  items: LxMusicInfo[];
+  /** 各平台里最大的总页数：> page 表示还能继续翻 */
+  maxPage: number;
 }
 
 /** 单平台搜索，失败也返回（不抛），供聚合用 */
-export async function searchPlatform(
+async function searchPlatform(
   keyword: string,
   source: string,
-  page: number = 1,
-  limit: number = 30,
+  page: number,
+  limit: number,
 ): Promise<LxPlatformSearch> {
   try {
-    const items: LxMusicInfo[] = await searchMusic(keyword, source, page, limit);
-    return { source: source, items: items, error: '' };
+    const result: LxSearchPage = await searchMusicPage(keyword, source, page, limit);
+    return {
+      source: source,
+      items: result.list,
+      error: '',
+      allPage: result.allPage,
+      total: result.total,
+    };
   } catch (e) {
-    return { source: source, items: [], error: (e as Error).message };
+    return { source: source, items: [], error: (e as Error).message, allPage: page, total: 0 };
   }
 }
 
 /**
- * 聚合搜索：一次问所有平台。
+ * 聚合搜索一页：一次问所有平台，合起来排一次、去一次重。
  *
- * 单个平台失败（超时、接口改了、歌没版权…）不该让整次搜索失败，
- * 所以逐平台各自 try 一遍，失败的把原因带回来给界面显示。
+ * 单个平台失败（超时、接口改了、歌没版权…）不该让整次搜索失败，所以逐平台各自
+ * try 一遍，失败的把原因带回来给界面显示。
+ *
+ * @param page 页码，从 1 开始；翻页由界面连续调用（见 SearchView.loadMore）
  */
 export async function searchMusicAll(
   keyword: string,
   sources: string[] = SEARCH_PLATFORMS,
   page: number = 1,
   limit: number = 30,
-): Promise<LxAggSearchResult> {
+): Promise<LxSearchOutcome> {
   const str: string = keyword.trim();
   if (str.length === 0) {
     throw new Error('请输入搜索关键词');
@@ -862,15 +1155,31 @@ export async function searchMusicAll(
   }
   const settled: PromiseSettledResult<LxPlatformSearch>[] = await Promise.allSettled(tasks);
   const platforms: LxPlatformSearch[] = [];
+  const flat: LxMusicInfo[] = [];
+  let maxPage: number = page;
   for (let i = 0; i < settled.length; i++) {
     const r: PromiseSettledResult<LxPlatformSearch> = settled[i];
-    if (r.status === 'fulfilled') {
-      platforms.push(r.value);
-    } else {
-      platforms.push({ source: sources[i], items: [], error: '搜索失败' });
+    const one: LxPlatformSearch = r.status === 'fulfilled'
+      ? r.value
+      : { source: sources[i], items: [], error: '搜索失败', allPage: page, total: 0 };
+    platforms.push(one);
+    if (one.allPage > maxPage) {
+      maxPage = one.allPage;
+    }
+    for (const item of one.items) {
+      flat.push(item);
     }
   }
-  return { keyword: str, platforms: platforms };
+  return {
+    keyword: str,
+    page: page,
+    platforms: platforms,
+    // 先去重再排序：同一首歌在几个平台都有时，留下的是**先问的那个平台**那一份
+    // （sources 的顺序，缺省是 SEARCH_PLATFORMS = 酷我打头）。反过来先排序再去重的话，
+    // 留下谁就取决于二分插入对同分条目的落位，读代码的人根本看不出来。
+    items: sortByRelevance(dedupeSongs(flat), str),
+    maxPage: maxPage,
+  };
 }
 
 // ------------------------------------------------------------------ QQ 音乐 tx
@@ -1042,8 +1351,10 @@ function addTxQuality(
   qualityMap[quality] = qualityItem;
 }
 
-async function searchTx(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+async function searchTx(str: string, page: number, limit: number): Promise<LxSearchPage> {
   let lastCode: number = 0;
+  let list: LxMusicInfo[] = [];
+  let total: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const body: string = createTxRequestBody(str, page, limit);
     const sign: string = createZzcSign(body);
@@ -1059,16 +1370,18 @@ async function searchTx(str: string, page: number, limit: number): Promise<LxMus
     const data: Record<string, Object> = asRecord(req['data']);
     const inner: Record<string, Object> = asRecord(data['body']);
     const song: Record<string, Object> = asRecord(inner['song']);
-    const list: LxMusicInfo[] = parseTxSongs(asObjectArray(song['list']));
+    // 命中总数在 data.meta.sum（洛雪 tx/musicSearch.js 也是取 meta.sum）
+    total = asNumber(asRecord(data['meta'])['sum']);
+    list = parseTxSongs(asObjectArray(song['list']));
     if (list.length > 0) {
-      return list;
+      break;
     }
   }
   // 同上：接口报错如实抛，别伪装成「没搜到」
   if (lastCode !== 0) {
     throw new Error(`QQ 音乐接口返回 code ${lastCode}`);
   }
-  return [];
+  return pageOf(list, total, page, limit);
 }
 
 // ------------------------------------------------------------------ 网易 wy
@@ -1178,7 +1491,7 @@ export function parseWySongs(resources: Object[]): LxMusicInfo[] {
   return out;
 }
 
-async function searchWy(str: string, page: number, limit: number): Promise<LxMusicInfo[]> {
+async function searchWy(str: string, page: number, limit: number): Promise<LxSearchPage> {
   const path: string = '/api/search/song/list/page';
   const params: Record<string, Object> = {
     'keyword': str,
@@ -1190,6 +1503,8 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
     'limit': limit,
   };
   let lastCode: number = 0;
+  let list: LxMusicInfo[] = [];
+  let total: number = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     const dataJson: string = JSON.stringify(params);
     const form: Record<string, string> = { 'params': createEapiParams(path, dataJson) };
@@ -1203,9 +1518,10 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
       continue;
     }
     const data: Record<string, Object> = asRecord(body['data']);
-    const list: LxMusicInfo[] = parseWySongs(asObjectArray(data['resources']));
+    total = asNumber(data['totalCount']);
+    list = parseWySongs(asObjectArray(data['resources']));
     if (list.length > 0) {
-      return list;
+      break;
     }
   }
   // 接口返非 200 时以前也是返回空数组，界面上就成了「没有搜索结果（网易）」
@@ -1214,7 +1530,7 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxMus
   if (lastCode !== 200) {
     throw new Error(`网易接口返回 code ${lastCode}（该接口当前不可用）`);
   }
-  return [];
+  return pageOf(list, total, page, limit);
 }
 
 /** POST JSON，返回解析后的对象 */

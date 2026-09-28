@@ -56,6 +56,8 @@
 
   /** 宿主已抓回来的响应：key -> 响应正文 */
   var NET_CACHE = {};
+  /** 宿主已抓回来的响应头：key -> { Name: Value }（`java.post(...).headers()` 要用） */
+  var NET_HEADERS = {};
   /** 本轮缺失的请求：key -> 请求描述 */
   var NET_MISS = {};
 
@@ -79,6 +81,21 @@
     return out;
   }
 
+  /**
+   * 宽松解析一段 JSON
+   *
+   * 书源里把 key / 字符串写成单引号很常见（`{'headers':{...}}`）—— 这在标准 JSON 里
+   * 非法，但阅读用的 Gson 宽松模式能吃。严格 JSON 解析失败时，把单引号换成双引号再试一次。
+   */
+  function parseLooseJson(text) {
+    try { return JSON.parse(text); } catch (e) { /* 再宽松试一次 */ }
+    var fixed = String(text)
+      .replace(/([{,]\s*)'([^']+)'\s*:/g, '$1"$2":')
+      .replace(/:\s*'([^']*)'/g, ':"$1"')
+      .replace(/,\s*([}\]])/g, '$1');
+    try { return JSON.parse(fixed); } catch (e2) { return null; }
+  }
+
   /** 归一化请求描述（java.ajax 接的既可能是字符串，也可能是 `url,{json}`） */
   function specOf(arg, extraHeaders) {
     var url = '';
@@ -90,7 +107,7 @@
       url = String(arg[0]);
       if (arg.length > 1 && arg[1]) {
         try {
-          options = (typeof arg[1] === 'string') ? JSON.parse(arg[1]) : arg[1];
+          options = (typeof arg[1] === 'string') ? parseLooseJson(arg[1]) || {} : arg[1];
         } catch (e) { options = {}; }
       }
     } else if (arg !== undefined && arg !== null) {
@@ -101,13 +118,11 @@
     var comma = url.lastIndexOf(',{');
     if (comma > 0) {
       var tail = url.slice(comma + 1);
-      try {
-        var parsed = JSON.parse(tail);
-        if (parsed && typeof parsed === 'object') {
-          options = parsed;
-          url = url.slice(0, comma);
-        }
-      } catch (e) { /* 不是选项 JSON，原样当 URL */ }
+      var parsed = parseLooseJson(tail);
+      if (parsed && typeof parsed === 'object') {
+        options = parsed;
+        url = url.slice(0, comma);
+      }
     }
     var headers = {};
     if (extraHeaders) {
@@ -150,26 +165,62 @@
     return '';
   }
 
-  /** java.ajax(url)：同步返回响应正文 */
-  function ajax(arg) {
-    var spec = specOf(arg, CUR_SOURCE ? sourceHeaders() : null);
-    return requestBody(spec);
+  /**
+   * 同一次请求的**响应头**（宿主与正文一起带回来）
+   *
+   * 只有正文被缓存过的 key 才有头；没缓存就返回空对象（不额外登记缺失 ——
+   * 正文那一步已经登记过了，宿主抓回来时头和正文是一起到的）。
+   */
+  function requestHeaders(spec) {
+    var key = netKey(spec);
+    return Object.prototype.hasOwnProperty.call(NET_HEADERS, key) ? NET_HEADERS[key] : {};
   }
 
-  /** java.connect(url, header)：返回一个带 body() 的响应对象 */
-  function connect(arg, header) {
-    var spec = specOf(arg, sourceHeaders());
+  /**
+   * java.ajax(url[, header])：同步返回响应正文
+   *
+   * 阅读的 `java.ajax` 允许第二个参数给请求头（书音FM 的 ECMS 调用就传了一段
+   * header JSON）。早先这里只收一个参数，那些头被静默丢掉 —— 站点按 Referer /
+   * Accept 区分响应时会拿到错误结果。现在与 `java.connect` 一样吃下这个参数。
+   */
+  function ajax(arg, header) {
+    var spec = specOf(arg, CUR_SOURCE ? sourceHeaders() : null);
     if (header) {
       var h = header;
       if (typeof h === 'string') { try { h = JSON.parse(h); } catch (e) { h = null; } }
-      if (h) { for (var k in h) { spec.headers[k] = String(h[k]); } }
-      // 头变了要重新算 key
-      spec = { url: spec.url, method: spec.method, body: spec.body, headers: spec.headers };
+      if (h) {
+        for (var k in h) { spec.headers[k] = String(h[k]); }
+        // 头变了要重新算 key
+        spec = { url: spec.url, method: spec.method, body: spec.body, headers: spec.headers };
+      }
     }
+    return requestBody(spec);
+  }
+
+  /** java.connect(url, header, body)：返回一个带 body() / headers() 的响应对象 */
+  function connect(arg, header, body) {
+    var spec = specOf(arg, sourceHeaders());
+    if (body !== undefined && body !== null) { spec.body = String(body); }
+    if (header) {
+      var h = header;
+      if (typeof h === 'string') { try { h = parseLooseJson(h); } catch (e) { h = null; } }
+      if (h) { for (var k in h) { spec.headers[k] = String(h[k]); } }
+    }
+    // body / 头变过都要重新算 key（netKey 把它们都算进去了）
+    spec = { url: spec.url, method: spec.method, body: spec.body, headers: spec.headers };
     return {
       url: spec.url,
       code: function () { return 200; },
-      headers: function () { return ''; },
+      headers: function () {
+        var raw = requestHeaders(spec);
+        var out = {};
+        for (var k in raw) {
+          out[k] = raw[k];
+          // 头名大小写不一：源里常写 `res.location` 而后端发的是 `Location`
+          out[String(k).toLowerCase()] = raw[k];
+        }
+        return out;
+      },
       body: function () { return requestBody(spec); },
       toString: function () { return requestBody(spec); },
     };
@@ -238,8 +289,33 @@
       getVariable: function () { return CUR_VARIABLE; },
       setVariable: function (v) { CUR_VARIABLE = v === undefined || v === null ? '' : String(v); },
       getLoginInfoMap: function () { return CUR_LOGIN; },
+      /** 登录信息（同 getLoginInfoMap；阅读里两个名字都有） */
+      getLoginInfo: function () { return CUR_LOGIN; },
+      /**
+       * 保存登录信息（登录弹窗里的「保存 Cookie」按钮会调）
+       *
+       * 沙箱每次调用都是无状态的，所以这里只把值并进本轮的 `CUR_LOGIN`，
+       * 宿主从返回值里把它取走落盘（见 BookEngine.runLoginAction）。
+       */
+      putLoginInfo: function (map) {
+        if (map !== null && map !== undefined && typeof map === 'object') {
+          for (var k in map) { CUR_LOGIN[k] = map[k] === undefined || map[k] === null ? '' : String(map[k]); }
+        }
+        return CUR_LOGIN;
+      },
+      /** 源自己的临时变量（阅读里 source.put / source.get，跨规则共享，如懒人听书的 bookIds） */
+      put: function (key, value) {
+        PUT_STORE[String(key)] = (value === undefined || value === null) ? '' : String(value);
+        return value;
+      },
+      get: function (key) {
+        var v = PUT_STORE[String(key)];
+        return v === undefined ? '' : v;
+      },
       getKey: function () { return CUR_VARIABLE; },
-      bookSourceUrl: function () { return CUR_SOURCE ? String(CUR_SOURCE.bookSourceUrl || '') : ''; },
+      // 阅读里 bookSourceUrl 是**属性**（`source.bookSourceUrl + "xxx"`），不是方法：
+      // 写成方法会让 `source.bookSourceUrl + "e/search"` 拼出整个函数源码
+      bookSourceUrl: CUR_SOURCE ? String(CUR_SOURCE.bookSourceUrl || '') : '',
     };
   }
 
@@ -247,8 +323,17 @@
 
   var PURE = global.LXPureUtils;
 
+  /**
+   * md5（小写 hex）
+   *
+   * `lx_utils.js` 导出的是 `str2md5(str)`（内部才是 `md5Hex(bytes)`），
+   * 早先这里写的 `PURE.md5(...)` 并不存在 —— 于是 `java.md5Encode()` 永远返回空串，
+   * 书源里凡是用 md5 签名（书音FM 的 ECMS token 就是）的接口都会算错 token、拿不到音频。
+   * 两个名字都认一下，避免以后改名又悄悄失效。
+   */
   function md5Hex(text) {
-    if (PURE && PURE.md5) { return PURE.md5(String(text)); }
+    if (PURE && typeof PURE.str2md5 === 'function') { return PURE.str2md5(String(text)); }
+    if (PURE && typeof PURE.md5 === 'function') { return PURE.md5(String(text)); }
     return '';
   }
 
@@ -267,6 +352,75 @@
     } catch (e) {
       return '';
     }
+  }
+
+  /** 十六进制字符串 -> UTF-8 文本（阅读的 java.hexDecodeToString） */
+  function hexDecodeToString(text) {
+    var hex = String(text === undefined || text === null ? '' : text).replace(/[^0-9a-fA-F]/g, '');
+    if (hex.length === 0) { return ''; }
+    var encoded = '';
+    for (var i = 0; i + 1 < hex.length; i += 2) {
+      encoded += '%' + hex.substr(i, 2);
+    }
+    try {
+      return decodeURIComponent(encoded);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /**
+   * 阅读的 `getArguments(str, key, def)`：从 `key=value&...` 或 JSON 串里取一个值
+   *
+   * 「小说，漫画，听书」那类源把配置塞在 variable/comment 里，规则开头的 `<js>` 用它取服务器地址。
+   */
+  function getArguments(text, key, def) {
+    var s = String(text === undefined || text === null ? '' : text).trim();
+    if (s.length === 0) { return def === undefined ? '' : def; }
+    if (s.charAt(0) === '{') {
+      var obj = parseLooseJson(s);
+      if (obj && typeof obj === 'object' && obj[key] !== undefined && obj[key] !== null) { return obj[key]; }
+      return def === undefined ? '' : def;
+    }
+    var parts = s.split(/[&\n]/);
+    for (var i = 0; i < parts.length; i++) {
+      var idx = parts[i].indexOf('=');
+      if (idx > 0 && parts[i].slice(0, idx).trim() === String(key)) {
+        return parts[i].slice(idx + 1).trim();
+      }
+    }
+    return def === undefined ? '' : def;
+  }
+
+  /** 从 `a=1; b=2` 的 Cookie 串里取一个名字的值（忽略大小写） */
+  function cookieValueOf(cookieString, name) {
+    var parts = String(cookieString === undefined || cookieString === null ? '' : cookieString).split(';');
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].trim();
+      var eq = pair.indexOf('=');
+      if (eq > 0 && pair.slice(0, eq).trim().toLowerCase() === String(name).toLowerCase()) {
+        return pair.slice(eq + 1).trim();
+      }
+    }
+    return '';
+  }
+
+  /**
+   * 当前源的登录 Cookie 串
+   *
+   * 优先用固定键 `Cookie`；没有就找登录信息表里任何「名字含 cookie」的字段 ——
+   * 喜马拉雅只写了 `喜马拉雅Cookie` 这个键，哔哩哔哩靠网页登录写进来的 `Cookie`，
+   * 两者都要能取到。
+   */
+  function loginCookieString() {
+    if (CUR_LOGIN) {
+      if (CUR_LOGIN['Cookie']) { return String(CUR_LOGIN['Cookie']); }
+      if (CUR_LOGIN['cookie']) { return String(CUR_LOGIN['cookie']); }
+      for (var k in CUR_LOGIN) {
+        if (String(k).toLowerCase().indexOf('cookie') >= 0 && CUR_LOGIN[k]) { return String(CUR_LOGIN[k]); }
+      }
+    }
+    return '';
   }
 
   function pad2(n) { return n < 10 ? '0' + n : '' + n; }
@@ -588,8 +742,33 @@
       page: ctx.page,
       title: ctx.title,
       bookUrl: ctx.book ? String(ctx.book.bookUrl || '') : '',
-      cookie: { getCookie: function () { return ''; } },
+      cookie: {
+        /** cookie.getCookie(url[, name])：返回网页登录抓来的 Cookie（可按名字取单个） */
+        getCookie: function (url, name) {
+          var c = loginCookieString();
+          if (name !== undefined && name !== null && String(name).length > 0) {
+            return cookieValueOf(c, name);
+          }
+          return c;
+        },
+        /**
+         * 删除 Cookie 并返回删除前的值（阅读的 cookie.removeCookie）
+         *
+         * 书源把它当「取一次并清掉」用（幸福听书的 searchUrl 就是
+         * `{{cookie.removeCookie(source.getKey())}}`）。应用不在这里维护站点 Cookie 的
+         * 生命周期，所以返回空串 —— 效果是把那段模板替换成空，地址自然接成相对路径。
+         * 注意别返回整串登录 Cookie：那会被拼进 URL 里。
+         */
+        removeCookie: function () { return ''; },
+        setCookie: function () { },
+      },
+      getArguments: getArguments,
       fromBookInfo: ctx.fromBookInfo,
+      // 登录弹窗的动作里要读用户刚填的值（`infoMap["喜马拉雅Cookie"]`），
+      // 以及裸调 `startBrowser('...')`（播客源的登录按钮就是裸调）
+      infoMap: CUR_LOGIN,
+      startBrowser: function (url) { java.startBrowser(url); },
+      loginInfo: CUR_LOGIN,
     };
   }
 
@@ -612,8 +791,18 @@
   /** java.* 门面（对应阅读的 AnalyzeRule 自己） */
   function javaApi(ctx) {
     var api = {
-      ajax: function (url) { return ajax(url); },
+      ajax: function (url, header) { return ajax(url, header); },
       connect: function (url, header) { return connect(url, header); },
+      /**
+       * java.post(url, body, headers)：发一个 POST，返回带 body()/headers()/code() 的对象
+       *
+       * 阅读的书源用它先拿一次 302 的 Location（书听FM 的搜索就是这么两跳的）。
+       * 走的是同一套回放循环，所以 body()/headers() 是同步取缓存。
+       */
+      post: function (url, body, header) {
+        var opts = '{"method":"POST"}';
+        return connect(url + ',' + opts, header, body);
+      },
       ajaxAll: function (urls) {
         var out = [];
         if (urls && urls.length !== undefined) {
@@ -630,6 +819,7 @@
       base64Encode: function (s) { return base64Encode(s); },
       base64EncodeToString: function (s) { return base64Encode(s); },
       base64Decode: function (s) { return base64Decode(s); },
+      hexDecodeToString: function (s) { return hexDecodeToString(s); },
       encodeURI: function (s) { return encodeURIComponent(String(s)); },
       getString: function (rule, content, isUrl) {
         var sub = new Ctx(content === undefined || content === null ? ctx.result : content, ctx.baseUrl, ctx.src, {
@@ -644,11 +834,26 @@
         return evalList(rule, sub);
       },
       getElement: function (rule) { return evalList(rule, ctx)[0] || ''; },
-      getCookie: function () { return ''; },
+      /** java.getCookie(domain[, name])：从网页登录抓来的 Cookie 串里取值 */
+      getCookie: function (domain, name) {
+        var c = loginCookieString();
+        if (name !== undefined && name !== null && String(name).length > 0) {
+          return cookieValueOf(c, name);
+        }
+        return c;
+      },
       setCookie: function () { },
       log: function (msg) { LOGS.push(String(msg)); },
       logType: function () { },
-      toast: function () { },
+      /** 阅读的 java.toast：登录弹窗里用来给用户回话，宿主拿出来显示 */
+      toast: function (msg) { TOASTS.push(String(msg)); LOGS.push('[toast] ' + String(msg)); },
+      longToast: function (msg) { TOASTS.push(String(msg)); LOGS.push('[toast] ' + String(msg)); },
+      /** 阅读的 java.startBrowser：宿主用系统浏览器打开（登录页） */
+      startBrowser: function (url) {
+        var u = String(url || '');
+        if (u.length > 0) { OPENS.push(u); }
+      },
+      androidId: function () { return 'zcode-harmony-listen'; },
       put: function (key, value) { PUT_STORE[String(key)] = value === undefined ? '' : String(value); return value; },
       get: function (key) { var v = PUT_STORE[String(key)]; return v === undefined ? '' : v; },
       reGetBook: function () { },
@@ -660,6 +865,10 @@
 
   var LOGS = [];
   var PUT_STORE = {};
+  /** 登录弹窗里 java.toast 说的话（宿主拿出来显示给用户） */
+  var TOASTS = [];
+  /** java.startBrowser / startBrowser 要打开的地址（宿主用系统浏览器打开） */
+  var OPENS = [];
 
   /**
    * 书源的 jsLib（公共函数库）
@@ -1261,11 +1470,18 @@
       // 由宿主直接给的地址（目录页等）
       return absolute(String(ctx.baseUrl || ''), explicitUrl);
     }
-    // 整条就是个 js：跑出地址来
+    // 整条就是个 js：跑出地址来（阅读里 `<js>` 与 `@js:` 两种写法都算数，
+    // 目录 / 详情 / 搜索地址都可能是 `@js:` —— 只认 `<js>` 会把规则原样当地址拼，
+    // 结果就是一个 404 的 `https://站点/@js:(function...`）
     if (/^<js>/i.test(text)) {
       var code = text.replace(/^<js>/i, '').replace(/<\/js>$/i, '');
       var v = runJS(code, ctx);
       return v === null || v === undefined ? '' : String(v).trim();
+    }
+    if (/^@js:/i.test(text)) {
+      var code2 = text.replace(/^@js:/i, '');
+      var v2 = runJS(code2, ctx);
+      return v2 === null || v2 === undefined ? '' : String(v2).trim();
     }
     var made = makeUpRule(text, ctx, jsOnly).trim();
     // 搜索 / 发现地址允许写成相对路径（`/search.php?...`），用书源自己的站址补全
@@ -1511,6 +1727,38 @@
   function resetRound() {
     NET_MISS = {};
     LOGS = [];
+    TOASTS = [];
+    OPENS = [];
+  }
+
+  /**
+   * 登录动作（登录弹窗里的按钮 / `loginCheckJs`）
+   *
+   * 跑一条 `@js:` 规则，把 `infoMap` 与 `source` 绑进去。规则里通常会：
+   *   - `source.putLoginInfo(infoMap)` 保存用户填的值；
+   *   - `java.connect(...)` 校验（会走回放循环，缺地址就 return 'net'，宿主抓完再重跑）；
+   *   - `java.toast('...')` 给用户回话。
+   * 宿主从返回值里拿走三样：`login`（落盘）、`toasts`、`openUrl`。
+   */
+  function doLogin(job) {
+    var rule = String(job.rule || '');
+    // 规则通常写成 `@js: ...`（也有 `<js></js>` 的），要先把前缀摘掉再 eval
+    var code = stripPrefix(rule, 'js');
+    var ctx = new Ctx('', String(CUR_SOURCE ? CUR_SOURCE.bookSourceUrl : ''), '', {});
+    var value = '';
+    try {
+      var v = runJS(code, ctx);
+      value = (v === undefined || v === null) ? '' : String(v);
+    } catch (e) {
+      LOGS.push('登录动作出错：' + (e && e.message ? e.message : String(e)));
+      value = '';
+    }
+    return {
+      result: value,
+      login: CUR_LOGIN,
+      toasts: TOASTS.slice(0),
+      openUrl: OPENS.length > 0 ? OPENS[OPENS.length - 1] : '',
+    };
   }
 
   function netMissList() {
@@ -1537,6 +1785,9 @@
     if (job.netCache) {
       for (var k in job.netCache) { NET_CACHE[k] = job.netCache[k]; }
     }
+    if (job.netHeaders) {
+      for (var hk in job.netHeaders) { NET_HEADERS[hk] = job.netHeaders[hk]; }
+    }
 
     var data = null;
     var error = null;
@@ -1548,6 +1799,7 @@
       else if (action === 'bookInfo') { data = doBookInfo(job); }
       else if (action === 'toc') { data = doToc(job); }
       else if (action === 'content') { data = doContent(job); }
+      else if (action === 'login') { data = doLogin(job); }
       else { error = '未知动作：' + action; }
     } catch (e) {
       error = (e && e.message) ? String(e.message) : String(e);

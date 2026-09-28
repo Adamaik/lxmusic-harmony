@@ -9,9 +9,11 @@ import { aesDecryptBase64, aesEncryptBase64, deriveKeyB64, generateRsaKey, rsaDe
 import { defaultDeviceName, SyncStore } from './SyncStore';
 import { FEATURE_VERSION, LxListData, LxSyncAction, SyncKeyInfo, SyncStatus, SyncUrlInfo,
   SYNC_AUTH_MSG, SYNC_CLIENT_TYPE, SYNC_CLOSE_FAILED, SYNC_CLOSE_NORMAL, SYNC_CODE_AUTH_FAILED,
-  SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_SERVICE_FAILED, SYNC_CODE_GET_SERVICE_ID_FAILED,
+  SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_FAILED, SYNC_CODE_CONNECT_SERVICE_FAILED,
+  SYNC_CODE_GET_SERVICE_ID_FAILED,
   SYNC_CODE_HIGH_SERVICE_VERSION, SYNC_CODE_LOW_SERVICE_VERSION, SYNC_CODE_MISSING_AUTH_CODE,
-  SYNC_HELLO_MSG, SYNC_ID_PREFIX, SYNC_MSG_AUTH_FAILED, SYNC_MSG_BLOCKED_IP, SYNC_MSG_CONNECT } from './SyncTypes';
+  SYNC_HELLO_MSG, SYNC_ID_PREFIX, SYNC_KNOWN_CODES, SYNC_MSG_AUTH_FAILED, SYNC_MSG_BLOCKED_IP,
+  SYNC_MSG_CONNECT } from './SyncTypes';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SyncClient';
@@ -145,9 +147,14 @@ export class SyncClient {
       if (id !== this.connectId) {
         return;
       }
-      const message: string = (e as Error).message;
+      // 协议里的码原样保留（认证失败、地址不对这些是要用户处理的）；其余全归到
+      // CONNECT_FAILED：WebSocket / HTTP / 加密抛出来的 message 是系统原文（英文，
+      // 形如 "Operation timeout"），直接当状态发出去会以一句裸英文弹到用户面前 ——
+      // 看着像应用坏了，其实下一轮重连就接上了。原文只进 hilog。
+      const raw: string = (e as Error).message;
+      const message: string = SYNC_KNOWN_CODES.includes(raw) ? raw : SYNC_CODE_CONNECT_FAILED;
       this.setStatus(false, message);
-      hilog.error(DOMAIN, TAG, 'connect failed: %{public}s', message);
+      hilog.error(DOMAIN, TAG, 'connect failed: %{public}s', raw);
       throw e as Error;
     }
   }
@@ -404,8 +411,9 @@ export class SyncClient {
         return;
       }
       hilog.error(DOMAIN, TAG, 'socket error: %{public}s', JSON.stringify(err));
-      this.setStatus(false, err !== undefined && err !== null && err.message !== undefined
-        ? err.message : 'connect error');
+      // 以前这里把 err.message 原样当状态，message 缺省时兜底成英文 'connect error' ——
+      // 两种都会以裸英文弹提示条（用户反馈过「connect error 报错」）。一律走统一码。
+      this.setStatus(false, SYNC_CODE_CONNECT_FAILED);
     });
 
     socket.connect(url).catch((err: BusinessError) => {
@@ -413,7 +421,7 @@ export class SyncClient {
         return;
       }
       hilog.error(DOMAIN, TAG, 'connect socket failed: %{public}s', JSON.stringify(err));
-      this.setStatus(false, err.message);
+      this.setStatus(false, SYNC_CODE_CONNECT_FAILED);
     });
   }
 
