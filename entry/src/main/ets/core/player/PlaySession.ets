@@ -14,8 +14,10 @@ import { PlayStateStore } from './PlayStateStore';
 import { ShuffleBag } from './ShuffleBag';
 import { PlaySettings } from '../settings/PlaySettings';
 import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
-import { AutoDownloadSong, downloadedFile, requestAutoDownload } from '../download/DownloadIndex';
+import { AutoDownloadSong, downloadedFile, removeDownloadedFile,
+  requestAutoDownload } from '../download/DownloadIndex';
 import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
+import { LocalAccess } from '../local/LocalAccess';
 import { AutoMatchResult, autoMatchLyric } from '../local/LyricMatch';
 import { WebDavLibrary, isWebDavSong } from '../webdav/WebDavLibrary';
 import { WebDavClient } from '../webdav/WebDavClient';
@@ -47,6 +49,13 @@ export const K_QUEUE_COUNT: string = 'ps_queue_count';
 export const K_CURRENT_ID: string = 'ps_current_id';
 export const K_CURRENT_NAME: string = 'ps_current_name';
 export const K_CURRENT_SINGER: string = 'ps_current_singer';
+/**
+ * 当前这首的来源平台
+ *
+ * 播放页点歌手名要进歌手聚合页，而「去哪个平台认这位歌手」得知道这首歌是从哪儿搜来的 ——
+ * 歌手那一行字本身不带平台信息（`SongItem.singer` 只是一串名字）。
+ */
+export const K_CURRENT_SOURCE: string = 'ps_current_source';
 export const K_CURRENT_COVER: string = 'ps_current_cover';
 export const K_CURRENT_ART: string = 'ps_current_art';
 export const K_CURRENT_QUALITY: string = 'ps_current_quality';
@@ -78,6 +87,11 @@ export const K_HISTORY_VERSION: string = 'ps_history_version';
  * 让 MiniBar 的内容组件自己订阅（不依赖 builder 是否被重新调用）。
  */
 export const K_MINI_EXPANDED: string = 'ps_mini_expanded';
+// 曾经给「迷你栏封面 ↔ 播放页封面」的共享元素转场用过两个常量（配对 id `K_PLAYER_GEO`
+// 与时长 `PLAYER_MORPH_MS`），已随那套转场一起撤掉：播放页是 bindContentCover 的模态
+// （独立渲染根），geometryTransition 跨不过去，实机表现是「屏幕左上角闪一张封面」。
+// 现在播放页的进入/退出走系统标准的 `ModalTransition.DEFAULT`（上升 / 下降），
+// 见 pages/Index.ets 里 bindContentCover 上那段说明。
 /** 当前这首歌的歌词（LyricLine[]，由源的 lyric action 解析而来） */
 export const K_LYRIC_LINES: string = 'ps_lyric_lines';
 /** 歌词状态：none（没有/音源不支持）/ loading / ready */
@@ -889,6 +903,7 @@ export class PlaySession {
       AppStorage.setOrCreate(K_CURRENT_ID, item.id);
       AppStorage.setOrCreate(K_CURRENT_NAME, item.name);
       AppStorage.setOrCreate(K_CURRENT_SINGER, item.singer);
+      AppStorage.setOrCreate(K_CURRENT_SOURCE, item.source);
       AppStorage.setOrCreate(K_CURRENT_COVER, item.coverUrl);
       AppStorage.setOrCreate(K_CURRENT_ART, item.art);
       AppStorage.setOrCreate(K_CURRENT_QUALITY, item.quality);
@@ -898,6 +913,7 @@ export class PlaySession {
       AppStorage.setOrCreate(K_CURRENT_ID, '');
       AppStorage.setOrCreate(K_CURRENT_NAME, '');
       AppStorage.setOrCreate(K_CURRENT_SINGER, '');
+      AppStorage.setOrCreate(K_CURRENT_SOURCE, '');
       AppStorage.setOrCreate(K_CURRENT_COVER, '');
       AppStorage.setOrCreate(K_CURRENT_ART, false);
       AppStorage.setOrCreate(K_CURRENT_QUALITY, '128k');
@@ -1112,6 +1128,21 @@ export class PlaySession {
       const message: string = `「${item.name}」的文件已经不在了，请重新导入本地音乐`;
       this.setStatus('error', message);
       this.notify(message);
+      return;
+    }
+    /**
+     * 引用式条目给的是设备里的原文件 URI：冷启动后要先激活持久化授权才能读
+     * （见 core/local/LocalAccess.ets）。这里按需 ensure 一次，已激活时只是一次内存查表。
+     * 失败基本只有一种原因：用户在文件管理里把原文件删了 / 改名 / 移动了。
+     */
+    if (!(await LocalAccess.ensure(path))) {
+      const message: string = `「${item.name}」的原文件已经被移动或删除，请重新导入这首`;
+      hilog.warn(DOMAIN, TAG, 'local uri inaccessible: %{public}s', item.name);
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    if (this.playToken !== token) {
       return;
     }
     // 这几个现场变量是给「在线歌失败要重来」用的，本地歌一律清空
@@ -1420,6 +1451,16 @@ export class PlaySession {
       this.currentUrlFromCache = false;
       this.currentLocalPath = '';
 
+      // ---------------------------------------------------------- 自动下载（缓存时）
+      // 必须在「已下载 / 沙箱缓存」这两条早退**之前**排队：那两条会直接 return 去读本地
+      // 文件，而以前排队放在下面「联网播成功之后」，于是「以前听过、沙箱里已经有缓存」
+      // 的歌再听一遍也永远进不了下载文件夹 —— 用户看到的就是「有的歌就是不下」。
+      // 已经下载过的 / 已在队列里的由 DownloadManager.enqueue 自己去重（返回原记录，
+      // 不会重复下一份）；下载失败过、或文件已经不在了的，也会在这里被重新排队（自愈）。
+      if (audioCache.isAutoDownload()) {
+        this.queueAutoDownload(item, quality);
+      }
+
       // 0) 用户主动下载到本地的：优先放它。
       // 下载是明确的用户意图、文件是长期保留的，比 LRU 播放缓存更该被优先使用：
       // 离线能放、也不看音源脸色（音源失效时下载过的歌照样能听）。
@@ -1441,6 +1482,10 @@ export class PlaySession {
           this.currentLocalPath = '';
           hilog.warn(DOMAIN, TAG, 'play downloaded file failed, fallback to online: %{public}s',
             (e as Error).message);
+          // 这条「已下载」记录对应的文件打不开了（用户删了 / 目录授权失效 / 文件损坏）：
+          // 把内存里这条映射去掉，下一次播这首时 DownloadManager.enqueue 就会把它当作
+          // 「已下载但读不到」重新下一遍（续上目录授权），而不是永远拿一个打不开的路径。
+          removeDownloadedFile(cacheKey.length > 0 ? cacheKey : item.id);
         }
       }
 
@@ -1501,12 +1546,8 @@ export class PlaySession {
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
       // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支。
-      //    开着「缓存时自动下载」时**另外**再整份下一遍到下载文件夹（两份落盘的分工
-      //    见 AudioCache.autoDownload）：沙箱这份受缓存上限约束、会被 LRU 淘汰，
-      //    下载那份是用户在下载管理里能看见、能长期留的。
-      if (audioCache.isAutoDownload()) {
-        this.queueAutoDownload(item, quality);
-      }
+      //    下载文件夹里那一份在开头已经排过队了（见上面「自动下载」那段），这里只管
+      //    沙箱这份 —— 两份落盘的分工见 AudioCache.autoDownload。
       audioCache.cacheSong(cacheKey, quality, url);
       // 4) 预取下一首：切歌时直接读本地文件，不用现场解析 + 缓冲
       void this.prefetchNext(token, index);
@@ -1600,14 +1641,16 @@ export class PlaySession {
         return;
       }
       const cache = AudioCache.getInstance();
+      // 开了「缓存时自动下载」：先排一份整份下载进下载文件夹（它自己解析地址）。
+      // 这一步必须在下一条「沙箱里已经有这首歌」的早退**之前** —— 沙箱有缓存不代表下载
+      // 文件夹里有文件（开开关之前听过的歌、预取时就命中缓存的歌，都只有沙箱那一份），
+      // 早退掉就永远补不上。已经下载过的由 DownloadManager 去重，不会重复下。
+      if (cache.isAutoDownload()) {
+        this.queueAutoDownload(item, quality);
+      }
       if (cache.localPath(key, quality).length > 0) {
         // 已经是本地文件了，切过去本来就不用联网
         return;
-      }
-      // 开了「缓存时自动下载」：额外排一份整份下载进下载文件夹（它自己解析地址）。
-      // 这里**不 return** —— 沙箱缓存那份照旧要预取（两条链路并存，见 queueAutoDownload）
-      if (cache.isAutoDownload()) {
-        this.queueAutoDownload(item, quality);
       }
       let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
       if (url.length === 0) {

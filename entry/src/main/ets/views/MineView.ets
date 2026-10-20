@@ -1,4 +1,5 @@
 import { K_HISTORY_VERSION, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { BottomBar } from '../ui/BottomBar';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylist, CollectedPlaylists, K_COLLECTED_VERSION, collectedKeyOf } from '../core/sync/CollectedPlaylists';
@@ -746,6 +747,11 @@ export struct MineView {
         .scrollBar(BarState.Off)
         .layoutWeight(1)
         .align(Alignment.Top)
+        .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+          // 列表上滑 → 底栏收成单排；下滑 → 回到两排（照派音，见 ui/BottomBar.ets）
+          BottomBar.notifyScrollDelta(this.getUIContext(), offset);
+          return { offsetRemain: offset };
+        })
         .width('100%')
       }
       .width('100%')

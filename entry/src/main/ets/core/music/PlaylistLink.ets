@@ -45,7 +45,16 @@ const PLATFORM_DOMAINS: string[][] = [
  *   kw  listDetailLink  /^.+\/playlist(?:_detail)?\/(\d+)(?:\?.*|&.*$|#.*$|$)/
  *   kg  listDetailLink  /^.+\/(\d+)\.html(?:\?.*|&.*$|#.*$|$)/
  *   tx  listDetailLink  /\/playlist\/(\d+)/ + listDetailLink2 /id=(\d+)/
+ *
+ * 酷狗还有一类洛雪没管、用户分享出来却最常见的：用户歌单（gcid 全局集合 id），
+ * 形如 m.kugou.com/songlist/gcid_3z18r5q99zaz0b6/?src_cid=...&uid=...。
+ * 它既不是 /<id>.html、也没有 specialid=，照洛雪那两条正则永远抠不出来，
+ * 老版本直接报「没能从酷狗链接里找到歌单 id」。这里单独认一下：id 原样保留成
+ * gcid_xxx，由 MusicList 的 kgPlaylistDetail 再用歌单页换出 specialid。
  */
+const KG_GCID_PATH: RegExp = /\/(gcid_[0-9A-Za-z]+)/i;
+const KG_GCID_PARAM: RegExp = /[?&](?:src_cid|gcid|global_collection_id)=([0-9A-Za-z]+)/;
+
 const ID_REGEXPS: Record<string, RegExp[]> = {
   'wy': [/[?&]id=(\d+)/, /\/playlist\/(\d+)\/\d+/, /\/playlist\/(\d+)/],
   'mg': [/\/playlist\/(\d+)/, /[?&](?:playlistId|id)=(\d+)/],
@@ -140,6 +149,18 @@ export function platformOfUrl(url: string): string {
 
 /** 按平台的正则从链接里抠歌单 id；抠不到返回空串 */
 function extractId(source: string, url: string): string {
+  // 酷狗用户歌单先单独认：gcid 既可能在路径里（/songlist/gcid_xxx/），也可能是
+  // src_cid 参数（分享链里两种都出现过），参数里那个不带前缀，补上才是完整 id
+  if (source === 'kg') {
+    const byPath: RegExpMatchArray | null = url.match(KG_GCID_PATH);
+    if (byPath !== null && byPath[1] !== undefined) {
+      return byPath[1];
+    }
+    const byParam: RegExpMatchArray | null = url.match(KG_GCID_PARAM);
+    if (byParam !== null && byParam[1] !== undefined && byParam[1].length > 0) {
+      return 'gcid_' + byParam[1];
+    }
+  }
   const patterns: RegExp[] = ID_REGEXPS[source];
   if (patterns === undefined) {
     return '';
@@ -197,7 +218,9 @@ function linkFromTarget(source: string, target: string): PlaylistLink | null {
     const id: string = extractId(source, target);
     return id.length > 0 ? makeLink(source, id, target) : null;
   }
-  return /^\d+$/.test(target) ? makeLink(source, target, '') : null;
+  // 酷狗用户歌单的 id 是 gcid_xxx（不是纯数字），深链里也会这么给
+  return (/^\d+$/.test(target) || /^gcid_[0-9A-Za-z]+$/i.test(target))
+    ? makeLink(source, target, '') : null;
 }
 
 /** 直接由「平台 + 歌单 id」造一条链接（从在线歌单详情页导入时用，不需要解析） */

@@ -355,6 +355,85 @@ async function diagnoseSource(win, source, keyword, dumpDir, log, bookUrl) {
   return { name: source.bookSourceName, url: source.bookSourceUrl, stages, hardFail: !verdict.ok };
 }
 
+// ------------------------------------------------------------ 发现（explore）链路
+
+/**
+ * ruleExplore 空不空 —— 空了发现页要靠**退回搜索规则**（阅读 BookList.kt 的行为）
+ *
+ * 导出的书源里这很常见：有的写成空对象，有的干脆是空数组（`"ruleExplore": []`）。
+ * 不退回就是「分类列得出来、点进去一本没有」，还不报错。
+ */
+function exploreRuleNote(source) {
+  const ex = source.ruleExplore;
+  const list = ex && !Array.isArray(ex) ? ex.bookList : null;
+  const usable = list !== null && list !== undefined && String(list).trim().length > 0;
+  if (usable) return '';
+  const hasSearch = source.ruleSearch && String(source.ruleSearch.bookList || '').trim().length > 0;
+  return hasSearch ? '（ruleExplore 为空，已回退搜索规则）' : '（ruleExplore 与 ruleSearch 都为空）';
+}
+
+/**
+ * 发现链路诊断：exploreUrl → 分类表 → 分类列表 → 翻页
+ *
+ * 与搜索是两条路（exploreUrl + ruleExplore，见 docs/BOOK_SOURCE_ENGINE.md），所以单独一段。
+ * 这里验的三件事都是真实书源踩过的坑：
+ *   1. 分类表里**空地址的条目是分组标题**，不该当成能点的分类（听友FM、「小说，漫画，听书」）；
+ *   2. `ruleExplore` 为空要**退回搜索规则**（幻听网、懒人听书这一批都是这样）；
+ *   3. 地址里的可选段 `<,_{{page}}>` 要按页解析（幻听网、恋听、56听书…第一页才不是 404）。
+ */
+async function diagnoseExplore(win, source, log) {
+  const jar = new CookieJar();
+  const stages = [];
+  const rec = (stage, ok, why, extra) => stages.push({ stage, ok, why, extra: extra || '' });
+
+  const listRes = await runJob(win, { action: 'exploreList', source }, jar, log);
+  if (listRes.res.status !== 'ok') {
+    rec('分类表', false, listRes.res.message || listRes.res.status);
+    return { name: source.bookSourceName, url: source.bookSourceUrl, stages, hardFail: true };
+  }
+  const all = listRes.res.data || [];
+  // 与 BookEngine.exploreCategories 同一口径：空地址的是分组标题，扔掉
+  const cats = all.filter((c) =>
+    String(c.title || '').trim().length > 0 && String(c.url || '').trim().length > 0);
+  const headers = all.length - cats.length;
+  rec('分类表', cats.length > 0,
+    `${cats.length} 个分类${headers > 0 ? `（另有 ${headers} 条是空地址的分组标题，已跳过）` : ''}${exploreRuleNote(source)}`,
+    cats.length > 0 ? `${cats[0].title} -> ${cats[0].url}` : '');
+  if (cats.length === 0) return { name: source.bookSourceName, url: source.bookSourceUrl, stages, hardFail: true };
+
+  // 前两个分类各拉第 1 页
+  for (let i = 0; i < Math.min(2, cats.length); i++) {
+    const cat = cats[i];
+    const out = await runJob(win, { action: 'explore', source, exploreUrl: cat.url, key: '', page: 1 }, jar, log);
+    const note = (out.netFails && out.netFails.length > 0) ? `（${out.netFails.length} 次请求失败：${out.netFails[0]}）` : '';
+    if (out.res.status !== 'ok') {
+      rec(`分类第 ${i + 1} 页「${cat.title}」`, false, (out.res.message || out.res.status) + note);
+      continue;
+    }
+    const hits = out.res.data || [];
+    const good = hits.filter((h) => String(h.name || '').trim().length > 0 && isHttp(h.bookUrl));
+    rec(`分类「${cat.title}」第 1 页`, good.length > 0,
+      `${hits.length} 条${good.length !== hits.length ? `（其中 ${hits.length - good.length} 条缺书名/地址）` : ''}${note}`,
+      good[0] ? `${good[0].name} -> ${good[0].bookUrl}` : '');
+  }
+
+  // 翻页：地址带 {{page}} 的才试第 2 页，第 2 页必须给出跟第 1 页不一样的书才算通
+  const paged = cats.find((c) => String(c.url).indexOf('{{page}}') >= 0);
+  if (paged) {
+    const p1 = await runJob(win, { action: 'explore', source, exploreUrl: paged.url, key: '', page: 1 }, jar, log);
+    const p2 = await runJob(win, { action: 'explore', source, exploreUrl: paged.url, key: '', page: 2 }, jar, log);
+    const a = (p1.res.data || []).map((h) => String(h.bookUrl)).join('|');
+    const b = (p2.res.data || []).map((h) => String(h.bookUrl)).join('|');
+    const n2 = (p2.res.data || []).length;
+    rec('翻页第 2 页', n2 > 0 && b !== a,
+      n2 === 0 ? `0 条${(p2.netFails && p2.netFails.length > 0) ? `（${p2.netFails[0]}）` : ''}`
+        : (b === a ? '与第 1 页完全一样（{{page}} 没生效）' : `${n2} 条`),
+      `「${paged.title}」`);
+  }
+
+  return { name: source.bookSourceName, url: source.bookSourceUrl, stages, hardFail: stages.some((s) => !s.ok) };
+}
+
 // ------------------------------------------------------------ 离线夹具
 
 async function offlineCases(win) {
@@ -483,6 +562,104 @@ async function offlineCases(win) {
   check('网页登录抓来的 Cookie 能被 java.getCookie / cookie.getCookie / infoMap 读到',
     cookieJob.data && cookieJob.data.name === 'abc|1|SESSDATA=abc; u=1', JSON.stringify(cookieJob.data && cookieJob.data.name));
 
+  // ---------------------------------------------------------- 发现（explore）相关
+  // 见 docs/BOOK_SOURCE_ENGINE.md §5.4 / §5.5：这几条都是真实书源踩过的坑
+
+  const exploreListOf = (exploreUrl) => JSON.parse(unwrapJsonString(JSON.stringify(win.__book_run__(JSON.stringify({
+    action: 'exploreList',
+    source: { bookSourceName: 't', bookSourceUrl: 'https://x.test', exploreUrl },
+    netCache: {}, netHeaders: {},
+  })))));
+
+  // 「标题::地址」的分隔符 `&&` 与换行都算（56听书的分类表整条都挤在一行里、用 && 串起来）
+  const amp = exploreListOf('玄幻::http://a/1.html&&武侠::http://a/2.html');
+  check('分类表认 `&&` 分隔', amp.status === 'ok' && amp.data.length === 2 && amp.data[1].title === '武侠',
+    JSON.stringify(amp.data));
+  const nl = exploreListOf('玄幻::http://a/1.html\n武侠::http://a/2.html');
+  check('分类表认换行分隔', nl.status === 'ok' && nl.data.length === 2, JSON.stringify(nl.data));
+  // url 为空的是分组标题（听友FM 的「有声小说 / 评书」那两条），不是能点的分类
+  const hdr = exploreListOf('[{"title":"有声小说","url":""},{"title":"玄幻","url":"http://a/1.html"}]');
+  check('分类表跳过空地址的分组标题', hdr.status === 'ok' && hdr.data.length === 1 && hdr.data[0].title === '玄幻',
+    JSON.stringify(hdr.data));
+
+  /**
+   * 跑一次 explore，把缺失的地址补成同一个夹具页 —— 顺便把「实际请求的地址」带回来
+   * （可选段那两条要断言地址本身，光看结果看不出来）
+   */
+  const exploreWithFixture = (source, exploreUrl, page, html, cache) => {
+    const run = () => JSON.parse(unwrapJsonString(JSON.stringify(win.__book_run__(JSON.stringify({
+      action: 'explore', source, exploreUrl, key: '', page, netCache: cache, netHeaders: {},
+    })))));
+    let r = run();
+    const asked = (r.status === 'net' && r.urls) ? r.urls.map((u) => u.url) : [];
+    if (r.status === 'net') {
+      for (const u of r.urls) { cache[u.key] = html; }
+      r = run();
+    }
+    return { res: r, asked };
+  };
+
+  const listHtml = '<html><body><ul class="clist"><li><a href="/b/9.html" title="书九"></a></li></ul></body></html>';
+
+  // ruleExplore 空（空对象或空数组都算）要退回搜索规则 —— 阅读 BookList.kt 就是这么做的。
+  // 不退回就是「分类列得出来、点进去一本没有」，还不报错。
+  const fallbackSrc = {
+    bookSourceName: 't', bookSourceUrl: 'https://x.test',
+    exploreUrl: '玄幻::https://x.test/list/1.html',
+    ruleExplore: [],
+    ruleSearch: { bookList: 'ul.clist li', name: 'a@title', bookUrl: 'a@href' },
+  };
+  const fb = exploreWithFixture(fallbackSrc, 'https://x.test/list/1.html', 1, listHtml, {});
+  check('ruleExplore 为空时回退搜索规则',
+    fb.res.status === 'ok' && fb.res.data.length === 1 && fb.res.data[0].bookUrl === 'https://x.test/b/9.html',
+    JSON.stringify(fb.res).slice(0, 200));
+
+  // 地址可选段 `<,_{{page}}>`：第一页没有这一段，第二页起才有（幻听网、恋听、56听书都用它）。
+  // 以前 `{{page}}` 照样被替换，地址里带着 `<,1>` 去请求 —— 第一页就 404。
+  const optSrc = {
+    bookSourceName: 't', bookSourceUrl: 'https://x.test',
+    exploreUrl: '玄幻::/booklist/1<,_{{page}}>.html',
+    ruleSearch: { bookList: 'ul.clist li', name: 'a@title', bookUrl: 'a@href' },
+  };
+  const optCache = {};
+  const o1 = exploreWithFixture(optSrc, '/booklist/1<,_{{page}}>.html', 1, listHtml, optCache);
+  check('可选段：第 1 页地址里没有这一段',
+    o1.asked.length === 1 && o1.asked[0] === 'https://x.test/booklist/1.html', JSON.stringify(o1.asked));
+  const o2 = exploreWithFixture(optSrc, '/booklist/1<,_{{page}}>.html', 2, listHtml, optCache);
+  check('可选段：第 2 页带上 _2',
+    o2.asked.length === 1 && o2.asked[0] === 'https://x.test/booklist/1_2.html', JSON.stringify(o2.asked));
+
+  // Rhino 的 Java 互操作：听友FM 的 XChaCha20Poly1305、懒人听书本地源的 android.util.Base64 靠它。
+  // 密文用 RFC 8439 §2.8.2 的官方向量 —— 手写的密码学最容易悄悄坏掉，必须有守卫。
+  const aead = {
+    key: '808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f',
+    nonce: '070000004041424344454647',
+    aad: '50515253c0c1c2c3c4c5c6c7',
+    ct: 'd31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6'
+      + '3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3'
+      + '692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc'
+      + '3ff4def08e4b7a9de576d26586cec64b6116',
+    tag: '1ae10b594f09e26a7e902ecbd0600691',
+  };
+  const aeadJs = `@js:(function(){
+    var h=function(s){var o=[];for(var i=0;i<s.length;i+=2){o.push(parseInt(s.substr(i,2),16));}return new Uint8Array(o);};
+    var c=Packages.javax.crypto.Cipher.getInstance('ChaCha20-Poly1305');
+    c.init(javax.crypto.Cipher.DECRYPT_MODE,
+      new Packages.javax.crypto.spec.SecretKeySpec(h('${aead.key}'),'ChaCha20'),
+      new Packages.javax.crypto.spec.GCMParameterSpec(128,h('${aead.nonce}')));
+    c.updateAAD(h('${aead.aad}'));
+    return new Packages.java.lang.String(c.doFinal(h('${aead.ct + aead.tag}')),'UTF-8');
+  })()`;
+  const aeadOut = bookInfoWith({ name: aeadJs }, 'data:text/html,x');
+  const aeadText = String((aeadOut.data && aeadOut.data.name) || '');
+  check('Java 互操作：ChaCha20-Poly1305 过 RFC 8439 §2.8.2 向量',
+    aeadText.startsWith("Ladies and Gentlemen of the class of '99"), JSON.stringify(aeadText.slice(0, 60)));
+
+  // 懒人听书本地源要的是 Android 的 Base64（flags 2 = 不折行）
+  const b64Out = bookInfoWith({ name: "@js: Packages.android.util.Base64.encodeToString(new Uint8Array([228,189,160]), 2)" }, 'data:text/html,x');
+  check('Java 互操作：android.util.Base64 不折行', String((b64Out.data && b64Out.data.name) || '') === '5L2g',
+    JSON.stringify(b64Out.data && b64Out.data.name));
+
   console.log(`\n离线结果：${pass} 通过 / ${fail} 失败`);
   return fail;
 }
@@ -546,6 +723,38 @@ function loadSources(filter, fileFilter, nameFilter) {
   if (sources.length === 0) {
     console.error(`没找到书源（过滤「${filter}」）。查找目录：\n  ${SOURCE_DIRS.join('\n  ')}`);
     process.exit(2);
+  }
+
+  // 发现（explore）单独一条链路，按 --explore 走
+  if (args.includes('--explore')) {
+    const withExplore = sources.filter(({ source }) => String(source.exploreUrl || '').trim().length > 0);
+    console.log(`\n== 发现（explore）诊断：${sources.length} 个源里有 ${withExplore.length} 个带 exploreUrl ==`);
+    let badExp = 0;
+    for (const { file, source } of withExplore) {
+      console.log(`\n================ ${source.bookSourceName} 发现 ================`);
+      console.log(`  文件：${file}\n  站址：${source.bookSourceUrl}`);
+      const logExp = process.env.BOOK_DEBUG ? (l) => console.log('  ' + l) : null;
+      let r;
+      try {
+        r = await Promise.race([
+          diagnoseExplore(win, source, logExp),
+          new Promise((resolve) => setTimeout(() => resolve({
+            name: source.bookSourceName,
+            stages: [{ stage: '超时', ok: false, why: '单个书源超过 90 秒还没跑完', extra: '' }],
+            hardFail: true,
+          }), 150000)),
+        ]);
+      } catch (e) {
+        r = { name: source.bookSourceName, stages: [], hardFail: true, crash: (e && e.stack) ? e.stack : String(e) };
+      }
+      for (const s of r.stages) {
+        console.log(`  ${s.ok ? '✓' : '✗'} ${s.stage}：${s.why}${s.extra ? '   [' + s.extra + ']' : ''}`);
+      }
+      if (r.crash) console.log(`  ✗ 脚本抛错：${r.crash}`);
+      if (r.hardFail) badExp++;
+    }
+    console.log(`\n发现链路：${withExplore.length} 个源，硬失败 ${badExp} 个。`);
+    process.exit(badExp > 0 ? 1 : 0);
   }
 
   const quiet = args.includes('--summary');

@@ -1,10 +1,12 @@
 import { common } from '@kit.AbilityKit';
 import { resourceManager } from '@kit.LocalizationKit';
 import { SymbolGlyphModifier, window } from '@kit.ArkUI';
-import { BlurStrategy, HdsBarStyle, HdsNavigation, HdsNavigationTitleBarOptions, HdsNavigationTitleMode,
-  HdsNavDestination, HdsTabs, HdsTabsController, HdsTitleBarContentStyle,
-  TitleBarStyleOptions, TitleSize } from '@kit.UIDesignKit';
-import { K_CURRENT_ID, K_MINI_EXPANDED, K_QUEUE_COUNT, K_STATUS_TEXT, PlaySession, SongItem } from '../core/player/PlaySession';
+import { BlurStrategy, HdsBarLayoutMode, HdsBarStyle, HdsNavigation, HdsNavigationTitleBarOptions,
+  HdsNavigationTitleMode, HdsNavDestination, HdsTabs, HdsTabsBarChangeMode, HdsTabsController,
+  HdsTabsMiniBar, HdsTitleBarContentStyle, TitleBarStyleOptions, TitleSize } from '@kit.UIDesignKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { K_CURRENT_ID, K_MINI_EXPANDED, K_QUEUE_COUNT, K_STATUS_TEXT, PlaySession,
+  SongItem } from '../core/player/PlaySession';
 import { LocalMusic } from '../core/local/LocalMusic';
 import { WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { SourceEngine } from '../core/source/SourceEngine';
@@ -18,19 +20,22 @@ import { SourceSandboxHost } from '../components/SourceSandboxHost';
 import { SyncManager, K_SYNC_STATUS } from '../core/sync/SyncManager';
 import { describeStatus, shouldNotifySyncMessage } from '../core/sync/SyncStatusText';
 import { buildTitleMaterial, HDS_BAR_HEIGHT, HDS_TITLE_BAR_HEIGHT } from '../ui/Hds';
-import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { K_MATERIAL_LEVEL, K_NAV_FOLLOW_HAND } from '../core/settings/AppearanceSettings';
 import { K_BAR_MINI_WIDTH, K_WINDOW_WIDTH, publishedMiniBarWidth } from '../ui/Layout';
+import { BAR_ONE_ROW, BAR_TWO_ROWS, BottomBar, K_BAR_LAYOUT, twoRowLayoutSupported }
+  from '../ui/BottomBar';
 import { PageTitle, RoundIconButton, WidePane } from '../ui/Widgets';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
 import { AboutView } from '../views/AboutView';
 import { WebDavSettingsView } from '../views/WebDavSettingsView';
 import { ListenSettingsView } from '../views/ListenSettingsView';
-import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_HOME, I_HOME_FILL, I_IDENTIFY, I_PERSON,
-  I_PERSON_FILL, I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
+import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_ECHO, I_ECHO_FILL, I_HOME, I_HOME_FILL,
+  I_IDENTIFY, I_PERSON, I_PERSON_FILL, I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
 import { MiniBarView } from '../views/MiniBar';
 import { BookSandboxHost } from '../components/BookSandboxHost';
 import { BookDetailView } from '../views/BookDetailView';
 import { ListenView } from '../views/ListenView';
+import { EchoView, echoTitleOf, K_ECHO_TITLE } from '../views/EchoView';
 import { BookShelf } from '../core/book/BookShelf';
 import { BookHit } from '../core/book/BookTypes';
 import { MineView } from '../views/MineView';
@@ -40,6 +45,7 @@ import { PlayerView } from '../views/PlayerView';
 import { PlayQueueContent } from '../views/PlayQueueSheet';
 import { PlaylistDetailView } from '../views/PlaylistDetailView';
 import { HistoryView } from '../views/HistoryView';
+import { PlaylistSquareView } from '../views/PlaylistSquareView';
 import { LocalMusicPane } from '../views/LocalMusicView';
 import { DownloadListPane } from '../views/DownloadListView';
 import { WebDavPane } from '../views/WebDavView';
@@ -48,6 +54,11 @@ import { K_HIDE_LISTEN_TAB } from '../core/settings/ListenSettings';
 import { RecommendView } from '../views/RecommendView';
 import { RecognizeView } from '../views/RecognizeView';
 import { SearchView } from '../views/SearchView';
+import { ArtistView } from '../views/ArtistView';
+import { ArtistPickerView } from '../views/ArtistPickerView';
+import { ArtistNav } from '../ui/ArtistNav';
+import { ArtistCandidate, artistCandidatesOf, cachedArtistOf, LxArtist,
+  resolveArtistByName } from '../core/music/MusicArtist';
 import { SettingsView } from '../views/SettingsView';
 import { SourceSettingsView } from '../views/SourceSettingsView';
 import { SyncModeContent } from '../views/SyncModeSheet';
@@ -85,6 +96,8 @@ const PAGE_ABOUT: string = 'about';
 const PAGE_SETTINGS: string = 'settings';
 /** 播放历史（「我的」页快捷入口里的「最近播放」） */
 const PAGE_HISTORY: string = 'history';
+/** 全部歌单（推荐页分区标题右边「更多」进来的那一页） */
+const PAGE_SQUARE: string = 'square';
 /** 本地音乐（导入本机音频 / 批量移除） */
 const PAGE_LOCAL: string = 'local';
 /** 下载管理（下载中 / 已完成 / 失败重下） */
@@ -93,6 +106,10 @@ const PAGE_DOWNLOADS: string = 'downloads';
 const PAGE_CLOUD: string = 'cloud';
 /** 听书：一本书的详情 + 目录 */
 const PAGE_BOOK: string = 'book';
+/** 歌手页：一位歌手的全部歌曲（按歌手聚合，见 core/music/MusicArtist） */
+const PAGE_ARTIST: string = 'artist';
+/** 歌手列表页：挑一位歌手（回响的常听歌手 / 一首歌挂着几位歌手时） */
+const PAGE_ARTIST_PICKER: string = 'artistPicker';
 
 /**
  * 底部悬浮页签的页签
@@ -111,7 +128,7 @@ interface TabDef {
 }
 
 /**
- * 三个页签：推荐 / 听书 / 我的
+ * 四个页签：推荐 / 听书 / 回响 / 我的
  *
  * 原来是四个（推荐 / 歌单 / 我的 / 设置）：歌单与设置的**内容**现在都在「我的」页里
  * （照华为音乐的「我的」重排：快捷入口 + 歌单卡 + 设置卡），再留着那两个页签就是
@@ -122,26 +139,39 @@ interface TabDef {
  * 混进推荐页会让「音乐」那一栏的语义变糊；而它又是使用频率很高的主功能，
  * 藏在「我的」的二级入口里不合适，所以给它一个并列的一级页签。
  *
- * 「听书」可以在「设置 - 听书」里隐藏：整块 TabContent 一起不摆，导航栏只剩「推荐」与「我的」。
+ * 「回响」（月度收听记录）排在「我的」前面，与无界音乐的「首页 / 回响 / 我的」同一个排法：
+ * 左边两栏是**内容**（推荐、听书），右边两栏是**关于我自己的**（回响是我听过的账，
+ * 我的是我收藏的东西），两两相邻。
+ *
+ * 「听书」可以在「设置 - 听书」里隐藏：整块 TabContent 一起不摆，导航栏只剩「推荐」「回响」「我的」。
+ *
+ * 四栏的**排法**是固定的（推荐 / 听书 / 回响 / 我的，我的在最右）。悬浮栏整体的**位置**另说：
+ * 开了「左右跟手」（设置 - 外观）之后它不再恒定居中，而是贴到握持手那一侧 —— 这件事由 HDS
+ * 的 `adaptToHandedness` 做（见 build 里 barFloatingStyle），并且只在「栏比窗口窄」的宽屏下
+ * 看得出来。它不动栏里的次序，折叠成的那颗球永远是那一组的左端元素。
  */
 const TAB_KEY_HOME: string = 'home';
 const TAB_KEY_LISTEN: string = 'listen';
+const TAB_KEY_ECHO: string = 'echo';
 const TAB_KEY_MINE: string = 'mine';
 
 const TAB_HOME: TabDef = { key: TAB_KEY_HOME, icon: I_HOME, iconActive: I_HOME_FILL, label: '推荐' };
 const TAB_LISTEN: TabDef = { key: TAB_KEY_LISTEN, icon: I_BOOK, iconActive: I_BOOK_FILL, label: '听书' };
+const TAB_ECHO: TabDef = { key: TAB_KEY_ECHO, icon: I_ECHO, iconActive: I_ECHO_FILL, label: '回响' };
 const TAB_MINE: TabDef = { key: TAB_KEY_MINE, icon: I_PERSON, iconActive: I_PERSON_FILL, label: '我的' };
 
-const TABS: TabDef[] = [TAB_HOME, TAB_LISTEN, TAB_MINE];
+const TABS: TabDef[] = [TAB_HOME, TAB_LISTEN, TAB_ECHO, TAB_MINE];
 
 /**
- * 悬浮页签栏里每颗页签占的宽度（中档 / 大档）
+ * 底栏那份日志（HDS 的样式回调与滚动联动各打一行，`hdc shell hilog | grep BottomBar` 能查到）
  *
- * HDS 官方的档位（284 / 328）对三颗页签给出的是 216 / 240，摊到每颗就是 72 / 80。
- * 按页签署数算，藏掉「听书」只剩两颗时页签栏会自己收窄（见 barWidth）。
+ * 宽度不再按「每颗页签占多少」算（barWidth / miniBarWidth 都不声明了，见 barFloatingStyle 那段），
+ * 所以原来那两个 TAB_SLOT_* 常量一并去掉。
  */
-const TAB_SLOT_MEDIUM: number = 72;
-const TAB_SLOT_LARGE: number = 80;
+const DOMAIN_BAR: number = 0x0001;
+const TAG_BAR: string = 'BottomBar';
+
+
 
 /**
  * 应用壳层
@@ -150,9 +180,10 @@ const TAB_SLOT_LARGE: number = 80;
  *   底部是 HDS 的悬浮页签栏（推荐 / 歌单 / 我的 / 设置）+ 挂在它右边的迷你栏：
  *     迷你栏折叠 = 洛雪那颗悬浮专辑圆钮，展开 = 迷你播放器（封面 + 播放/下一首/播放列表）。
  *     展开与折叠的互斥、让位动画都是 HDS 自己做的，点一下就切换。
- *   点迷你播放器的信息区弹出全屏播放器：它是系统的底部半模态（bindSheet），
- *     从下往上弹、顶边停在状态栏下方，下面那层页面不重建也不退出；
- *     播放列表是另一层半模态，两者各自挂在不同节点上，互不干扰。
+ *   点迷你播放器的信息区弹出全屏播放器：它是**全屏模态**（bindContentCover），
+ *     整页从下往上升起、收起时从上往下滑走（`ModalTransition.DEFAULT`）；
+ *     下面那层页面不重建也不退出；播放列表是另一层半模态，
+ *     两者各自挂在不同节点上，互不干扰。
  *   音源沙箱（1x1 的 ArkWeb）始终挂在最外层，保证换页不会打断源脚本状态
  */
 @Entry
@@ -167,6 +198,22 @@ struct Index {
    */
   @State activeTabKey: string = TAB_KEY_HOME;
   @State playerOpen: boolean = false;
+  /**
+   * 播放页里那一层自绘覆盖物（评论 / 更多 / 音质 / 匹配歌词）开着没有
+   *
+   * 播放页是 bindContentCover 全屏模态：系统返回键默认直接收起整个模态。
+   * 评论页只是模态里自绘的一层，如果不拦一下，按返回会把播放页一起收掉、露出
+   * 下面的页签页 —— 就是用户反馈的「从评论返回有概率回到一级菜单」。
+   * 由 PlayerView 在覆盖物开合时回调过来，见下面 bindContentCover 的 onWillDismiss。
+   */
+  @State playerOverlayOpen: boolean = false;
+  /**
+   * 让播放页「收掉最上面那层覆盖物」的信号（每次返回键 +1）
+   *
+   * 壳层没法直接调子组件的私有方法，就按状态传：PlayerView 里 @Watch 它，
+   * 收到就按「评论 → 匹配歌词 → 音质 → 更多」的顺序收一层。
+   */
+  @State playerBackTick: number = 0;
   @State queueOpen: boolean = false;
   @State topInset: number = 0;
   @State bottomInset: number = 0;
@@ -180,6 +227,10 @@ struct Index {
   @State routePlaylistId: string = '';
   @State routePlaylistName: string = '歌单';
   /** 在线歌单 / 榜单详情页的当前目标 */
+  /** 全部歌单那一页的口径：哪个平台 × 哪个排序 */
+  @State routeSquareSource: string = 'kw';
+  @State routeSquareSortId: string = '';
+  @State routeSquareName: string = '';
   @State routeOnlineKind: string = 'playlist';
   @State routeOnlineSource: string = 'kw';
   @State routeOnlineId: string = '';
@@ -190,6 +241,26 @@ struct Index {
     id: '', sourceId: '', sourceName: '', name: '', author: '', coverUrl: '',
     intro: '', kind: '', wordCount: '', status: '', lastChapter: '', bookUrl: '',
   };
+  /**
+   * 歌手页当前要看的歌手
+   *
+   * 与歌单 / 听书同样由壳层持有（路由参数只收 Object，传对象进来还要再拆一遍）。
+   * 这几项都是基本类型，正好对上 ArtistView 那几个 @Prop。
+   */
+  @State routeArtistSource: string = '';
+  @State routeArtistId: string = '';
+  @State routeArtistMid: string = '';
+  @State routeArtistName: string = '';
+  @State routeArtistPicUrl: string = '';
+  @State routeArtistSongNum: number = 0;
+  /**
+   * 歌手列表页要显示的那份名单
+   *
+   * 两个来源共用：回响的「常听歌手」整份名单，或一首歌挂着几位歌手时的候选。
+   */
+  @State routeArtistCandidates: ArtistCandidate[] = [];
+  @State routeArtistPickerTitle: string = '选择歌手';
+  @State routeArtistPickerHint: string = '';
   @StorageLink(K_CURRENT_ID) currentId: string = '';
   @StorageLink(K_STATUS_TEXT) statusText: string = '';
   @StorageLink(K_QUEUE_COUNT) queueCount: number = 0;
@@ -220,6 +291,40 @@ struct Index {
    * （见 activeTabKey），栏位下标每次渲染现算，所以隐藏 / 显示都不需要搬移选中项。
    */
   @StorageLink(K_HIDE_LISTEN_TAB) hideListenTab: boolean = false;
+  /**
+   * 悬浮栏左右跟手（设置 - 外观，默认开）
+   *
+   * 交给 HDS 自己的左右跟手能力（见 build 里 barFloatingStyle 的 adaptToHandedness）：
+   * 悬浮栏不再恒定居中，而是贴到握持手那一侧（右手握持贴右、左手握持贴左）。
+   * 只在「栏比窗口窄」的宽屏下看得出来；手机竖屏两条栏本来就铺满，看不出变化。
+   * 三条页内播放条（歌单详情 / 在线详情 / 四个面板页）跟着同一个值走，见那几页的 followHand。
+   */
+  @StorageLink(K_NAV_FOLLOW_HAND) followHand: boolean = true;
+  /**
+   * 底栏现在是「上下两排」还是「单排」（ui/BottomBar.ets 是唯一的状态源）
+   *
+   * 默认**两排**（派音 / musicfree 的默认观感）：迷你条一排、页签一排，页签永远够得着 ——
+   * 这也是这次改动的初衷（单排时页签让位收成左侧一颗圆钮，右手握着够不到）。
+   * 列表上滑收成单排、下滑回到两排，见 ui/BottomBar.ets 的 notifyScrollDelta。
+   */
+  @StorageLink(K_BAR_LAYOUT) barLayout: number = BAR_TWO_ROWS;
+  /**
+   * 迷你条是不是展开态（单排 = 拉成整条通栏，两排 = 收成窄胶囊）
+   *
+   * 这个值现在**由我们写**（ui/BottomBar.ets 里与排布一起翻），HDS 的样式回调只当报告看
+   * （唯一例外是用户点那颗圆钮，见 onBarStyleChanged）。页内那条自绘迷你栏的宽度、各页的
+   * 底部让位也读它（见 publishLayout）。
+   */
+  @StorageLink(K_MINI_EXPANDED) miniExpanded: boolean = false;
+
+  /**
+   * 回响那一栏的页头大标题（「10 月 · 回响」）
+   *
+   * 页头一律由壳层画（见 homeHeader），而回响的标题要带**月份**、跟着页面里那颗月份
+   * 选择器走，所以由 views/EchoView 把标题发布到这个键、壳层订阅它。
+   * 默认按当月给：回响页是懒加载的，还没被创建过时就先显示当月这一档。
+   */
+  @StorageLink(K_ECHO_TITLE) echoTitle: string = echoTitleOf(new Date().getMonth() + 1);
   /**
    * 多选：顶栏整条换成「取消 + 已选中 N 项 + 全选」
    *
@@ -283,6 +388,21 @@ struct Index {
       this.showToast(text);
     };
     PlaySession.getInstance().setNoticeListener(this.noticeListener);
+
+    /**
+     * 「点歌手名 -> 歌手聚合页」的入口注册（见 ui/ArtistNav.ets）
+     *
+     * 播放页、每一个歌曲列表行、回响的常听歌手都通过这个单例触发；页面栈在这边，
+     * 所以只有这里知道该怎么开。放在 aboutToAppear 而不是别处：壳层先于任何页面建好，
+     * 注册完就一直在（重复注册也只是覆盖同一个函数）。
+     */
+    const artistNav: ArtistNav = ArtistNav.getInstance();
+    artistNav.register((source: string, singer: string) => {
+      this.openArtistFromSinger(source, singer);
+    });
+    artistNav.registerList((title: string, hint: string, candidates: ArtistCandidate[]) => {
+      this.openArtistList(title, hint, candidates);
+    });
 
     // 同步模块的提示（认证失败、连接断开等）走同一条提示条；
     // 服务端要同步方式时，把选择框弹出来，用户选完再回传给 SyncManager。
@@ -493,19 +613,25 @@ struct Index {
   /**
    * 打开 / 关闭全屏播放器
    *
-   * 播放器是**系统的底部半模态**（bindSheet，SheetSize.LARGE = 接近满屏、顶部留一条），
-   * 不是当前页里的一层覆盖物、也不是路由页：
-   *   - 路由页会把下面的页面整个盖住/重建，不符合「从下往上弹、不干扰原页面」；
-   *   - 而半模态是系统弹窗，下面的页面原样留着（只压一层遮罩），返回键 / 侧滑返回
-   *     由系统分发给最上层弹窗并收起它（DismissReason.PRESS_BACK），不会把应用退回桌面。
-   * 状态栏字色挂在半模态的 onWillAppear / onDisappear 上，跟弹出、收起对齐。
+   * 播放器是**全屏模态**（bindContentCover）：铺满整个窗口，下面那层页面原样留着，
+   * 返回键 / 侧滑返回由系统分发给它并收起（DismissReason.PRESS_BACK），不会把应用退回桌面。
+   * 状态栏字色挂在它的 onWillAppear / onDisappear 上，跟弹出、收起对齐。
+   *
+   * 这里**不裹 animateTo**：进入/退出动效由模态自己那条 `ModalTransition.DEFAULT`
+   * （向上滑入 / 向下滑出）带动，包一层 animateTo 反而会跟它抢动画配置。
+   * 曾经在这里裹 animateTo 驱动的「迷你栏封面 ↔ 播放页封面」共享元素转场已经撤掉，
+   * 理由见下面 bindContentCover 上那段说明。
    */
   private openPlayer(): void {
+    // 每次打开都是新的一层播放页（覆盖物默认全关）：把壳层记的「覆盖物开着」清掉，
+    // 免得上一次留下的状态让第一次返回键什么都不做
+    this.playerOverlayOpen = false;
     this.playerOpen = true;
   }
 
   private closePlayer(): void {
     this.playerOpen = false;
+    this.playerOverlayOpen = false;
   }
 
   private openQueue(): void {
@@ -519,16 +645,64 @@ struct Index {
 
   // ------------------------------------------------------------ 底部页签 / 迷你栏
 
+
+
   /**
-   * 悬浮页签栏的宽度（vp）
+   * 传给 HDS 的排布模式（见 ui/BottomBar.ets）
    *
-   * 口径照派音：小档按「窗口宽 - 96」（左右各留 48）。窄屏下这条要铺到接近满宽，
-   * 与华为音乐那种「一条长胶囊托住所有页签」的观感一致。
-   * 中 / 大档另给（见 barFloatingStyle 里的 barWidth）—— **不要再自己算宽度塞给
-   * miniBarWidth**，那会和 HDS 的让位动画打架。
+   * 两排 = `VERTICAL`、单排 = `HORIZONTAL`；低版本发行版（< 6.1.1(24)）没有这一项能力，
+   * 返回 undefined —— 那种机型上底栏只能是单排，是能力不存在，不是写法问题。
    */
-  private floatingBarSmallWidthVp(): number {
-    return this.windowWidth > 0 ? this.windowWidth - 96 : 264;
+  private barLayoutModeForHds(): HdsBarLayoutMode | undefined {
+    if (!twoRowLayoutSupported()) {
+      return undefined;
+    }
+    return this.barLayout === BAR_ONE_ROW ? HdsBarLayoutMode.HORIZONTAL : HdsBarLayoutMode.VERTICAL;
+  }
+
+  /**
+   * 迷你栏的配置
+   *
+   * 单独拼一遍是因为 `barLayoutMode` 这个键**在低版本上要整条不出现**（不是给 undefined）：
+   * 实机上见过「键在、值为空」时页签栏整条不见的现象，而官方文档说的「未设置时默认左右布局」
+   * 指的是键不存在。支持这一项的机型上（`distributionOSApiVersion >= 60101`）才补上。
+   */
+  private miniBarConfig(): HdsTabsMiniBar {
+    const bar: HdsTabsMiniBar = {
+      miniBarBuilder: () => this.miniBarBuilder(),
+      // 受控：状态在我们手里，HDS 只负责画（见 onBarStyleChanged）
+      miniBarStyle: this.miniExpanded ? HdsBarStyle.EXPAND : HdsBarStyle.COLLAPSE,
+      onBarStyleChange: (miniBarStyle: HdsBarStyle, tabBarStyle: HdsBarStyle,
+        miniBarWidth: number, tabBarWidth: number, mode: HdsTabsBarChangeMode) => {
+        this.onBarStyleChanged(miniBarStyle, tabBarStyle, miniBarWidth, tabBarWidth, mode);
+      },
+    };
+    const mode: HdsBarLayoutMode | undefined = this.barLayoutModeForHds();
+    if (mode !== undefined) {
+      bar.barLayoutMode = mode;
+    }
+    return bar;
+  }
+
+  /**
+   * HDS 的样式回调：只当「报告」看，不当状态源（派音最新代码里明确写了这一条）
+   *
+   * NORMAL（屏幕尺寸变化）/ APP_TRIGGER（应用触发）都只落一条日志：排布的唯一来源是
+   * ui/BottomBar.ets 里的那个状态，拿回调再反过来改状态就会两边打架。
+   *
+   * 唯一例外是**用户点击**（USER_CLICK）：单排时页签让位收成了左侧一颗圆钮，点它 HDS 会把
+   * 页签栏展开、顺手把迷你条收起来。那一下要恢复成「完整两排」，而不是停在 HDS 自己挑的
+   * 单排形态里 —— 做法与派音一致：翻回两排 + 让控制器把迷你条收起。
+   */
+  private onBarStyleChanged(miniBarStyle: HdsBarStyle, tabBarStyle: HdsBarStyle,
+    miniBarWidth: number, tabBarWidth: number, mode: HdsTabsBarChangeMode): void {
+    hilog.info(DOMAIN_BAR, TAG_BAR, 'style report: mini=%{public}d tab=%{public}d width=%{public}d/%{public}d mode=%{public}d',
+      miniBarStyle, tabBarStyle, miniBarWidth, tabBarWidth, mode);
+    if (mode === HdsTabsBarChangeMode.USER_CLICK && this.barLayout === BAR_ONE_ROW) {
+      BottomBar.applyLayoutAnimated(this.getUIContext(), true);
+      this.tabsController.applyMiniBarStyle(HdsBarStyle.COLLAPSE);
+      hilog.info(DOMAIN_BAR, TAG_BAR, '%{public}s', 'user click on round tab -> restored two rows');
+    }
   }
 
   /**
@@ -557,11 +731,11 @@ struct Index {
    * 当前挂在导航栏上的页签（「听书」可以在设置里隐藏）
    *
    * 顺序必须与 build() 里 TabContent 的出现顺序**一致**：页签下标是位置决定的，
-   * 隐藏听书之后「我的」就顶到第 1 个。所以栏里的图标 / 文字 / 选中态一律用 {@link tabDefOf}
-   * 按 key 取（key 不随显隐变），绝不把下标当身份传来传去。
+   * 隐藏听书之后「回响」「我的」各自往前顶一格。所以栏里的图标 / 文字 / 选中态一律用
+   * {@link tabDefOf} 按 key 取（key 不随显隐变），绝不把下标当身份传来传去。
    */
   private visibleTabDefs(): TabDef[] {
-    return this.hideListenTab ? [TAB_HOME, TAB_MINE] : TABS;
+    return this.hideListenTab ? [TAB_HOME, TAB_ECHO, TAB_MINE] : TABS;
   }
 
   /** 某个身份（key）对应的页签定义 */
@@ -743,7 +917,11 @@ struct Index {
   @Builder
   homeHeader() {
     Row({ space: 10 }) {
-      PageTitle({ text: this.tabDefOf(this.activeTabKey).label })
+      // 标题按页签取：回响是「10 月 · 回响」（月份跟着它的选择器变，见 echoTitle），
+      // 其余直接用页签自己的名字
+      PageTitle({ text: this.activeTabKey === TAB_KEY_ECHO
+        ? this.echoTitle
+        : this.tabDefOf(this.activeTabKey).label })
       Blank()
       if (this.activeTabKey === TAB_KEY_HOME) {
         this.sourcePicker()
@@ -827,15 +1005,16 @@ struct Index {
   }
 
   /**
-   * 播放器半模态的内容
+   * 全屏播放器的内容
    *
-   * 半模态的顶边已经在状态栏下方，所以这里给 PlayerView 的 topInset 传 0：
-   * 再让一次状态栏的位就会多出一条空白。底部手势条的避让仍旧照给。
+   * 全屏模态的顶边就是窗口顶（不再像半模态那样自带一条状态栏的让位），所以状态栏那一段
+   * 要交给 PlayerView 自己让：把量到的 topInset 传进去，它给顶栏（下拉箭头 / 页码 / 分享）
+   * 垫出那一截，背景则铺到状态栏底下。底部手势条的避让照旧。
    */
   @Builder
   playerSheet() {
     PlayerView({
-      topInset: 0,
+      topInset: this.topInset,
       bottomInset: this.bottomInset,
       // 宽屏下播放页走「左封面 + 右歌词」的并排版式（见 PlayerView 的 wideLeftPane）
       windowWidth: this.windowWidth,
@@ -848,6 +1027,12 @@ struct Index {
       onKeepScreenOn: (on: boolean) => {
         this.setKeepScreenOn(on);
       },
+      // 返回键的交接：覆盖物开着没有（评论 / 更多 / 音质 / 匹配歌词）
+      onOverlayChange: (open: boolean) => {
+        this.playerOverlayOpen = open;
+      },
+      // 收到返回键：按 +1 通知播放页收掉最上面那层
+      backTick: this.playerBackTick,
     })
       .width('100%')
       .height('100%')
@@ -892,6 +1077,14 @@ struct Index {
   }
 
   /** 点在线榜单 / 在线歌单 -> 打开在线详情页（歌单与榜单共用一页，kind 区分取数接口） */
+  /** 打开「全部歌单」页（推荐页每个歌单分区的「更多」） */
+  private openSquare(source: string, sortId: string, name: string): void {
+    this.routeSquareSource = source;
+    this.routeSquareSortId = sortId;
+    this.routeSquareName = name;
+    this.pathStack.pushPath({ name: PAGE_SQUARE });
+  }
+
   private openOnline(route: OnlineRoute): void {
     this.routeOnlineKind = route.kind;
     this.routeOnlineSource = route.source;
@@ -905,6 +1098,118 @@ struct Index {
   private openBook(hit: BookHit): void {
     this.routeBook = hit;
     this.pathStack.pushPath({ name: PAGE_BOOK });
+  }
+
+  /**
+   * 点一位歌手 -> 打开歌手页（这位歌手在该平台的全部歌曲，按歌手聚合）
+   *
+   * 参数用基本类型逐项搬过去：ArtistView 那几个 @Prop 就是按值收的，
+   * 与歌单 / 听书一样由壳层持有当前目标。
+   */
+  private openArtist(artist: LxArtist): void {
+    this.routeArtistSource = artist.source;
+    this.routeArtistId = artist.id;
+    this.routeArtistMid = artist.mid;
+    this.routeArtistName = artist.name;
+    this.routeArtistPicUrl = artist.picUrl;
+    this.routeArtistSongNum = artist.songNum;
+    this.pathStack.pushPath({ name: PAGE_ARTIST });
+  }
+
+  /**
+   * 点了某个歌手名（播放页那一行、歌曲列表行、回响的歌手列表都走这里）
+   *
+   * 这些调用点只报「谁在哪首歌里点的」，怎么开页面是这里的事，三件事都得在这一条路上办：
+   *
+   *   1. **播放页是全屏模态**（bindContentCover，压在导航层之上）—— 从播放页点歌手时
+   *      得先把它收起来，否则歌手页会开在它底下、看不见。收起用的是同一个动画
+   *      （closePlayer），所以观感上是「播放页退出去、歌手页进来」。
+   *   2. **一位歌手就直接开**：歌手名是「名字」，而歌手页要的是「平台 + id」，
+   *      所以先拿名字去平台认人（认不到会换别的平台试，见 resolveArtistByName）。
+   *   3. **多位歌手先让人挑**：一首歌挂着「周杰伦、方文山」两位时，点一下没法知道
+   *      用户想看谁 —— 先开歌手列表页，选完再进歌手页（回响的名单也是这一页）。
+   */
+  private openArtistFromSinger(source: string, singer: string): void {
+    const candidates: ArtistCandidate[] = artistCandidatesOf(source, singer);
+    if (candidates.length === 0) {
+      return;
+    }
+    this.dismissPlayerIfOpen();
+    if (candidates.length > 1) {
+      this.openArtistList('选择歌手', '这首歌有几位歌手，想看哪一位？', candidates);
+      return;
+    }
+    void this.resolveAndOpenArtist(candidates[0].source, candidates[0].name);
+  }
+
+  /** 开歌手列表页（回响的「常听歌手」整份名单也走它） */
+  private openArtistList(title: string, hint: string, candidates: ArtistCandidate[]): void {
+    if (candidates.length === 0) {
+      return;
+    }
+    this.dismissPlayerIfOpen();
+    this.routeArtistCandidates = candidates;
+    this.routeArtistPickerTitle = title;
+    this.routeArtistPickerHint = hint;
+    this.pathStack.pushPath({ name: PAGE_ARTIST_PICKER });
+  }
+
+  /**
+   * 播放页开着就先收起来（歌手页要压在导航层上，不收起来会被模态盖住）
+   *
+   * 播放队列那个半模态也一样得收：它挂在**最外层 Stack**上（比导航层还高一档），
+   * 从队列里点歌手名时若不收起它，歌手页会被它整个盖住 —— 用户看到的是
+   * 「点了没反应」。两个弹层都可能开着，所以一起收。
+   */
+  private dismissPlayerIfOpen(): void {
+    if (this.playerOpen) {
+      this.closePlayer();
+    }
+    if (this.queueOpen) {
+      this.closeQueue();
+    }
+  }
+
+  /**
+   * 认人这件事正在飞（防连点）
+   *
+   * 认人要联网，一两秒内连点两下会解析出两条路由、叠两个歌手页。与回响那边
+   * `playingKey` 是同一个意思，只是这里不需要参与渲染，所以用普通私有字段。
+   */
+  private artistOpening: boolean = false;
+
+  /**
+   * 拿名字去认一位歌手，认到了就开歌手页
+   *
+   * 认人要联网（就是一次歌手搜索），所以先给一句提示：点了一下没反应、
+   * 一两秒后才跳页是最容易被当成「卡了」的。认不到就说清楚，别静默失败。
+   */
+  private async resolveAndOpenArtist(source: string, name: string): Promise<void> {
+    // 认过的歌手直接开，不闪那句「正在查找歌手…」：从歌手列表页点进来时几乎总是命中
+    // （那一页进去时已经挨个认过一遍，结果落盘了，见 MusicArtist 的 ArtistStore）
+    const known: LxArtist | null = cachedArtistOf(name);
+    if (known !== null) {
+      this.openArtist(known);
+      return;
+    }
+    if (this.artistOpening) {
+      return;
+    }
+    this.artistOpening = true;
+    this.showToast(`正在查找歌手「${name}」…`);
+    let found: LxArtist | null = null;
+    try {
+      found = await resolveArtistByName(name, source);
+    } catch (e) {
+      found = null;
+    } finally {
+      this.artistOpening = false;
+    }
+    if (found === null) {
+      this.showToast(`没找到歌手「${name}」（各平台都没搜到同名歌手）`);
+      return;
+    }
+    this.openArtist(found);
   }
 
   /**
@@ -1127,10 +1432,79 @@ struct Index {
     if (name === PAGE_SEARCH) {
       HdsNavDestination() {
         WidePane() {
-          SearchView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+          /**
+           * 搜索页也套 `PanePage`：**底下要有那条页内迷你播放条**
+           *
+           * 这一页与歌单详情 / 在线详情 / 本地音乐那几页是同一类：压在 HdsNavigation 路由栈上
+           * 的 NavDestination，把壳层那条带迷你栏的 HdsTabs 整个盖住了 —— 不自己挂一条，
+           * 搜索页上就没有任何播放条（用户反馈「搜索结果页面也加上播放条，跟详情页面一样」）。
+           * 复用 PanePage 而不是又抄一份 Tabs 外壳：那条胶囊的几何、材质、左右跟手、多选时
+           * 让位给批量操作条，全都只有一份实现（见 views/PanePage.ets 开头）。
+           */
+          PanePage({
+            windowWidth: this.windowWidth,
+            bottomInset: this.bottomInset,
+            onOpenPlayer: () => {
+              this.openPlayer();
+            },
+            onOpenQueue: () => {
+              this.openQueue();
+            },
+          }) {
+            SearchView({
+              // 列表滚到底时要停在悬浮迷你条**上方**：条高 + 与它的间距，与其余几页同一口径
+              bottomInset: this.bottomInset + HDS_BAR_HEIGHT + 26,
+              topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+              // 搜索页的「歌手」模式里点一位歌手 -> 歌手页（按歌手聚合的全部歌曲）
+              onOpenArtist: (artist: LxArtist) => {
+                this.openArtist(artist);
+              },
+              // 搜索页的「歌单」模式里点一张歌单 -> 在线歌单详情（与推荐页的歌单广场同一条路）
+              onOpenOnline: (route: OnlineRoute) => {
+                this.openOnline(route);
+              },
+            })
+          }
         }
       }
       .titleBar(this.titleBarOptions('搜索'))
+    } else if (name === PAGE_ARTIST) {
+      // 歌手页：与搜索页同一套让位方式（顶部是固定的歌手头，歌曲列表自己滚）
+      HdsNavDestination() {
+        WidePane() {
+          ArtistView({
+            source: this.routeArtistSource,
+            artistId: this.routeArtistId,
+            artistMid: this.routeArtistMid,
+            artistName: this.routeArtistName,
+            artistPicUrl: this.routeArtistPicUrl,
+            artistSongNum: this.routeArtistSongNum,
+            topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+            bottomInset: this.bottomInset + HDS_BAR_HEIGHT,
+            currentId: this.currentId,
+          })
+        }
+      }
+      // 歌手名已经写在头部（大头像右边），标题栏不再重复同一行字
+      .titleBar(this.titleBarOptions(''))
+    } else if (name === PAGE_ARTIST_PICKER) {
+      // 歌手列表页：挑一位再进歌手页（回响的常听歌手 / 一首歌有几位歌手时）
+      HdsNavDestination() {
+        WidePane() {
+          ArtistPickerView({
+            title: this.routeArtistPickerTitle,
+            hint: this.routeArtistPickerHint,
+            candidates: this.routeArtistCandidates,
+            topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+            bottomInset: this.bottomInset,
+            onPick: (candidate: ArtistCandidate) => {
+              void this.resolveAndOpenArtist(candidate.source, candidate.name);
+            },
+          })
+        }
+      }
+      // 标题栏与页内那个「N 位」标题重复，所以这里不给标题
+      .titleBar(this.titleBarOptions(''))
     } else if (name === PAGE_RECOGNIZE) {
       // 听歌识曲：可滚动的内容页，给一条顶栏渐隐（同各设置页），
       // 内容自己用一段会跟着滚走的顶部占位让开标题栏
@@ -1245,6 +1619,34 @@ struct Index {
       }
       // 多选时整条换成「取消 + 已选中 N 项 + 全选」（见 pageTitleBar）
       .titleBar(this.pageTitleBar('最近播放'))
+    } else if (name === PAGE_SQUARE) {
+      // 全部歌单：某个平台 × 某个排序的全部歌单（推荐页分区标题右边「更多」进来的）
+      HdsNavDestination() {
+        WidePane() {
+          PanePage({
+            windowWidth: this.windowWidth,
+            bottomInset: this.bottomInset,
+            onOpenPlayer: () => {
+              this.openPlayer();
+            },
+            onOpenQueue: () => {
+              this.openQueue();
+            },
+          }) {
+            PlaylistSquareView({
+              topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+              bottomInset: this.bottomInset + HDS_BAR_HEIGHT + 26,
+              source: this.routeSquareSource,
+              sortId: this.routeSquareSortId,
+              sortName: this.routeSquareName,
+              onOpenOnline: (route: OnlineRoute) => {
+                this.openOnline(route);
+              },
+            })
+          }
+        }
+      }
+      .titleBar(this.pageTitleBar(this.routeSquareName))
     } else if (name === PAGE_LOCAL) {
       HdsNavDestination() {
         WidePane() {
@@ -1435,11 +1837,11 @@ struct Index {
               RecommendView({
                 topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
                 bottomInset: this.bottomInset + 96,
-                onOpenSearch: () => {
-                  this.go(PAGE_SEARCH);
-                },
                 onOpenOnline: (route: OnlineRoute) => {
                   this.openOnline(route);
+                },
+                onOpenSquare: (source: string, sortId: string, name: string) => {
+                  this.openSquare(source, sortId, name);
                 },
               })
             }
@@ -1471,6 +1873,22 @@ struct Index {
             }
             .tabBar(this.tabBarItem(TAB_KEY_LISTEN))
           }
+
+          /**
+           * 回响：月度收听记录（大标题 + 总时长 + 三格统计 + 年月选择 + 这个月听过的歌）
+           *
+           * 它跟「听书」一样是**内容铺满**的页签页，页内自带顶栏渐隐与底部让位
+           * （见 views/EchoView.ets）。
+           */
+          TabContent() {
+            WidePane() {
+              EchoView({
+                topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
+                bottomInset: this.bottomInset + 96,
+              })
+            }
+          }
+          .tabBar(this.tabBarItem(TAB_KEY_ECHO))
 
           TabContent() {
             WidePane() {
@@ -1506,38 +1924,39 @@ struct Index {
         .zIndex(1)
         .barFloatingStyle({
           /**
-           * 只给「页签栏宽度 + 离底距离 + 材质 + 迷你栏」，其余全部交给 HDS 自己算
+           * 左右跟手：迷你播放器展开、页签栏折叠成一颗球时，那颗球按托着手机的那只手换边
            *
-           * 这是派音（RzdMusic）那套配置，也正是这里之前被改坏的地方 —— 之前额外塞了
-           * `miniBarWidth` / `barSideMargin` / `gradientMask` / `barLayoutMode`：
-           *   - `miniBarWidth` 顶掉了 HDS 的让位动画：折叠态本来只有一颗圆钮宽
-           *     （宽度等于栏高），硬塞展开态的 286~328 就在页签栏右边压出一整条；
-           *   - `barSideMargin` 与 HDS 内部的宽度分配互相打架，两条栏一起展开时叠在一起；
-           *   - `barLayoutMode` 又把两条栏的排布方式改了第二遍。
-           * 现在宽度只声明页签栏那一档（见下面 barWidth），迷你栏多宽、怎么让位，
-           * 全由 HDS 按形态自己决定。
+           * 迷你栏展开时两条栏是左右并排的（页签栏一边、迷你栏一边），页签栏被让位折叠成
+           * 一颗圆球 —— 球站哪一边由 HDS 的 `adaptToHandedness`（6.1.0/23 起）定：
+           * 开了就跟着握持手走（右手握持时那颗球贴右边，拇指够得着），不开是恒定的
+           * 「页签栏在左、迷你栏在右」。官方文档里这一项只有一句「左右手跟手能力依赖底层
+           * 硬件，部分历史设备硬件能力不支持」——**没有**任何权限要求，跟手这件事是 HDS
+           * 自己读的（不必在应用侧订阅握姿，见 module.json5 里没有相关权限）。
+           * 开关在「设置 - 外观」，读不出来 / 不支持的机型上就是原样，不会乱跑。
            */
-          barWidth: {
-            // 窄屏铺到接近满宽（照华为音乐那种一条长胶囊托住页签的观感）
-            smallWidth: this.floatingBarSmallWidthVp(),
-            // 中 / 大档按**页签署数**给：284 / 328 是 HDS 对四个页签的档位值
-            // （官方文档里的分档只按窗口宽度给，不管页签署数），照那个宽度画就是一条
-            // 空落落的宽胶囊，所以按每颗页签 ~72 / 80vp 收窄：三个页签 = 216 / 240，
-            // 「听书」在设置里藏掉之后只剩两颗，自动变成 144 / 160。
-            mediumWidth: TAB_SLOT_MEDIUM * this.visibleTabDefs().length,
-            largeWidth: TAB_SLOT_LARGE * this.visibleTabDefs().length,
-          },
+          adaptToHandedness: this.followHand,
+          /**
+           * **不声明 barWidth / miniBarWidth**（派音最新代码踩过一轮后的结论）
+           *
+           * 我们原来按档算了页签栏与迷你栏的宽度（smallWidth = 窗口宽 − 96、miniBarWidth 按
+           * 每档减掉另一条栏要占的宽度）。派音那边也这么干过，结论写在他们的 Index.ets 里：
+           * 「不要传 barWidth……我们原来传的三档会让整条底栏明显窄于屏幕，**上下两排时两侧就
+           * 留出很大空隙**（用户反馈的就是这个）」。他们现在只留
+           * barBottomMargin / systemMaterialEffect / adaptToHandedness / miniBar 四项 ——
+           * 宽度全交给 HDS 按排布自己算：单排时迷你条铺满整条、两排时两条各占一排。
+           * 这里照此把两项一起去掉（原来那套按档算的口径留在 ui/Layout.ets，页内那条自绘迷你栏
+           * 还在用）。
+           *
+           * `barSideMargin` / `gradientMask` 也仍然不声明：前者与 HDS 内部的宽度分配互相打架
+           * （两条栏一起展开时叠在一起），后者没必要。
+           */
           barBottomMargin: this.homeTabBarBottomMarginVp(),
           // 与标题栏、半模态共用同一个材质档位（外观设置里改一处，三处一起变）
           systemMaterialEffect: buildTitleMaterial(this.materialLevel),
-          // 迷你栏：折叠态是那颗圆封面，展开态是迷你播放器
-          miniBar: {
-            miniBarBuilder: () => this.miniBarBuilder(),
-            onBarStyleChange: (miniBarStyle: HdsBarStyle) => {
-              AppStorage.setOrCreate(K_MINI_EXPANDED, miniBarStyle === HdsBarStyle.EXPAND);
-              this.publishLayout();
-            },
-          },
+          // 迷你栏：单排时被拉成整条通栏（展开播放态），两排时收成窄胶囊，页签自己一排。
+          // 配置由 miniBarConfig() 拼（那里说明了两排状态怎么落给 HDS、以及低版本为什么要
+          // 让 barLayoutMode 这个键整条不出现）。
+          miniBar: this.miniBarConfig(),
         })
         .onChange((index: number) => {
           // 框架给的是「第几栏」，这里立刻换成身份存下来（见 onTabChanged）
@@ -1571,31 +1990,63 @@ struct Index {
       .width('100%')
       .height('100%')
       /**
-       * 全屏播放器：系统的底部半模态
+       * 全屏播放器：全屏模态（bindContentCover）
        *
-       * 挂在导航节点而不是最外层 Stack 上，是为了和播放列表那个 bindSheet 分开挂载，
-       * 免得同一个组件上叠两个 bindSheet。LARGE = 高度接近整屏、顶部留出一条，
-       * 于是下面那层页面（页签 + 迷你栏）保持原样留在上方那条缝里，不会被重建。
-       * 没有拖动条与关闭钮：播放器自己的顶栏（下拉箭头 / 页码 / 分享）就是它的头部。
+       * 以前这里是 bindSheet（底部半模态）：弹起时整块面板从下往上滑，与下面那条迷你栏
+       * 没有任何视觉联系，观感上就是「一个盖子上来」——也就是「割裂」的来源。
+       * 中间试过一版「共享元素转场（一镜到底）」：把迷你栏那颗封面与播放页封面绑同一个
+       * `geometryTransition` id，让封面从迷你栏长到播放页。**那一版已撤掉**，因为配对根本不成立：
+       *   - `geometryTransition` 只能在**同一棵渲染树**里配对 in/out 两个节点，而播放页是
+       *     bindContentCover 的**模态**（独立渲染根），迷你栏那颗封面在模态之外的那棵树里；
+       *   - 迷你栏内容又会被 HDS 在页签变化/壳层重渲染时重建，起点节点连自己那一帧的几何
+       *     都还没量好。
+       * 框架拿不到可信的起点几何，就按「未知帧」起飞 —— 实机表现就是用户反馈的
+       * 「屏幕左上角莫名其妙闪一张歌曲封面、然后消失，再打开播放页」。同时 `follow: true`
+       * 官方写明**只在 `if` 语法里生效**，常驻在树上的迷你栏封面不在 if 里，也参与不进来。
+       *
+       * 现在用系统标准模态转场 `ModalTransition.DEFAULT`：官方定义就是
+       * 「Upward animation when entering and downward animation when exiting」
+       * —— 打开时整页从下往上升起、收起（返回 / 侧滑 / 下拉）时从上往下滑走，
+       * 不需要我们自己的 animateTo 或 transition 参与（见 openPlayer 的说明）。
+       * 以后若要做「从小播放器展开成播放页」那种华为音乐式的一镜到底，得走官方那条路
+       * （同一棵树里的 if/else 配对 + `follow`，或 NavContentTransition 那一套），
+       * 不能再把 geometryTransition 跨到模态上去。
+       *
+       * 仍然挂在导航节点（而不是最外层 Stack）上，好和播放列表那个 bindSheet 分开挂载：
+       * 同一个节点上叠两个弹层会互相干扰。
        */
-      .bindSheet($$this.playerOpen, this.playerSheet(), {
-        preferType: SheetType.BOTTOM,
-        detents: [SheetSize.LARGE],
-        detentSelection: SheetSize.LARGE,
-        dragBar: false,
-        showClose: false,
+      .bindContentCover($$this.playerOpen, this.playerSheet(), {
+        modalTransition: ModalTransition.DEFAULT,
+        // 底色交给 PlayerView 自己画：模态这层再铺一层不透明底会把转场那一下盖掉
+        backgroundColor: Color.Transparent,
         onWillAppear: () => {
           this.applyStatusBarColor(true);
         },
         onDisappear: () => {
           this.applyStatusBarColor(false);
+          // 模态被系统收掉（下拉 / 侧滑 / 返回）时不走 closePlayer，这里兜底清状态
+          this.playerOverlayOpen = false;
+        },
+        /**
+         * 系统返回键先交给播放页处理
+         *
+         * 注册这个回调之后，返回键不再立刻收起模态：评论 / 更多 / 音质 / 匹配歌词
+         * 这些自绘覆盖物还开着时，先去收那一层（评论页的返回箭头一直是好的，系统
+         * 返回键以前却会把整个播放页收掉，露出下面的页签页 —— 就是「有概率回到
+         * 一级菜单」的由来）。其余情况（没有覆盖物、下拉手势等）照旧收起播放页。
+         */
+        onWillDismiss: (action: DismissContentCoverAction) => {
+          if (action.reason === DismissReason.PRESS_BACK && this.playerOverlayOpen) {
+            this.playerBackTick++;
+            return;
+          }
+          this.playerOverlayOpen = false;
+          action.dismiss();
         },
       })
 
-      // 全屏播放器不在这层：它是压在 HdsNavigation 路由栈上的真实页面（见 destination），
-      // 这样系统侧滑返回 / 返回键才有「上一级」可退，而不是把应用退回桌面。
-
       // 播放列表是系统的半模态：bindSheet 挂在最外层 Stack 上（见文件末尾）
+      // ——弹层之间「后开的在上」，所以从播放页里点开播放列表，它会盖在播放页之上。
 
       // ---------------------------------------------------- 状态提示
       if (this.toast.length > 0) {
@@ -1684,6 +2135,19 @@ struct Index {
       // 默认只升到半屏（还能往上拖到接近全屏）
       detents: [SheetSize.MEDIUM, SheetSize.LARGE],
       detentSelection: SheetSize.MEDIUM,
+      // 高度变化时滚动区域要跟着实时变（默认 FOLLOW_DETENT 是「滑完才更新」，见下）。
+      // 默认值 `ScrollSizeMode.FOLLOW_DETENT` 的官方语义是「滑完（档位动画结束）之后才更新
+      // 滚动区域」：从 MEDIUM 往上拖到 LARGE 的这几百毫秒里，面板本身已经长高了，里面的
+      // List 却还按半屏的高度排版 —— 实机表现就是用户反馈的
+      // 「向上滑先滑一半，再拉到顶的时候，歌曲会先显示一半，然后再加载出剩下的部分」：
+      // 白卡只铺到半屏，等动画结束 List 视口才被换成满高，下半截的行这时才建出来补上。
+      // 改成 `CONTINUOUS`（官方语义：滑动过程中就更新滚动区域）之后，List 的视口与面板
+      // 同步长高，新露出来的那几行当场量出来，不再有「先半屏、再补全」的两段式。
+      // 依据：华为开发者问答《为什么在半模态中渲染列表，半模态高度变化的时候，列表会延迟
+      // 渲染》的采纳答复就是加这一个属性（提问描述的现象与本条反馈完全一致）。
+      // `scrollSizeMode` 是 API 12 的接口，本工程 compatibleSdkVersion 6.1.0(23) 起就能用，
+      // 不用像材质那套（鸿蒙7 才有）那样做版本判断。
+      scrollSizeMode: ScrollSizeMode.CONTINUOUS,
       dragBar: true,
       showClose: true,
       // 材质与毛玻璃是互斥的两条路，不能同时挂着：官方对弹出框写明「已主动设置背景色、

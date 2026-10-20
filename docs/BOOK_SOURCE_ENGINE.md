@@ -33,7 +33,7 @@
 | `core/book/BookHttp.ets` | 宿主网络代理 + **Cookie 罐**（`data:` URL 就地解码） |
 | `core/book/BookEngine.ets` | 书源导入/删除、搜索/详情/目录/音频、**网络回放循环**、沙箱注入 |
 | `core/book/BookShelf.ets` | 书架（书 + 目录 + 听到第几集） |
-| `views/ListenView.ets` | 听书页：书架 / 搜索 / 书源 三个分段 |
+| `views/ListenView.ets` | 听书页：书架 / 发现 / 搜索 / 书源 四个分段 |
 | `views/BookDetailView.ets` | 一本书的详情 + 目录，点一集即播 |
 | `tools/book_source_diagnose.js` | **全链路诊断**：宿主侧照设备实现（Cookie 罐 / 重定向 / POST 表单头），逐段严格判定 |
 | `tools/book_engine_selftest.js` | 无设备自检（jsdom 顶替沙箱 + 真实书源联网跑通） |
@@ -257,6 +257,58 @@ WebView 登录 → WebCookieManager.fetchCookieSync(登录页 / 站址 / 当前�
 - 离线回归守卫：`book_source_diagnose.js --offline`（infoMap 绑定 / putLoginInfo 回写 /
   toast / startBrowser / `java.getCookie`）与 `book_import_test.js` 的
   「静态守卫：书源登录的接线」（含网页登录的整条接线）。
+
+---
+
+## 5.4 发现分段（2026-10-12 新增）
+
+「按分类推书」在书源协议里就是 **`exploreUrl` + `ruleExplore`**（与 searchUrl 是两套地址，
+不需要关键词），也是别的听书软件那种「自动推荐」的实现方式。**引擎侧早就接通了** ——
+`BookEngine.exploreCategories()` / `explore()` 与沙箱的 `explore` / `exploreList` 动作一直都在，
+只是界面没人调：全项目只有书源列表拿 `canExplore` 显示「发现」两个字。
+
+现在 `ListenView` 多了「发现」分段，画法照**首页推荐页**（`views/RecommendView.ets`）：
+**来源胶囊 + 一排横滑卡片 + 下面的列表**。
+
+| 处 | 说明 |
+| --- | --- |
+| 书源胶囊 | 「分类」那一行右侧的下拉胶囊，列的是 `canExplore` 的书源。**一次只看一个源** —— 导一个书源合集进来会有几十个源、近百个分类，全拍平成药丸墙既看不清也翻不到底 |
+| 分类卡片 | 该源 `exploreCategories()` 的分类，横滑的渐变卡片（`CategoryCard`，画法同首页榜单卡片）；选中态加一圈白边 |
+| 自动推荐 | 进分段自动选第一个源、拉它的第一个分类，不用输关键词。已经选过就保留上次的书单，不重复联网；源列表每次进来重建（只读本地索引），导入 / 删除书源立刻反映 |
+| 取数 | `explore(sourceId, url, page)`。**必须串行**：沙箱里 `CUR_SOURCE` 是单个全局，并发下发多个作业会互相串味 |
+| 翻页 | 底部「加载更多」按 `page + 1`；只有分类地址里带 `{{page}}` 才算能翻页，这一页一本新的都没拿到就不再给按钮 |
+
+## 5.5 发现链路上的六个引擎缺口（2026-10-12 修）
+
+界面接上之后才暴露出来 —— 全都是「规则写得对、引擎没接上」，表现全是
+**一本都拿不到，而且不报错**，最难查的那一类：
+
+| 缺口 | 谁踩的 | 修法 |
+| --- | --- | --- |
+| `ruleExplore` 为空时不回退 | 幻听网、懒人听书（×2）、听书宝、幸福听书 —— 有的写成空对象、有的干脆是空数组 `[]` | 照阅读 `BookList.kt`：`getExploreRule().bookList` 为空就用 `getSearchRule()` |
+| 地址可选段 `<,_{{page}}>` 不认 | 幻听网、恋听、56听书、听书宝、海洋听书 | 第一页整段去掉、第二页起取第一个有内容的候选（等价于阅读规则书里写的 `{{page - 1 == 0 ? "": page}}`）。不认的话 `{{page}}` 照样替换成 1，地址里带着 `<,1>` 去请求，**第一页就 404** |
+| 空地址的分组标题混进分类表 | 听友FM（「有声小说」「评书」两条）、小说漫画听书 | `url` 为空的条目在阅读里是分组小标题，不是能点的分类，解析时跳过（宿主与沙箱两处解析器一起改） |
+| 「标题::地址」只按换行切 | 56听书（分类表整条挤在一行、用 `&&` 串起来） | `&&` 与换行都当分隔符（阅读的规则说明里就是这么写的） |
+| JSON 数组写法不认尾逗号 | 幸福听书（整张表最后一项后面多一个逗号） | 严格 `JSON.parse` 失败时去掉尾逗号再试一次 —— 沙箱复用已有的 `parseLooseJson`，宿主补一份同口径的（阅读用的 Gson 宽松模式本来就吃） |
+| 没有 Rhino 的 Java 互操作 | 听友FM（XChaCha20Poly1305 解密）、懒人听书app本地源（android.util.Base64） | 沙箱补上 `Packages` / `java.lang.String` / `javax.crypto.Cipher`(ChaCha20-Poly1305) / `spec.*` / `android.util.Base64` —— 只补实际用到的几个类，纯 JS 实现（规则是同步求值的，WebCrypto 全是 Promise 用不上），见 `book_preload.js` 的「6.5 Rhino 的 Java 互操作」 |
+
+守卫：`node tools/book_source_diagnose.js --offline` 里有 9 条新夹具（`&&` 分隔、换行分隔、
+跳过分组标题、回退搜索规则、可选段第一页 / 第二页的实际请求地址、ChaCha20-Poly1305 的
+RFC 8439 §2.8.2 官方向量、android Base64）。**手写的密码学必须有向量守卫** ——
+实现时就把 Poly1305 的 `s` 读成了大端，靠向量才抓出来。
+
+发现链路的实测入口（与搜索那条链路分开）：
+
+```bash
+node tools/book_source_diagnose.js --explore                       # 全部带 exploreUrl 的源
+node tools/book_source_diagnose.js --explore --name 听友FM         # 单个源
+BOOK_DEBUG=1 node tools/book_source_diagnose.js --explore --name X # 连每次请求一起打印
+```
+
+**还没做**：`@js:` 那种整段脚本自己生成分类表的 exploreUrl（懒人听书的两个源）引擎不认 ——
+那要跑沙箱、且 `exploreCategories` 得改成异步，目前返回空，界面上这个源不出现（不影响搜索）；
+`enabledExplore` 没被读（`canExplore` 只看 `exploreUrl` 非空）；`ruleExplore.nextPageUrl`
+引擎不认（喜马拉雅写了但用不上，靠 `{{page}}` 递增即可）。
 
 ---
 

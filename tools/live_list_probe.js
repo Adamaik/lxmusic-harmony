@@ -27,10 +27,14 @@ const UA_LINUX = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, lik
   'Chrome/60.0.3112.90 Safari/537.36'
 
 const MG_HEADERS = { 'User-Agent': UA_IPHONE, 'Referer': 'https://m.music.migu.cn/' }
+// 网易的明文接口必须带 `Cookie: os=pc`：不带它，歌单详情的 playlist.tracks 只会回
+// 开头若干首的试听预览（实测普通歌单恒 10 首、「我喜欢的音乐」6 首），
+// 而 playlist.trackIds 一直是完整的 —— 见 docs/DEFECTS.md 的 2026-10-08 复核。
 const WY_HEADERS = {
   'User-Agent': UA_LINUX,
   'Referer': 'https://music.163.com/',
   'Origin': 'https://music.163.com',
+  'Cookie': 'os=pc',
 }
 const TX_MUSICU = 'https://u.y.qq.com/cgi-bin/musicu.fcg' +
   '?loginUin=0&hostUin=0&format=json&inCharset=utf-8&outCharset=utf-8&notice=0' +
@@ -151,7 +155,39 @@ async function kwDetail (id) {
   }
 }
 
+/**
+ * 酷狗用户歌单（gcid_xxx）-> 精选集 specialid
+ *
+ * 与 MusicList.ets 的 kgGcidInfo 一致：用户歌单页里 window.$output 的
+ * info.listinfo.specialid 就是精选集 id，拿到它才能走 special/single 那条路取全量。
+ * **必须带 App UA**：桌面 UA 拿到的是另一套老页面，里面没有 $output。
+ */
+const KG_APP_UA = 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi'
+
+async function kgSpecialIdOfGcid (gcid) {
+  const res = await fetch('https://m.kugou.com/songlist/' + encodeURIComponent(gcid) + '/', {
+    headers: { 'User-Agent': KG_APP_UA },
+  })
+  const html = await res.text()
+  const at = html.indexOf('window.$output = ')
+  const end = html.indexOf('</script>', at)
+  if (at < 0 || end < 0) throw new Error('kg 用户歌单页里没有 window.$output（UA 不对或页面结构已变）')
+  let json = html.slice(at + 'window.$output = '.length, end).trim()
+  if (json.endsWith(';')) json = json.slice(0, -1)
+  const out = JSON.parse(json)
+  const info = out?.info?.listinfo ?? {}
+  if (!info.specialid) throw new Error('kg 用户歌单页里没有 listinfo.specialid')
+  return { specialId: String(info.specialid), name: info.name ?? '', count: info.count ?? 0 }
+}
+
 async function kgDetail (id) {
+  if (String(id).startsWith('gcid_')) {
+    const resolved = await kgSpecialIdOfGcid(id)
+    // 用 specialid 继续走原来的路，顺便核对「歌单页说的条数」与「实际取到的条数」
+    const detail = await kgDetail(resolved.specialId)
+    detail.note = `用户歌单 ${id} -> specialid=${resolved.specialId}（页面 count=${resolved.count}）`
+    return detail
+  }
   const url = `http://www2.kugou.kugou.com/yueku/v9/special/single/${encodeURIComponent(id)}-5-9999.html`
   const { text } = await get(url)
   const listMatch = text.match(/global\.data = (\[.+\]);/)
@@ -220,11 +256,25 @@ async function mgDetail (id) {
   if (String(body.code) !== '000000') throw new Error(`mg 歌单详情返回 code=${body.code}`)
   const data = body.data ?? {}
   const songs = data.songList ?? []
+  // ZQ24 = 咪咕的 24bit 档：导入/榜单这条链路曾把它漏映射成空档（DEFECTS D-012），
+  // 探针顺手把本页有多少首带 24bit 报出来，方便以后复核
+  const zq24 = songs.filter(s => (s.audioFormats ?? []).some(f => f.formatType === 'ZQ24')).length
+  // 歌单名/作者在另一个接口里（App 里 mgPlaylistDetail 会再请求一次）
+  let name = ''
+  try {
+    const info = jsonOf((await get('https://c.musicapp.migu.cn/MIGUM3.0/resource/playlist/v2.0' +
+      `?playlistId=${encodeURIComponent(id)}`, MG_HEADERS)).text, 'mg 歌单信息')
+    name = info?.data?.title ?? ''
+  } catch (e) {
+    // 歌单信息拿不到不影响听歌
+  }
+  const singersOf = (s) => (s.singerList ?? []).map(x => x.name).join('、')
   return {
-    name: '',
+    name,
     total: Number(data.totalCount) || songs.length,
     got: songs.length,
-    sample: songs.slice(0, 3).map(s => `${s.name ?? s.songName} - ${s.singer ?? ''}`),
+    sample: songs.slice(0, 3).map(s => `${s.songName ?? s.name} - ${singersOf(s)}`),
+    note: `本页 ${zq24} 首带 ZQ24（24bit）`,
   }
 }
 
@@ -239,7 +289,9 @@ async function txDetail (id) {
   }
 }
 
-async function txDetailMusicu (id) {
+const TX_DISS_SONG_NUM = 1000
+
+async function txPage (id, page) {
   const payload = {
     comm: {
       cv: 4747474, ct: 24, format: 'json', inCharset: 'utf-8', outCharset: 'utf-8',
@@ -250,7 +302,8 @@ async function txDetailMusicu (id) {
       method: 'uniform_get_Dissinfo',
       param: {
         disstid: parseInt(id, 10), userinfo: 1, tag: 1, orderlist: 1,
-        song_begin: 0, song_num: 1000, onlysonglist: 0, enc_host_uin: '',
+        song_begin: (page - 1) * TX_DISS_SONG_NUM, song_num: TX_DISS_SONG_NUM,
+        onlysonglist: 0, enc_host_uin: '',
       },
     },
   }
@@ -268,15 +321,41 @@ async function txDetailMusicu (id) {
   if (Number(body.code) !== 0) throw new Error(`code=${body.code}`)
   const req = body.req_1 ?? {}
   const data = req.data ?? {}
-  const songs = data.songlist ?? []
-  if (Number(req.code) !== 0 || !songs.length) throw new Error(`req_1.code=${req.code} 且没有歌曲`)
-  const dir = data.dirinfo ?? {}
-  return {
-    name: dir.title,
-    total: Number(data.total_song_num) || songs.length,
-    got: songs.length,
-    sample: songs.slice(0, 3).map(s => `${s.name} - ${(s.singer ?? []).map(x => x.name).join('、')}`),
+  if (Number(req.code) !== 0) throw new Error(`req_1.code=${req.code}`)
+  return { songs: data.songlist ?? [], total: Number(data.total_song_num) || 0, dir: data.dirinfo ?? {} }
+}
+
+/**
+ * 与 MusicList.ets 的 txPlaylistDetail 一致：按 song_begin 真翻页
+ *
+ * 早先这里（和 App 里一样）只发一页、把 page 丢掉，超过 1000 首的歌单会被静默截断
+ * （实测 1919 首的那张只回 999 首）。探针必须跟 App 的行为一致，否则测不出这个问题。
+ */
+async function txDetailMusicu (id) {
+  const seen = new Set()
+  const samples = []
+  let total = 0
+  let name = ''
+  let page = 1
+  while (page <= 40) {
+    const r = await txPage(id, page)
+    total = Math.max(total, r.total)
+    if (!name) name = r.dir.title ?? ''
+    let added = 0
+    for (const s of r.songs) {
+      const key = String(s.mid ?? s.id ?? s.name)
+      if (seen.has(key)) continue
+      seen.add(key)
+      added++
+      if (samples.length < 3) samples.push(`${s.name} - ${(s.singer ?? []).map(x => x.name).join('、')}`)
+    }
+    // 第一页就为空才算失败；翻到最后一页之后空页是「没有下一页」，正常收尾
+    if (page === 1 && seen.size === 0) throw new Error('req_1 没有歌曲')
+    if (added === 0) break
+    if (total > 0 && seen.size >= total) break
+    page++
   }
+  return { name, total, got: seen.size, sample: samples }
 }
 
 async function txDetailLegacy (id) {

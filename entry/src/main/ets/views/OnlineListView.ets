@@ -7,12 +7,12 @@ import { CollectedPlaylists, K_COLLECTED_VERSION } from '../core/sync/CollectedP
 import { C_BG, C_DIVIDER, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_DOWNLOAD, I_HEART, I_HEART_FILLED,
   I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
-import { CoverArt, FavoriteHeart } from '../ui/Widgets';
+import { CoverArt, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
   SelectionActions, SelectSession, toggleSelected } from '../ui/Selection';
 import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
-import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { K_MATERIAL_LEVEL, K_NAV_FOLLOW_HAND } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { K_BAR_MINI_WIDTH, barSideMarginFor, contentColumnsFor } from '../ui/Layout';
 import { MiniBarView } from './MiniBar';
@@ -81,6 +81,14 @@ export struct OnlineListView {
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   /** 页内迷你播放条的最大宽度：壳层按窗口宽度算好（0 = 窄屏不限，见 ui/Layout.ets） */
   @StorageLink(K_BAR_MINI_WIDTH) wideMiniBarWidth: number = 0;
+  /**
+   * 悬浮栏左右跟手（设置 - 外观）：这一页那条播放条跟着同一档走
+   *
+   * 与壳层底部那条同一个开关，只是这一页走的是 ArkUI 原生的
+   * `Tabs.barFloatingStyle`（`FloatingTabBarStyle.adaptToHandedness`，API 26 起），
+   * 所以要在这里再接一次（见 PanePage 里同一项的说明）。
+   */
+  @StorageLink(K_NAV_FOLLOW_HAND) followHand: boolean = true;
   onOpenPlayer: () => void = () => {
   };
   onOpenQueue: () => void = () => {
@@ -777,13 +785,8 @@ export struct OnlineListView {
           .width('100%')
           .textAlign(TextAlign.Start)
         if (item.singer.length > 0) {
-          Text(item.singer)
-            .fontSize(F_SUB)
-            .fontColor(C_TEXT_WEAK)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-            .textAlign(TextAlign.Start)
+          // 歌手名：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
+          SingerLink({ singer: item.singer, source: item.source })
         }
       }
       .layoutWeight(1)
@@ -850,6 +853,8 @@ export struct OnlineListView {
       } else {
         MiniBarView({
           forceExpanded: true,
+          // 窗口宽必须传：不传的话里面读到 0，右留白与任何按窗口算的量都会错（真机日志里 window=0）
+          windowWidth: this.windowWidth,
           onOpenPlayer: this.onOpenPlayer,
           onOpenQueue: this.onOpenQueue,
         })
@@ -878,6 +883,8 @@ export struct OnlineListView {
       maskColor: PAGE_BAR_MASK_COLOR,
       maskHeight: PAGE_BAR_MASK_HEIGHT,
       systemMaterial: immersiveMaterialForBar(this.materialLevel),
+      // 左右跟手：与壳层底部那条同一个开关；宽屏下这条栏比窗口窄，贴到手那一侧才看得见
+      adaptToHandedness: this.followHand,
     };
     // 宽度必须显式给（否则框架按自己的默认宽度画，内容会被挤在一条窄胶囊里）：
     // 宽屏与壳层那条迷你栏同宽；窄屏铺满（窗口宽 － 左右边距），也就是「把外面那条延长」

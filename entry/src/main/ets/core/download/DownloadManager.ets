@@ -27,9 +27,17 @@ export const K_DOWNLOAD_VERSION: string = 'download_version';
 
 /** 应用内的下载目录（系统的公共目录拿不到时的兜底；卸载应用才会删） */
 const DIR_NAME: string = 'Download';
-/** 公共目录 uri 的前缀：据此把「文件管理里能看到的文件」与沙箱兜底文件区分开 */
-const PUBLIC_URI_PREFIX: string = 'file://docs';
 const INDEX_FILE: string = 'downloads.json';
+/**
+ * 应用是不是在前台（EntryAbility 的 onForeground / onBackground 维护）
+ *
+ * 自动下载大半发生在后台（息屏 / 切走了还在放），而系统保存对话框那条路在后台拿不到
+ * 目录：硬问一次多半失败，失败就会退到「文件管理」里看不见的应用内目录 —— 用户看到的
+ * 就是「这首歌没下到文件夹里」。所以后台时先不下，等回到前台由 resume() 接着排。
+ */
+export const K_APP_FOREGROUND: string = 'app_foreground';
+/** 「先别拿保存目录（当前在后台）」的内部信号：不是失败，放回队列等回到前台（见 runTask） */
+const DEFER_BACKGROUND: string = '等回到前台再获取下载目录';
 const PART_SUFFIX: string = '.part';
 /** 同时下载数：跟着洛雪的 download.maxDownloadNum 取 2，少占带宽也少被平台限流 */
 const MAX_ACTIVE: number = 2;
@@ -340,6 +348,15 @@ export class DownloadManager {
   private persistTimer: number = 0;
   /** 自动下载等播放缓过来时的复查定时器 */
   private pumpTimer: number = 0;
+  /** 记住的系统下载目录（本机路径）；空串 = 还没拿到过（见 knownPublicDirPath） */
+  private publicDirPathCache: string = '';
+  /**
+   * 本次会话有没有真的往系统下载目录写成功过
+   *
+   * 只有它为真，后台才敢让自动下载开工：保存对话框给的授权可能是**会话级**的
+   * （重启后要重新拿一次），没验证过就在后台写，失败就会落到应用内目录。
+   */
+  private publicDirVerified: boolean = false;
 
   init(context: common.Context): void {
     if (this.inited) {
@@ -394,6 +411,88 @@ export class DownloadManager {
   /** 应用内下载目录（设置页显示用） */
   appDir(): string {
     return this.dir;
+  }
+
+  // ---------------------------------------------------------------- 保存位置：目录判定
+
+  /**
+   * 这条记录指向的文件是不是写在**系统公共下载目录**里（而不是应用内兜底目录）
+   *
+   * 不能按 `file://docs` 前缀判：真正记进索引的是 `fileUri.FileUri(uri).path` 转出来的
+   * **本机路径**（`/storage/Users/currentUser/Download/<包名>/xxx.mp3`），永远不带
+   * `file://docs`。以前按前缀判，结果「公共目录那份」全被当成应用内文件 ——
+   * 重启后读不到时会误报「文件找不到了」，而且永远不会走「重下一遍续授权」那条自愈路径。
+   * 现在反过来判：**不**在我们自己的兜底目录里的，就是公共目录那份。
+   */
+  private isPublicFile(uri: string): boolean {
+    return uri.length > 0 && !uri.startsWith(this.dir + '/');
+  }
+
+  /**
+   * 记住的系统下载目录（本机路径），没有返回空串
+   *
+   * 保存对话框每次给的目录都是同一个。记下来之后下一次直接往这里写，不必再问系统一次：
+   * 一是快，二是后台播放时那个对话框拿不到目录（见 K_APP_FOREGROUND 的说明）。
+   * 路径由设置里存的目录 uri 转出来；跨重启后授权可能已经收回，写失败会自动退回保存对话框。
+   */
+  private knownPublicDirPath(): string {
+    if (this.publicDirPathCache.length > 0) {
+      return this.publicDirPathCache;
+    }
+    const uri: string = DownloadSettings.getInstance().getDownloadDirUri();
+    if (uri.length === 0) {
+      return '';
+    }
+    try {
+      const path: string = new fileUri.FileUri(uri).path;
+      if (path.length > 0) {
+        this.publicDirPathCache = path;
+        return path;
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'parse download dir uri failed: %{public}s', JSON.stringify(e));
+    }
+    return '';
+  }
+
+  /** 应用当前是不是在前台（没设过按前台处理，别把下载卡死） */
+  private inForeground(): boolean {
+    try {
+      const value: boolean | undefined = AppStorage.get<boolean>(K_APP_FOREGROUND);
+      return value === undefined ? true : value;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  /**
+   * 自动下载现在能不能开工（保存位置这一关）
+   *
+   * 前台：随便下（拿不到系统目录也能弹对话框，或者如实退回应用内目录）。
+   * 后台：只有「本次会话已经写成功过系统下载目录」才开工 —— 否则先等着，
+   * 免得因为后台拿不到目录而静默落进「文件管理」看不见的应用内目录。
+   */
+  private canAutoWriteNow(): boolean {
+    if (this.inForeground()) {
+      return true;
+    }
+    return this.publicDirVerified && this.knownPublicDirPath().length > 0;
+  }
+
+  /**
+   * 回到前台：把停在「等保存目录」的自动下载接着排（EntryAbility.onForeground 调用）
+   *
+   * 清掉那个 4 秒的复查定时器再泵一次，回到前台的这一刻就开工，不用再等一轮。
+   */
+  resume(): void {
+    if (!this.inited) {
+      return;
+    }
+    if (this.pumpTimer !== 0) {
+      clearTimeout(this.pumpTimer);
+      this.pumpTimer = 0;
+    }
+    this.pump();
   }
 
   /** 下载列表：新的在前 */
@@ -492,7 +591,7 @@ export class DownloadManager {
       // 重启后系统就收了回去。再走一遍保存对话框会重新拿到授权，文件重写一遍就能读了 ——
       // 这是唯一能让它自己好起来的办法，不然「下载过 = 离线能放」在重启后永远不成立。
       const unreadable: boolean = existed.status === 'done'
-        && existed.uri.startsWith(PUBLIC_URI_PREFIX)
+        && this.isPublicFile(existed.uri)
         && downloadedFile(existed.key).length === 0;
       if (unreadable) {
         hilog.info(DOMAIN, TAG, 're-download to renew dir grant: %{public}s', existed.name);
@@ -744,13 +843,15 @@ export class DownloadManager {
     if (learned.length > 0) {
       return learned;
     }
+    // 设置里没记下来（老版本升上来的）就从下载记录里挑一条公共目录的文件，去掉文件名当目录。
+    // 记下来的 uri 与这里的本机路径都能用：folderLabel 只认路径里的 /Download/ 那一段。
     for (let i = this.items.length - 1; i >= 0; i--) {
       const uri: string = this.items[i].uri;
-      if (!uri.startsWith(PUBLIC_URI_PREFIX)) {
+      if (!this.isPublicFile(uri)) {
         continue;
       }
       const cut: number = uri.lastIndexOf('/');
-      if (cut > PUBLIC_URI_PREFIX.length) {
+      if (cut > 0) {
         return uri.substring(0, cut);
       }
     }
@@ -760,8 +861,11 @@ export class DownloadManager {
   /**
    * 打开这次下载要写的位置
    *
-   * 目标固定是**应用自己的下载目录**（用户不再选保存位置），按两条路试：
+   * 目标固定是**应用自己的下载目录**（用户不再选保存位置），按三条路试：
    *
+   *   0. 设置里记住的系统下载目录：上一次已经问系统要过、也写成功过，这里直接往
+   *      `<目录>/<文件名>` 写。不用再问一次系统，也不受「后台拿不到对话框」影响。
+   *      跨重启后授权可能收回（会报 13900002 之类），失败就往下走。
    *   1. 系统保存对话框的 DOWNLOAD 模式（`save(pickerMode = DOWNLOAD)`）：不弹界面，
    *      系统返回 Download/<包名>/ 这个**目录** uri（带持久化权限），我们拼上文件名
    *      自己建文件。这是手机上把文件写进「文件管理」能看到的目录的**唯一**官方通路 ——
@@ -770,10 +874,21 @@ export class DownloadManager {
    *   2. 应用内 files/Download。第 1 条失败时的兜底：歌下得来、也能播，
    *      但在「文件管理」里看不到，所以把失败原因写进 note，列表里如实显示。
    *
+   * 在后台、又还没验证过能写系统目录时：抛 DEFER_BACKGROUND，让调用方把这一首放回队列
+   * 等回到前台（EntryAbility.onForeground -> resume()）。**不要**默默退到应用内目录 ——
+   * 那种「下好了但文件管理里找不到」最容易被当成「没下载」。
+   *
    * 返回 null 表示这次下载没法开始（拿不到可写句柄）。
    */
-  private async openTarget(fileName: string): Promise<WriteTarget | null> {
-    const attempt: PickerAttempt = await this.openViaPicker(fileName);
+  private async openTarget(fileName: string, key: string): Promise<WriteTarget | null> {
+    const direct: WriteTarget | null = this.openInKnownDir(fileName, key);
+    if (direct !== null) {
+      return direct;
+    }
+    if (!this.inForeground()) {
+      throw new Error(DEFER_BACKGROUND);
+    }
+    const attempt: PickerAttempt = await this.openViaPicker(fileName, key);
     if (attempt.target !== null) {
       return attempt.target;
     }
@@ -784,11 +899,62 @@ export class DownloadManager {
     }
     return {
       path: target,
-      part: `${target}${PART_SUFFIX}`,
+      part: target + PART_SUFFIX,
       handle: handle,
       fallback: true,
       reason: attempt.reason,
     };
+  }
+
+  /**
+   * 直接写进记住的系统下载目录
+   *
+   * 成功返回写目标；目录没记住或写不进去（授权过期 / 后台）返回 null，
+   * 并把 publicDirVerified 置假 —— 下一次在后台就不会再冒这个险。
+   */
+  private openInKnownDir(fileName: string, key: string): WriteTarget | null {
+    const dir: string = this.knownPublicDirPath();
+    if (dir.length === 0) {
+      return null;
+    }
+    const path: string = this.publicTargetPath(dir, fileName, key);
+    try {
+      const handle: fs.File = fs.openSync(path,
+        fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      this.publicDirVerified = true;
+      return { path: path, part: '', handle: handle, fallback: false, reason: '' };
+    } catch (e) {
+      this.publicDirVerified = false;
+      hilog.warn(DOMAIN, TAG, 'remembered download dir not writable: %{public}s', JSON.stringify(e));
+      return null;
+    }
+  }
+
+  /**
+   * 公共目录里的目标路径：同名文件不覆盖别人的
+   *
+   * 「歌曲名」这种命名格式下，不同歌手的同名歌（翻唱、Live、伴奏）撞车是常事；
+   * 以前一律 TRUNC 同一个文件名，后下的会把先下的那份盖掉 —— 文件夹里少一首，
+   * 下载记录却还显示「已下载」。这里撞名就加 (1)(2)…，只有**同一条下载记录**重下
+   * （续授权 / 手动重试）才复用原路径、TRUNC 覆盖自己那份。
+   */
+  private publicTargetPath(dir: string, fileName: string, key: string): string {
+    const dot: number = fileName.lastIndexOf('.');
+    const stem: string = dot > 0 ? fileName.substring(0, dot) : fileName;
+    const ext: string = dot > 0 ? fileName.substring(dot) : '';
+    let candidate: string = dir + '/' + fileName;
+    let index: number = 1;
+    while (this.exists(candidate) && !this.ownsPath(candidate, key) && index < 100) {
+      candidate = dir + '/' + stem + ' (' + index + ')' + ext;
+      index++;
+    }
+    return candidate;
+  }
+
+  /** 这条路径是不是某条下载记录（key）自己的落盘位置 */
+  private ownsPath(path: string, key: string): boolean {
+    const own: DownloadItem | null = this.stateOf(key);
+    return own !== null && own.uri === path;
   }
 
   /** 记下这条路的目录 uri（设置页「下载目录」显示的就是它） */
@@ -797,7 +963,7 @@ export class DownloadManager {
   }
 
   /** 第 2 条路（系统保存对话框）的结果：target 非空=成功，否则 reason 是失败原因 */
-  private async openViaPicker(fileName: string): Promise<PickerAttempt> {
+  private async openViaPicker(fileName: string, key: string): Promise<PickerAttempt> {
     const context = this.context;
     if (context === null) {
       return { target: null, reason: '应用上下文还没准备好' };
@@ -819,11 +985,17 @@ export class DownloadManager {
       // 之前把它当文件 uri 打开、还带 TRUNC（目录打不开），这条路径其实一直是失败的，
       // 只是失败被静默吞掉、直接落到了应用内目录。
       const dirUri: string = uris[0];
-      const path: string = new fileUri.FileUri(`${dirUri}/${fileName}`).path;
-      // TRUNC：同名文件（重下同一首、或两首歌撞了同一个文件名）要从头写。不截断的话
-      // 新内容比旧文件短时，尾巴上会留着上一次的字节，拼出一个坏文件。
+      // 目录路径转成「本机路径」：之后直接 openSync 建文件，不必再问系统
+      const dirPath: string = new fileUri.FileUri(dirUri).path;
+      // 同名文件不互相覆盖（见 publicTargetPath）：不同歌手的同名歌撞车时各留各的
+      const path: string = this.publicTargetPath(dirPath, fileName, key);
+      // TRUNC：重下同一条记录（续授权 / 手动重试）要从头写。不截断的话新内容比旧文件短时，
+      // 尾巴上会留着上一次的字节，拼出一个坏文件。
       const handle: fs.File = fs.openSync(path,
         fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      // 记下来：下一次（含后台播放时）直接往这里写，不再走保存对话框
+      this.publicDirPathCache = dirPath;
+      this.publicDirVerified = true;
       this.learnDirOf(dirUri);
       return { target: { path: path, part: '', handle: handle, fallback: false, reason: '' },
         reason: '' };
@@ -856,6 +1028,15 @@ export class DownloadManager {
         hilog.info(DOMAIN, TAG,
           'auto task defers (playback busy): %{public}s, player %{public}s buffering=%{public}s active=%{public}d',
           next.name, player.getStatus(), player.isBuffering() ? 'yes' : 'no', this.active);
+        this.schedulePump();
+        return;
+      }
+      // 保存位置这一关：后台、又还没验证过能写系统下载目录时先不下（见 canAutoWriteNow）。
+      // 回到前台 EntryAbility 会调 resume()，不用靠定时器轮询也能马上开工。
+      if (next.auto && !this.canAutoWriteNow()) {
+        hilog.info(DOMAIN, TAG,
+          'auto task waits for foreground (save dir not verified): %{public}s, active=%{public}d',
+          next.name, this.active);
         this.schedulePump();
         return;
       }
@@ -1000,9 +1181,15 @@ export class DownloadManager {
     item.fileName = fileName;
     let write: WriteTarget | null = null;
     try {
-      write = await this.openTarget(fileName);
+      write = await this.openTarget(fileName, item.key);
     } catch (e) {
-      this.fail(item, `保存位置不可用：${(e as Error).message}`);
+      const message: string = (e as Error).message;
+      if (message === DEFER_BACKGROUND) {
+        // 不是失败：放回队列，等回到前台再拿保存位置（EntryAbility.onForeground -> resume）
+        this.deferForForeground(item);
+        return;
+      }
+      this.fail(item, `保存位置不可用：${message}`);
       return;
     }
     if (write === null) {
@@ -1196,6 +1383,23 @@ export class DownloadManager {
       throw new Error('这一集没解析出音频地址（书源规则可能已失效，或这一集需要登录）');
     }
     return { url: audio.url, headers: engine.audioHeaders(payload.sourceId) };
+  }
+
+  /**
+   * 先不下：保存位置要等回到前台才拿得到（不是失败，别在列表里报红）
+   *
+   * 放回 waiting 之后由 startTask 的 finally 触发的那次 pump 接着排；pump 里那道
+   * canAutoWriteNow 会拦住，直到回前台 resume()。
+   */
+  private deferForForeground(item: DownloadItem): void {
+    if (item.status !== 'downloading') {
+      return;
+    }
+    item.status = 'waiting';
+    item.error = '';
+    item.received = 0;
+    item.total = 0;
+    hilog.info(DOMAIN, TAG, 'auto task deferred until foreground: %{public}s', item.name);
   }
 
   /** 标记失败（只管状态，并发位的收尾在 startTask 的 finally 里） */
@@ -1422,9 +1626,10 @@ export class DownloadManager {
             item.error = '这条下载记录没有文件路径（可能是很旧的版本留下的），可以重新下载';
           } else if (this.exists(item.uri)) {
             setDownloadedFile(item.key, item.uri);
-          } else if (item.uri.startsWith(PUBLIC_URI_PREFIX)) {
-            // 公共下载目录里的文件：系统保存对话框给的是**会话级**授权（module.json5 里
-            // 特意没声明 FILE_ACCESS_PERSIST 那个受限权限），重启后 App 就读不到它了。
+          } else if (this.isPublicFile(item.uri)) {
+            // 公共下载目录里的文件（路径不在我们的兜底目录里，见 isPublicFile）：系统保存
+            // 对话框给的是**会话级**授权（module.json5 里特意没声明 FILE_ACCESS_PERSIST
+            // 那个受限权限），重启后 App 就读不到它了。
             // 这跟「被清理工具删了」是两回事：文件还在「文件管理」里，只是这次启动没权限，
             // 所以留着 done、把情况写进 note，别标成失败冤枉用户（也免得他重复下载）。
             item.note = '文件在下载目录里，但本次启动系统没给读取授权（重启后要重新联网播）';

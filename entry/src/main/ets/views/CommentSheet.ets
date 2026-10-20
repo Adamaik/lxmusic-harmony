@@ -38,6 +38,18 @@ const C_PANEL_LINE: string = '#1FFFFFFF';
 @Component
 export struct CommentSheet {
   @Prop songName: string = '';
+  /**
+   * 状态栏的避让高度（vp）
+   *
+   * 播放页是**全屏模态**（bindContentCover），根节点又用 expandSafeArea 把背景铺到了
+   * 状态栏底下（见 views/PlayerView.ets 末尾），所以这一层铺满播放器的覆盖物也是从
+   * **窗口顶边**开始摆的 —— 不给顶栏垫这一截，返回键和「「歌名」的评论」就会直接压在
+   * 时间/电量的字上（用户实测截图确认）。
+   *
+   * 与 bottomInset 同一条路：由播放页把壳层量到的值传进来；
+   * 读到 0 表示系统已经避让过，此时按 0 处理，避免双重留白。
+   */
+  @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   /**
    * 这首歌是不是「需要先匹配」的本地音乐 / 云端音乐
@@ -257,8 +269,9 @@ export struct CommentSheet {
         .accessibilityLevel('yes')
     }
     .width('100%')
-    .height(50)
-    .padding({ left: 6, right: 6 })
+    // 高度要把状态栏的留白算进去，否则 padding 会把这 50vp 的内容区吃掉一截
+    .height(50 + this.topInset)
+    .padding({ left: 6, right: 6, top: this.topInset })
   }
 
   @Builder

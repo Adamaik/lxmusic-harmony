@@ -3,9 +3,9 @@ import { PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySessi
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
 import { platformName } from '../core/music/MusicList';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, F_SUB, platformColor, platformTint } from '../ui/Theme';
+import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, platformColor, platformTint } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_MORE_CIRCLE, IconGlyph } from '../ui/Icons';
-import { CoverArt, EmptyState, FavoriteHeart } from '../ui/Widgets';
+import { CoverArt, EmptyState, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
@@ -286,14 +286,10 @@ export struct SongListPane {
       if (item.singer.length > 0 || this.showSource) {
         Row({ space: 6 }) {
           if (item.singer.length > 0) {
-            Text(item.singer)
-              .fontSize(F_SUB)
-              .fontColor(C_TEXT_WEAK)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-              .textAlign(TextAlign.Start)
+            // 歌手名：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
+            SingerLink({ singer: item.singer, source: item.source })
           }
+          Blank()
           if (this.showSource) {
             // 来源标签：同一首歌在五个平台都有，扫列表时得一眼看出哪条是哪个站
             Text(platformName(item.source))
@@ -363,7 +359,7 @@ export struct SongListPane {
            * 为什么要套一层组：宽屏要一屏多列（List.lanes），而 lanes 是**按条目**分的 ——
            * 把状态行当普通条目丢进去，它只会占**一列**，一屏四列时缩在最左边那列里居中，
            * 看着就是错位。ListItemGroup 在分栏模式下自己占满整行，组尾（footer）也就通栏了，
-           * 与其余几个列表页是同一套写法（见 RecommendView 的 listHeader/listFooter）。
+           * 与其余几个列表页是同一套写法（见 OnlineListView / PlaylistDetailView 的组头组尾）。
            */
           ListItemGroup({ footer: this.statusFooter() }) {
             LazyForEach(this.source, (item: SongItem, index: number) => {

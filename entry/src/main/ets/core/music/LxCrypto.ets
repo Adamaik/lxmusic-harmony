@@ -75,7 +75,15 @@ export function toBase64(bytes: number[]): string {
   return out;
 }
 
-/** 字节数组 -> 字符串（UTF-8 解码，非法序列用 U+FFFD 兜底） */
+/**
+ * UTF-8 字节 → 字符串（纯 ArkTS，非法序列用 U+FFFD 兜底）
+ *
+ * **这一份是给主机单测和小输入用的**：`entry/src/test` 的 hypium 单测跑在 PC 上，本地没有
+ * `@kit.ArkTS` / `@kit.CryptoArchitectureKit`，所以这个文件**不能引任何 kit**（否则本地
+ * 单测连模块都加载不起来）。逐字符拼接是 O(n²)，输入一大就会卡主线程 —— 所以
+ * **大块数据（酷我榜单响应 25 万字节、云同步载荷）一律走 `core/music/PlatformCrypto.ets`
+ * 的原生实现**，别在这里解大数据。
+ */
 export function bytesToUtf8(bytes: number[]): string {
   let out: string = '';
   let i: number = 0;
@@ -96,12 +104,12 @@ export function bytesToUtf8(bytes: number[]): string {
       code = b0 & 0x07;
       extra = 3;
     } else {
-      out += '\uFFFD';
+      out += '�';
       i++;
       continue;
     }
     if (i + extra >= bytes.length) {
-      out += '\uFFFD';
+      out += '�';
       break;
     }
     let ok: boolean = true;
@@ -114,7 +122,7 @@ export function bytesToUtf8(bytes: number[]): string {
       code = (code << 6) | (b & 0x3F);
     }
     if (!ok) {
-      out += '\uFFFD';
+      out += '�';
       i++;
       continue;
     }
@@ -452,10 +460,10 @@ function aesEncryptBlock(block: number[], w: number[]): void {
         const a1: number = block[o + 1];
         const a2: number = block[o + 2];
         const a3: number = block[o + 3];
-        block[o] = aesGmul(a0, 2) ^ aesGmul(a1, 3) ^ a2 ^ a3;
-        block[o + 1] = a0 ^ aesGmul(a1, 2) ^ aesGmul(a2, 3) ^ a3;
-        block[o + 2] = a0 ^ a1 ^ aesGmul(a2, 2) ^ aesGmul(a3, 3);
-        block[o + 3] = aesGmul(a0, 3) ^ a1 ^ a2 ^ aesGmul(a3, 2);
+        block[o] = GMUL2[a0] ^ GMUL3[a1] ^ a2 ^ a3;
+        block[o + 1] = a0 ^ GMUL2[a1] ^ GMUL3[a2] ^ a3;
+        block[o + 2] = a0 ^ a1 ^ GMUL2[a2] ^ GMUL3[a3];
+        block[o + 3] = GMUL3[a0] ^ a1 ^ a2 ^ GMUL2[a3];
       }
     }
     const base: number = round * 16;
@@ -539,6 +547,29 @@ export function aes128EcbPkcs7DecryptBytes(keyBytes: number[], dataBytes: number
 
 /** AES-128 逆 S 盒，解密用 */
 const AES_INV_SBOX: number[] = buildInvSbox();
+/**
+ * MixColumns / InvMixColumns 用的乘法表（预计算 256 项）
+ *
+ * **不要在每轮里调 `aesGmul(a, 14)`**：那是「8 次循环 + 分支」的函数调用，一个 16 字节块
+ * 光 InvMixColumns 就要调 144 次（4 列 × 4 项 × 9 轮）。酷我榜单接口解密后是 25 万字节、
+ * 一万六千多个块，合计一亿多次运算 —— 主线程要卡三四秒（2026-10-13 实机反馈
+ * 「时不时卡上三四秒」）。查表之后这部分只剩 16 次数组读取 + 几次异或。
+ */
+const GMUL2: number[] = buildGmulTable(2);
+const GMUL3: number[] = buildGmulTable(3);
+const GMUL9: number[] = buildGmulTable(9);
+const GMUL11: number[] = buildGmulTable(11);
+const GMUL13: number[] = buildGmulTable(13);
+const GMUL14: number[] = buildGmulTable(14);
+
+/** 建一张 GF(2^8) 乘法表（只在模块初始化时跑 256 次） */
+function buildGmulTable(factor: number): number[] {
+  const table: number[] = new Array<number>(256);
+  for (let i = 0; i < 256; i++) {
+    table[i] = aesGmul(i, factor);
+  }
+  return table;
+}
 
 function buildInvSbox(): number[] {
   const table: number[] = new Array<number>(256);
@@ -587,10 +618,10 @@ function aesDecryptBlock(block: number[], w: number[]): void {
         const a1: number = block[o + 1];
         const a2: number = block[o + 2];
         const a3: number = block[o + 3];
-        block[o] = aesGmul(a0, 14) ^ aesGmul(a1, 11) ^ aesGmul(a2, 13) ^ aesGmul(a3, 9);
-        block[o + 1] = aesGmul(a0, 9) ^ aesGmul(a1, 14) ^ aesGmul(a2, 11) ^ aesGmul(a3, 13);
-        block[o + 2] = aesGmul(a0, 13) ^ aesGmul(a1, 9) ^ aesGmul(a2, 14) ^ aesGmul(a3, 11);
-        block[o + 3] = aesGmul(a0, 11) ^ aesGmul(a1, 13) ^ aesGmul(a2, 9) ^ aesGmul(a3, 14);
+        block[o] = GMUL14[a0] ^ GMUL11[a1] ^ GMUL13[a2] ^ GMUL9[a3];
+        block[o + 1] = GMUL9[a0] ^ GMUL14[a1] ^ GMUL11[a2] ^ GMUL13[a3];
+        block[o + 2] = GMUL13[a0] ^ GMUL9[a1] ^ GMUL14[a2] ^ GMUL11[a3];
+        block[o + 3] = GMUL11[a0] ^ GMUL13[a1] ^ GMUL9[a2] ^ GMUL14[a3];
       }
     }
   }

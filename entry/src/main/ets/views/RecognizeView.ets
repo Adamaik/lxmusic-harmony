@@ -11,10 +11,13 @@ import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_ON_ACCENT, C_RED, C_TEXT
 import { CoverArt, SectionTitle } from '../ui/Widgets';
 import { I_IDENTIFY, I_MORE, I_TRASH, IconGlyph } from '../ui/Icons';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
+import { CapsuleSegment } from '../ui/CapsuleSegment';
 import { EngineReport, EngineResultGroup, RecognitionResult, RecognitionStatus } from '../core/recognize/RecognitionTypes';
-import { MicCancelledError, MicPermissionError, MicRecorder } from '../core/recognize/MicRecorder';
+import { AudioRecorder, CaptureCancelledError, CapturePermissionError, CaptureSource } from '../core/recognize/AudioRecorder';
 import { RecognitionNetworkError } from '../core/recognize/errors';
 import { RecognitionHistory } from '../core/recognize/RecognitionHistory';
+import { K_RECOGNIZE_SOURCE, RecognizeSettings, RECOGNIZE_SOURCE_MIC,
+  RECOGNIZE_SOURCE_PLAYBACK } from '../core/settings/RecognizeSettings';
 import { MultiEngineOutput, recognizeAll } from '../core/recognize/RecognitionEngine';
 import { NeteaseRecognizer } from '../core/recognize/NeteaseRecognizer';
 
@@ -25,6 +28,17 @@ const TAG: string = 'RecognizeView';
 const SILENCE_RMS: number = 32 / 32768;
 /** 播放时按「歌名 + 歌手」搜几条候选，取第一条 */
 const PLAY_SEARCH_LIMIT: number = 10;
+/**
+ * 采集来源分段选择器的两档
+ *
+ * 下标即这一档在界面上的位置，也用来在「存档里的来源」与「选中哪一档」之间换算。
+ * 默认那档（外界录音）排在左边 —— 抓本机播放的声音是隐私上更重的一档，得用户自己选。
+ */
+const SOURCE_LABELS: string[] = ['周围声音', '本机播放'];
+const SRC_MIC: number = 0;
+const SRC_PLAYBACK: number = 1;
+/** 来源选择器的宽度：两档各占一半，拉满整卡会成一条又长又扁的带子 */
+const SOURCE_SEGMENT_WIDTH: number = 210;
 
 /** 网易云 AFP 指纹页面回调的桥对象（必须用对象字面量，见 SourceSandboxHost 的说明） */
 interface AfpBridgeObject {
@@ -34,8 +48,14 @@ interface AfpBridgeObject {
 /**
  * 听歌识曲页
  *
- * 流程：请求麦克风权限 → 录 12 秒 → 酷狗 + 网易云两个引擎并发识别 → 归并出主结果，
- * 每个引擎的候选各自分组展示，成功识别的歌记进「识别历史」。
+ * 流程：选采集来源 → 走麦克风时先要权限 → 录 12 秒 → 酷狗 + 网易云两个引擎并发识别 →
+ * 归并出主结果，每个引擎的候选各自分组展示，成功识别的歌记进「识别历史」。
+ *
+ * 采集来源是页面上一个开关（见 core/recognize/AudioRecorder）：
+ *   - 周围声音：麦克风录周围的声音，听音箱外放的场合用；
+ *   - 本机播放：直接抓本机正在播放的媒体音频，抖音 / 视频号放什么就抓什么，不挑环境。
+ * 默认是「周围声音」，用户自己切到「本机播放」才走内录 —— 抓本机播放的声音隐私上更重一档，
+ * 不能替用户默认打开；选过的那一档会记住（见 core/settings/RecognizeSettings）。
  *
  * 移植自派音的听歌识曲页，界面按聆听的规范重写：
  *   - 颜色一律走 ui/Theme 的语义 token（深浅模式自动换），不再有自绘的主题色；
@@ -62,7 +82,16 @@ export struct RecognizeView {
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
    */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
-  private recorder: MicRecorder = new MicRecorder();
+  /** 本机能不能内录；不能就只剩「周围声音」一路，来源选择器也不显示 */
+  @State playbackSupported: boolean = false;
+  /**
+   * 采集来源（识别页上那个开关，取值见 core/settings/RecognizeSettings）
+   *
+   * 用 @StorageLink 而不是 @State：这一档要记住 —— 默认是外界录音，用户切到「本机播放」
+   * 之后下次进来还是它。存法在 RecognizeSettings（沙箱 JSON）。
+   */
+  @StorageLink(K_RECOGNIZE_SOURCE) recognizeSource: string = RECOGNIZE_SOURCE_MIC;
+  private recorder: AudioRecorder = new AudioRecorder();
   private webController: webview.WebviewController = new webview.WebviewController();
   private netease: NeteaseRecognizer = new NeteaseRecognizer(this.webController);
   private afpBridge: AfpBridgeObject = {
@@ -74,6 +103,22 @@ export struct RecognizeView {
 
   aboutToAppear(): void {
     this.history = RecognitionHistory.getInstance().list();
+    /**
+     * 「本机播放」（内录本机声音）这一档**已取消**，所以这里恒为 false：不摆来源选择器，
+     * 识曲只走「周围声音」（麦克风）。
+     *
+     * 取消的原因（2026-10-11 实机排查结论）：按官方口径把内录该走的接口都走通了 —— 先
+     * `requestPlaybackCaptureStart` 触发用户授权、回调返回 STATE_SUCCESS，紧接着 `start()`
+     * 被判 6800103「状态不支持」，之后**一个字节都收不到**。这是平台没把 AudioCapturer 的
+     * 回放采集放给三方应用：native 侧同族接口（PlaybackCaptureMode / StartState /
+     * RequestPlaybackCaptureStart）标着「该API暂不对外支持」，ArkTS 侧的
+     * SOURCE_TYPE_PLAYBACK_CAPTURE 自 API 12 起就废弃、官方让改用录屏接口 AVScreenCapture。
+     * 三方要拿系统音频只能起录屏会话（每次授权 + 系统指示常亮），不适配识曲这个场景。
+     *
+     * 采集侧的实现（AudioRecorder 的内录分支、RecognizeSettings 的 source 字段）保持原样，
+     * 将来平台放开时把这里恢复成 `AudioRecorder.isPlaybackSupported()` 即可。
+     */
+    this.playbackSupported = false;
   }
 
   aboutToDisappear(): void {
@@ -114,6 +159,20 @@ export struct RecognizeView {
     }
   }
 
+  /** 存档里的来源 → 分段选择器选中的那一档 */
+  private sourceIndex(): number {
+    return this.recognizeSource === RECOGNIZE_SOURCE_PLAYBACK ? SRC_PLAYBACK : SRC_MIC;
+  }
+
+  /**
+   * 这次跑的是内录（抓本机正在播放的声音）还是外录（麦克风）
+   *
+   * 两个条件是「与」：存档里选了「本机播放」，但这台设备压根没有内录能力时，仍然按外录走。
+   */
+  private isPlayback(): boolean {
+    return this.playbackSupported && this.recognizeSource === RECOGNIZE_SOURCE_PLAYBACK;
+  }
+
   private statusDetail(): string {
     if (this.status === RecognitionStatus.Capturing) {
       return `采集进度 ${Math.round(this.captureProgress * 100)}%`;
@@ -124,7 +183,9 @@ export struct RecognizeView {
       return this.errorText;
     }
     if (this.status === RecognitionStatus.Idle) {
-      return '把手机靠近音源，点「开始识别」后录 12 秒。';
+      return this.isPlayback()
+        ? '点「开始识别」后录 12 秒，抓的是本机正在播放的声音（抖音等应用照常放着就行）。'
+        : '把手机靠近音源，点「开始识别」后录 12 秒。';
     }
     return '';
   }
@@ -154,12 +215,17 @@ export struct RecognizeView {
     if (this.isBusy()) {
       return;
     }
-    this.status = RecognitionStatus.RequestingPermission;
-    const granted: boolean = await this.requestMicPermission();
-    if (!granted) {
-      this.status = RecognitionStatus.PermissionDenied;
-      this.errorText = '没有麦克风权限就没法听周围的声音，请在系统设置里允许「聆听」使用麦克风。';
-      return;
+    const source: CaptureSource = this.isPlayback() ? CaptureSource.PLAYBACK : CaptureSource.MIC;
+    // 只有麦克风那一路要权限：内录抓的是本机自己的音频通路，本应用没有任何可申请的权限
+    // （系统侧相关权限全是 system_grant，见 module.json5 的说明），也就别弹无谓的授权框
+    if (source === CaptureSource.MIC) {
+      this.status = RecognitionStatus.RequestingPermission;
+      const granted: boolean = await this.requestMicPermission();
+      if (!granted) {
+        this.status = RecognitionStatus.PermissionDenied;
+        this.errorText = '没有麦克风权限就没法听周围的声音，请在系统设置里允许「聆听」使用麦克风。';
+        return;
+      }
     }
     this.status = RecognitionStatus.Capturing;
     this.captureProgress = 0;
@@ -170,19 +236,21 @@ export struct RecognizeView {
     try {
       samples = await this.recorder.capture((progress: number): void => {
         this.captureProgress = progress;
-      });
+      }, source);
     } catch (e) {
-      hilog.error(DOMAIN, TAG, '麦克风采集异常: %{public}s', JSON.stringify(e));
+      hilog.error(DOMAIN, TAG, '音频采集异常: %{public}s', JSON.stringify(e));
       this.handleError(e);
       return;
     }
     // 先过一道静音检查：对着一屋子底噪跑一次网络识别只会白等往返，还容易被误报成结果
-    const rms: number = MicRecorder.computeRms(samples);
-    hilog.info(DOMAIN, TAG, '采集完成 样本数=%{public}d RMS=%{public}f 时长=%{public}fs',
-      samples.length, rms, samples.length / 16000);
+    const rms: number = AudioRecorder.computeRms(samples);
+    hilog.info(DOMAIN, TAG, '采集完成 来源=%{public}d 样本数=%{public}d RMS=%{public}f 时长=%{public}fs',
+      source, samples.length, rms, samples.length / 16000);
     if (rms < SILENCE_RMS) {
       this.status = RecognitionStatus.NoAudio;
-      this.errorText = '录到的几乎都是环境底噪，把手机再靠近音源一些试试。';
+      this.errorText = source === CaptureSource.PLAYBACK
+        ? '本机这会儿没有在播放声音。先让抖音等应用把歌放起来，再点「开始识别」；如果是音箱外放，把来源切成「周围声音」。'
+        : '录到的几乎都是环境底噪，把手机再靠近音源一些试试。';
       return;
     }
     this.status = RecognitionStatus.Recognizing;
@@ -210,13 +278,13 @@ export struct RecognizeView {
   }
 
   private handleError(err: Object): void {
-    if (err instanceof MicCancelledError) {
+    if (err instanceof CaptureCancelledError) {
       // 用户自己点的「停止」：不是错误，回到待机就好
       this.status = RecognitionStatus.Idle;
       this.errorText = '';
       return;
     }
-    if (err instanceof MicPermissionError) {
+    if (err instanceof CapturePermissionError) {
       this.status = RecognitionStatus.PermissionDenied;
       this.errorText = err.message;
       return;
@@ -434,6 +502,25 @@ export struct RecognizeView {
         Progress({ value: Math.round(this.captureProgress * 100), total: 100, type: ProgressType.Linear })
           .width('72%')
           .color(C_RED)
+      }
+
+      // 采集来源开关：本机不给内录就只剩「周围声音」一路，那就不摆这个选择器了
+      if (this.playbackSupported) {
+        Row() {
+          CapsuleSegment({
+            labels: SOURCE_LABELS,
+            selectedIndex: this.sourceIndex(),
+            compact: true,
+            onSelect: (index: number): void => {
+              // 走存档：切完立刻落盘，识别页靠 @StorageLink 跟着变色
+              RecognizeSettings.getInstance().setSource(
+                index === SRC_PLAYBACK ? RECOGNIZE_SOURCE_PLAYBACK : RECOGNIZE_SOURCE_MIC);
+            },
+          })
+        }
+        .width(SOURCE_SEGMENT_WIDTH)
+        .accessibilityText('采集来源')
+        .accessibilityLevel('yes')
       }
 
       Button({ type: ButtonType.Capsule, stateEffect: true }) {

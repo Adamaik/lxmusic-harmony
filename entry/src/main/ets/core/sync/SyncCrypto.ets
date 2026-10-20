@@ -1,7 +1,8 @@
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { md5Hex } from '../music/LxCrypto';
 import { aes128EcbPkcs7EncryptBytes, aes128EcbPkcs7DecryptBytes, bytesToUtf8, fromBase64,
-  md5Hex, toBase64, utf8Bytes } from '../music/LxCrypto';
+  toBase64, utf8Bytes } from '../music/PlatformCrypto';
 import { RsaKeyPairB64 } from './SyncTypes';
 
 const DOMAIN: number = 0x0001;
@@ -17,7 +18,9 @@ const TAG: string = 'SyncCrypto';
  *     RSA_PKCS1_OAEP_PADDING 默认参数、移动端 OAEPWithSHA1AndMGF1Padding 一致；
  *   - 摘要：MD5 小写 hex（洛雪 toMD5 就是 crypto.createHash('md5').digest('hex')）。
  *
- * AES/MD5/Base64 复用 core/music/LxCrypto.ets（纯 ArkTS，已与 node:crypto 的向量对齐），
+ * AES/Base64/UTF-8 走 core/music/PlatformCrypto.ets 的原生实现（同步载荷几十万字节，
+ * 纯 ArkTS 那份 AES 会把主线程卡住），MD5 仍是 core/music/LxCrypto.ets 的纯实现
+ * （输入只几十字节，且那一份由主机单测比对向量），
  * 这里只补 RSA —— 它必须走系统 CryptoArchitectureKit：密钥生成与 OAEP 解密都不是
  * 纯 ArkTS 能可靠实现的。
  */

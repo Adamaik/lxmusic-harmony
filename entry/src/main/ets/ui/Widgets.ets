@@ -4,6 +4,8 @@ import { glassLight, immersiveMaterialFor, materialFirstGlass, thinGlass } from 
 import { I_CHEVRON_RIGHT, I_DOC, I_HEART, I_HEART_FILLED, I_MORE, I_TRASH, I_VOLUME, IconGlyph } from './Icons';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { ArtistNav } from './ArtistNav';
+import { ARTIST_PLATFORMS } from '../core/music/MusicArtist';
 
 /**
  * 通用小组件：封面、圆形图标按钮、歌曲行
@@ -223,11 +225,21 @@ export struct EmptyState {
   /** 副文案：告诉用户「怎么才会有内容」，比单说「没有数据」有用 */
   @Prop hint: string = '';
   @Prop topPadding: number = 64;
+  /**
+   * 要不要那颗大图标
+   *
+   * 默认要有（各列表页的空态都带图标，一眼能认出是「没数据」而不是「还没加载出来」）。
+   * 月报类页面（回响）关掉它：那里是一页统计，空态只是「这个月还没听过」的一句话，
+   * 顶上再压一颗 42 的灰图标，整页看着会更空更沉。
+   */
+  @Prop showIcon: boolean = true;
 
   build() {
     Column({ space: 10 }) {
-      IconGlyph({ symbol: this.icon, iconSize: 42, color: C_TEXT_WEAK })
-        .accessibilityLevel('no')
+      if (this.showIcon) {
+        IconGlyph({ symbol: this.icon, iconSize: 42, color: C_TEXT_WEAK })
+          .accessibilityLevel('no')
+      }
       Text(this.text)
         .fontSize(F_ITEM)
         .fontColor(C_TEXT_SUB)
@@ -479,6 +491,83 @@ export struct FavoriteHeart {
       this.onToggle();
     })
     .accessibilityText(this.isLiked() ? '取消收藏' : '收藏')
+    .accessibilityLevel('yes')
+  }
+}
+
+/**
+ * 歌曲行里的歌手名（点了就进这位歌手的聚合页）
+ *
+ * 这是「点歌手名」在界面上唯一的实现：播放页那一行、每一个歌曲列表行
+ * （搜索 / 歌单 / 在线详情 / 队列 / 历史 / 本地 / 云端…）都用它。
+ * 早先各页各写一份同样的「Text + 小尖角 + onClick」，五处慢慢就会走样
+ * （字号、热区、能不能点各不一样）—— 这个项目里凡是共用的小组件都收在
+ * `ui/` 下（同 CoverArt / FavoriteHeart），这里也一样。
+ *
+ * 两个刻意的设计：
+ *   - **热区只有这块文字**（含右边那枚小尖角），不外扩到整条子行 ——
+ *     整行的点击是「播这首歌」，把空白也算进来会让「想播歌却进了歌手页」很容易踩。
+ *     名字长时靠 `flexShrink` 收缩 + 省略号，不会把行尾那枚来源标签挤出屏幕。
+ *   - **不能点时不装出能点的样子**：本地歌 / 云端歌没有平台可查、或名字为空，
+ *     那就和以前一样只是一行灰字（不给一个点了必然失败的入口）。
+ */
+@Component
+export struct SingerLink {
+  /** 歌手那一行的原文，可能是一位，也可能是「周杰伦、方文山」多位 */
+  @Prop singer: string = '';
+  /** 这首歌的来源平台：点它时先去哪个平台认人（认不到会自动换别的平台） */
+  @Prop source: string = '';
+  /** 字号：各处行的样式不一样（列表行 12.5、播放页那一行 13.5） */
+  @Prop fontSize: number = F_SUB;
+  /**
+   * 深色底上用另一组颜色
+   *
+   * 全屏播放器是整块深色底，主题里那几个「正文色」token 在那儿是看不清的
+   * （它本来是按页面底设计的），所以那儿按原来的白字微调，不走 token。
+   */
+  @Prop onDark: boolean = false;
+  /** 右尖角大小（0 = 不画：有些窄行放不下这枚角） */
+  @Prop chevronSize: number = 11;
+
+  private linkable(): boolean {
+    return this.singer.length > 0 && ARTIST_PLATFORMS.includes(this.source)
+      && ArtistNav.getInstance().canOpen(this.singer);
+  }
+
+  /** 可点时把字提亮一档（「这里能点」），不可点时保持原来的灰 */
+  private textColor(): ResourceColor {
+    if (this.onDark) {
+      return this.linkable() ? '#E8FFFFFF' : '#A6FFFFFF';
+    }
+    return this.linkable() ? C_TEXT_SUB : C_TEXT_WEAK;
+  }
+
+  private chevronColor(): ResourceColor {
+    return this.onDark ? '#A6FFFFFF' : C_TEXT_WEAK;
+  }
+
+  build() {
+    Row({ space: 2 }) {
+      Text(this.singer)
+        .fontSize(this.fontSize)
+        .fontColor(this.textColor())
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textAlign(TextAlign.Start)
+      if (this.linkable() && this.chevronSize > 0) {
+        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: this.chevronSize, color: this.chevronColor() })
+          .accessibilityLevel('no')
+      }
+    }
+    .constraintSize({ maxWidth: '100%' })
+    .flexShrink(1)
+    .onClick(() => {
+      if (this.linkable()) {
+        ArtistNav.getInstance().open(this.source, this.singer);
+      }
+    })
+    // 读屏：能点就把「点按做什么」说清楚；不能点就只念名字
+    .accessibilityText(this.linkable() ? `${this.singer}，点按查看这位歌手的全部歌曲` : this.singer)
     .accessibilityLevel('yes')
   }
 }

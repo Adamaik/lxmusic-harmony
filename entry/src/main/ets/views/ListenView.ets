@@ -1,13 +1,14 @@
 import { common } from '@kit.AbilityKit';
+import { BottomBar } from '../ui/BottomBar';
 import { picker } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 import { BookEngine } from '../core/book/BookEngine';
 import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
-import { BookHit, BookSourceInfo } from '../core/book/BookTypes';
+import { BookExploreCategory, BookHit, BookSourceInfo } from '../core/book/BookTypes';
 import { BookLoginWeb } from '../components/BookLoginWeb';
-import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
-  F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK,
+  F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { glassLight, immersiveMaterialFor, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
 import { CapsuleSegment } from '../ui/CapsuleSegment';
@@ -19,13 +20,14 @@ import { CONTENT_MAX_WIDTH, contentColumnsFor, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'ListenView';
 
-/** 分段选择器（书架 / 搜索 / 书源）在宽屏下的最大宽度：拉满整屏会变成一条又长又扁的带子 */
+/** 分段选择器（书架 / 发现 / 搜索 / 书源）在宽屏下的最大宽度：拉满整屏会变成一条又长又扁的带子 */
 const SEGMENT_MAX_WIDTH: number = 560;
 
-/** 三个分段：书架（我的书）/ 搜索（找书）/ 书源（导入与管理） */
+/** 四个分段：书架（我的书）/ 发现（按分类推书）/ 搜索（找书）/ 书源（导入与管理） */
 const PANE_SHELF: number = 0;
-const PANE_SEARCH: number = 1;
-const PANE_SOURCE: number = 2;
+const PANE_DISCOVER: number = 1;
+const PANE_SEARCH: number = 2;
+const PANE_SOURCE: number = 3;
 
 /** 书源筛选里「不筛」的那一项 */
 const FILTER_ALL: string = '';
@@ -99,14 +101,83 @@ export struct BookRow {
   }
 }
 
+/** 分类卡片的配色（按分类顺序循环取，同一个源每次进来颜色不变） */
+const CAT_COLORS: string[][] = [
+  ['#7B6CF6', '#4E3FD6'],
+  ['#3FD07A', '#17A94F'],
+  ['#FF7A59', '#E2432F'],
+  ['#4FA8FF', '#1E6FD9'],
+  ['#FFB13D', '#E0810F'],
+  ['#F26DB4', '#C22C86'],
+];
+
+function catColors(index: number): string[] {
+  return CAT_COLORS[index % CAT_COLORS.length];
+}
+
+/** 分类卡片的高度：横滑那一排与卡片本身共用 */
+const CAT_CARD_H: number = 84;
+
+/**
+ * 分类卡片（发现页那排横滑卡片）
+ *
+ * 画法照首页推荐的榜单卡片（见 views/RecommendView.ets 的 RankCard）：渐变底 + 底部压暗
+ * + 白字，只是小一号 —— 分类名就两到四个字，做成长条卡片比药丸好扫，颜色也帮着记位置。
+ * 点一下 = 把下面的书单换成这个分类；选中态加一圈白边。
+ */
+@Component
+struct CategoryCard {
+  @Prop title: string = '';
+  @Prop colorA: string = '#7B6CF6';
+  @Prop colorB: string = '#4E3FD6';
+  @Prop cardWidth: number = 118;
+  @Prop selected: boolean = false;
+  onTap: () => void = () => {
+  };
+
+  build() {
+    Stack({ alignContent: Alignment.BottomStart }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .linearGradient({ angle: 160, colors: [[this.colorA, 0.0], [this.colorB, 1.0]] })
+      // 底部压暗，白字才跳得出来
+      Column()
+        .width('100%')
+        .height('60%')
+        .linearGradient({ angle: 0, colors: [['#00000000', 0.0], ['#59000000', 1.0]] })
+      Text(this.title)
+        .fontSize(14)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Color.White)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textShadow({ radius: 10, color: '#33000000', offsetX: 0, offsetY: 2 })
+        .padding({ left: 11, right: 11, bottom: 10 })
+    }
+    .width(this.cardWidth)
+    .height(CAT_CARD_H)
+    .borderRadius(18)
+    .clip(true)
+    .border({ width: this.selected ? 2 : 0, color: '#FFFFFF' })
+    .shadow({ radius: 12, color: '#1A000000', offsetX: 0, offsetY: 5 })
+    .onClick(() => {
+      this.onTap();
+    })
+    .accessibilityGroup(true)
+    .accessibilityText(this.selected ? `分类 ${this.title}，已选中` : `分类 ${this.title}`)
+    .accessibilityLevel('yes')
+  }
+}
+
 /**
  * 听书页
  *
- * 「阅读（Legado）」书源的入口：导入书源 → 搜索 / 发现 → 打开一本书 → 播它的某一集。
+ * 「阅读（Legado）」书源的入口：导入书源 → 发现 / 搜索 → 打开一本书 → 播它的某一集。
  * 书源协议与音源完全不同（见 core/book/book_preload.js 的说明），所以这里是一套
- * 自己的三段式：**书架 / 搜索 / 书源**。
+ * 自己的四段式：**书架 / 发现 / 搜索 / 书源**。
  *
- * 三段放在一页里而不是拆成三个页签，是因为它们的使用频率差很多（书架天天看、
+ * 四段放在一页里而不是拆成四个页签，是因为它们的使用频率差很多（书架天天看、
  * 书源一个月动一次），拆页签会让底栏变成五个，得不偿失。
  */
 @Component
@@ -123,7 +194,7 @@ export struct ListenView {
   };
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   /**
-   * 窗口宽度（vp）：三个分段里的列表按它算一屏几列（0 = 还没量到，按手机一列）
+   * 窗口宽度（vp）：四个分段里的列表按它算一屏几列（0 = 还没量到，按手机一列）
    *
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），本页只订阅。
    */
@@ -147,6 +218,22 @@ export struct ListenView {
   @State searched: boolean = false;
   @State status: string = '';
   @State filter: string = FILTER_ALL;
+  /** 发现（按分类推书）：书源 → 分类卡片 → 书单，三段状态都在这里 */
+  @State discoverSources: BookSourceInfo[] = [];
+  /** 当前看的是哪个书源的分类（空 = 还没有可发现的源） */
+  @State categorySourceId: string = '';
+  @State cats: BookExploreCategory[] = [];
+  /** 当前选中的分类下标（-1 = 还没选过） */
+  @State catIndex: number = -1;
+  @State discoverBooks: BookHit[] = [];
+  @State discoverLoading: boolean = false;
+  /** 「书单」那一行右侧的小字：加载进度 / 共几本 / 没有更多了 */
+  @State discoverStatus: string = '';
+  /** 拉失败的原因（空 = 没出错） */
+  @State discoverError: string = '';
+  @State discoverPage: number = 1;
+  /** 还能翻下一页（分类地址带 {{page}}，且上一页确实拿到了新书） */
+  @State discoverMore: boolean = false;
   /** 书源管理：导入状态 */
   @State busy: boolean = false;
   @State sourceStatus: string = '';
@@ -189,7 +276,7 @@ export struct ListenView {
    * 一屏放几列（宽屏多列，窄屏 1 列 = 改之前的样子）
    *
    * 口径在 ui/Layout.ets 的 contentColumnsFor：按窗口宽度算，一列至少 360vp、最多 4 列。
-   * 书架、搜索结果、书源三张列表都用它。
+   * 书架、发现、搜索结果、书源四张列表都用它。
    */
   private columns(): number {
     return contentColumnsFor(this.windowWidth);
@@ -275,6 +362,138 @@ export struct ListenView {
     this.results = [];
     this.searched = false;
     this.status = '';
+  }
+
+  // ------------------------------------------------------------ 发现（按分类推书）
+
+  /**
+   * 能用「发现」的书源
+   *
+   * 只按 `canExplore`（exploreUrl 非空）筛，**不去真的解析分类表** —— 那要为每个源
+   * 跑一遍解析，而用户一次只看一个源。分类表在切到那个源时再取。
+   */
+  private explorableSources(): BookSourceInfo[] {
+    return this.sources.filter((s: BookSourceInfo) => s.canExplore);
+  }
+
+  /**
+   * 进发现分段
+   *
+   * 源列表每次进来都重建（只读本地索引，不联网），导入 / 删除书源立刻反映；
+   * 但**只有还没选过源时才自动选第一个并拉书** —— 否则每次切回来都重新联网，
+   * 明明上次的书单还在。
+   */
+  private onDiscoverEnter(): void {
+    this.discoverSources = this.explorableSources();
+    if (this.discoverSources.length === 0) {
+      this.categorySourceId = '';
+      this.cats = [];
+      this.catIndex = -1;
+      this.discoverBooks = [];
+      this.discoverStatus = '';
+      this.discoverError = '';
+      return;
+    }
+    let keep: boolean = false;
+    for (const s of this.discoverSources) {
+      if (s.id === this.categorySourceId && this.cats.length > 0) {
+        keep = true;
+        break;
+      }
+    }
+    if (keep) {
+      return;
+    }
+    this.switchSource(this.discoverSources[0].id);
+  }
+
+  /** 换一个书源：分类表是本地解析（不联网），拿到就自动拉第一个分类的书 */
+  private switchSource(sourceId: string): void {
+    this.categorySourceId = sourceId;
+    this.catIndex = -1;
+    this.cats = [];
+    this.discoverBooks = [];
+    this.discoverPage = 1;
+    this.discoverMore = false;
+    this.discoverStatus = '';
+    this.discoverError = '';
+    try {
+      this.cats = BookEngine.getInstance().exploreCategories(sourceId);
+    } catch (e) {
+      this.discoverError = `读不到这个书源的发现分类：${(e as Error).message}`;
+      return;
+    }
+    if (this.cats.length === 0) {
+      // `@js:` 那种自己生成分类表的写法引擎还不认（要跑沙箱），这个源就不出现在发现页
+      this.discoverError = '这个书源的发现规则不是静态分类表（可能是 @js 动态生成的），发现页暂时用不了它。';
+      return;
+    }
+    void this.loadCategory(0, 1);
+  }
+
+  /**
+   * 拉一个分类的书（page > 1 时追加到现有列表 = 「加载更多」）
+   *
+   * **必须串行**：书源规则都跑在同一个沙箱页面里，`CUR_SOURCE` 是沙箱里的单个全局
+   * （见 book_preload.js）—— 并发下发多个作业会互相串味。
+   */
+  private async loadCategory(index: number, page: number): Promise<void> {
+    if (index < 0 || index >= this.cats.length) {
+      return;
+    }
+    const cat: BookExploreCategory = this.cats[index];
+    const first: boolean = page <= 1;
+    this.catIndex = index;
+    this.discoverLoading = true;
+    this.discoverError = '';
+    if (first) {
+      this.discoverBooks = [];
+      this.discoverPage = 1;
+    }
+    this.discoverStatus = `正在加载「${cat.title}」…`;
+    try {
+      const hits: BookHit[] =
+        await BookEngine.getInstance().explore(this.categorySourceId, cat.url, page);
+      const fresh: BookHit[] = this.dedupe(hits, first ? [] : this.discoverBooks);
+      this.discoverBooks = first ? fresh : this.discoverBooks.concat(fresh);
+      this.discoverPage = page;
+      // 这一页一本新的都没拿到（翻到底了，或分类地址里根本没有 {{page}}）就不再给「加载更多」
+      this.discoverMore = fresh.length > 0 && cat.url.indexOf('{{page}}') >= 0;
+      if (this.discoverBooks.length === 0) {
+        this.discoverStatus = '';
+      } else if (!first && fresh.length === 0) {
+        this.discoverStatus = `已加载全部 ${this.discoverBooks.length} 本`;
+      } else {
+        this.discoverStatus = this.discoverMore
+          ? `共 ${this.discoverBooks.length} 本`
+          : `共 ${this.discoverBooks.length} 本（没有更多了）`;
+      }
+    } catch (e) {
+      this.discoverError = `「${cat.title}」没加载出来：${(e as Error).message}`;
+      this.discoverMore = false;
+      this.discoverStatus = '';
+      hilog.warn(DOMAIN, TAG, 'explore failed on %{public}s: %{public}s',
+        this.categorySourceId, (e as Error).message);
+    } finally {
+      this.discoverLoading = false;
+    }
+  }
+
+  /** 去掉已有的（按 BookHit.id：`来源id:书地址`） */
+  private dedupe(incoming: BookHit[], existing: BookHit[]): BookHit[] {
+    const seen: Set<string> = new Set();
+    for (const hit of existing) {
+      seen.add(hit.id);
+    }
+    const out: BookHit[] = [];
+    for (const hit of incoming) {
+      if (seen.has(hit.id)) {
+        continue;
+      }
+      seen.add(hit.id);
+      out.push(hit);
+    }
+    return out;
   }
 
   // ------------------------------------------------------------ 书源导入
@@ -535,8 +754,18 @@ export struct ListenView {
       .lanes(this.columns())
       .width('100%')
       .layoutWeight(1)
-      .scrollBar(BarState.Off)
+.scrollBar(BarState.Off)
       .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 84, endMargin: 0 })
+      .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+        // 列表上滑 → 底栏收成单排；下滑 → 回到两排（照派音，见 ui/BottomBar.ets）
+        BottomBar.notifyScrollDelta(this.getUIContext(), offset);
+        return { offsetRemain: offset };
+      })
+        .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+        // 列表上滑 → 底栏收成单排；下滑 → 回到两排（照派音，见 ui/BottomBar.ets）
+        BottomBar.notifyScrollDelta(this.getUIContext(), offset);
+        return { offsetRemain: offset };
+      })
     }
   }
 
@@ -634,12 +863,238 @@ export struct ListenView {
         .lanes(this.columns())
         .width('100%')
         .layoutWeight(1)
-        .scrollBar(BarState.Off)
+.scrollBar(BarState.Off)
         .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 84, endMargin: 0 })
+        .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+          // 列表上滑 → 底栏收成单排；下滑 → 回到两排（照派音，见 ui/BottomBar.ets）
+          BottomBar.notifyScrollDelta(this.getUIContext(), offset);
+          return { offsetRemain: offset };
+        })
       }
     }
     .width('100%')
     .layoutWeight(1)
+  }
+
+  // ------------------------------------------------------------ 发现分段
+
+  /**
+   * 发现分段：书源胶囊 + 一排横滑分类卡片 + 书单
+   *
+   * 画法照首页推荐页（views/RecommendView.ets）：**来源胶囊 + 横滑卡片 + 下面的列表**。
+   * 上一版这里是几十上百个分类胶囊挤成一片药丸墙 —— 导一个书源合集进来就是近百个，
+   * 既看不出是什么、也翻不到底。分类卡片横滑（一屏扫得完、颜色帮着记位置），
+   * 换源交给「分类」那一行右侧的下拉胶囊（几个源，不是几十个分类）。
+   */
+  @Builder
+  discoverPane() {
+    if (this.discoverSources.length === 0) {
+      EmptyState({
+        icon: I_BOOK,
+        text: '没有可发现的分类',
+        hint: this.sources.length === 0
+          ? '先到「书源」分段导入一个听书书源，这里就会按分类推书。'
+          : '已导入的书源都没有发现（exploreUrl）规则，只有搜索能用。',
+        topPadding: 56,
+      })
+    } else {
+      Column() {
+        Row({ space: 8 }) {
+          SectionTitle({ text: '分类' })
+          Blank()
+          if (this.discoverSources.length > 1) {
+            this.discoverSourcePill()
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 10 })
+
+        if (this.cats.length > 0) {
+          List({ space: 10 }) {
+            ForEach(this.cats, (cat: BookExploreCategory, index: number) => {
+              ListItem() {
+                CategoryCard({
+                  title: cat.title,
+                  colorA: catColors(index)[0],
+                  colorB: catColors(index)[1],
+                  cardWidth: this.catCardWidth(),
+                  selected: this.catIndex === index,
+                  onTap: () => {
+                    void this.loadCategory(index, 1);
+                  },
+                })
+              }
+              // 选中态拼进 key：ForEach 对 key 没变的条目**不会重跑生成器**，
+              // 只靠 @Prop 传不过去，选中的白边就永远不出现（与书源列表那颗登录按钮同理）
+            }, (cat: BookExploreCategory, index: number) =>
+              `${index}_${cat.title}_${this.catIndex === index ? 'on' : 'off'}`)
+          }
+          .scrollBar(BarState.Off)
+          .listDirection(Axis.Horizontal)
+          .width('100%')
+          .height(CAT_CARD_H)
+          .padding({ left: 16, right: 16 })
+        }
+
+        Row({ space: 8 }) {
+          SectionTitle({ text: '书单' })
+          Blank()
+          if (this.discoverStatus.length > 0) {
+            Text(this.discoverStatus)
+              .fontSize(F_SUB)
+              .fontColor(C_TEXT_SUB)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: this.cats.length > 0 ? 22 : 4, bottom: 6 })
+
+        if (this.cats.length === 0) {
+          EmptyState({
+            icon: I_BOOK,
+            text: '这个书源没有可用的分类',
+            hint: this.discoverError.length > 0 ? this.discoverError : '换个书源看看。',
+            topPadding: 40,
+          })
+        } else if (this.discoverLoading && this.discoverBooks.length === 0) {
+          Column() {
+            LoadingProgress().width(38).height(38).color(C_RED)
+          }
+          .width('100%')
+          .padding({ top: 44 })
+        } else if (this.discoverBooks.length === 0 && this.discoverError.length > 0) {
+          Column({ space: 10 }) {
+            Text(this.discoverError)
+              .fontSize(13.5)
+              .fontColor(C_TEXT_SUB)
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(TextAlign.Center)
+              .padding({ left: 26, right: 26 })
+            Text('点击重试')
+              .fontSize(14)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(C_RED)
+              .padding({ left: 18, right: 18, top: 8, bottom: 8 })
+              .borderRadius(18)
+              .backgroundColor(C_RED_TINT)
+              .onClick(() => {
+                void this.loadCategory(this.catIndex, 1);
+              })
+          }
+          .width('100%')
+          .padding({ top: 36, bottom: 20 })
+        } else if (this.discoverBooks.length === 0) {
+          EmptyState({
+            icon: I_BOOK,
+            text: '这个分类没有书',
+            hint: '换个分类看看，或者到「搜索」分段按书名找。',
+            topPadding: 40,
+          })
+        } else {
+          List() {
+            ForEach(this.discoverBooks, (hit: BookHit) => {
+              ListItem() {
+                BookRow({
+                  name: hit.name,
+                  subtitle: [hit.author, hit.kind, hit.status].filter((s: string) => s.length > 0).join(' · '),
+                  coverUrl: hit.coverUrl,
+                  badge: hit.sourceName,
+                  onTap: () => {
+                    this.onOpenBook(hit);
+                  },
+                })
+              }
+            }, (hit: BookHit) => hit.id)
+            ListItem() {
+              Column().height(this.bottomInset + 96)
+            }
+          }
+          .lanes(this.columns())
+          .width('100%')
+          .layoutWeight(1)
+.scrollBar(BarState.Off)
+          .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 84, endMargin: 0 })
+          .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+            // 列表上滑 → 底栏收成单排；下滑 → 回到两排（照派音，见 ui/BottomBar.ets）
+            BottomBar.notifyScrollDelta(this.getUIContext(), offset);
+            return { offsetRemain: offset };
+          })
+        }
+
+        // 「加载更多」钉在列表下面：放进 List 里的话，宽屏多列时它会单独占掉一个格子
+        if (this.discoverMore && this.discoverBooks.length > 0) {
+          Text(this.discoverLoading ? '加载中…' : '加载更多')
+            .fontSize(14.5)
+            .fontColor(this.discoverLoading ? C_TEXT_WEAK : C_RED)
+            .textAlign(TextAlign.Center)
+            .width('100%')
+            .height(46)
+            .onClick(() => {
+              if (!this.discoverLoading) {
+                void this.loadCategory(this.catIndex, this.discoverPage + 1);
+              }
+            })
+            .accessibilityText('加载更多')
+            .accessibilityLevel('yes')
+        }
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+    }
+  }
+
+  /** 发现页的书源胶囊（与搜索那颗筛选胶囊同一副样子，管的是「看哪个源的分类」） */
+  @Builder
+  discoverSourcePill() {
+    Row({ space: 3 }) {
+      Text(this.discoverSourceName())
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(C_TEXT)
+        .maxLines(1)
+      IconGlyph({ symbol: I_CHEVRON_DOWN, iconSize: 13, color: C_TEXT_SUB })
+        .accessibilityLevel('no')
+    }
+    .height(30)
+    .padding({ left: 12, right: 8 })
+    .attributeModifier(thinGlass(15, false, '', this.materialLevel))
+    .systemMaterial(immersiveMaterialFor(this.materialLevel))
+    // 边沿那圈光：鸿蒙7 是空效果（光感归材质），鸿蒙6 落成 HDS 轮廓点光（普通光效）
+    .visualEffect(glassLight())
+    .bindMenu(this.discoverSourceMenu())
+    .accessibilityText(`发现来源：${this.discoverSourceName()}，点按切换`)
+    .accessibilityLevel('yes')
+  }
+
+  private discoverSourceName(): string {
+    for (const s of this.discoverSources) {
+      if (s.id === this.categorySourceId) {
+        return s.name;
+      }
+    }
+    return this.discoverSources.length > 0 ? this.discoverSources[0].name : '';
+  }
+
+  @Builder
+  discoverSourceMenu() {
+    Menu() {
+      ForEach(this.discoverSources, (info: BookSourceInfo) => {
+        MenuItem({ content: info.name })
+          .onClick(() => {
+            if (info.id !== this.categorySourceId) {
+              this.switchSource(info.id);
+            }
+          })
+      }, (info: BookSourceInfo) => info.id)
+    }
+  }
+
+  /** 分类卡片的宽度：手机上约莫两张半，宽屏放宽一点（与首页榜单那排同一口径） */
+  private catCardWidth(): number {
+    return this.columns() > 1 ? 132 : 118;
   }
 
   // ------------------------------------------------------------ 书源分段
@@ -917,24 +1372,29 @@ export struct ListenView {
     Column() {
       Row() {
         CapsuleSegment({
-          labels: ['书架', '搜索', '书源'],
+          labels: ['书架', '发现', '搜索', '书源'],
           selectedIndex: this.pane,
           compact: false,
           onSelect: (index: number) => {
             this.pane = index;
             if (index === PANE_SHELF || index === PANE_SOURCE) {
               this.refresh();
+            } else if (index === PANE_DISCOVER) {
+              this.refresh();
+              this.onDiscoverEnter();
             }
           },
         })
       }
       .width('100%')
-      // 宽屏下分段选择器不跟着铺满：三个选项拉过整屏就成了一条又长又扁的带子（限宽见 SEGMENT_MAX_WIDTH）
+      // 宽屏下分段选择器不跟着铺满：四个选项拉过整屏就成了一条又长又扁的带子（限宽见 SEGMENT_MAX_WIDTH）
       .constraintSize({ maxWidth: this.columns() > 1 ? SEGMENT_MAX_WIDTH : LAYOUT_UNBOUNDED })
       .padding({ left: 16, right: 16, top: 6, bottom: 10 })
 
       if (this.pane === PANE_SHELF) {
         this.shelfPane()
+      } else if (this.pane === PANE_DISCOVER) {
+        this.discoverPane()
       } else if (this.pane === PANE_SEARCH) {
         this.searchPane()
       } else {

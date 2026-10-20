@@ -1,7 +1,7 @@
 import { LxMusicInfo, decodeName } from './MusicSearch';
 import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
 import { asObjectArray, asRecord, asString, httpGetJson, httpGetText, httpPostForm } from './PlatformHttp';
-import { bytesToUtf8, fromBase64, utf8Bytes } from './LxCrypto';
+import { bytesToUtf8, fromBase64, utf8Bytes } from './PlatformCrypto';
 import { inflateZlib } from './Inflate';
 
 /**

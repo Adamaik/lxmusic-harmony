@@ -91,7 +91,7 @@ export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
  * 所以「挂断之后接不接着放」只能由应用决定，这里给它一个开关。
  *
  * 默认开：这是官方推荐的适配方式，也是用户在音乐应用上的预期（来电挂断接着听）。
- * 「与其他应用同时播放」开着时走独立焦点模式、不会被打断，这一项也就不起作用。
+ * 「与其他应用同时播放」开着时走的是混音音频会话、别的应用压不住我们，这一项也就不起作用。
  */
 export const K_AUTO_RESUME_AFTER_INTERRUPT: string = 'cfg_auto_resume_after_interrupt';
 

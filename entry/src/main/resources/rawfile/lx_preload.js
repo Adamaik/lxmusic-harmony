@@ -146,12 +146,19 @@
   const events = { request: null }
 
   const allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'local']
+  // 本工程支持的全部音质档（与洛雪 LX.Quality 一致）：四档普通 + 四档拓展。
+  // 这里是「宿主能力」白名单，最终能力 = 白名单 ∩ 音源自己声明的 qualitys。
+  // 早先这张表只写了前四档，于是音源即使声明了 hires/atmos/atmos_plus/master，
+  // 也会在 init 时被整段过滤掉 —— 设置里开了「拓展音质」，播放页也永远没有拓展档可选
+  // （见 docs/DEFECTS.md 的 D-013）。拓展档要不要用，由用户设置与平台是否提供决定，
+  // 这里不该提前砍掉。
+  const MUSIC_QUALITYS = ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'atmos_plus', 'master']
   const supportQualitys = {
-    kw: ['128k', '320k', 'flac', 'flac24bit'],
-    kg: ['128k', '320k', 'flac', 'flac24bit'],
-    tx: ['128k', '320k', 'flac', 'flac24bit'],
-    wy: ['128k', '320k', 'flac', 'flac24bit'],
-    mg: ['128k', '320k', 'flac', 'flac24bit'],
+    kw: MUSIC_QUALITYS,
+    kg: MUSIC_QUALITYS,
+    tx: MUSIC_QUALITYS,
+    wy: MUSIC_QUALITYS,
+    mg: MUSIC_QUALITYS,
     local: [],
   }
   // 官方 preload 只给平台源 musicUrl，等于把源自带的 lyric/pic 能力过滤掉了

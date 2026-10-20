@@ -24,15 +24,19 @@ const LOCAL_ACTIONS: string[] = ['收藏', '加入播放列表', '加入歌单']
  *
  * 为什么是「导入」而不是「扫描本机音乐」：系统不把音乐库开放给三方应用读
  * （ohos.permission.READ_AUDIO 是受限权限，只批克隆/备份/同步场景；也没有枚举
- * 音频媒体的 API），官方给的正路是让用户用 Picker 选。选中的 URI 只有临时权限，
- * 退到后台就失效，所以选中后立刻拷一份进沙箱 —— 从此不看系统脸色。
+ * 音频媒体的 API），官方给的正路是让用户用 Picker 选。
+ *
+ * 选中之后**不再复制一份**：把 Picker 的临时授权持久化（`core/local/LocalAccess`），
+ * 条目只记 URI，播放时直接读设备里的原文件。2026-10-20 真机验证过整条链路
+ * （persist → 杀进程 → activate → 直接读原文件），详见 docs/LOCAL_MUSIC.md。
+ * 旧版本已经复制进沙箱的条目继续按副本播放，不强制迁移。
  *
  * 导入按钮直接拉起**文件管理的音频聚合视图**（`mergeMode = AUDIO`）：一屏列出
  * 设备上所有音频，全选一次导完。不再提供别的入口，理由见 `scanDeviceAudio()`。
  * 详细调研见 docs/LOCAL_MUSIC.md。
  *
  * 多选与「我的」页其它列表一致：长按任意一行进多选（右上角那枚「选择」是另一个入口，
- * 想不起来长按的时候点它），能收藏 / 入歌单 / 入播放列表，以及移除应用内副本。
+ * 想不起来长按的时候点它），能收藏 / 入歌单 / 入播放列表，以及从本地音乐里移除。
  */
 @Component
 export struct LocalMusicPane {
@@ -417,7 +421,7 @@ export struct LocalMusicPane {
         Text('系统不允许三方应用自己扫描音乐库，所以导入走文件管理的音频列表：\n'
           + '点上面的「导入音乐」→ 一屏列出设备上的音频 → 长按任意一首选「全选」→ 确定，'
           + '一次就能把整个文件夹导进来。\n'
-          + '选中的歌会拷一份到应用内，设备里的原文件不动。')
+          + '导入只记住文件位置，不会复制进应用；原文件被移动或删除后需要重新导入。')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
           .width('100%')
@@ -478,8 +482,9 @@ export struct LocalMusicPane {
 }
 
 /**
- * 删除一批本地歌：删掉应用内的副本，并把收藏 / 播放历史 / 队列里的同一条一起摘掉
+ * 删除一批本地歌：从本地音乐里移除记录，并把收藏 / 播放历史 / 队列里的同一条一起摘掉
  *
+ * 引用式条目只删记录（设备里的原文件不动）；旧副本式条目顺手删掉沙箱里的副本。
  * 界面上有三个地方能删（本地音乐列表、播放历史、将来别处），逻辑一样，所以放在这里共用。
  * @returns 真正删掉的条数
  */
@@ -511,7 +516,7 @@ export function confirmRemoveLocalSongs(context: UIContext, items: SongItem[],
   const what: string = items.length === 1 ? `「${items[0].name}」` : `这 ${items.length} 首`;
   context.showAlertDialog({
     title: '从本地音乐移除',
-    message: `将删除${what}在应用内的副本（设备里的原文件不受影响）。`,
+    message: `将从本地音乐移除${what}；设备里的原文件不受影响（旧版本复制进应用的副本会一并删掉）。`,
     autoCancel: true,
     buttons: [
       { value: '取消', action: () => { } },

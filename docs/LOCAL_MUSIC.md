@@ -5,11 +5,11 @@
 
 本文记调研结论、设计取舍，以及最后实现出来的样子。
 
-> 已实现（`core/local/LocalMusic.ets` + 我的页「本地音乐」分段页）：
-> 导入（文件管理的音频聚合视图，一步到位）、元数据与内嵌封面、去重、
-> 删除（单条 / 长按进多选批量）、混进播放队列、加进歌单与收藏（非同步侧表）、
-> 同步设置页注明本地歌会被抛弃。
-> 没做：同名 `.lrc` 歌词、失效条目标记、空间统计页，详见文末「分期」。
+> 已实现（`core/local/LocalMusic.ets` + `core/local/LocalAccess.ets` + 我的页「本地音乐」分段页）：
+> 导入（文件管理的音频聚合视图，一步到位；**引用式，不复制音频**，2026-10-20 真机验证）、
+> 元数据与内嵌封面、去重、删除（单条 / 长按进多选批量）、混进播放队列、
+> 加进歌单与收藏（非同步侧表）、同步设置页注明本地歌会被抛弃。
+> 没做：同名 `.lrc` 歌词、失效条目的置灰标记、空间统计页，详见文末「分期」。
 
 ## 1. 权限：先给结论
 
@@ -32,31 +32,57 @@ AudioViewPicker」。所以「应用自己扫描全盘音乐」在设计上就�
 `WRITE_AUDIO`（往公共目录写音频）同样受限，场景也是克隆 / 备份 / 同步 —— 本项目不需要它
 （导入是往沙箱写，不碰公共目录）。
 
-## 2. 授权时效：为什么只能「导入」，不能「引用」
+## 2. 授权时效：引用式可行（2026-10-20 真机验证，旧结论已更正）
 
-Picker 返回的 URI **只有临时权限**，而且短得超出直觉：
+Picker 返回的 URI **只有临时权限**，应用退出 / 重启后失效 —— 这一点没变：
 
 > 使用Picker获取的select()返回的URI权限是临时只读权限，**待退出应用后台后，获取的临时权限就会失效**。
 > —— `开发指南/Core_File_Kit/用户文件/选择与保存用户文件/选择用户文件/select-user-file`
 
-FAQ 里还有一条：应用被终止后（包括重启）该权限失效，重启后必须重新让用户选。
+变的是「能不能把它变成持久的」。
 
-音乐播放器必然要退到后台（我们本来就申请了 `KEEP_BACKGROUND_RUNNING` + `audioPlayback`
-长时任务），所以**「只存 URI、播放时现读」的方案必然在放歌中途掉链子**。
+> **旧结论（2026-09，已更正）**：曾判断 `fileShare.persistPermission()` 需要受限 ACL 权限
+> `ohos.permission.FILE_ACCESS_PERSIST`，普通应用申请不下来，因此只能选中即复制进沙箱。
+> 这个判断让本项目（和派音 RzdMusic）都做了「复制式导入」。
 
-那能不能把临时权限变成持久的？可以，但代价是我们已经踩过一次的那个坑：
+2026-10-20 复核 SDK 定义 + 真机实测，旧结论是**错的**：
 
-- 持久化要 `fileShare.persistPermission()`，它**需要 `ohos.permission.FILE_ACCESS_PERSIST`** ——
-  又是一个受限 ACL 权限，必须在签名 Profile 的 `allowed-acls` 里声明才能生效；
-- 而且持久化只是把策略写进系统数据库，**应用或设备重启后还要 `activatePermission()` 激活**才可用；
-- 本项目 `module.json5` 里已经因为「自动生成的调试 Profile 没有 `allowed-acls`，
-  声明了也只是摆设」把同一个权限删掉过一次（见该文件里的注释）。
+| 证据 | 内容 |
+| --- | --- |
+| SDK `toolchains/lib/PermissionDefinitions.json` | `FILE_ACCESS_PERSIST`：`grantMode=system_grant`、`availableLevel=normal`、`availableType=NORMAL` —— 与 `INTERNET` 同档，**不是 ACL 权限**，声明即授予 |
+| SDK `hms/ets/api/device-define/api-version/CoreFileKit.json` | `fileShare.PolicyInfo` / `persistPermission` 等标注 `phone since 12`、`tablet since 12` |
+| 真机 PLR-AL30 / 鸿蒙 7.0.0.109 / API 26 | `canIUse('…AppFileService.FolderAuthorization')=true`、`checkAccessToken=GRANTED`、`persistPermission` 成功 |
 
-**结论：选中文件后把音频拷贝进应用沙箱（导入式）。** 零权限、退后台不掉、跨重启有效，
-代价是同一首歌在设备上占两份存储（原件 + 副本），删歌只删副本、不动原文件。
+所以正式方案改成**引用式导入**（实现在 `core/local/LocalAccess.ets`）：
 
-这条取舍和项目现有约定是一致的：`AudioCache` 已经在往 `files/lx_media_audio/` 落整首音频，
-`playAt` 已经有一条「本地文件优先」的分支，`module.json5` 也已经为「不申请 ACL」做过一次同样的决定。
+1. 选完文件（临时权限还在时）立刻 `fileShare.persistPermission(uri)` 落库；
+2. 每次冷启动 `checkPersistentPermission` → `activatePermission` 按需激活
+   （`LocalMusic.init` 里异步预热，播放前再 `ensure()` 兜底）；
+3. 播放直接 `fs.openSync(uri)` → AVPlayer `fdSrc`，**不复制音频**。
+
+真机验证记录（2026-10-20，当时的临时探针，现已并入 `LocalAccess`）：
+
+```
+init:  syscap=true access=granted=true
+pick:  n=1 syscap=true
+persist OK: file://docs/storage/Users/currentUser/Download/com.example.listen/听-128k.mp3
+—— aa force-stop 后重新启动 ——
+load:  n=1
+start: checkPersistentPermission=[true]
+start: activate OK n=1
+start: READ OK size=4673028
+```
+
+**兜底**：设备没有能力位、或某次持久化失败时，该次导入自动退回「复制进沙箱」，
+功能不会半坏（`LocalSong.file` 非空即旧式副本，`uri` 非空即引用式，两种并存）。
+
+**代价**（与复制式相比）：
+
+- 原文件被移动 / 改名 / 删除后该条目失效，播放时会提示「请重新导入」；
+- 每次冷启动要激活一次（异步，已做成不阻塞启动）；
+- 卸载重装授权会清空（API 24+ 可用 `module.json5` metadata
+  `ohos.fileshare.supportPreservePersistentPermission` 保留，本项目暂未启用）；
+- 换来的是：设备上只存一份、删条目不误删用户文件。
 
 ## 3. 怎么选文件（只有一个入口：文件管理的音频聚合视图）
 
@@ -151,18 +177,22 @@ FAQ 里还有一条：应用被终止后（包括重启）该权限失效，重�
   `if (info.source === 'local') { return null; }`，注释还写着「本地文件不在同步范围内
   （洛雪也只同步在线歌曲）」—— 本地歌进任何列表都不会被上行。
 
-存储：
+存储（两种持有方式并存，见第 2 节）：
 
 | 项 | 位置 |
 | --- | --- |
-| 音频副本 | `files/local_music/`，一个 id 一个文件，保留原后缀 |
-| 索引 | `files/local_music/index.json`（歌单级元数据 + 文件映射） |
-| 封面 | 走现有 `CoverStore` 那套（导入时把 PixelMap 编码存下来） |
+| 原文件 | **不动**。引用式条目只记 Picker 的 URI（已持久化授权） |
+| 旧副本 | `files/local_music/`（仅 2026-10 之前导入的老数据，一个 id 一个文件，保留原后缀） |
+| 索引 | `files/local_music/index.json`（元数据；`uri` 与 `file` 二选一） |
+| 封面 | 缩略图落 `files/local_music/covers/`（两种条目都有，内嵌封面抽成 jpeg） |
+
+`LocalSong` 的持有方式字段：`uri` 非空 = 引用式（新）；`file` 非空 = 复制式（旧）。
+播放、删除、孤儿清理都按「哪个非空」分支处理，老数据不需要迁移。
 
 **不能放进 `AudioCache` 的 `lx_media_audio/`**：那是个 LRU 淘汰目录，
 `AudioCache.clear()` / 容量回收会直接删里面的文件 —— 用户导入的歌是资产，不是缓存。
 
-索引每条记：`id`、文件名、标题、歌手、专辑、时长、字节数、导入时间、来源文件名、去重指纹，
+索引每条记：标题、歌手、专辑、时长、字节数、导入时间、来源文件名、去重指纹，
 以及歌词用的那几个字段（见第 9 节）。
 
 ## 6. 播放链路改造点（已实现）
@@ -178,13 +208,18 @@ FAQ 里还有一条：应用被终止后（包括重启）该权限失效，重�
 ```
 let item = this.queue[index]
 if (item.source === 'local') {           // 本地歌：不联网、不看音源脸色
-   校验文件还在 -> LxPlayer.playLocal(沙箱路径) -> return
+   取可播放位置（引用式=URI / 旧副本=沙箱路径）
+   -> LocalAccess.ensure(uri)            // 冷启动后按需激活持久化授权（幂等）
+   -> LxPlayer.playLocal(位置)            // fs.openSync -> fdSrc
+   -> return
 }
 if (!engine.isInited()) { ... }          // 原来的音源检查往后挪了
 ```
 
 理由是本地播放本来就不该依赖音源是否加载：原来的检查会让「没导音源」的用户连自己手机里的歌都放不了。
-文件不在（清过应用数据 / 手动删了副本）时报「文件已经不在了，请重新导入」，不静默失败。
+位置为空（清过应用数据 / 手动删了副本）时报「文件已经不在了，请重新导入」；
+引用式条目在 `ensure()` 失败（原文件被移动/删除）时报「原文件已经被移动或删除，请重新导入这首」，
+都不静默失败。
 
 其它会误伤本地歌的现成逻辑，逐个加了 `source === 'local'` 早退：
 

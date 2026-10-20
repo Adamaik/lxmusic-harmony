@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 import { lxRequest, LxResponse } from '../source/LxHttp';
-import { bytesToUtf8, fromBase64 } from '../music/LxCrypto';
+import { bytesToUtf8, fromBase64 } from '../music/PlatformCrypto';
 import { BookNetRequest } from './BookTypes';
 
 const DOMAIN: number = 0x0001;

@@ -8,7 +8,9 @@
 
 ```
 pages/Index.ets                 壳层：两个页签（推荐 / 我的）+ 底部玻璃层 + 全屏播放器 + 播放列表半模态 + 音源沙箱
-views/RecommendView.ets         推荐：排行榜横滑卡片 + 推荐歌单列表（栏内排序下拉框）
+views/RecommendView.ets         推荐：三个胶囊三套版面（见下面「推荐页」一节）
+views/PlaylistSquareView.ets    全部歌单：某个平台 × 某个排序的全量（分区「更多」进来的那一页）
+ui/PlaylistGrid.ets             歌单大卡 + 两列网格的行数据源（推荐页与全部歌单页共用）
 views/MineView.ets              我的（照华为音乐的「我的」重排）：快捷入口卡 + 自建歌单卡 + 设置卡
 views/HistoryView.ets           最近播放（我的 - 快捷入口）：播放历史列表 + 多选（只删记录）
 views/PanePage.ets              子页面外壳：单页签 Tabs + 页内悬浮迷你播放条（本地 / 历史 / 下载 / 云端四页共用）
@@ -34,6 +36,112 @@ core/music/Inflate.ets          纯 ArkTS zlib/deflate 解压（酷我歌词用�
 core/music/PlaylistLink.ets     歌单分享链接解析（五平台正则 + 短链跟随 + lxmusic 深链，见 docs/LIST_IMPORT.md）
 core/sync/CollectedPlaylists.ets 收藏歌单（收藏**线上**歌单，纯本地落盘、不参与同步；见下面那一节）
 ```
+
+## 推荐页：三个胶囊三套版面（照华为音乐截图）
+
+2026-10-13 照用户给的华为音乐截图重排（`views/RecommendView.ets`）。顶部（哪个胶囊下都在）：
+
+| 区块 | 内容 | 数据来源 |
+| --- | --- | --- |
+| **推荐歌曲** | 一条**可右滑**的大卡，一屏露两张半、共 8 首；封面铺满 + 底部压暗 + 左下歌名/歌手 + 右下播放钮，点卡片从这首放起 | 第一张榜（热歌榜）的前几首 |
+| 分类胶囊 | 精选 / 歌单 / 排行榜（选中那颗是深色实心胶囊，带图标） | 纯界面状态（`tab`） |
+
+| 胶囊 | 版面 |
+| --- | --- |
+| **歌手** | **歌手分类**（一横排渐变卡，第一张固定「热门」= 该平台热歌榜，其余是名字带曲风关键词的榜：说唱 / 电音 / 民谣 / 古风 / ACG / 欧美…）+ **热门歌手**（圆头像 + 名字 / 别名 + 歌曲数胶囊的一行一位，点开进歌手页） |
+| **精选** | **分区信息流**：每个排序一区（标题 + 「更多」+ 三列横滑卡，封面右下压播放量）→ **排行榜**（**多张榜一横排、可自由右滑**，每张榜一张卡：榜名 + 播放钮 + 三行 + 「查看完整榜单」）→ **新歌精选**（歌曲行：封面播放钮 + 歌名/歌手 + 收藏）→ **歌单·漫游**（两列大卡） |
+| **歌单** | **歌单分类**（一横排渐变卡 = 平台的排序，选中那张描红边）+ **歌单广场**（两列大卡，封面左下压「播放量」角标，滑到底翻页） |
+| **排行榜** | **官方榜**（每张榜一张白卡：榜名 → 榜单页、封面 → 从第一首放起、三行「序号/歌名/歌手」）+ **精选榜**（其余榜单，两列渐变卡） |
+
+华为首页里那些运营策展区（旋律旅程 / 曲风 / 艺人歌单精选 / 数字专辑 / 近期热点追踪 /
+影廊·速递）是它的运营内容，宿主没有对应接口，没有拿别的数据硬凑标题。能用真实数据填满的
+版面都照着它的观感排了。
+
+**歌手那一栏的数据口径**（宿主没有「热门歌手 / 歌手分类」接口，只有按关键词搜歌手）：分类 =
+**平台榜单里那些曲风榜**（按名字里的 说唱 / 电音 / 民谣 / 古风 / ACG / 欧美… 关键词挑，第一张固定
+是「热门」= 热歌榜）；「热门歌手」= **那一榜前几首的歌手里拆名去重**（`splitSingerNames`）。
+头像是**按行懒解析**的（`resolveArtistByName`，认过落盘，见 `core/music/MusicArtist.ets` 的
+ArtistStore）：这一行滚进可视区才去认一次，认到才有头像 / 别名 / 歌曲数。点一行走
+`ArtistNav.getInstance().open(source, name)` 这条既有链（壳层负责认人、认不到给提示）。
+截图上那颗「＋关注」没有做 —— 应用里没有「关注歌手」这套东西，行右边改成了歌曲数胶囊。
+
+**每个分区都能点进「全部」**（2026-10-13 补的）：
+
+| 分区 | 「更多」去哪 |
+| --- | --- |
+| 每个排序区（最热歌单…） | **「全部歌单」页**（`PAGE_SQUARE` + `views/PlaylistSquareView.ets`，两列大卡、滑到底翻页） |
+| 精选页排行榜的每一张榜 | 该榜的**榜单页**（`OnlineListView`，全量歌曲） |
+| 新歌精选 | **新歌榜的榜单页**（页面上只露 4 首，全部在那儿） |
+| 歌单·漫游 | 「全部歌单」页（当前选中的分类） |
+
+**精选页的排行榜是多张榜横滑**：一横排摆 6 张榜、一屏露两张，右滑看其余。每张榜
+**自己懒加载**（`BoardColumn.asked` + `onVisibleAreaChange`）—— 一上来就把十几张榜的歌
+全取回来（每张最多上千首）正是之前卡死那个坑；`onVisibleAreaChange` 的可见性是相对窗口
+算的，横向滚出屏幕的卡片也会回调，所以横滑列表同样能做懒加载。
+
+**播放钮的位置（踩过一次）**：封面上的播放钮一律压在**封面左下角**（照华为音乐）。摆放要用
+「再套一层铺满的 Stack、靠它的 `alignContent(Alignment.BottomStart)` 定位」，**不要用子组件的
+`.align(Alignment.BottomStart)`** —— 实测它不生效，钮会落在卡片正中压住榜名（2026-10-13 实机
+截图反馈的就是这个，`hotBoardTile` / `officialCard` 两处都改成了嵌套 Stack 的写法）。
+渐变卡上的钮是白三角（不加深色圆底），封面上的钮是深色半透明圆底 + 白三角。
+
+**懒加载与主线程纪律**（2026-10-13 实机反馈「切酷我 / 网易会卡好久、甚至闪退」之后定的）：
+
+| 措施 | 位置 |
+| --- | --- |
+| 开页**只取首屏那一条**（推荐歌曲），榜单 / 排序分区 / 广场都在各自滚进可视区时才发请求 | `reload` / `ensureBoards` / `ensureSortSection` / `ensurePlaza` |
+| 可视区判定用 `onVisibleAreaChange`，**不能用 `onAppear`**（外层 List 是 ForEach，开页时每一块都会回调一次，等于没懒加载）；失败也记 `asked`，否则失败→重建→再问会变成请求风暴 | 各 `ensureXxx` |
+| 几张榜**依次取、不并发**：一份榜单响应最大上千首（网易 n=1000），两坨大 JSON 同一个 tick 落在主线程上会卡住滑动 | `loadBoards` |
+| 一张榜**只转前 50 首**（酷我 rn=100 / 酷狗 100 / QQ 300 / 网易 n=1000，以前整张榜都 `songFromSearch`，每首一次 `JSON.stringify`，几张榜几千次转换全在主线程） | `BOARD_SONGS_MAX` + `fillSongs` |
+| 一行多卡 / 两列网格都用**数据源 + LazyForEach**（`PlaylistSource` / `PlazaRowSource`），只建可视区那几张那几行 | `sortSectionBlock` / `plazaRow` |
+| 没数据时一律摆**灰块骨架**（`bone` 一族，色用 `C_FILL_SOFT_STRONG`），尺寸照真卡排版给；只有「真失败」「取回来确实是空的」才给一句话 | 各 `...Bone` |
+
+**根上的原因**：ArkTS 的 JS 跑在主线程上，`http` 回来的大 JSON 解析、`songFromSearch` 的
+序列化、以及几十个 `Image` 同帧开下，都是主线程的活 —— 一个页面里同时做这几件事就会卡，
+再叠上节点数暴涨就是闪退（`ui/SongListSource.ets` 开头记过同一类故障）。列表类页面一律
+「可视区驱动 + 分批」。**「异步」只解决了等待（网络），没解决解析** —— 响应回来之后的解密 /
+解析照样占着主线程。
+
+**两个实机反馈的坑（2026-10-13）**：
+
+1. **酷我整页卡死再闪退**：根因在 `core/music/LxCrypto.ets` 的 `bytesToUtf8` —— 逐字符
+   `out += ch` 拼字符串是 O(n²)，而酷我榜单接口的响应实测 **35 万字符**加密文本、
+   解密后 **25 万字节 JSON**（临时探针量过，用完即删），逐字拼就是几秒到
+   几十秒的主线程卡死 → 被系统杀掉。现在交给原生 `util.TextDecoder`（`BookEngine` 同款）。
+   注意：这个坑之前没露出来，是因为酷我榜单只在「榜单页」才取；现在首页开篇就要取推荐歌曲
+   那一张榜（酷我 = 热歌榜）就撞上了。
+   换掉 `bytesToUtf8` 之后**还剩三四秒的抖动**，那是「用 JS 逐字节做 AES」的代价：
+   `aesDecryptBlock` 每轮都调 `aesGmul(a, 14)`（8 次循环 + 分支的函数），一个 16 字节块
+   光 InvMixColumns 就要 144 次调用，一万六千多块合计一亿多次运算。**别在脚本里实现 AES** ——
+   现在整个应用的大块加解密都走系统原生能力（新文件 `core/music/PlatformCrypto.ets`）：
+   `cryptoFramework` 的 `AES128|ECB|PKCS7`（`convertKeySync` / `initSync` / `doFinalSync`）、
+   `util.Base64Helper`、`util.TextDecoder`；酷我榜单解密与云同步载荷都用它。
+   顺带把其它「解大块数据」的调用点（本地歌词、书源 JS、听书章节、平台歌词）也从纯实现
+   挪了过去 —— 同一个坑别在别处再踩一遍。
+
+   **`LxCrypto` 为什么还留着**：`entry/src/test` 的主机单测（hypium 在 PC 上跑）要 import 它
+   跟 node:crypto 的已知向量比对，而本地环境没有 `@kit.*`，所以那份**必须保持零 kit 依赖**；
+   它的身份现在只是「单测参照 + 小输入」（签名、几百字节的请求体，`aes128EcbPkcs7HexUpper`
+   那种）。要彻底删掉手写实现，得先把那几个单测挪到设备侧（ohosTest）跑。
+   **顺带把首页的请求量压下来**：`getBoardSongs` 加了 `limit`（首页传 20），各平台各自的
+   每页条数参数跟着走（酷我 `rn` / 酷狗 `pagesize` / QQ `num` / 网易 `n`）—— 以前为三行歌
+   把整张榜拉回来（酷我 35 万字符加密响应、网易 n=1000）。注意网易限量时**不能再按
+   `trackIds` 补齐**（否则等于把整张榜用 `/api/song/detail` 一批批拉回来）。
+
+   > 「异步」这件事要说清：ArkTS 的 JS 全在主线程，`await` 让出的是**等待**（网络），
+   > 不让出**计算**。真要搬线程得用 taskpool / worker（`@Concurrent` 函数 + 跨线程序列化），
+   > 而这条链路的成本是算法问题（一亿次函数调用），先把它降到几十毫秒比搬线程划算；
+   > 搬线程还要把 35 万字符密文送过去、25 万字符明文送回来。
+2. **酷狗的单曲封面在外面（列表里）看不见、点开播放才有**：酷狗**榜单接口不回封面**
+   （`MusicList.ets` 的 `kgFilterBoardSongs` 里 `img: ''`），播放页是走 `CoverStore` 现解的，
+   而列表如果直接用 `song.coverUrl` 就永远是一张占位图。歌行一律用
+   `CoverStore.getInstance().coverFor(song.musicInfoJson, song.coverUrl)` + 订阅
+   `K_COVER_VERSION` 重画（与仓库里其余歌曲列表同一套）。
+
+另外两条细节：`BoardColumn.version` / `SortSection.version` / `PlaylistRow.version` / `hotRowKey`
+都是给 ForEach 当 key 用的（V1 状态管理下同 key 的条目不会因为内部字段变了而刷新）；圆底色一律
+`Column` + `borderRadius(50%)`，不用 `Circle().fill(资源色)`（取不到资源会退回黑色，同
+`SettingsView` / `AboutView` 那条）。
 
 ## 图标：官方符号图标库
 
@@ -527,12 +635,33 @@ new BottomTabBarStyle(
 3. **封面要画「已解好的位图」，不能只给地址**：HDS 在**每次切换页签**时都会重建迷你栏，
    而 `Image(地址)` 是异步加载的 —— 重建出来的那一瞬间它还没有图，底下垫的东西就被看见，
    表现就是「切页签时右边那颗封面先黑一下、再亮起来」。现在这颗封面由迷你栏自绘
-   （`MiniBar.coverView`，不再用 `CoverArt`）：最下面是一层淡圆底 + **应用图标**
-   （照派音那颗圆封面，加载期间露的是默认封面而不是黑块），真封面优先画
+   （`MiniBar.coverView`，不再用 `CoverArt`）：最下面是一层淡圆底，真封面优先画
    `CoverStore.pixelFor()` 解好的位图（`Image(位图)` 是同步绘制，重建多少次都不闪），
    没解好才退回按地址加载。位图在切歌时就 `preloadPixel()` 解好，缓存十来张、超了就释放。
    （官方文档对 `Image.syncLoad(true)` 的说法是「加载时闪烁就设 true，同步加载不显示占位图」，
    但那是拿主线程做加载 —— 我们的封面是网络图，主线程上等一次网络请求更糟，所以不用它。）
+   两条配套的红线（2026-10-12 实机反馈「切页签时那颗圆会跳回聆听的应用图标、再闪一下才
+   变回封面」之后补的）：**① 应用图标只能当「确实没有封面」的兜底**（没有地址 /
+   `Image` 报 `onError` 已失效），**不能当加载中的占位层** —— 重建的那一帧露出来的就是
+   垫在最下面的那层，垫应用图标看着像播放器被重置了（全屏播放器那边一直是这条口径，
+   见 `ui/Widgets.ets` 的 `CoverArt`：不给 `Image` 设 alt）；**② 这颗封面不许挂
+   `transition`**：HDS 重建出来的新节点带上 insert 转场就会跟着淡入一次，那个「闪」
+   就是这么来的。
+
+### 播放页的进出动效：走模态自己的转场，不要跨模态做共享元素
+
+播放页是全屏模态（`bindContentCover`），进出动效交给 `ModalTransition.DEFAULT` —— 官方对
+它的定义就是「进入向上、退出向下」，也就是用户要的「从下往上升起来、从上往下滑关闭」，
+壳层不再自己包 `animateTo`（见 `pages/Index.ets` 里 `bindContentCover` 上那段说明）。
+
+中间试过一版「迷你栏封面 ↔ 播放页封面」的共享元素转场（两边绑同一个 `geometryTransition`
+id，壳层用 `animateTo` 驱动），**已撤掉**：`geometryTransition` 只能在**同一棵渲染树**里
+配对 in/out 节点，而播放页是模态（独立渲染根），迷你栏那颗封面又在模态之外、还会被 HDS
+重建 —— 起点几何拿不到，框架按未知帧起飞，实机表现就是「屏幕左上角莫名其妙闪一张歌曲封面
+然后消失」。`follow: true` 官方也写明只在 `if` 语法里生效，常驻树上的迷你栏封面参与不进来。
+将来要不要做「从小播放器展开成播放页」那种华为音乐式的一镜到底，得走官方那条路（同一棵树里的
+`if/else` 配对 + `follow`，或 `NavContentTransition` 那一套），不能再把 `geometryTransition`
+跨到模态上。
 
 ### 宽屏（折叠屏展开态 / 平板）：两条栏的宽度必须一起算
 
@@ -571,9 +700,13 @@ new BottomTabBarStyle(
   （`ui/Widgets.ets` 的 `WidePane`，壳层按窗口宽度把上限传进去）：否则列表与设置项
   会从屏幕左边缘一直拉到右边缘，一行的封面和文字隔着半个屏幕。手机（< 600vp）
   的约束值是窗口宽度本身 = 不限宽，界面与改之前逐像素一致。
-- 歌单详情 / 在线详情 / 本地音乐 / 最近播放 / 下载管理 / 云端音乐这六页里那条**页内**
-  迷你栏（不在页签体系里）。后四页共用同一个外壳 `views/PanePage.ets`，
-  另两页各有自己的一份（`views/PlaylistDetailView.ets`、`views/OnlineListView.ets`）。
+- 歌单详情 / 在线详情 / 本地音乐 / 最近播放 / 下载管理 / 云端音乐 / 全部歌单 / 搜索结果
+  这几页里那条**页内**迷你栏（不在页签体系里）。其中本地音乐、最近播放、下载管理、
+  云端音乐、全部歌单、搜索结果六页共用同一个外壳 `views/PanePage.ets`（搜索页是
+  2026-10-20 接进去的：它同样是压在路由栈上的 NavDestination，同样需要页内播放条，
+  用户反馈「搜索结果页面也加上播放条，跟详情页面一样」），
+  另两页各有自己的一份（`views/PlaylistDetailView.ets`、`views/OnlineListView.ets`，
+  它们的滚动头部与多选要自己管）。
   **它是 Tabs 自带的悬浮栏，不是自绘玻璃**（2026-09 改）：这一页是压在 HdsNavigation
   路由栈上的 NavDestination，把壳层那条带迷你栏的 HdsTabs 整个盖住了，所以得自己挂一条；
   而沉浸光感有生效范围 —— 普通组件画在内容区设 `systemMaterial` 只会得到
@@ -596,6 +729,8 @@ new BottomTabBarStyle(
   preferType: SheetType.BOTTOM,
   detents: [SheetSize.MEDIUM, SheetSize.LARGE],
   detentSelection: SheetSize.MEDIUM,   // 默认半屏；往下拖会先吸回这一档，再拖才关闭
+  // 高度变化时滚动区域实时跟随（默认 FOLLOW_DETENT 要等档位动画结束才更新，见下）
+  scrollSizeMode: ScrollSizeMode.CONTINUOUS,
   dragBar: true, showClose: true,
   blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
   systemMaterial: { materialType: hdsMaterial.MaterialType.IMMERSIVE,
@@ -607,6 +742,18 @@ new BottomTabBarStyle(
 - `isShow` 用 `$$` 双向绑定：用户下滑或点系统关闭钮时 `queueOpen` 自动变 false。
 - 高度用两档 `detents`：默认停在 `MEDIUM`（半屏），往上能拖到 `LARGE`，
   往下拖会先吸回 `MEDIUM` 这个中间档、只有继续往下拖才会关闭——这是系统半模态自带的吸附。
+- **`scrollSizeMode` 必须显式给 `CONTINUOUS`（2026-10-20，实机反馈「向上滑先滑一半、
+  拉到顶时歌曲只显示一半再补上剩下部分」之后加的）**。默认值
+  `ScrollSizeMode.FOLLOW_DETENT` 的官方语义是「滑完（档位动画结束）之后才更新滚动区域」——
+  面板从半屏长到满屏的那几百毫秒里，里面的 `List` 还按半屏高度排版，白卡（`ListItemGroup`
+  的 `CARD` 底）于是只铺到半屏，等动画结束视口换成满高，下半截的行才建出来补上，看着就是
+  「先显示一半、再加载剩下部分」。`CONTINUOUS` 让滚动区域在滑动过程中就跟着变，视口与
+  面板同步长高。依据：华为开发者问答《为什么在半模态中渲染列表，半模态高度变化的时候，
+  列表会延迟渲染》的采纳答复就是加这一个属性。API 12 起有，`compatibleSdkVersion
+  6.1.0(23)` 可直接用，不需要版本判断。
+- 内容列表侧另配 `List.cachedCount(6)`（`PlayQueueSheet.ets`）：`ListItemGroup` + `LazyForEach`
+  显示区外的行默认「进了视口才创建」，缓存几行能让「视口长高那一下」要补的行提前备好，
+  两处配合才没有空窗期（与 `SongListPane` / `SearchView` 的 `cachedCount(3)` 同一口径）。
 - 本 SDK 的 `SheetOptions` **没有** `backgroundColor` 和 `onDisappear`，背景靠
   `blurStyle` / `systemMaterial`（都是官方材质）；`radius` 只接受
   `LengthMetrics | BorderRadiuses`，给数字会编译报错，所以干脆用系统默认圆角。
@@ -776,7 +923,9 @@ HdsListItemCard({
   点不动的档；选中某一档 = 写「播放音质」这个设置（同一个值，不另开一份）+
   用新档把当前这首歌重新解析一次，进度与暂停态都保留（`PlaySession.switchQuality`）。
   拓展档（母带 / 全景声…）只在设置里开了「拓展音质」时才列 —— 没开的时候选它就是解析失败，
-  与其点了没反应不如不列。
+  与其点了没反应不如不列。另外还要求**音源声明里有那一档**：音源沙箱在 init 时会把它的
+  `qualitys` 与宿主白名单（`rawfile/lx_preload.js` 的 `supportQualitys`）取交集，
+  白名单漏档的话面板一样永远不出现（见 `DEFECTS.md` 的 D-014）。
 - **进度 / 时长 / 播放态全部来自 AVPlayer**：`LxPlayer` 把 `timeUpdate` / `durationUpdate` /
   `stateChange` 通过订阅回调交给 `PlaySession` 回写 AppStorage，播完自动下一首挂在
   `completed` 上。以前是 `PlaySession` 每秒 +1 自己造进度，所以没声音时界面照样走进度条，

@@ -67,7 +67,8 @@ struct ExtendQualitySetting {
  * 所有项都写进 PlaySettings（沙箱 JSON + AppStorage），改完立即落盘，重启不丢。
  * 真机上生效的路径：
  *   - 播放音质 / 拓展音质 -> PlaySession.negotiateQuality 解析播放链接时按候选顺序取
- *   - 与其他应用同时播放 -> LxPlayer 建 AVPlayer 时设 audioInterruptMode
+ *   - 与其他应用同时播放 -> LxPlayer 起播时设 audioInterruptMode、并激活「与其他应用混音」
+ *     的应用级音频会话（跨应用只认后者，见 LxPlayer.applyConcurrency）
  *   - 被打断结束后自动重新播放 -> LxPlayer 的 audioInterrupt 监听收到 RESUME 时再 play 一次
  *   - 歌词各项 -> PlayerView（封面页小歌词 / 歌词页背景、对齐、字号）
  *   - 歌词页不熄屏 -> 页面把窗口的 keepScreenOn 打开（见 pages/Index.ets）
@@ -164,14 +165,15 @@ export struct PlaySettingsView {
    * 「被打断结束后自动重新播放」的说明
    *
    * 要讲两件事：这一项在什么场景下管用（来电 / 闹铃 / 别的应用出声），以及它和上面那项
-   * 「与其他应用同时播放」的关系 —— 同时播放走独立焦点，基本不会被我们这边的开关管到。
+   * 「与其他应用同时播放」的关系 —— 同时播放走的是混音会话，别的声音压不住我们，
+   * 自然不会收到打断；收不到打断，这一项也就用不上。
    * 不说清就会出现「开关拨了没反应」的困惑（与桌面歌词那一项的处理一致）。
    */
   private autoResumeHint(): string {
     const base: string = '被来电、闹铃或别的应用的声音打断时，系统会把我们暂停；这一项开着，'
       + '打断结束（挂断、闹铃停）就自动接着放，关掉则停在暂停、等你自己按播放。';
     if (this.playWithOthers) {
-      return base + '「与其他应用同时播放」开着时走独立音频焦点模式，一般不会被打断，这一项多半用不上。';
+      return base + '「与其他应用同时播放」开着时走的是混音，别的声音一般不打断我们，这一项多半用不上。';
     }
     return base;
   }

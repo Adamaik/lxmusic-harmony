@@ -57,8 +57,8 @@ export interface LxMusicInfo {
   otherSource: string | null;
 }
 
-/** 已实现内置搜索的平台 */
-export const SEARCH_PLATFORMS: string[] = ['kw', 'kg', 'mg', 'tx', 'wy'];
+/** 已实现内置搜索的平台（qs = 汽水音乐，见下面的「汽水 qs」一节） */
+export const SEARCH_PLATFORMS: string[] = ['kw', 'kg', 'mg', 'tx', 'wy', 'qs'];
 
 export function isSearchSupported(source: string): boolean {
   return SEARCH_PLATFORMS.includes(source);
@@ -528,7 +528,7 @@ async function searchKg(str: string, page: number, limit: number): Promise<LxSea
 
 // ------------------------------------------------------------------ 咪咕 mg
 
-const MG_DEVICE_ID: string = '963B7AA0D21511ED807EE5846EC87D20';
+export const MG_DEVICE_ID: string = '963B7AA0D21511ED807EE5846EC87D20';
 const MG_SIGNATURE_MD5: string = '6cdc72a439cef99a3418d2a78aa28c73';
 const MG_SIGNATURE_SALT: string = 'yyapp2d16148780a1dcc7408e06336b98cfd50';
 
@@ -652,6 +652,190 @@ async function searchMg(str: string, page: number, limit: number): Promise<LxSea
   const songResultData: Record<string, Object> = asRecord(body['songResultData']);
   const list: LxMusicInfo[] = parseMgResult(asObjectArray(songResultData['resultList']));
   return pageOf(list, asNumber(songResultData['totalCount']), page, limit);
+}
+
+// ------------------------------------------------------------------ 汽水 qs
+
+/** 汽水搜索页结构（列表 + 还有没有下一页） */
+export interface QsSearchPage {
+  list: LxMusicInfo[];
+  hasMore: boolean;
+}
+
+/**
+ * 汽水音乐的搜索：App 侧 Luna 接口（\`/luna/search/track\`），不需要登录
+ *
+ * 为什么不用 PC 接口：PC 那条（\`api.qishui.com/luna/pc/search/track\`）要签名头 X-Helios /
+ * X-Medusa 或登录 Cookie，而 App 侧这条只要一组设备参数就能返回结果（2026-10-20 实连验证）。
+ * 它每页固定 20 条、翻页用**绝对 cursor**（不是页码），所以下面按 20 条一页换算，
+ * allPage 交给响应的 has_more 决定 —— 不能套 pagesOf 那套「总条数 / 每页条数」的算法。
+ */
+const QS_SEARCH_URL: string = 'https://beta-luna.douyin.com/luna/search/track';
+const QS_PAGE_SIZE: number = 20;
+const QS_DEVICE_ID: string = qsRandomId(16);
+const QS_INSTALL_ID: string = qsRandomId(16);
+/** 汽水 App 侧接口的公共请求头（搜索 / 发现页 / 歌单详情共用） */
+export const QS_APP_HEADERS: Record<string, string> = {
+  'User-Agent': 'Luna/19.1.0 Android',
+  'Accept': 'application/json',
+};
+
+/** 生成一个纯数字设备号（与汽水客户端同形：16 位数字） */
+function qsRandomId(length: number): string {
+  let out: string = '';
+  while (out.length < length) {
+    out += Math.floor(Math.random() * 10).toString();
+  }
+  return out;
+}
+
+/**
+ * 汽水封面地址：`urls[0] + uri + ~c5_500x500.jpg`
+ *
+ * 它的封面是「前缀列表 + 相对路径 + 图床尺寸后缀」三段拼出来的。只拼前两段
+ * （最早那版）会返回 `400 {"code":2004,"fail to handle request"}` —— 界面上的表现
+ * 就是「封面加载不出来」。尺寸后缀在抖音图床是 `~c5_宽x高.jpg`，500 方图够列表与
+ * 播放页用（实测 375 / 500 / 1080 都能出 jpeg）。
+ */
+export function qsCoverOf(cover: Record<string, Object>): string {
+  const uri: string = asString(cover['uri']);
+  if (uri.length === 0) {
+    return '';
+  }
+  if (/^https?:\/\//i.test(uri)) {
+    return uri;
+  }
+  const urls: Object[] = asObjectArray(cover['urls']);
+  let base: string = '';
+  if (urls.length > 0) {
+    base = asString(urls[0]);
+  }
+  if (base.length === 0) {
+    return '';
+  }
+  // uri 自带扩展名就别再缀尺寸后缀（少数外链封面是完整相对路径）
+  if (/\.(jpg|jpeg|png|webp)$/i.test(uri)) {
+    return base + uri;
+  }
+  return base + uri + '~c5_500x500.jpg';
+}
+
+/** 汽水 App 侧接口的公共设备参数（搜索 / 发现页 / 歌单详情共用一组设备号） */
+export function qsDeviceQuery(): string {
+  return 'aid=386088&app_name=luna&region=cn&geo_region=cn&os_region=cn' +
+    `&device_id=${QS_DEVICE_ID}&iid=${QS_INSTALL_ID}&device_platform=android` +
+    '&version_code=30020100&version_name=3.0.2.1&channel=official';
+}
+
+/** 汽水 quality_map 的键 -> 我们的音质档（spatial 没有对应档，不列出来） */
+function qsQualityOf(key: string): string {
+  if (key === 'lossless') {
+    return 'flac';
+  }
+  if (key === 'hi_res') {
+    return 'hires';
+  }
+  if (key === 'higher' || key === 'highest') {
+    return '320k';
+  }
+  if (key === 'medium') {
+    return '128k';
+  }
+  return '';
+}
+
+/**
+ * 汽水的一条 track（搜索结果 / 歌单详情 / 榜单里的 entity.track）-> LxMusicInfo
+ *
+ * 三处用的是同一个对象形状，抽成一份：歌单详情与榜单都复用它（MusicList 会 import）。
+ * 没有 id 的条目返回 null（调用方过滤掉）。
+ */
+export function qsTrackToInfo(track: Record<string, Object>): LxMusicInfo | null {
+  const id: string = asString(track['id']);
+  if (id.length === 0) {
+    return null;
+  }
+  const album: Record<string, Object> = asRecord(track['album']);
+  const label: Record<string, Object> = asRecord(track['label_info']);
+  const qualityMapRaw: Record<string, Object> = asRecord(label['quality_map']);
+  const types: LxQualityItem[] = [];
+  const qualityMap: Record<string, LxQualityItem> = {};
+  for (const key of Object.keys(qualityMapRaw)) {
+    const quality: string = qsQualityOf(key);
+    if (quality.length === 0 || hasQualityEntry(qualityMap, quality)) {
+      continue;
+    }
+    const item: LxQualityItem = { type: quality, size: '' };
+    types.push(item);
+    qualityMap[quality] = item;
+  }
+  // 曲目没报音质（少数翻唱 / 用户上传）：按汽水的常规三档算，别让音质面板空着
+  if (types.length === 0) {
+    for (const quality of ['128k', '320k', 'flac']) {
+      const item: LxQualityItem = { type: quality, size: '' };
+      types.push(item);
+      qualityMap[quality] = item;
+    }
+  }
+  const names: string[] = [];
+  for (const artistRaw of asObjectArray(track['artists'])) {
+    const artist: Record<string, Object> = asRecord(artistRaw);
+    let name: string = asString(artist['name']);
+    if (name.length === 0) {
+      name = asString(asRecord(artist['user_info'])['nickname']);
+    }
+    if (name.length > 0) {
+      names.push(name);
+    }
+  }
+  const seconds: number = Math.round(asNumber(track['duration']) / 1000);
+  return createInfo(
+    asString(track['name']),
+    names.join('、'),
+    'qs',
+    id,
+    asString(album['name']),
+    asString(album['id']),
+    formatPlayTime(seconds),
+    qsCoverOf(asRecord(album['url_cover'])),
+    '',
+    types,
+    qualityMap,
+  );
+}
+
+/** 解析汽水搜索结果（result_groups[].data[].entity.track） */
+export function parseQsTracks(body: Record<string, Object>): QsSearchPage {
+  const out: LxMusicInfo[] = [];
+  let hasMore: boolean = false;
+  for (const groupRaw of asObjectArray(body['result_groups'])) {
+    const group: Record<string, Object> = asRecord(groupRaw);
+    if (group['has_more'] === true) {
+      hasMore = true;
+    }
+    for (const rowRaw of asObjectArray(group['data'])) {
+      const row: Record<string, Object> = asRecord(rowRaw);
+      const entity: Record<string, Object> = asRecord(row['entity']);
+      const info: LxMusicInfo | null = qsTrackToInfo(asRecord(entity['track']));
+      if (info !== null) {
+        out.push(info);
+      }
+    }
+  }
+  return { list: out, hasMore: hasMore };
+}
+
+async function searchQs(str: string, page: number, limit: number): Promise<LxSearchPage> {
+  const cursor: number = (page - 1) * QS_PAGE_SIZE;
+  const query: string = qsDeviceQuery() +
+    `&q=${encodeURIComponent(str)}&cursor=${cursor}&count=${QS_PAGE_SIZE}&search_method=input`;
+  const body: Record<string, Object> = await httpGetJson(`${QS_SEARCH_URL}?${query}`, QS_APP_HEADERS);
+  const parsed: QsSearchPage = parseQsTracks(body);
+  // 接口固定每页 20 条：按调用方要的每页条数截一下（通常 30 > 20，等于不截）
+  const list: LxMusicInfo[] = parsed.list.slice(0, limit);
+  // 有下一页就把 allPage 抬一页：界面靠它决定「滚到底还要不要再拉」
+  const allPage: number = parsed.hasMore ? page + 1 : page;
+  return { list: list, total: 0, allPage: allPage, limit: limit };
 }
 
 // ------------------------------------------------------------------ 封面
@@ -827,6 +1011,9 @@ export async function searchMusicPage(
   if (source === 'wy') {
     return searchWy(str, page, limit);
   }
+  if (source === 'qs') {
+    return searchQs(str, page, limit);
+  }
   // xm（喜马拉雅）在洛雪里整块是注释掉的死代码，没有可移植的实现
   throw new Error(`${source} 暂无内置搜索实现（当前支持：${SEARCH_PLATFORMS.join(' / ')}）`);
 }
@@ -954,8 +1141,13 @@ export function searchIdOf(info: LxMusicInfo): string {
   return `${info.source}_${songmid}`;
 }
 
-/** 歌手分隔符（洛雪的 singersRxp）："周杰伦、方文山" 与 "方文山/周杰伦" 要认成同一组 */
-const SINGER_SEPARATORS: RegExp = /、|&|;|；|\/|,|，|\|/;
+/**
+ * 歌手分隔符（洛雪的 singersRxp）："周杰伦、方文山" 与 "方文山/周杰伦" 要认成同一组
+ *
+ * 导出给 `MusicArtist.splitSingerNames` 用：拆歌手的口径必须与去重/打分那套完全一致，
+ * 两处各写一份迟早会走样（比如这里补了「；」，那边还只认「、」）。
+ */
+export const SINGER_SEPARATORS: RegExp = /、|&|;|；|\/|,|，|\|/;
 
 /**
  * 归一化时丢掉的字符（洛雪 findMusic 的 filterStr）
@@ -1426,6 +1618,24 @@ function addWyExtendQuality(
   qualityMap[quality] = qualityItem;
 }
 
+/**
+ * 把网易的拓展档补进 types / _types（搜索结果与歌单 / 榜单两条解析路径共用）
+ *
+ * 网易把「母带 jymaster / 沉浸声 sky / 杜比全景声 dolby」报在 `privilege.maxBrLevel` 上，
+ * 对应本工程的 master / atmos_plus / atmos。补进 `_types` 之后，用户在「设置 - 播放设置」
+ * 里开了拓展音质才会被协商到；关着时协商只走普通音质，这几档躺着不影响播放。
+ *
+ * 早先这段逻辑只写在搜索解析里，歌单 / 榜单（MusicList.wyFilterSongs）没补，
+ * 于是从歌单进来的网易歌永远没有拓展档（见 docs/DEFECTS.md 的 D-013）。
+ */
+export function appendWyExtendQualities(privilege: Record<string, Object>, item: Record<string, Object>,
+  types: LxQualityItem[], map: Record<string, LxQualityItem>): void {
+  const brLevel: string = asString(privilege['maxBrLevel']);
+  addWyExtendQuality(brLevel, item, 'jymaster', 'master', types, map);
+  addWyExtendQuality(brLevel, item, 'sky', 'atmos_plus', types, map);
+  addWyExtendQuality(brLevel, item, 'dolby', 'atmos', types, map);
+}
+
 /** 解析网易搜索结果（data.resources[].baseInfo.simpleSongData） */
 export function parseWySongs(resources: Object[]): LxMusicInfo[] {
   const out: LxMusicInfo[] = [];
@@ -1446,12 +1656,9 @@ export function parseWySongs(resources: Object[]): LxMusicInfo[] {
       types.push(qualityItem);
       qualityMap['flac24bit'] = qualityItem;
     }
-    // 拓展音质：网易把「母带 / 沉浸声 / 杜比全景声」也报在 maxBrLevel 上，
-    // 补进 _types 后，用户在「设置 - 播放设置」里开了拓展音质才会被选中
-    // （关着时协商只走普通音质，这几档躺着不影响播放）。
-    addWyExtendQuality(brLevel, item, 'jymaster', 'master', types, qualityMap);
-    addWyExtendQuality(brLevel, item, 'sky', 'atmos_plus', types, qualityMap);
-    addWyExtendQuality(brLevel, item, 'dolby', 'atmos', types, qualityMap);
+    // 拓展音质：网易把「母带 / 沉浸声 / 杜比全景声」也报在 maxBrLevel 上；
+    // 规则与歌单 / 榜单那条路共用一份（见 appendWyExtendQualities）
+    appendWyExtendQualities(privilege, item, types, qualityMap);
     // 注意：洛雪这里 switch 是「故意穿透」的，命中 999000 会同时补 320k 与 128k
     if (maxBr === 999000 || maxBr === 320000 || maxBr === 192000 || maxBr === 128000) {
       if (maxBr === 999000) {

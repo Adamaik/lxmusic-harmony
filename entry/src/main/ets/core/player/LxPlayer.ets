@@ -126,6 +126,10 @@ export class LxPlayer {
    * 用户主动停的不该在别的声音结束后自己响起来，见 PlaySettings.K_AUTO_RESUME_AFTER_INTERRUPT。
    */
   private focusPaused: boolean = false;
+  /** 音频会话管理器：「与其他应用同时播放」靠它激活混音会话（见 applyConcurrency） */
+  private sessionManager: audio.AudioSessionManager | null = null;
+  /** 取会话管理器失败（例如环境不支持）后不再反复重试 */
+  private sessionManagerFailed: boolean = false;
 
   // ------------------------------------------------------------ 订阅
 
@@ -492,13 +496,18 @@ export class LxPlayer {
           // 所以这里先把 prepare 往后放一拍（见 applyPlaybackStrategy）
           void this.prepareWithStrategy(player);
           break;
-        case 'prepared':
-          // 音频焦点模式要在首次 play() 之前设，prepared 正好是唯一能设又还没出声的时机
-          this.applyInterruptMode(player, PlaySettings.getInstance().isPlayWithOthers());
+        case 'prepared': {
+          // 两处都要在首次 play() 之前落地：焦点模式只能在 prepared/playing/paused/completed
+          // 设（prepared 是唯一「能设又还没出声」的时机，见 applyInterruptMode）；
+          // 音频会话则每次起播都要补一次（系统会在没有流跑之后超时回收，见 applyConcurrency）
+          const withOthers: boolean = PlaySettings.getInstance().isPlayWithOthers();
+          this.applyInterruptMode(player, withOthers);
+          this.applyConcurrency(withOthers);
           player.play().catch((err: BusinessError) => {
             this.update('error', `播放失败：${err.message}`);
           });
           break;
+        }
         case 'playing':
           this.update('playing', '正在播放');
           break;
@@ -621,15 +630,22 @@ export class LxPlayer {
   }
 
   /**
-   * 「与其他应用同时播放」——对应 AVPlayer 的音频焦点模式
+   * 「与其他应用同时播放」——两件事，缺一不可
    *
-   * 系统默认是 SHARE_MODE（0）：几个流共享一个中断单元，别的应用一出声就把我们打断。
-   * 允许同时播放就是 INDEPENDENT_MODE（1）：各自的流互不打断，混在一起响，
-   * 这也是导航类应用要「压着音乐播」时用的模式。
-   * 属性只能在 prepared/playing/paused/completed 态设置，且首次 play() 之后才设就不算数，
-   * 所以真正生效点是 preparePlayer 的 prepared 回调（见 applyInterruptMode）。
+   * 1. AVPlayer 的音频焦点模式（applyInterruptMode）：按 SDK 原文，SHARE_MODE 是
+   *    「几条流共用一个中断单元」、INDEPENDENT_MODE 是「每条流各有各的中断单元」——
+   *    它管的是**本应用内**几条流之间的关系，跨应用不归它管。
+   * 2. 应用级音频会话（applyConcurrency）：只有激活会话、把并发模式声明成
+   *    CONCURRENCY_MIX_WITH_OTHERS（「和其他音频并发，即混音」），别的应用才真的
+   *    不会把我们按默认焦点策略暂停掉。少了这一步，开关拨成什么样都拦不住抖音。
+   *
+   * 焦点模式只能在 prepared/playing/paused/completed 态设、且首次 play() 之前设才生效，
+   * 所以那一半的生效点是 preparePlayer 的 prepared 回调（见 applyInterruptMode）；
+   * 会话那半边不受播放器状态限制，这里也一并走一遍（关开关时要能立刻撤销）。
    */
   setPlayWithOthers(value: boolean): void {
+    // 会话是应用级的：关掉开关时哪怕此刻没在播，也得把混音会话撤下来，否则「独占」是假的
+    this.applyConcurrency(value);
     const player = this.avPlayer;
     if (player === null) {
       return;
@@ -648,6 +664,63 @@ export class LxPlayer {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'set audioInterruptMode failed: %{public}s', JSON.stringify(err));
     }
+  }
+
+  /**
+   * 「与其他应用同时播放」真正生效的那一半：激活音频会话 + 声明与其他应用混音
+   *
+   * 不激活会话时走系统默认并发策略（CONCURRENCY_DEFAULT）：抖音一出声，系统按焦点策略
+   * 把我们的流强制暂停（INTERRUPT_FORCE + INTERRUPT_HINT_PAUSE），界面就停在「已暂停」——
+   * 这就是「开着同时播放还是被掐掉」的原因。声明成 CONCURRENCY_MIX_WITH_OTHERS 之后，
+   * 两条流各响各的，系统不再因为我们「该让路」而停我们。
+   *
+   * 会话在「本应用没有音频流在跑」之后会被系统超时回收，所以每次起播（prepared）都要补一次；
+   * 用户关掉开关时主动撤销。取管理器/激活失败都不阻断播放：退回系统默认策略，还是能听。
+   */
+  private applyConcurrency(withOthers: boolean): void {
+    const manager: audio.AudioSessionManager | null = this.sessionManagerOf();
+    if (manager === null) {
+      return;
+    }
+    try {
+      if (!withOthers) {
+        if (manager.isAudioSessionActivated()) {
+          manager.deactivateAudioSession().catch((err: BusinessError) => {
+            hilog.warn(DOMAIN, TAG, 'deactivateAudioSession failed: %{public}s', JSON.stringify(err));
+          });
+        }
+        return;
+      }
+      if (manager.isAudioSessionActivated()) {
+        return;
+      }
+      const strategy: audio.AudioSessionStrategy = {
+        concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_MIX_WITH_OTHERS,
+      };
+      manager.activateAudioSession(strategy).catch((err: BusinessError) => {
+        hilog.warn(DOMAIN, TAG, 'activateAudioSession failed: %{public}s', JSON.stringify(err));
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'apply audio session failed: %{public}s', JSON.stringify(err));
+    }
+  }
+
+  /** 音频会话管理器（拿一次存着；环境不支持时只记一次失败，不反复试） */
+  private sessionManagerOf(): audio.AudioSessionManager | null {
+    if (this.sessionManager !== null) {
+      return this.sessionManager;
+    }
+    if (this.sessionManagerFailed) {
+      return null;
+    }
+    try {
+      this.sessionManager = audio.getAudioManager().getSessionManager();
+    } catch (err) {
+      this.sessionManagerFailed = true;
+      hilog.warn(DOMAIN, TAG, 'getSessionManager failed: %{public}s', JSON.stringify(err));
+      return null;
+    }
+    return this.sessionManager;
   }
 
   /**

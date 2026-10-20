@@ -533,10 +533,28 @@ node "C:\Program Files\Huawei\DevEco Studio\tools\node\node.exe" ^
 2. **binary 响应**：洛雪返回 Buffer 对象；这里返回字节数组（`number[]`），
    `lx.utils.buffer.bufToString(bytes, 'base64')` 可直接使用。多数音源的 `musicUrl`
    不走 binary。
-3. **musicInfo 来源 / 内置搜索范围**：自定义音源只负责「给定 musicInfo → 播放链接」。
-   本工程已移植 **kw / kg / mg / tx / wy** 五个平台的内置搜索（含 tx 的 zzcSign、
-   wy 的 eapi 加密），喜马拉雅 xm 在洛雪里是整块注释掉的死代码，没有实现可移植。
+3. **musicInfo 来源 / 内置搜索范围**：自定义音源只负责「给定 musicInfo → 播放链接」，
+   平台搜索是应用自己的事。本工程已移植 **kw / kg / mg / tx / wy / qs（汽水）** 六个平台
+   的内置搜索（含 tx 的 zzcSign、wy 的 eapi 加密与 qs 的 Luna App 接口），
+   喜马拉雅 xm 在洛雪里是整块注释掉的死代码，没有实现可移植。
    搜索出的结果直接就是旧版 musicInfo，无需再经 `toNewMusicInfo/toOldMusicInfo` 转换。
+
+   **qs（汽水音乐）的接入范围**：洛雪上游（桌面 / 移动）都没有内置 qs 平台，星海 v3.2.15+
+   这类源脚本只声明 `qs` 的 `musicUrl/lyric/pic`，所以「能不能放汽水」取决于
+   **当前加载的源脚本有没有声明 qs**；没有时搜索结果里的汽水条目会按「歌名 + 歌手」
+   自动换源到脚本支持的其他平台（与其它不支持的平台同一条兜底）。应用侧已接：
+
+   | 能力 | 接口 | 说明 |
+   | --- | --- | --- |
+   | 单曲搜索 | GET `beta-luna.douyin.com/luna/search/track` | 免登录；每页固定 20 条、绝对 cursor 翻页，`allPage` 由 `has_more` 决定，不套 `pagesOf()` |
+   | 歌单搜索 | POST `/luna/search/playlist` | 同一组 App 设备参数，免登录 |
+   | 歌单广场 / 推荐 | POST `/luna/discover/mix` | 发现页混排；顶层没有可用的 `next_cursor`，只出第一页（`count=30`） |
+   | 歌单详情 | POST `/luna/playlist/detail` | cursor + session_id 游标翻页，`getPlaylistDetailAll()` 能整单拉全 |
+   | 榜单 | POST `/luna/discover` | 三张榜（热歌 / 新歌 / 欧美，各 50 首）整块在 `discover_top_song_list` 里；一次响应约 1.6MB，代码里做了 60 秒短缓存供三栏共用 |
+   | 评论 | GET `/luna/comments` | **未接**：免登录请求返回空响应，需要汽水登录态（Cookie / session），拿不到就先不装“能看评论”的入口 |
+
+   封面：汽水图床是「`urls[0]` + `uri` + `~c5_宽x高.jpg`」三段拼接，只拼前两段会返回
+   `400 {code:2004}`（界面表现就是封面加载不出来）；统一走 `qsCoverOf()` 拼 500 方图。
 4. **musicInfo 字段要「该没有的就没有」**：洛雪里 kw / mg / tx / wy 的 musicInfo
    **根本没有 `hash` 字段**，只有 kg 有。源脚本普遍写 `musicInfo.hash ?? musicInfo.songmid`，
    如果把 `hash` 写成空串，`??` 不会回退，songId 变成空串，接口直接报参数错误。

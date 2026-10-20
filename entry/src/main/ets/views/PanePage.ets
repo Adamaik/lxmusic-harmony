@@ -1,5 +1,5 @@
 import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
-import { K_MATERIAL_LEVEL } from '../core/settings/AppearanceSettings';
+import { K_MATERIAL_LEVEL, K_NAV_FOLLOW_HAND } from '../core/settings/AppearanceSettings';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { K_BAR_MINI_WIDTH, barSideMarginFor } from '../ui/Layout';
 import { K_SELECT_ACTIVE, SelectionActions } from '../ui/Selection';
@@ -10,14 +10,18 @@ import { MiniBarView } from './MiniBar';
 const PAGE_BAR_BOTTOM_GAP: number = 10;
 
 /**
- * 子页面外壳：本地音乐 / 播放历史 / 下载管理 / 云端音乐
+ * 子页面外壳：本地音乐 / 播放历史 / 下载管理 / 云端音乐 / 全部歌单 / 搜索结果
  *
- * 这四页都是「一列歌曲 + 一条迷你播放条」，结构与歌单详情、在线详情完全一样，
+ * 这几页都是「一列内容 + 一条迷你播放条」，结构与歌单详情、在线详情完全一样，
  * 所以外壳也照抄那两页：根容器是**只有一个页签的 Tabs**，为的是拿到那条官方认可的
  * 底部悬浮栏 —— 沉浸光感有生效范围（除弹窗类组件外，普通组件只有落在
  * Navigation/NavDestination 标题栏或「横向 Tabs 中 barPosition 为 BarPosition.End
  * 的底部 TabBar」里才渲染材质），画在内容区的普通组件不构成材质，运行时只得到一句
  * `Material inactive: out of scope. Use component in navigation title bar or Tabbar.`
+ *
+ * 搜索页（2026-10-20 接入）与其余几页的差别只在顶部那排搜索栏；「底下要有播放条」
+ * 这件事一模一样 —— 它同样是压在路由栈上的 NavDestination，把壳层那条带迷你栏的
+ * HdsTabs 盖住了，所以照样套这个外壳，不在搜索页里另抄一份 Tabs。
  *
  * 这几页是压在路由栈上的 HdsNavDestination，把壳层那条带迷你栏的 HdsTabs 整个盖住了，
  * 所以迷你条得自己挂一条；胶囊的圆角、边距、底色、材质全由框架画，这里**只提供栏里的内容**，
@@ -42,6 +46,16 @@ export struct PanePage {
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   /** 迷你条的最大宽度：壳层按窗口宽度算好（0 = 窄屏不限，见 ui/Layout.ets） */
   @StorageLink(K_BAR_MINI_WIDTH) wideMiniBarWidth: number = 0;
+  /**
+   * 悬浮栏左右跟手（设置 - 外观）：这一页那条播放条跟着同一档走
+   *
+   * 壳层底部那条已经把这个值喂给 HDS 的 `adaptToHandedness`（见 pages/Index.ets），
+   * 这一页是 ArkUI 原生的 `Tabs.barFloatingStyle`（另一种实现），同一个概念在这里叫
+   * `FloatingTabBarStyle.adaptToHandedness`（API 26 起），所以同一个开关要在这里再接一次
+   * —— 两条栏表现不一致（外面那条贴边、进来这条还居中）比都不跟更难看。
+   * 它的作用范围见设置页那行提示：管的是整条栏贴哪一侧，宽屏下才看得出来。
+   */
+  @StorageLink(K_NAV_FOLLOW_HAND) followHand: boolean = true;
   /** 里面的面板是不是正在多选（是的话这条悬浮栏换成批量操作条，见 miniBarTabBar） */
   @StorageLink(K_SELECT_ACTIVE) selectBarActive: boolean = false;
 
@@ -64,6 +78,8 @@ export struct PanePage {
       } else {
         MiniBarView({
           forceExpanded: true,
+          // 窗口宽必须传：不传的话里面读到 0，右留白与任何按窗口算的量都会错（真机日志里 window=0）
+          windowWidth: this.windowWidth,
           onOpenPlayer: this.onOpenPlayer,
           onOpenQueue: this.onOpenQueue,
         })
@@ -92,6 +108,9 @@ export struct PanePage {
       barSideMargin: side,
       barBottomMargin: this.bottomInset + PAGE_BAR_BOTTOM_GAP,
       systemMaterial: immersiveMaterialForBar(this.materialLevel),
+      // 左右跟手：与壳层底部那条同一个开关（见 followHand 的说明）。宽屏下这条栏比窗口窄，
+      // 开着就贴到握持手那一侧（默认是居中）；手机窄屏它本来就铺满，看不出差别。
+      adaptToHandedness: this.followHand,
     };
     // 宽度必须显式给（否则框架按自己的默认宽度画，内容会被挤在一条窄胶囊里）：
     // 宽屏与壳层那条迷你栏同宽；窄屏铺满（窗口宽 － 左右边距），也就是「把外面那条延长」

@@ -10,15 +10,20 @@ import { WebDavSettings } from '../core/webdav/WebDavSettings';
 import { AudioCache } from '../core/music/AudioCache';
 import { MediaCache } from '../core/music/MediaCache';
 import { SearchHistory } from '../core/music/SearchHistory';
+import { initArtistCache } from '../core/music/MusicArtist';
+import { applyImageByteCache, applyImageUiCache } from '../core/music/ImageCache';
 import { RecognitionHistory } from '../core/recognize/RecognitionHistory';
+import { ListenLog } from '../core/history/ListenLog';
+import { ListenTracker } from '../core/history/ListenTracker';
 import { SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
 import { PlaySettings } from '../core/settings/PlaySettings';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
 import { RecommendSettings } from '../core/settings/RecommendSettings';
 import { ListenSettings } from '../core/settings/ListenSettings';
+import { RecognizeSettings } from '../core/settings/RecognizeSettings';
 import { DownloadSettings } from '../core/download/DownloadSettings';
-import { DownloadManager } from '../core/download/DownloadManager';
+import { DownloadManager, K_APP_FOREGROUND } from '../core/download/DownloadManager';
 
 const DOMAIN = 0x0000;
 
@@ -42,8 +47,16 @@ export default class EntryAbility extends UIAbility {
     AudioCache.getInstance().init(this.context);
     // 搜索历史：搜索页第一帧就要显示它（读一次 JSON，很快），也在这里读回来
     SearchHistory.getInstance().init(this.context);
+    // 认过的歌手（含头像地址）：歌手列表页一进去就要给每位显示头像，缓存读回来就不用联网认人
+    initArtistCache(this.context);
+    // 图片（封面 / 头像）的字节与解码缓存：鸿蒙默认不缓存，不开的话每次滚回去都要重下重解码
+    applyImageByteCache();
     // 听歌识曲的识别历史：识别页第一帧就要显示它，同样在这里读回来
     RecognitionHistory.getInstance().init(this.context);
+    // 回响：收听流水要读回来（回响页第一帧就是它的月度账），记账的那一位也在这里挂上
+    // 播放器 —— 越早越好，不然刚进应用听的第一首会漏记
+    ListenLog.getInstance().init(this.context);
+    ListenTracker.getInstance().init();
     // 播放设置（音质 / 歌词 / 音频焦点）要读回上次的选择，而且必须早于界面创建：
     // 界面用 @StorageLink 订阅它发布的值，晚了第一帧会拿到默认值。
     PlaySettings.getInstance().init(this.context);
@@ -56,9 +69,14 @@ export default class EntryAbility extends UIAbility {
     // 听书设置（是否隐藏「听书」页签）：同样要早于界面创建，壳层按它决定导航栏里
     // 摆哪几栏（页签栏的序号由 TabContent 的位置决定，晚了第一帧会闪一下）
     ListenSettings.getInstance().init(this.context);
+    // 听歌识曲的采集来源（周围声音 / 本机播放）：识别页的分段选择器用 @StorageLink
+    // 订阅它发布的值，晚了第一帧会先画成默认那一档再跳
+    RecognizeSettings.getInstance().init(this.context);
     // 下载：设置要先读回来（文件名格式 / 保存位置），管理器的索引也要在界面（我的页）
     // 建出来之前恢复好，否则列表第一帧是空的
     DownloadSettings.getInstance().init(this.context);
+    // 应用此刻在前台：自动下载的「后台先别拿保存目录」那条判断要用它（见 DownloadManager）
+    AppStorage.setOrCreate(K_APP_FOREGROUND, true);
     DownloadManager.getInstance().init(this.context);
     // WebDAV 连接设置（服务器地址 / 账号密码）：要早于界面创建，
     // 设置页与浏览页用 @StorageLink 订阅它发布的值
@@ -70,6 +88,8 @@ export default class EntryAbility extends UIAbility {
 
   onDestroy(): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
+    // 进程要走了：正在听的那一首先把时长结清落盘（与退到后台那一刻同一个道理）
+    ListenTracker.getInstance().settle();
     PlaybackService.getInstance().close();
   }
 
@@ -83,6 +103,12 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      // 界面起来了才拿得到 UIContext：把图片的缓存层开上（见 core/music/ImageCache）
+      try {
+        applyImageUiCache(windowStage.getMainWindowSync().getUIContext());
+      } catch (e) {
+        hilog.warn(DOMAIN, 'testTag', 'enable image ui cache failed: %{public}s', JSON.stringify(e));
+      }
     });
 
     // 深浅模式先定下来（界面颜色已全部迁到资源 token，见 ui/Theme.ets 与
@@ -130,6 +156,9 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     // Ability has brought to foreground
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    // 回到前台：把在后台时不敢开工的自动下载接着排（保存目录那一步要在前台才拿得到）
+    AppStorage.setOrCreate(K_APP_FOREGROUND, true);
+    DownloadManager.getInstance().resume();
     // 同步开着但连接断了（被系统挂起 / 网络切换 / 服务端重启）时补一次连接
     void SyncManager.getInstance().ensureConnected();
   }
@@ -137,8 +166,13 @@ export default class EntryAbility extends UIAbility {
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    // 后台不再新开自动下载任务（保存目录拿不到，硬写会落到文件管理看不见的目录）
+    AppStorage.setOrCreate(K_APP_FOREGROUND, false);
     // 退到后台是「记下停在哪儿」的最好时机：进度只在切歌/退后台时才落盘，
     // 不然每秒写一次文件。force 绕过节流，保证这次一定写上。
     PlaySession.getInstance().persistPlayState(true);
+    // 收听流水同理：正在听的这一首到此结一次账（听满 30 秒的留下）。
+    // 后台接着放的话，会另开一条继续记 —— 那一段也照样算进回响。
+    ListenTracker.getInstance().settle();
   }
 }

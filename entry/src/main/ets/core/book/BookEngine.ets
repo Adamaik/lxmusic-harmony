@@ -20,7 +20,7 @@ import {
 } from './BookTypes';
 import { BookCookieJar, BookResponse, bookRequest } from './BookHttp';
 import { BookSourceStore, sourceText } from './BookSourceStore';
-import { bytesToUtf8, utf8Bytes } from '../music/LxCrypto';
+import { bytesToUtf8, utf8Bytes } from '../music/PlatformCrypto';
 import { unwrapJsonString } from '../source/SourceEngine';
 
 const DOMAIN: number = 0x0001;
@@ -274,42 +274,76 @@ export class BookEngine {
     return this.store.getRaw(sourceId);
   }
 
-  /** 书源的发现分类（exploreUrl 有两种写法：JSON 数组与「标题::地址」逐行） */
+  /**
+   * 书源的发现分类（exploreUrl 有两种静态写法：JSON 数组，与「标题::地址」逐条）
+   *
+   * 「标题::地址」这种**用 `&&` 或换行隔开都算**（阅读的规则说明里就是这么写的，
+   * 56听书的分类表整条都在一行上、用 `&&` 串起来）。只按换行切的话，整串会被当成
+   * **一个**分类，地址里还带着 `&&` 和 `::` —— 请求出去必然不对。
+   *
+   * `url` 为空的一条**不是分类，是分组标题**。阅读的发现页用空地址的条目做小标题
+   * （听友FM 就是「有声小说」下面挂几十个品类、再来一个「评书」），点它没有意义。
+   * 以前这里只跳过空标题，于是这些分组标题混进分类列表，点下去等于拿空地址去求值 ——
+   * 引擎会退回用整个 exploreUrl 原文当地址，一本都拿不到，还看不出哪里错了。
+   *
+   * 第三种写法是 `@js:`（整段脚本自己生成分类表，懒人听书的两个源就是这样），
+   * 那要跑沙箱，本方法不处理 —— 返回空，界面上这个源就不会出现在发现页。
+   */
   exploreCategories(sourceId: string): BookExploreCategory[] {
     const raw: string = this.rawOf(sourceId);
     const source: BookSource = JSON.parse(raw) as BookSource;
-    const text: string = sourceText(source, 'exploreUrl');
+    const text: string = sourceText(source, 'exploreUrl').trim();
     const out: BookExploreCategory[] = [];
-    if (text.trim().length === 0) {
+    if (text.length === 0) {
       return out;
     }
-    if (text.trim().startsWith('[')) {
-      try {
-        const arr = JSON.parse(text) as BookExploreCategory[];
+    if (text.startsWith('[')) {
+      const arr: BookExploreCategory[] | null = BookEngine.parseExploreArray(text);
+      if (arr !== null) {
         for (const item of arr) {
-          const title: string = item.title !== undefined ? String(item.title) : '';
-          const url: string = item.url !== undefined ? String(item.url) : '';
-          if (title.length > 0) {
+          const title: string = item.title !== undefined ? String(item.title).trim() : '';
+          const url: string = item.url !== undefined ? String(item.url).trim() : '';
+          if (title.length > 0 && url.length > 0) {
             out.push({ title: title, url: url });
           }
         }
         return out;
-      } catch (e) {
-        // 掉回逐行格式
       }
     }
-    for (const line of text.split('\n')) {
+    for (const line of text.split(/&&|\n/)) {
       const trimmed: string = line.trim();
       const idx: number = trimmed.indexOf('::');
       if (idx < 0) {
         continue;
       }
-      out.push({
-        title: trimmed.substring(0, idx).trim(),
-        url: trimmed.substring(idx + 2).trim(),
-      });
+      const title: string = trimmed.substring(0, idx).trim();
+      const url: string = trimmed.substring(idx + 2).trim();
+      if (title.length > 0 && url.length > 0) {
+        out.push({ title: title, url: url });
+      }
     }
     return out;
+  }
+
+  /**
+   * 解析 exploreUrl 的 JSON 数组写法
+   *
+   * 书源的分类表常有**尾逗号**（幸福听书整张表的最后一项后面就多一个），阅读用的 Gson
+   * 宽松模式吃得下，标准 `JSON.parse` 会直接抛 —— 一抛就掉到「标题::地址」那条路，
+   * 结果一个分类都解析不出来、还不报错。所以严格失败时去掉尾逗号再试一次
+   * （与 book_preload.js 的 parseLooseJson 同一口径）。
+   */
+  private static parseExploreArray(text: string): BookExploreCategory[] | null {
+    try {
+      return JSON.parse(text) as BookExploreCategory[];
+    } catch (e) {
+      // 落到下面那次宽松解析
+    }
+    try {
+      return JSON.parse(text.replace(/,\s*([\]}])/g, '$1')) as BookExploreCategory[];
+    } catch (e2) {
+      return null;
+    }
   }
 
   // ------------------------------------------------------------ 动作

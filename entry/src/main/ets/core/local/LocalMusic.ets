@@ -6,8 +6,9 @@ import { image } from '@kit.ImageKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SongItem } from '../player/PlaySession';
 import { LxMusicInfo } from '../music/MusicSearch';
-import { bytesToUtf8 } from '../music/LxCrypto';
+import { bytesToUtf8 } from '../music/PlatformCrypto';
 import { SongSideTable } from './SideTable';
+import { LocalAccess } from './LocalAccess';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LocalMusic';
@@ -57,7 +58,14 @@ export const LOCAL_ID_PREFIX: string = 'local_';
 export interface LocalSong {
   /** 稳定标识（不含 local_ 前缀），同时作为 musicInfo.songmid */
   key: string;
-  /** 沙箱里的文件名（含后缀） */
+  /**
+   * 引用式导入：Picker 给的原始 URI（已做持久化授权，见 LocalAccess）
+   *
+   * 与 `file` 二选一：新导入的都是引用式（uri 非空、file 为空）；2026-10 之前导入的
+   * 老数据是复制式（file 非空、uri 为空），继续按沙箱文件播，不强制迁移。
+   */
+  uri: string;
+  /** 旧数据：沙箱里的文件名（含后缀）。引用式为空串 */
   file: string;
   /** 封面文件名（covers/ 下），没有内嵌封面时为空串 */
   cover: string;
@@ -108,17 +116,20 @@ interface LocalIndex {
 }
 
 /**
- * 本地音乐库（设备里的音频文件，导入进沙箱的那一份）
+ * 本地音乐库（设备里的音频文件，两种持有方式：引用式为主、旧的复制式兼容）
  *
- * 为什么是「导入」而不是「记住文件路径」：Picker 返回的 URI 只有临时权限，
- * 官方文档写明「待退出应用后台后，获取的临时权限就会失效」；要跨重启就得
- * fileShare.persistPermission，那需要受限 ACL 权限（ohos.permission.FILE_ACCESS_PERSIST），
- * 而受限权限只批给「克隆 / 备份 / 同步」场景，音乐播放器申请不下来（详见 docs/LOCAL_MUSIC.md）。
- * 所以选中即拷贝一份到 files/local_music/：零权限、退后台不掉、重启还在。
+ * 新导入（2026-10-21 起）是**引用式**：只记住 Picker 给的 URI，用 `LocalAccess` 把临时授权
+ * 持久化，播放时直接读设备里的原文件 —— 不占第二份空间，删条目也不动用户文件。
+ * 依据与真机验证见 `core/local/LocalAccess.ets` 开头（那个「需要受限 ACL、手机不支持」的
+ * 旧结论已被实测推翻：手机上有能力位，权限是 system_grant/normal，声明即授予）。
+ *
+ * 旧数据（2026-10 之前导入的）是**复制式**：音频副本在 files/local_music/ 下，`file` 非空。
+ * 两种条目并存：`uri` 与 `file` 二选一，播放/删除/清理都按「哪个非空」走，不强制迁移。
  *
  * 本模块不依赖播放与同步模块（只借它们的类型），是本地歌的唯一持有者：
- *   - 音频副本与索引：files/local_music/index.json
- *   - 封面：files/local_music/covers/
+ *   - 索引：files/local_music/index.json（引用式条目只有 URI；复制式条目才有 file）
+ *   - 副本（仅旧数据）：files/local_music/<key>.<后缀>
+ *   - 封面：files/local_music/covers/（两种条目都有：内嵌封面抽成 jpeg 落在沙箱）
  *   - 非同步侧表：index.json 的 lists（本地歌进了哪些歌单 / 收藏）
  *
  * 侧表单独存的原因：参与同步的那份数据要按 listData() 的 JSON 算 md5 和服务端比对，
@@ -175,6 +186,14 @@ export class LocalMusic implements SongSideTable {
       return;
     }
     this.load();
+    // 引用式条目：冷启动后异步预热授权（不阻塞启动；播放时还会再 ensure 一次兜底）
+    const uris: string[] = [];
+    for (const song of this.songs) {
+      if (song.uri.length > 0) {
+        uris.push(song.uri);
+      }
+    }
+    void LocalAccess.warmUp(uris);
   }
 
   isReady(): boolean {
@@ -204,11 +223,20 @@ export class LocalMusic implements SongSideTable {
     return sum;
   }
 
-  /** 沙箱里的绝对路径；文件不在了返回空串（用户清过数据 / 文件被误删） */
+  /**
+   * 这首歌「可播放的位置」：引用式返回原文件 URI，复制式返回沙箱绝对路径
+   *
+   * 返回空串 = 复制式的副本已经不在（用户清过应用数据 / 手动删了副本）。
+   * 引用式的 URI 这里不做同步探测（激活是异步的），真的读不到时由播放侧
+   * `LocalAccess.ensure()` 给出明确失败 —— 这样冷启动第一帧不会因为等系统接口而卡住。
+   */
   pathOf(key: string): string {
     const song: LocalSong | undefined = this.byKey.get(key);
     if (song === undefined) {
       return '';
+    }
+    if (song.uri.length > 0) {
+      return song.uri;
     }
     const path: string = `${this.dir}/${song.file}`;
     try {
@@ -247,7 +275,9 @@ export class LocalMusic implements SongSideTable {
 
   /** 一条本地歌的展示条目 */
   songOf(song: LocalSong): SongItem {
-    const name: string = song.name.length > 0 ? song.name : stripExt(song.file);
+    // 名字兜底：引用式用 URI 里的文件名，复制式用沙箱文件名
+    const fileName: string = song.file.length > 0 ? song.file : fileNameOf(song.uri);
+    const name: string = song.name.length > 0 ? song.name : stripExt(fileName);
     const info: LxMusicInfo = {
       name: name,
       singer: song.singer,
@@ -445,7 +475,16 @@ export class LocalMusic implements SongSideTable {
     return text !== undefined && text.length > 0;
   }
 
-  /** @returns added / skipped / unsupported / failed */
+  /**
+   * 导入一首（引用式优先，失败退回复制式）
+   *
+   * 引用式：选完文件的临时权限还在，立刻 `LocalAccess.persist(uri)` 落库；成功后条目只记 URI，
+   * **不复制音频**（标签/内嵌封面照旧从原文件读，封面缩略图仍落沙箱 covers/，那是小图）。
+   * 复制式（兜底）：设备不支持持久化授权、或持久化失败时，仍按老办法拷一份进沙箱，
+   * 保证功能不会因为「权限拿不到」而完全不可用。
+   *
+   * @returns added / skipped / unsupported / failed
+   */
   private async importOne(uri: string, label: string): Promise<string> {
     const ext: string = extOf(label);
     if (!isSupportedAudioFile(label)) {
@@ -465,21 +504,34 @@ export class LocalMusic implements SongSideTable {
         return 'skipped';
       }
       const key: string = this.nextKey();
-      const file: string = `${key}${ext}`;
-      const dest: string = `${this.dir}/${file}`;
-      fs.copyFileSync(src.fd, dest);
-      closeQuietly(src);
-      src = null;
+      // 引用式：必须趁临时权限还在（刚 Picker 返回）立刻持久化
+      const ref: boolean = await LocalAccess.persist(uri);
+      let file: string = '';
+      let source: string = uri;
+      if (ref) {
+        // 引用式不用副本：把刚才用于 stat 的句柄关掉，readMetadata 会自己开新的
+        closeQuietly(src);
+        src = null;
+        hilog.info(DOMAIN, TAG, 'import by reference: %{public}s', label);
+      } else {
+        // 退回复制式：与改造前完全一样
+        file = `${key}${ext}`;
+        fs.copyFileSync(src.fd, `${this.dir}/${file}`);
+        closeQuietly(src);
+        src = null;
+        source = `${this.dir}/${file}`;
+        hilog.info(DOMAIN, TAG, 'import by copy: %{public}s', label);
+      }
 
       // 读标签要用**另一个**句柄：官方文档明确说同一个 fd 同时给播放器和提取器
       // 会「存在竞争关系，将导致音视频元数据获取异常」
-      const meta: LocalMeta = await this.readMetadata(dest, size, key);
+      const meta: LocalMeta = await this.readMetadata(source, size, key);
       // 同目录下的同名 .lrc 一并拷进来：这是**精确匹配**的歌词，播放时优先用它。
-      // 「选文件夹」这条路一定拿得到；「选文件」那条路只授权了选中的文件，
-      // 兄弟文件多半读不到 —— 读不到就算了，之后还有在线匹配兜底。
+      // 引用式只授权了选中的那一个文件，兄弟文件读不到 —— 读不到就算了，还有在线匹配兜底。
       const lrc: string = this.copySiblingLrc(uri, key);
       const song: LocalSong = {
         key: key,
+        uri: ref ? uri : '',
         file: file,
         cover: meta.coverFile,
         lrc: lrc,
@@ -608,8 +660,10 @@ export class LocalMusic implements SongSideTable {
   // ------------------------------------------------------------ 删除
 
   /**
-   * 删掉一批本地歌（只删沙箱里的副本，用户原文件不动）
-   * 同时把它们从所有歌单 / 收藏的侧表里摘掉 —— 文件没了，引用必须一起清，
+   * 删掉一批本地歌
+   *
+   * 引用式只删索引记录、**不动设备里的原文件**；复制式（旧数据）顺手删掉沙箱副本。
+   * 同时把它们从所有歌单 / 收藏的侧表里摘掉 —— 记录没了，引用必须一起清，
    * 否则歌单里会留下打不开的条目。
    */
   removeKeys(keys: string[]): number {
@@ -620,7 +674,10 @@ export class LocalMusic implements SongSideTable {
     let removed: number = 0;
     for (const song of this.songs) {
       if (keys.includes(song.key)) {
-        unlinkQuietly(`${this.dir}/${song.file}`);
+        // 只删「应用内自己的文件」：旧副本式才有 file
+        if (song.file.length > 0) {
+          unlinkQuietly(`${this.dir}/${song.file}`);
+        }
         if (song.cover.length > 0) {
           unlinkQuietly(`${this.coverDir}/${song.cover}`);
         }
@@ -771,13 +828,17 @@ export class LocalMusic implements SongSideTable {
     const known: Set<string> = new Set<string>();
     const missing: string[] = [];
     for (const song of this.songs) {
-      known.add(song.file);
       if (song.cover.length > 0) {
         known.add(`${COVER_DIR}/${song.cover}`);
       }
       if (song.lrc.length > 0) {
         known.add(song.lrc);
       }
+      // 引用式没有副本可查：原文件是否还在要异步激活授权才知道，交给播放时 ensure
+      if (song.file.length === 0) {
+        continue;
+      }
+      known.add(song.file);
       try {
         if (!fs.accessSync(`${this.dir}/${song.file}`)) {
           missing.push(song.key);
@@ -1009,12 +1070,16 @@ function normalizeSongs(input: LocalSong[] | undefined): LocalSong[] {
     if (typeof item.key !== 'string' || item.key.length === 0) {
       continue;
     }
-    if (typeof item.file !== 'string' || item.file.length === 0) {
+    // 两种持有方式：引用式（uri 非空）或复制式（file 非空，2026-10 之前的老数据）
+    const uri: string = typeof item.uri === 'string' ? item.uri : '';
+    const file: string = typeof item.file === 'string' ? item.file : '';
+    if (uri.length === 0 && file.length === 0) {
       continue;
     }
     out.push({
       key: item.key,
-      file: item.file,
+      uri: uri,
+      file: file,
       cover: typeof item.cover === 'string' ? item.cover : '',
       lrc: typeof item.lrc === 'string' ? item.lrc : '',
       matchJson: typeof item.matchJson === 'string' ? item.matchJson : '',

@@ -30,7 +30,26 @@
         "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       },
       {
-        // 听歌识曲：录一段环境音去比对指纹（识别页进入时按需申请，不在启动时打扰用户）
+        // 本地音乐「引用式导入」：把 Picker 选中的音频 URI 做持久化授权，重启后直接读原文件
+        // （2026-10-20 真机验证：SDK 权限定义是 system_grant / normal，与 INTERNET 同档，
+        //  不是受限 ACL，声明即生效；详情见 core/local/PersistProbe.ets 与 docs/LOCAL_MUSIC.md）
+        "name": "ohos.permission.FILE_ACCESS_PERSIST",
+        "reason": "$string:reason_file_persist",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        // 听歌识曲的「周围声音」来源（默认那一档）：录一段环境音去比对指纹，
+        // 切到这一档才申请，不在启动时打扰用户。
+        // 另一档「本机播放」（内录本机正在播放的媒体音频，用户自己在识别页上选）不需要任何权限：
+        // 系统里跟回放采集沾边的权限（CAPTURE_PLAYBACK / CAPTURE_SCREEN /
+        // CAPTURE_VOICE_DOWNLINK_AUDIO）全是 system_grant 的 SYSTEM 权限，普通应用申请不到，
+        // 而 AudioCapturer 的回放采集音源对三方应用是直接放开的（API 26 起用
+        // playbackCaptureMode 指定，见 AudioRecorder）。
         "name": "ohos.permission.MICROPHONE",
         "reason": "$string:reason_microphone",
         "usedScene": {
@@ -40,11 +59,18 @@
           "when": "inuse"
         }
       }
-      // 这里原本还声明了 ohos.permission.FILE_ACCESS_PERSIST（持久化目录授权），已去掉：
-      // 它属于「受限 ACL 权限」，必须在签名 Profile 的 allowed-acls 里声明才能生效
-      // （自动生成的调试 Profile 里没有，声明了也只是摆设，还会卡住 AGC 上传时的
-      // 「ACL 权限声明一致性」校验）。而下载真正写文件走的是系统保存对话框
-      // （DocumentViewPicker.save），那条路本来就不需要这个权限，见 openTarget。
+      // 底部悬浮栏的「左右跟手」（`adaptToHandedness`）不需要应用侧的任何权限：跟手是悬浮栏
+      // 自己的实现（HDS 那份额外注明「依赖底层硬件，部分历史设备硬件能力不支持」），
+      // 由「设置 - 外观」那一项决定开关。这里一度声明过 ohos.permission.DETECT_GESTURE
+      // （自己订阅握姿，用来定位跟手为什么没生效），定位做完已经连同那套自研感知一并删掉。
+      // 这里原本还声明了 ohos.permission.FILE_ACCESS_PERSIST（持久化目录授权），2026-09 因为
+      // 「它属于受限 ACL 权限，自动生成的调试 Profile 里没有 allowed-acls，声明了只是摆设」
+      // 被删掉；2026-10-20 复核 SDK 的 PermissionDefinitions.json 发现这个判断是错的：
+      // 它是 system_grant / availableLevel=normal / availableType=NORMAL，与 INTERNET 同档，
+      // 不需要 ACL，声明即生效（真机验证见 core/local/PersistProbe.ets）。现已按「本地音乐
+      // 引用式导入」的需要重新声明，见上面 requestPermissions 里那条。
+      // 下载写文件仍然走系统保存对话框（DocumentViewPicker.save），那条路不需要这个权限，
+      // 见 openTarget。
     ],
     "abilities": [
       {

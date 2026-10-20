@@ -34,6 +34,20 @@ const CASES: LinkCase[] = [
   },
   { text: 'https://y.qq.com/n/ryqq/playlist/7823431554', source: 'tx', id: '7823431554' },
   { text: 'https://www.kugou.com/yy/special/single/1067062.html', source: 'kg', id: '1067062' },
+  // 酷狗「用户歌单」：路径里是 gcid_xxx（不是数字 id，老实现完全认不出来）。
+  // 分享文本实际长这样（m.kugou.com/songlist/gcid_xxx/?src_cid=...&uid=...&iszlist=1）
+  {
+    text: 'https://m.kugou.com/songlist/gcid_3z18r5q99zaz0b6/?src_cid=3z18r5q99zaz0b6&uid=2299204049&chl=message&iszlist=1',
+    source: 'kg',
+    id: 'gcid_3z18r5q99zaz0b6',
+  },
+  { text: 'https://www.kugou.com/songlist/gcid_3z18r5q99zaz0b6/', source: 'kg', id: 'gcid_3z18r5q99zaz0b6' },
+  // 只有 src_cid 参数时补上 gcid_ 前缀，才是详情层认得的 id
+  {
+    text: 'https://m.kugou.com/songlist/?src_cid=3z18r5q99zaz0b6&uid=1&iszlist=1',
+    source: 'kg',
+    id: 'gcid_3z18r5q99zaz0b6',
+  },
   { text: 'https://www.kuwo.cn/playlist_detail/2892110024', source: 'kw', id: '2892110024' },
   { text: 'https://m.kuwo.cn/h5app/playlist/123456?from=share', source: 'kw', id: '123456' },
   {
@@ -59,6 +73,9 @@ const CASES: LinkCase[] = [
   },
   // 直接给「平台__歌单id」（洛雪的列表标识）
   { text: 'wy__2892110024', source: 'wy', id: '2892110024' },
+  // 酷狗用户歌单也有这两种写法（列表标识 / 深链），id 里带下划线
+  { text: 'kg__gcid_3z18r5q99zaz0b6', source: 'kg', id: 'gcid_3z18r5q99zaz0b6' },
+  { text: 'lxmusic://songlist/open/kg/gcid_3z18r5q99zaz0b6', source: 'kg', id: 'gcid_3z18r5q99zaz0b6' },
 ];
 
 /** 不该被当成歌单的输入 */

@@ -149,6 +149,20 @@ export const I_CLOCK: Resource = $r('sys.symbol.clock');
 export const I_CLOUD: Resource = $r('sys.symbol.cloud');
 /** 帮助和反馈（问号圈） */
 export const I_HELP: Resource = $r('sys.symbol.questionmark_circle');
+/**
+ * 回响（月度收听记录）
+ *
+ * 一个圆点、左右各一道扩散的波纹 —— 与无界音乐那一栏同一个意象
+ * （官方符号表里的 dot_radiowaves_left_and_right）。
+ */
+export const I_ECHO: Resource = $r('sys.symbol.dot_radiowaves_left_and_right');
+/**
+ * 回响页签的选中态
+ *
+ * 官方符号表里这一枚没有实心变体，选中态就沿用同一枚：页签选中与否本来就靠颜色
+ * 区分（主题红 / 图标 token），硬凑一个别的形状反而会让两态看着像两件事。
+ */
+export const I_ECHO_FILL: Resource = I_ECHO;
 
 /**
  * 官方符号图标

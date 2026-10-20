@@ -600,6 +600,323 @@ node tools/search_merge_probe.js 晴天
       「文件找不到了」），且**本次会话点它能播放**（重启后首次会联网，第二次起读本地）。
 - [ ] 真机：下载目录不可用时（拒绝授权等），自动退回应用内目录并给出 note。
 
+## D-010 · 「缓存时自动下载」有的歌永远不进下载文件夹
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-10-20，待真机回归，见「验收标准」） |
+| 优先级 | P1（开关开着却只下一部分，用户可见） |
+| 发现日期 | 2026-10-20 |
+| 发现方式 | 用户反馈「有的播放歌曲还是不能自动下载到文件夹中」；逐行读播放 → 下载的接线 |
+
+### 影响面
+
+同一张队列里，有的歌下了、有的歌永远不进「下载」文件夹，下载管理里连记录都没有。
+
+### 根因（四处，前两条就能解释「有的歌不下」）
+
+1. **排队的位置在两条早退之后**。`PlaySession.playOnlineItem` 里「自动下载」原先只排在
+   `playUrl()` 成功之后，而它前面的两条分支会直接 `return`：已下载 → 读本地文件；
+   **沙箱播放缓存命中** → 读本地文件。于是「以前听过、沙箱里已经有缓存」的歌（默认缓存
+   上限 512MB，这个集合很大）再播一遍，两条早退都命中，`queueAutoDownload()` 根本没被调用 ——
+   表现就是「有的歌就是不下」。`prefetchNext` 同一处也有：命中沙箱缓存就 `return`，
+   连预取那条路上的排队也跳过了。
+2. **公共目录判定用错了前缀**。索引里记的是 `fileUri.FileUri(uri).path` 转出来的**本机路径**
+   （`/storage/Users/currentUser/Download/<包名>/x.mp3`），代码却按 `file://docs` 前缀判断
+   「这条记录在不在公共目录」。结果：重启后「公共目录那份读不到」的条目被当成应用内文件，
+   标成「文件找不到了（可能被清理过）」，而不是 D-009 约定的「已下载 + 本次启动没授权」；
+   `enqueue` 里那条「重下一遍续上目录授权」的自愈分支**永远不会触发**；`publicDirUri()` 的
+   兜底扫描也永远扫不到任何一条。
+3. **同名文件互相覆盖**。公共目录那条路按固定文件名 `CREATE|TRUNC` 打开：命名格式选「歌曲名」时，
+   不同歌手的同名歌（翻唱 / Live / 伴奏）落成同一个文件名，后下的把先下的那份盖掉 ——
+   文件夹里少一首，下载记录却都显示「已下载」。
+4. **后台拿不到保存目录时会静默退到应用内目录**。自动下载大多发生在后台（息屏 / 切走还在放），
+   而保存对话框（`DocumentViewPicker.save`，DOWNLOAD 模式）在后台拿不到目录；失败后代码退回
+   `files/Download`，并只在 `note` 里写一行 —— 用户在「文件管理」里看不到这首歌，也容易
+   读成「没下载」。
+
+### 修复
+
+| 问题 | 做法 |
+| --- | --- |
+| 早退跳过排队 | 播放路径：把 `queueAutoDownload()` 提到「已下载 / 沙箱缓存」两条早退**之前**（音质协商之后），每条在线歌都先过一遍下载器；已下载 / 已在队列的由 `enqueue` 去重，失败记录 / 文件已不在的会在这里重新排队（自愈）。预取路径同样提到缓存命中判断之前 |
+| 目录判定错 | 删掉 `PUBLIC_URI_PREFIX`，改成 `isPublicFile()`：**不在**应用内兜底目录里的就是公共目录那份。`enqueue` / `loadIndex` / `publicDirUri` 三处统一用它 |
+| 同名覆盖 | `publicTargetPath()`：撞名加 ` (1)(2)…`；只有**同一条下载记录**重下（续授权 / 手动重试）才复用原路径并 TRUNC |
+| 后台落进应用内目录 | 记住保存对话框给的目录（`knownPublicDirPath()`，设置里原本就存了 uri）：之后直接 `openSync` 写入，不再每次问系统；后台 + 本次会话还没验证过能写系统目录时，**先不下**，放回队列（`deferForForeground`），回到前台由 `EntryAbility.onForeground → DownloadManager.resume()` 接着排 |
+| 删除 / 授权失效后不自愈 | 播放已下载文件失败时调 `removeDownloadedFile(key)`，下一次播放就会走「已下载但读不到 → 重下一遍」那条路 |
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/player/PlaySession.ets` | `playOnlineItem` 提前 `queueAutoDownload`、下载文件打不开时 `removeDownloadedFile`；`prefetchNext` 把排队提到缓存命中之前 |
+| `core/download/DownloadManager.ets` | `K_APP_FOREGROUND` / `isPublicFile` / `knownPublicDirPath` / `inForeground` / `canAutoWriteNow` / `resume` / `openInKnownDir` / `publicTargetPath` / `ownsPath` / `deferForForeground`；`openTarget` / `openViaPicker` 改签名（带 key，用于同名判定） |
+| `entryability/EntryAbility.ets` | 维护 `K_APP_FOREGROUND`（create / foreground / background），回前台调 `DownloadManager.resume()` |
+
+### 验收标准
+
+- [ ] 真机：开着「缓存时自动下载」，先听 3 首（让它们进沙箱缓存），清空下载列表后再逐首重播，
+      3 首都出现在「我的 - 下载管理」里并下完（以前这三首会一首都不下）。
+- [ ] 真机：连着听 5 首以上，下载管理里的记录与「文件管理 → 下载 → 聆听」里的文件一一对应。
+- [ ] 真机：后台播放（息屏）时切歌，回到前台后这些歌接着下完，文件仍在「下载」文件夹里；
+      日志里能看到 `auto task waits for foreground`，之后是 `task start`。
+- [ ] 真机：两首同名不同歌手的歌（命名格式选「歌曲名」）都下完后，文件夹里是两个文件（`x.mp3`、`x (1).mp3`）。
+- [ ] 真机：下载后把文件从「文件管理」里删掉再播这首，会重新下一份出来。
+- [ ] 真机：重启应用后下载管理里公开目录那些记录显示「已下载 + 授权说明」（不再是「文件找不到了」）。
+- [x] `devecocli build --modules entry@default --build-mode debug` 通过（2026-10-20）。
+
+---
+
+## D-011 · 歌单导入两处静默问题：酷狗用户歌单认不出链接、QQ 超过 1000 首被悄悄截断
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-10-20） |
+| 优先级 | P1（用户可见：酷狗「我的歌单」分享链接直接报解析失败；QQ 大歌单导入少一半歌且不报错） |
+| 发现日期 | 2026-10-20 |
+| 发现方式 | 用户反馈「酷狗和 QQ 的歌单导入有问题」+ `tools/live_list_probe.js` 直连真实接口复现 |
+
+### 影响面
+
+1. **酷狗用户歌单完全导不进来**。酷狗有两套歌单：精选集（`specialid`，网页
+   `/yy/special/single/<id>.html`）与**用户歌单**（`global_collection_id`，即 `gcid_xxx`，
+   酷狗 App 里「我的歌单」分享出来的就是它）。解析器的正则照抄洛雪，只认 `/<数字>.html`
+   和 `specialid=`，于是 `m.kugou.com/songlist/gcid_3z.../?src_cid=...&uid=...` 这种链接
+   一律走进「没能从酷狗链接里找到歌单 id」。`docs/LIST_IMPORT.md` 原本把它记成「不支持」。
+2. **QQ 歌单超过 1000 首被静默截断**。`txPlaylistDetailMusicu` 固定 `song_begin: 0`、
+   `song_num: 1000`，而 `txPlaylistDetail(id)` 把 `page` 参数直接丢掉 ——
+   `getPlaylistDetailAll` 第二页拿到的还是同一批歌，判定「没有新歌」就停了。
+   表现是：不报错、歌单名也对，只是**少了 1000 首之后的部分**（实测 1919 首的歌单只导入 999 首）。
+
+### 证据（2026-10-20 实测）
+
+```bash
+# 1) 酷狗用户歌单：页里有 window.$output.info.listinfo.specialid，换出 specialid 后走精选集即可
+$ node tools/live_list_probe.js --detail kg gcid_3z18r5q99zaz0b6
+✅ kg  id=gcid_3z18r5q99zaz0b6  「都市茶歇 | 舒缓节奏放慢脚步」 total=52 取到=52
+     ℹ️ 用户歌单 gcid_3z18r5q99zaz0b6 -> specialid=8363749（页面 count=52）
+
+# 2) QQ 大歌单：song_begin 翻页确实能拿到后面的歌
+$ node tools/live_list_probe.js --detail tx 5909350456
+✅ tx  id=5909350456  「疯狂输出 | 快节奏游戏专用黑怕」 total=1919 取到=1915
+```
+
+两个细节，改的时候都踩到了：
+
+- 酷狗歌单页按 UA 给两套页面：**桌面 UA 拿到的是老的服务端渲染页，里面没有 `$output`**；
+  必须带 App UA（`KG_APP_UA`）才是那套 H5。
+- 页面里的 `$output.songs` 只有**前 10 首**（首屏预览），不能当全量用；
+  只从 `listinfo` 取 `specialid` / 歌单名 / 封面 / 简介，歌曲仍走精选集那条路。
+- QQ 翻到最后一页之后接口仍回 `code=0`、`songlist` 为空，这是「没有下一页」而不是失败，
+  不能抛错（否则整次导入会失败）。
+
+### 复现
+
+```bash
+node tools/live_list_probe.js --detail kg gcid_3z18r5q99zaz0b6   # 改前：解析失败 / 取到 0 首
+node tools/live_list_probe.js --detail tx 5909350456            # 改前：取到 999 / total 1919
+```
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/music/PlaylistLink.ets` | `KG_GCID_PATH` / `KG_GCID_PARAM`：认 `/songlist/gcid_xxx/` 与 `src_cid=`，`linkFromTarget` 允许 `gcid_xxx` 形式的裸 id |
+| `core/music/MusicList.ets` | `kgGcidInfo()` / `kgPageOutput()`：gcid -> `listinfo.specialid`；`kgPlaylistDetail` 先换 specialid 再走精选集，并用歌单页元信息兜底；`txPlaylistDetailMusicu(id, page)` 按 `song_begin` 翻页、末页空列表不报错 |
+| `entry/src/test/PlaylistLink.test.ets` | 新增 4 条酷狗用户歌单用例（路径式 / 只有 `src_cid` / `kg__gcid_...` / `lxmusic://` 深链） |
+| `tools/live_list_probe.js` | kg 增加 gcid 解析；tx 改成与 App 一致的 `song_begin` 翻页 |
+
+### 验收标准
+
+- [x] 酷狗用户歌单分享链能解析并取到全量（实测 52/52）。
+- [x] QQ 1919 首的歌单能取到 1915 首（余下几首是歌单在两次请求之间被改动）。
+- [x] `playlistLinkTest` 覆盖酷狗用户歌单的四种写法。
+- [ ] 真机：把酷狗「我的歌单」分享文本整段粘贴进「导入歌单」，预览出歌单名与曲目数并能导入。
+- [ ] 真机：导入一张上千首的 QQ 歌单，导入后的条数与平台页面一致。
+
+---
+
+## D-012 · 咪咕 24bit 音质档被漏掉：歌单 / 榜单里的 `ZQ24` 没映射，导入的歌丢了最高音质
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-10-20） |
+| 优先级 | P2（用户可见：咪咕歌单导入后，歌少了 flac24bit 这一档；音质设成 24bit 时这些歌选不到档位） |
+| 发现日期 | 2026-10-20 |
+| 发现方式 | 复核「咪咕歌单导入」时对比三处咪咕音质映射（搜索结果 / 歌手页 / 歌单与榜单） |
+
+### 影响面
+
+咪咕 `audioFormats[].formatType` 的实际取值是 `PQ` / `HQ` / `SQ` / **`ZQ24`**（24bit，
+个别条目还有放不了的 `AV3A`）。但本工程有三份独立的映射函数：
+
+| 位置 | 认的写法 | 结果 |
+| --- | --- | --- |
+| `MusicSearch.ets` 的 `mgFormatToQuality` | `PQ/HQ/SQ/ZQ24` | 正确 |
+| `MusicArtist.ets` 的 `mgFormatQuality` | `PQ/HQ/SQ/ZQ24` | 正确 |
+| `MusicList.ets` 的 `mgFormatToQuality` | `PQ/HQ/SQ/**ZQ**` | **`ZQ24` 永远匹配不上 -> flac24bit 整档丢失** |
+
+搜索结果与歌手页走前两份，所以一直正常；**在线歌单、榜单、歌单导入**走的是 `MusicList`，
+这些页面里的咪咕歌因此都没有 flac24bit 档（`_types` 里缺这一项，播放时按 24bit 协商就落空）。
+
+### 证据（2026-10-20 实测）
+
+```bash
+# 咪咕歌单 233230297 第一页的 audioFormats（formatType 是 ZQ24 不是 ZQ）
+PQ:4146366 HQ:10365598
+PQ:4063193 HQ:10157665 SQ:31755462 ZQ24:56123778
+PQ:2683864 HQ:6659345 SQ:15852985 ZQ24:31829173
+```
+
+改前 `mgFormatToQuality('ZQ24')` 返回空串，`addType` 里直接 `continue` 掉；
+改后这一档按 `flac24bit` 落进 `types` / `_types`。
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `core/music/MusicList.ets` | `mgFormatToQuality`：`ZQ24`（兼容旧的 `ZQ`）-> `flac24bit`，并注明 `AV3A` 不是可播放档位 |
+
+### 验收标准
+
+- [x] 歌单详情解析出的咪咕歌曲 `types` 里含 `flac24bit`（带 `ZQ24` 的歌）。
+- [x] `devecocli build --modules entry@default --build-mode debug` 通过。
+- [ ] 真机：播放设置选「无损 24bit」，从咪咕歌单导入的歌按 24bit 播放，音质面板显示 24bit 档。
+
+## D-013 · 从歌曲评论返回时有概率回到一级页签页，而不是播放页
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-10-20，待真机回归，见「验收标准」） |
+| 优先级 | P1（播放链路里最常用的返回动作，走错一层很显眼） |
+| 发现日期 | 2026-10-20 |
+| 发现方式 | 用户反馈「从歌曲评论返回时有概率没有正常返回播放页而是返回了一级菜单页」 |
+
+### 根因
+
+播放页是 `bindContentCover` 的**全屏模态**，评论页只是模态内部自绘的一层覆盖物
+（`PlayerView.commentOverlay`），并没有进路由栈。系统返回键的默认行为是**收起最上面的模态**：
+模态里没有任何返回拦截，所以按返回收起的是整个播放页，露出下面原来那一层页签页 ——
+用户看到的就是「从评论返回回到了首页」。
+
+「有概率」来自两种返回方式混用：评论页左上角那颗返回箭头走 `CommentSheet.onClose`（一直是对的），
+而系统返回键 / 侧滑返回走的是模态默认收起（错的）。同一套覆盖物里的「更多」「音质」
+「匹配歌词」也有同样的问题。另外播放页的下拉关闭手势当时只排除了「更多 / 音质 / 评论」，
+漏了「匹配歌词」。
+
+### 修复
+
+| 环节 | 做法 |
+| --- | --- |
+| 拦截系统返回 | `pages/Index.ets` 的 `bindContentCover` 加 `onWillDismiss`：注册后返回键不再立刻收起模态。`reason === DismissReason.PRESS_BACK`（含返回键 / 左右侧滑 / Esc）且播放页有覆盖物时，不 `dismiss()`，改为把「收一层」的信号交给播放页；其余情况照旧收起 |
+| 状态上报 | `PlayerView` 四个覆盖物状态（`commentOpen` / `matchOpen` / `qualityOpen` / `moreOpen`）挂 `@Watch('syncOverlayState')`，任何开合都把「有没有覆盖物」回调给壳层；打开 / 关闭播放页时壳层也把标记清零 |
+| 收层顺序 | 壳层把 `backTick` 加一传给 `PlayerView`（`@Prop @Watch`），按视觉层级收：评论 → 匹配歌词 → 音质 → 更多；一层都没有时兜底收起播放页 |
+| 下拉关闭手势 | 播放页根节点的 `PanGesture` 补上 `matchOpen`，与返回键同一条规则（面板开着时下拉不关播放页） |
+
+### 涉及代码
+
+| 位置 | 说明 |
+| --- | --- |
+| `pages/Index.ets` | `playerOverlayOpen` / `playerBackTick` 状态、`playerSheet` 传回调与信号、`bindContentCover` 的 `onWillDismiss`、`openPlayer` / `closePlayer` 重置标记 |
+| `views/PlayerView.ets` | `onOverlayChange` / `backTick` 入参、四个面板 `@Watch`、`hasOverlay` / `syncOverlayState` / `onBackRequested`、`PanGesture` 补 `matchOpen` |
+| `views/CommentSheet.ets` | 未改动（它自己的返回箭头本来就走 `onClose`） |
+
+### 验收标准
+
+- [ ] 真机：打开播放页 → 查看评论 → 按**系统返回键**，回到播放页（评论层收起），不是页签页。
+- [ ] 真机：评论页按**侧滑返回**，同样只收评论层。
+- [ ] 真机：评论页点左上角返回箭头，行为与上面一致。
+- [ ] 真机：没有覆盖物时按返回键，正常收起播放页（不会卡住）。
+- [ ] 真机：「更多」「音质」「匹配歌词」开着时按返回键，都是先收各自那一层。
+- [ ] 真机：播放页上打开「匹配歌词」时下拉，不会把播放页收掉。
+- [x] `devecocli build --modules entry@default --build-mode debug` 通过（2026-10-20）。
+
+---
+
+## D-014 · 开了「拓展音质」也选不到拓展档：沙箱白名单把四档拓展音质整段过滤掉
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修复**（2026-10-20） |
+| 优先级 | P1（用户可见：设置里开了拓展音质，播放网易云歌曲的音质面板永远只有 128K / 320K / FLAC / 24Bit） |
+| 发现日期 | 2026-10-20 |
+| 发现方式 | 用户反馈「设置里开启扩展音质时，播放网易云歌曲依然没有扩展音质的选项」；按「设置 -> 音源声明 -> 歌曲 _types -> 面板」整条链路逐段复现 |
+
+### 影响面
+
+拓展音质（Hi-Res / 全景声 / 全景声+ / 母带）要出现在播放页音质面板里，得同时满足三件事：
+
+1. 设置在「播放设置 - 拓展音质」里开着（`PlaySettings.isExtendQuality`）；
+2. 这首歌的 `_types` 里有这一档（平台给了这一档）；
+3. **音源声明的 `qualitys` 里有这一档**（`Quality.switchableQualitys` 取交集）。
+
+这次坏在**第 3 条的上游**：音源跑在 ArkWeb 沙箱里，`rawfile/lx_preload.js` 的 `handleInit`
+会把音源声明的 qualitys 与一张**写死的宿主白名单**取交集，而那张表只写了四档普通音质：
+
+```js
+const supportQualitys = {
+  kw: ['128k', '320k', 'flac', 'flac24bit'],
+  kg: ['128k', '320k', 'flac', 'flac24bit'],
+  tx: ['128k', '320k', 'flac', 'flac24bit'],
+  wy: ['128k', '320k', 'flac', 'flac24bit'],
+  mg: ['128k', '320k', 'flac', 'flac24bit'],
+  local: [],
+}
+// handleInit: qualitys: qualitys.filter(q => userSource.qualitys.includes(q))
+```
+
+于是音源即使声明了 `hires / atmos / atmos_plus / master`，到 ArkTS 侧也只剩四档，
+`switchableQualitys` 自然把拓展档全过滤掉 —— 面板里没有、`pickQuality` 也不会选中，
+整套拓展音质功能等于没接上。**与入口无关**：搜索、歌单、榜单、歌手页都受影响。
+
+另外还有两处配套的小缺口：
+
+- `core/source/LxTypes.ets` 的 `LxQuality` 联合类型同样只有四档（与运行时不一致）；
+- 网易歌的 `_types` 有两套生成逻辑：搜索（`MusicSearch.parseWySongs`）补了母带 / 沉浸声 /
+  杜比（`jymaster / sky / dolby` -> `master / atmos_plus / atmos`），但**歌单 / 榜单**
+  （`MusicList.wyFilterSongs`）与歌手页（`MusicArtist.artistSongsWy`）没补 ——
+  而网易 song 搜索那条 eapi 链路目前是 404（见 D-001），用户手上的网易歌基本都从歌单来。
+
+### 证据（2026-10-20）
+
+沙箱侧可以直接复现（新加的自检脚本 `tools/preload_quality_probe.js` 把 `lx_preload.js` +
+`lx_utils.js` 在 Node 的 vm 里跑起来，模拟一份声明了八档的音源）：
+
+```bash
+$ node tools/preload_quality_probe.js
+status=true
+  wy  actions=["musicUrl","lyric","pic"]  qualitys=["128k","320k","flac","flac24bit","hires","atmos","atmos_plus","master"]
+✅ 拓展档全部保留
+```
+
+把白名单临时改回旧的四档再跑同一段模拟，就是修复前的样子：
+
+```
+修复前 wy.qualitys = ["128k","320k","flac","flac24bit"]
+```
+
+### 修复
+
+| 位置 | 改动 |
+| --- | --- |
+| `entry/src/main/resources/rawfile/lx_preload.js` | `supportQualitys` 改成共享常量 `MUSIC_QUALITYS`（四档普通 + 四档拓展），音乐平台共用；`local` 仍是空 |
+| `core/source/LxTypes.ets` | `LxQuality` 补 `hires / atmos / atmos_plus / master` |
+| `core/music/MusicSearch.ets` | 抽出导出函数 `appendWyExtendQualities()`，搜索解析改用（行为不变） |
+| `core/music/MusicList.ets` | `wyFilterSongs` 调 `appendWyExtendQualities`，歌单 / 榜单的 `_types` 补上拓展档 |
+| `core/music/MusicArtist.ets` | `artistSongsWy` 同上（该接口把 `maxBrLevel` 放在每首歌的 `privilege` 里） |
+| `tools/preload_quality_probe.js` | 新增：沙箱白名单自检 |
+
+白名单语义是「宿主支持哪些档」，最终能力 = 白名单 ∩ 音源声明；拓展档用不用由用户设置
+与平台是否提供决定，宿主不该提前砍掉。
+
+### 验收标准
+
+- [x] `node tools/preload_quality_probe.js` 退出码 0，wy 八档全保留。
+- [x] `devecocli build --modules entry@default --build-mode debug` 通过。
+- [ ] 真机：音源声明了拓展档时，设置里开「拓展音质」并选「母带」，播放一首网易云超清母带歌曲，
+      音质面板里出现「母带」并且能解析、出声（需要音源真的实现了 `master`）。
+- [ ] 真机：音源没声明拓展档时，面板仍然只列普通档（这是预期，设置页那句提示已经写明）。
+
 ---
 
 ## 其他待办（不是缺陷，按需排期）
@@ -648,5 +965,23 @@ node tools/search_merge_probe.js 晴天
 | 歌单详情 kg | `GET www2.kugou.kugou.com/yueku/v9/special/single/<id>-5-9999.html` 取 hash，再 `POST gateway.kugou.com/v2/album_audio/audio` 换歌曲信息 | 真实请求，26/30 首（4 个 hash 换不到） |
 | 歌单详情 mg | `GET app.c.nf.migu.cn/MIGUM3.0/resource/playlist/song/v2.0?playlistId=<id>`（一页 30 首） | 真实请求，30/100，翻页在 App 里做 |
 | 歌单详情 tx | `POST u.y.qq.com/cgi-bin/musicu.fcg`（`music.srfDissInfo.aiDissInfo`） | 真实请求，50/50，见 D-002 |
-| 歌单详情 wy | `GET music.163.com/api/v6/playlist/detail?id=<id>&n=1000` | 真实请求，10/26（只回可播放曲目） |
+| 歌单详情 wy | `GET music.163.com/api/v6/playlist/detail?id=<id>&n=1000`（**须带 `Cookie: os=pc`**），缺的按 `trackIds` 走 `/api/song/detail` 补 | 真实请求；不带 cookie 时 10/26，带上是 27/27（见下方 2026-10-08 复核） |
 | 分享链接解析 | 五平台 `listDetailLink` 正则 + 短链跟随（`maxRedirects: 0` 读 `Location`） | 单测 `playlistLinkTest`：15 条真实分享文本 |
+
+### 2026-10-08 复核：wy 歌单「只有十几首」的根因
+
+原表里 wy 那行的「10/26（只回可播放曲目）」定性错了，实测结论是：
+
+- `/api/v6/playlist/detail` 对**匿名客户端**（请求头里没有 `Cookie: os=pc`）只回
+  `playlist.tracks` 的**开头一段试听预览**：抽查 60+ 张普通用户歌单恒为 10 首，
+  「我喜欢的音乐」(specialType=5) 是 6 首，官方榜单（热歌榜 200、飙升榜 98…）才是全量。
+  不是版权/可播放过滤 —— 同批歌单里「可播放」的有 8 首、30 首的，返回的仍然是 10 首。
+- 改 `n`（5/15/20/100/1000）、`s`（0…16）、UA（桌面/移动/客户端）、加不加 Referer 都不影响；
+  只要带上 `os=pc`（`os=ios`/`os=android` 同效）立刻变成全量（24/24、1000/1267，`n` 才封顶 1000）。
+- 同响应的 `playlist.trackIds` 一直是**完整**的，原实现只拿它算了 `total`，
+  于是列表页出现「共 27 首」但只有 10 行，导入也只落 10 首（`getPlaylistDetailAll`
+  第二页拿到同一批 -> 判定无新歌即停，符合预期地停在了 10）。
+
+修法（已落地，见 `core/music/MusicList.ets`）：请求头带 `Cookie: os=pc`；
+取歌以 `trackIds` 为准，`tracks` 里缺的按 100 个一批走 `/api/song/detail` 补回来
+（等价于洛雪 `wy/songList.js` 里 `trackIds.length == privileges.length` 的那个分支判断）。

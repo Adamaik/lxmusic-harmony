@@ -2,9 +2,9 @@ import { K_LIBRARY_VERSION, PlaySession, SongItem } from '../core/player/PlaySes
 import { K_CURRENT_ID, K_QUEUE_COUNT } from '../core/player/PlaySession';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SUB } from '../ui/Theme';
+import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB } from '../ui/Theme';
 import { I_QUEUE, I_TRASH, I_VOLUME, IconGlyph } from '../ui/Icons';
-import { CoverArt, EmptyState } from '../ui/Widgets';
+import { CoverArt, EmptyState, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
@@ -171,13 +171,8 @@ export struct PlayQueueContent {
           .width('100%')
           .textAlign(TextAlign.Start)
         if (item.singer.length > 0) {
-          Text(item.singer)
-            .fontSize(F_SUB)
-            .fontColor(C_TEXT_WEAK)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-            .textAlign(TextAlign.Start)
+          // 歌手名：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
+          SingerLink({ singer: item.singer, source: item.source })
         }
       }
       .layoutWeight(1)
@@ -241,6 +236,17 @@ export struct PlayQueueContent {
         .layoutWeight(1)
         .padding({ left: 16, right: 16 })
         .scrollBar(BarState.Off)
+        // 多备几行，别到要用的时候才建。
+        // `ListItemGroup` + `LazyForEach` 在显示区外的行默认是「进了视口才创建」，而半模态
+        // 从半屏拖到满屏时视口是一口气长高的：如果那几行还没建，新露出来的下半屏就会先空
+        // 一拍（外层白卡也跟着只铺到半屏），看起来就是「歌曲先显示一半，剩下的一会儿才
+        // 加载出来」。半模态那一侧的根治是 `scrollSizeMode: CONTINUOUS`（见 pages/Index.ets
+        // 播放列表 bindSheet 的说明），这里再用缓存把「刚长出来的那几行」提前备好，
+        // 两处配合才不会有空窗期。
+        // 行高 66：半屏约露 4~5 行、满屏约 9 行，长高那一下最多要补 5 行，缓存 6 行就够，
+        // 顺带给快速滑动留一点余量。与 SongListPane / SearchView 那两处 `cachedCount(3)`
+        // 同一口径（那两处行更高，所以行数少一些）。
+        .cachedCount(6)
       }
 
       Column().height(this.bottomInset + 8).width('100%')

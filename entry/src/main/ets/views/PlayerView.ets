@@ -1,13 +1,14 @@
 import { PlaySession, SongItem } from '../core/player/PlaySession';
 import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME,
-  K_CURRENT_QUALITY, K_CURRENT_SINGER, K_DURATION, K_LYRIC_LINES, K_LYRIC_STATUS, K_PLAYER_STATUS,
-  K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
+  K_CURRENT_QUALITY, K_CURRENT_SINGER, K_CURRENT_SOURCE, K_DURATION, K_LYRIC_LINES, K_LYRIC_STATUS,
+  K_PLAYER_STATUS, K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
   K_SHOW_MINI_LYRIC } from '../core/settings/PlaySettings';
-import { I_CAST, I_CHECK_CIRCLE, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE, I_NEXT, I_ORDER_PLAY,
-  I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE, IconGlyph } from '../ui/Icons';
-import { CoverArt, FavoriteHeart } from '../ui/Widgets';
+import { I_CAST, I_CHECK_CIRCLE, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE,
+  I_NEXT, I_ORDER_PLAY, I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE,
+  IconGlyph } from '../ui/Icons';
+import { CoverArt, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { AVCastPicker, AVCastPickerStyle } from '@kit.AVSessionKit';
 import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
@@ -97,6 +98,20 @@ export struct PlayerView {
    */
   onKeepScreenOn: (on: boolean) => void = () => {
   };
+  /**
+   * 覆盖物（评论 / 更多 / 音质 / 匹配歌词）开着没有：壳层据此决定系统返回键先收哪一层
+   *
+   * 壳层拿不到子组件的状态，所以在下面四个 @State 上挂 @Watch，任何一个开合都上报一次。
+   */
+  onOverlayChange: (open: boolean) => void = () => {
+  };
+  /**
+   * 壳层发来的「返回键」信号（每按一次 +1）
+   *
+   * 播放页是系统全屏模态，返回键本来是直接被壳层收掉的；壳层发现覆盖物开着时会改成
+   * 把这个信号 +1 交过来，由这里把最上面那层收掉。见 pages/Index.ets 的 onWillDismiss。
+   */
+  @Prop @Watch('onBackRequested') backTick: number = 0;
 
   @StorageLink(K_SHOW_MINI_LYRIC) showMiniLyric: boolean = false;
   @StorageLink(K_LYRIC_BLUR) lyricBlur: boolean = true;
@@ -107,6 +122,8 @@ export struct PlayerView {
   @StorageLink(K_CURRENT_ID) @Watch('onCurrentIdChanged') currentId: string = '';
   @StorageLink(K_CURRENT_NAME) name: string = '';
   @StorageLink(K_CURRENT_SINGER) singer: string = '';
+  /** 当前这首的来源平台：点歌手名时用它去对应的平台认人（见 ui/ArtistNav.ets） */
+  @StorageLink(K_CURRENT_SOURCE) currentSource: string = '';
   @StorageLink(K_CURRENT_COVER) cover: string = '';
   @StorageLink(K_CURRENT_ART) art: boolean = false;
   @StorageLink(K_CURRENT_QUALITY) quality: string = '128k';
@@ -123,14 +140,14 @@ export struct PlayerView {
   @StorageLink(K_LYRIC_STATUS) lyricStatus: string = 'none';
   @StorageLink(K_PLAY_MODE) playMode: string = 'list';
   @State pageIndex: number = 0;
-  /** 右下角「更多」的底部面板是否展开 */
-  @State moreOpen: boolean = false;
+  /** 右下角「更多」的底部面板是否展开（开合都上报壳层，返回键要用，见 onOverlayChange） */
+  @State @Watch('syncOverlayState') moreOpen: boolean = false;
   /** 「匹配歌词」面板是否展开（本地歌专用） */
-  @State matchOpen: boolean = false;
+  @State @Watch('syncOverlayState') matchOpen: boolean = false;
   /** 音质面板是否展开（进度条下面那颗音质钮点出来的） */
-  @State qualityOpen: boolean = false;
+  @State @Watch('syncOverlayState') qualityOpen: boolean = false;
   /** 评论页是否展开（铺满播放器的自绘覆盖物，见 CommentSheet 开头的说明） */
-  @State commentOpen: boolean = false;
+  @State @Watch('syncOverlayState') commentOpen: boolean = false;
   /** 当前唱到的歌词行；-1 = 没有时间轴/还没开始 */
   @State activeLine: number = -1;
   /**
@@ -172,6 +189,43 @@ export struct PlayerView {
     // 播放器收起就把常亮还回去，别让这个窗口一直钉在亮屏上
     this.onKeepScreenOn(false);
     this.stopCoverSpring();
+  }
+
+  // ------------------------------------------------------------ 返回键（覆盖物优先）
+
+  /** 有没有自绘覆盖物开着（有的话返回键先收它，而不是收起整个播放页） */
+  private hasOverlay(): boolean {
+    return this.commentOpen || this.matchOpen || this.qualityOpen || this.moreOpen;
+  }
+
+  /** 四个 @State 任何一个开合都走这里：把「有没有覆盖物」上报给壳层 */
+  syncOverlayState(): void {
+    this.onOverlayChange(this.hasOverlay());
+  }
+
+  /**
+   * 壳层把返回键交过来了：收掉最上面那层
+   *
+   * 顺序与视觉层级一致：评论铺满在最上面，其次匹配歌词 / 音质面板，最后是「更多」。
+   * 一层都没有时（理论上走不到：壳层只在有覆盖物时才转过来）兜底收起播放页，
+   * 免得状态不同步时按返回键什么都不发生。
+   */
+  onBackRequested(): void {
+    if (!this.hasOverlay()) {
+      this.onClose();
+      return;
+    }
+    if (this.commentOpen) {
+      this.commentOpen = false;
+    } else if (this.matchOpen) {
+      this.matchOpen = false;
+    } else if (this.qualityOpen) {
+      this.qualityOpen = false;
+    } else {
+      this.moreOpen = false;
+    }
+    // @Watch 已经会上报，这里再同步一次只是顺手，保证与壳层一致
+    this.syncOverlayState();
   }
 
   /** 播放状态变了：让封面弹到对应的目标尺寸（弹簧过程由 startCoverSpring 推进） */
@@ -817,6 +871,9 @@ export struct PlayerView {
   commentOverlay() {
     CommentSheet({
       songName: this.name,
+      // 播放器是铺到状态栏底下的全屏模态（见本文件末尾的 expandSafeArea），
+      // 评论页这一层也铺满，顶栏得自己让出状态栏那一段
+      topInset: this.topInset,
       bottomInset: this.bottomInset,
       needsMatch: this.isCurrentLocal() || this.isCurrentWebDav(),
       onResolveTarget: () => this.resolveCommentTarget(),
@@ -1061,13 +1118,21 @@ export struct PlayerView {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .textAlign(TextAlign.Start)
-          Text(this.singer)
-            .fontSize(13.5)
-            .fontColor('#A6FFFFFF')
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-            .textAlign(TextAlign.Start)
+          /**
+           * 歌手那一行：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
+           *
+           * 挂着几位歌手时不由这里挑 —— 交给壳层先开「选择歌手」那一页
+           * （见 ui/ArtistNav.ets 与 pages/Index.ets 的 openArtistFromSinger）。
+           * 本地歌 / 云端歌没有平台来源，认不出人，那一行保持不可点。
+           * onDark：播放页是整块深色底，主题那几个正文色 token 在这儿看不清。
+           */
+          SingerLink({
+            singer: this.singer,
+            source: this.currentSource,
+            fontSize: 13.5,
+            onDark: true,
+            chevronSize: 12,
+          })
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
@@ -1681,11 +1746,19 @@ export struct PlayerView {
     .width('100%')
     .height('100%')
     .backgroundColor('#0C0C0E')
+    /**
+     * 播放页现在是全屏模态（bindContentCover，见 pages/Index.ets）：顶边就是窗口顶，
+     * 不再像半模态那样自带一条让位。所以这里把背景铺到状态栏与手势条底下，
+     * 内容（顶栏 / 底栏）各自按 topInset / bottomInset 让位。
+     */
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .gesture(
       PanGesture({ direction: PanDirection.Vertical, distance: 12 })
         .onActionEnd((event: GestureEvent) => {
-          // 「更多」/「音质」/「评论」面板开着时不下滑关闭：在面板上往下拖不该把整个播放器收掉
-          if (!this.moreOpen && !this.qualityOpen && !this.commentOpen && event.offsetY > 70) {
+          // 「更多」/「音质」/「匹配歌词」/「评论」面板开着时不下滑关闭：在面板上往下拖
+          // 不该把整个播放器收掉（与返回键同一条规则，见 onBackRequested）
+          if (!this.moreOpen && !this.qualityOpen && !this.matchOpen && !this.commentOpen
+            && event.offsetY > 70) {
             this.onClose();
           }
         })

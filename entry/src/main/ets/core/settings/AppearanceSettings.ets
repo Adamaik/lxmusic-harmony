@@ -16,6 +16,7 @@ const SETTINGS_VERSION: number = 1;
  *   玻璃材质档位（跟随系统 / 弱 / 均衡 / 强）
  *   深浅模式（跟随系统 / 浅色 / 深色）
  *   播放页封面圆角
+ *   底部悬浮栏左右跟手（开 / 关）
  *
  * 深浅模式是**真的能切**的：界面颜色已经全部迁到资源 token
  * （`resources/base` 与 `resources/dark` 下的同名色，见 ui/Theme.ets），
@@ -31,12 +32,35 @@ const SETTINGS_VERSION: number = 1;
  * 但自适应在不同机型上表现差别很大（有的机型为了省电把玻璃压得很淡，
  * 看上去就像没生效），所以把选择权交给用户，标题栏、底部页签栏、半模态三处
  * 一起跟着变（见 ui/Hds.ets 的 buildTitleMaterial）。
+ *
+ * 底部悬浮栏的左右跟手也落在这里：它是悬浮栏（外观的一部分）的排法，跟材质档位、深浅模式
+ * 同一类。开着的时候，那条悬浮栏不再恒定居中，而是贴到**握持手那一侧**（右手握持贴右、
+ * 左手握持贴左，拇指够得着）—— 只在「栏比窗口窄」时看得出来（折叠屏展开态 / 平板 / 横屏），
+ * 手机竖屏两条栏本来就铺满，看不出来。
+ *
+ * 它**不动**栏里的左右次序：折叠成的那颗球永远是那一组的左端元素（组的内部次序是 HDS
+ * 固定的，官方没给换的接口）。这一点在真机上验过（换手时球不会跑到右边），设置页那行
+ * 提示里也照实写着，免得照着「球会换边」去试、试不出来以为坏了。
+ *
+ * 跟手这件事不用应用自己做：悬浮栏的样式里本来就是一项开关，界面侧只是把用户的意愿传给它。
+ * 一共两条实现、三处调用，都要接同一个值：
+ *   - 壳层底部那条（页签栏 + 迷你栏）：HDS 的 `barFloatingStyle.adaptToHandedness`
+ *     （6.1.0/23 起，见 pages/Index.ets）；
+ *   - 歌单详情 / 在线详情 / 四个面板页那条页内播放条：ArkUI 原生的
+ *     `Tabs.barFloatingStyle` → `FloatingTabBarStyle.adaptToHandedness`（26.0.0 起，
+ *     见 views/PlaylistDetailView、views/OnlineListView、views/PanePage）。
+ * 官方对两者的说明都只有一句「左右跟手开关 / 是否跟随操作手左右布局显示」，
+ * HDS 那份额外注明「依赖底层硬件，部分历史设备硬件能力不支持」，都没有权限要求。
  */
 
 /** 界面订阅这些 key 就能拿到最新设置（@StorageLink） */
 export const K_MATERIAL_LEVEL: string = 'cfg_material_level';
 export const K_COVER_RADIUS: string = 'cfg_cover_radius';
 export const K_COLOR_MODE: string = 'cfg_color_mode';
+export const K_NAV_FOLLOW_HAND: string = 'cfg_nav_follow_hand';
+
+/** 悬浮栏左右跟手：默认**开**（单手握着时栏本来该在拇指这一侧，居中是大屏下够不到两端的根源） */
+export const NAV_FOLLOW_HAND_DEFAULT: boolean = true;
 
 /** 深浅模式档位：0 跟随系统 / 1 浅色 / 2 深色 */
 export const COLOR_MODE_LABELS: string[] = ['跟随系统', '浅色', '深色'];
@@ -73,6 +97,7 @@ interface AppearanceSettingsData {
   materialLevel?: number;
   coverRadius?: number;
   colorMode?: number;
+  followHand?: boolean;
 }
 
 export class AppearanceSettings {
@@ -95,6 +120,8 @@ export class AppearanceSettings {
   private coverRadius: number = COVER_RADIUS_DEFAULT;
   /** 深浅模式默认「跟随系统」 */
   private colorMode: number = 0;
+  /** 底部导航栏左右跟手：默认开 */
+  private followHand: boolean = NAV_FOLLOW_HAND_DEFAULT;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -138,6 +165,7 @@ export class AppearanceSettings {
       materialLevel: this.materialLevel,
       coverRadius: this.coverRadius,
       colorMode: this.colorMode,
+      followHand: this.followHand,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -167,6 +195,10 @@ export class AppearanceSettings {
     if (mode !== undefined) {
       this.colorMode = clampColorMode(mode);
     }
+    const hand: boolean | undefined = data.followHand;
+    if (hand !== undefined) {
+      this.followHand = hand;
+    }
   }
 
   /** 把内存里的值同步到 AppStorage，界面据此实时刷新 */
@@ -175,6 +207,7 @@ export class AppearanceSettings {
       AppStorage.setOrCreate(K_MATERIAL_LEVEL, this.materialLevel);
       AppStorage.setOrCreate(K_COVER_RADIUS, this.coverRadius);
       AppStorage.setOrCreate(K_COLOR_MODE, this.colorMode);
+      AppStorage.setOrCreate(K_NAV_FOLLOW_HAND, this.followHand);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -194,6 +227,10 @@ export class AppearanceSettings {
 
   getColorMode(): number {
     return this.colorMode;
+  }
+
+  isFollowHand(): boolean {
+    return this.followHand;
   }
 
   /**
@@ -259,5 +296,21 @@ export class AppearanceSettings {
     AppStorage.setOrCreate(K_COLOR_MODE, next);
     this.write();
     this.applyColorMode(context);
+  }
+
+  /**
+   * 悬浮栏左右跟手（开 / 关）
+   *
+   * 壳层（pages/Index.ets）与三条页内播放条（views/PanePage、PlaylistDetailView、
+   * OnlineListView）都订阅这个值，喂给各自那条悬浮栏的 `adaptToHandedness`。
+   * 它只影响整条栏贴屏幕哪一侧，不动栏里的次序、也不动页签的次序。
+   */
+  setFollowHand(value: boolean): void {
+    if (value === this.followHand) {
+      return;
+    }
+    this.followHand = value;
+    AppStorage.setOrCreate(K_NAV_FOLLOW_HAND, value);
+    this.write();
   }
 }

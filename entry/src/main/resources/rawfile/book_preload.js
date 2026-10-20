@@ -712,6 +712,263 @@
     return scope;
   }
 
+  // ============================================================ 6.5 Rhino 的 Java 互操作
+
+  /**
+   * 阅读的书源跑在 Rhino 里，`Packages.xxx` / `java.lang.String` 能直接拿到真实 Java 类；
+   * 有些源的 jsLib 就靠这个做解密（听友FM 的 XChaCha20Poly1305、懒人听书本地源的
+   * android.util.Base64）。ArkWeb 里没有 Packages，规则一跑到那一行就抛
+   * `Packages is not defined`，`listField` 把它吞成空数组 —— 表现是「一本都没有」，
+   * 还看不出错在哪。
+   *
+   * 这里只补**实际用到的**那几个类，不做通用 Java 桥（浏览器里没有意义）：
+   *   java.io.ByteArrayOutputStream、java.lang.String、
+   *   javax.crypto.Cipher（ChaCha20-Poly1305，纯 JS）、spec.SecretKeySpec / GCMParameterSpec、
+   *   android.util.Base64。
+   * 规则是**同步**求值的，所以不能用 WebCrypto（全是 Promise），AEAD 只能自己写。
+   */
+
+  function __chachaRotl(v, n) { return ((v << n) | (v >>> (32 - n))) >>> 0; }
+
+  function __chachaQr(s, a, b, c, d) {
+    s[a] = (s[a] + s[b]) >>> 0; s[d] = __chachaRotl(s[d] ^ s[a], 16);
+    s[c] = (s[c] + s[d]) >>> 0; s[b] = __chachaRotl(s[b] ^ s[c], 12);
+    s[a] = (s[a] + s[b]) >>> 0; s[d] = __chachaRotl(s[d] ^ s[a], 8);
+    s[c] = (s[c] + s[d]) >>> 0; s[b] = __chachaRotl(s[b] ^ s[c], 7);
+  }
+
+  /** ChaCha20 的一个 64 字节密钥块（IETF 版：32 位计数器 + 12 字节 nonce） */
+  function __chachaBlock(key, counter, nonce) {
+    var st = new Uint32Array(16);
+    st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
+    for (var i = 0; i < 8; i++) {
+      st[4 + i] = (key[i * 4] | (key[i * 4 + 1] << 8) | (key[i * 4 + 2] << 16) | (key[i * 4 + 3] << 24)) >>> 0;
+    }
+    st[12] = counter >>> 0;
+    for (var j = 0; j < 3; j++) {
+      st[13 + j] = (nonce[j * 4] | (nonce[j * 4 + 1] << 8) | (nonce[j * 4 + 2] << 16) | (nonce[j * 4 + 3] << 24)) >>> 0;
+    }
+    var w = st.slice(0);
+    for (var r = 0; r < 10; r++) {
+      __chachaQr(st, 0, 4, 8, 12); __chachaQr(st, 1, 5, 9, 13); __chachaQr(st, 2, 6, 10, 14); __chachaQr(st, 3, 7, 11, 15);
+      __chachaQr(st, 0, 5, 10, 15); __chachaQr(st, 1, 6, 11, 12); __chachaQr(st, 2, 7, 8, 13); __chachaQr(st, 3, 4, 9, 14);
+    }
+    var out = new Uint8Array(64);
+    for (var k = 0; k < 16; k++) {
+      var v = (st[k] + w[k]) >>> 0;
+      out[k * 4] = v & 255; out[k * 4 + 1] = (v >>> 8) & 255;
+      out[k * 4 + 2] = (v >>> 16) & 255; out[k * 4 + 3] = (v >>> 24) & 255;
+    }
+    return out;
+  }
+
+  function __chachaXor(key, counter, nonce, data) {
+    var out = new Uint8Array(data.length);
+    var off = 0;
+    var c = counter >>> 0;
+    while (off < data.length) {
+      var ks = __chachaBlock(key, c, nonce);
+      for (var i = 0; i < 64 && off < data.length; i++, off++) { out[off] = data[off] ^ ks[i]; }
+      c = (c + 1) >>> 0;
+    }
+    return out;
+  }
+
+  /** Poly1305（RFC 8439），130 位乘法交给 BigInt，省得自己拼 limb */
+  function __poly1305(key, msg) {
+    var i;
+    var r = 0n;
+    for (i = 15; i >= 0; i--) { r = (r << 8n) | BigInt(key[i]); }
+    r &= 0x0ffffffc0ffffffc0ffffffc0fffffffn;
+    var s = 0n;
+    for (i = 15; i >= 0; i--) { s = (s << 8n) | BigInt(key[16 + i]); }
+    var p = (1n << 130n) - 5n;
+    var acc = 0n;
+    for (var off = 0; off < msg.length; off += 16) {
+      var n = msg.subarray(off, Math.min(off + 16, msg.length));
+      var v = 0n;
+      for (i = n.length - 1; i >= 0; i--) { v = (v << 8n) | BigInt(n[i]); }
+      v |= (1n << BigInt(n.length * 8));
+      acc = ((acc + v) * r) % p;
+    }
+    acc = (acc + s) & ((1n << 128n) - 1n);
+    var tag = new Uint8Array(16);
+    for (i = 0; i < 16; i++) { tag[i] = Number((acc >> BigInt(i * 8)) & 255n); }
+    return tag;
+  }
+
+  /** ChaCha20-Poly1305 AEAD 解密：`sealed` = 密文 || 16 字节标签（`aad` 可省，默认空） */
+  function __aeadDecrypt(key, nonce, sealed, aad) {
+    if (sealed.length < 16) { throw new Error('ChaCha20-Poly1305：密文短于 16 字节'); }
+    var ct = sealed.subarray(0, sealed.length - 16);
+    var tag = sealed.subarray(sealed.length - 16);
+    var ad = (aad === undefined || aad === null) ? new Uint8Array(0) : __bytesOf(aad);
+    var polyKey = __chachaBlock(key, 0, nonce).subarray(0, 32);
+    // MAC 的输入：aad || pad16 || 密文 || pad16 || len(aad) || len(密文)（RFC 8439 §2.8）
+    var adPad = (16 - (ad.length % 16)) % 16;
+    var ctPad = (16 - (ct.length % 16)) % 16;
+    var macLen = ad.length + adPad + ct.length + ctPad + 16;
+    var macData = new Uint8Array(macLen);
+    var at = 0;
+    macData.set(ad, at);
+    at += ad.length + adPad;
+    macData.set(ct, at);
+    var alen = ad.length;
+    var clen = ct.length;
+    for (var b = 0; b < 8; b++) {
+      macData[macLen - 16 + b] = b < 4 ? ((alen >>> (8 * b)) & 255) : 0;
+      macData[macLen - 8 + b] = b < 4 ? ((clen >>> (8 * b)) & 255) : 0;
+    }
+    var mac = __poly1305(polyKey, macData);
+    var diff = 0;
+    for (var i = 0; i < 16; i++) { diff |= mac[i] ^ tag[i]; }
+    if (diff !== 0) { throw new Error('ChaCha20-Poly1305：标签校验不过（密钥/密文/随机数对不上）'); }
+    return __chachaXor(key, 1, nonce, ct);
+  }
+
+  function __bytesOf(x) {
+    if (x instanceof Uint8Array) { return x; }
+    if (x && x.length !== undefined) { return new Uint8Array(Array.prototype.slice.call(x)); }
+    return new Uint8Array(0);
+  }
+
+  /** UTF-8 自己解：不依赖宿主的 TextDecoder（沙箱与无设备自检环境并不都提供它） */
+  function __utf8Decode(b) {
+    var out = '';
+    var i = 0;
+    while (i < b.length) {
+      var c = b[i++];
+      if (c < 0x80) { out += String.fromCharCode(c); continue; }
+      var extra = 0;
+      var cp = 0;
+      if ((c & 0xe0) === 0xc0) { extra = 1; cp = c & 0x1f; }
+      else if ((c & 0xf0) === 0xe0) { extra = 2; cp = c & 0x0f; }
+      else if ((c & 0xf8) === 0xf0) { extra = 3; cp = c & 0x07; }
+      else { out += '\ufffd'; continue; }
+      if (i + extra > b.length) { out += '\ufffd'; break; }
+      for (var k = 0; k < extra; k++) { cp = (cp << 6) | (b[i++] & 0x3f); }
+      if (cp > 0xffff) {
+        cp -= 0x10000;
+        out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+      } else {
+        out += String.fromCharCode(cp);
+      }
+    }
+    return out;
+  }
+
+  function __bytesToString(bytes, charset) {
+    var b = __bytesOf(bytes);
+    var cs = String(charset === undefined || charset === null ? 'UTF-8' : charset).toUpperCase();
+    if (cs === 'UTF-8' || cs === 'UTF8') { return __utf8Decode(b); }
+    // 非 UTF-8 少见（书源解密出来的都是 JSON），有 TextDecoder 就借一下
+    try {
+      if (typeof TextDecoder !== 'undefined') { return new TextDecoder(cs.toLowerCase()).decode(b); }
+    } catch (e) { /* 落回 UTF-8 */ }
+    return __utf8Decode(b);
+  }
+
+  var B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+  function __base64NoWrap(b) {
+    var out = '';
+    for (var i = 0; i < b.length; i += 3) {
+      var b0 = b[i];
+      var b1 = i + 1 < b.length ? b[i + 1] : -1;
+      var b2 = i + 2 < b.length ? b[i + 2] : -1;
+      out += B64_CHARS.charAt(b0 >> 2);
+      out += B64_CHARS.charAt(((b0 & 3) << 4) | (b1 < 0 ? 0 : (b1 >> 4)));
+      out += b1 < 0 ? '=' : B64_CHARS.charAt(((b1 & 15) << 2) | (b2 < 0 ? 0 : (b2 >> 6)));
+      out += b2 < 0 ? '=' : B64_CHARS.charAt(b2 & 63);
+    }
+    return out;
+  }
+
+  /**
+   * `new java.lang.String(bytes, charset)` —— 书源拿它把解密结果转成字符串
+   *
+   * 必须返回 **String 包装对象**，不能是原始字符串：`new F()` 里 F 返回原始值时
+   * JS 会丢掉它、改返回新对象，于是 JSON.parse 收到 "[object Object]"。
+   * 包装对象当字符串用没区别（拼接 / JSON.parse / .length / 下标都行）。
+   */
+  function javaLangString(bytes, charset) {
+    return new String(__bytesToString(bytes, charset));
+  }
+
+  var JAVA_PKG_CACHE = null;
+
+  /** 建出 `Packages` / `javax` / `android` 这几个门面（建一次就缓存） */
+  function buildJavaPackages() {
+    function ByteArrayOutputStream() {
+      var buf = [];
+      this.write = function (v) { buf.push(v & 255); };
+      this.toByteArray = function () { return new Uint8Array(buf); };
+    }
+
+    function SecretKeySpec(key, alg) { this.bytes = __bytesOf(key); this.alg = alg; }
+    function GCMParameterSpec(tagLen, iv) { this.tagLen = tagLen; this.iv = __bytesOf(iv); }
+
+    var DECRYPT_MODE = 2;
+    var ENCRYPT_MODE = 1;
+
+    function Cipher() {
+      this.__alg = '';
+      this.__mode = 0;
+      this.__key = null;
+      this.__iv = null;
+      this.__aad = null;
+      this.init = function (mode, key, spec) {
+        this.__mode = mode;
+        this.__key = key && key.bytes !== undefined ? key.bytes : __bytesOf(key);
+        this.__iv = spec && spec.iv !== undefined ? spec.iv : (spec ? __bytesOf(spec) : null);
+      };
+      this.updateAAD = function (aad) { this.__aad = __bytesOf(aad); };
+      this.doFinal = function (input) {
+        var data = __bytesOf(input);
+        if (String(this.__alg).toUpperCase().indexOf('CHACHA20-POLY1305') >= 0) {
+          if (this.__mode !== DECRYPT_MODE) { throw new Error('沙箱只实现了 ChaCha20-Poly1305 解密'); }
+          return __aeadDecrypt(this.__key, this.__iv, data, this.__aad);
+        }
+        throw new Error('沙箱没有实现这个算法：' + this.__alg);
+      };
+    }
+    Cipher.getInstance = function (name) {
+      var c = new Cipher();
+      c.__alg = String(name === undefined || name === null ? '' : name);
+      return c;
+    };
+    Cipher.DECRYPT_MODE = DECRYPT_MODE;
+    Cipher.ENCRYPT_MODE = ENCRYPT_MODE;
+
+    var Base64 = {
+      /** Android 的 `Base64.encodeToString(bytes, flags)`，flags 2 = NO_WRAP（不折行） */
+      encodeToString: function (bytes, flags) {
+        var out = __base64NoWrap(__bytesOf(bytes));
+        if ((Number(flags) & 2) === 0) { out = out.replace(/(.{76})/g, '$1\n'); }
+        return out;
+      },
+    };
+
+    return {
+      java: {
+        io: { ByteArrayOutputStream: ByteArrayOutputStream },
+        lang: { String: javaLangString },
+      },
+      javax: {
+        crypto: {
+          Cipher: Cipher,
+          spec: { SecretKeySpec: SecretKeySpec, GCMParameterSpec: GCMParameterSpec },
+        },
+      },
+      android: { util: { Base64: Base64 } },
+    };
+  }
+
+  function javaPackages() {
+    if (JAVA_PKG_CACHE === null) { JAVA_PKG_CACHE = buildJavaPackages(); }
+    return JAVA_PKG_CACHE;
+  }
+
   // ============================================================ 7. 规则求值
 
   /** 求值上下文 */
@@ -729,8 +986,13 @@
 
   function jsBindings(ctx) {
     var java = javaApi(ctx);
+    var pkg = javaPackages();
     return {
       java: java,
+      // Rhino 的 Java 互操作门面（见第 6.5 节）：jsLib 里的函数是在全局作用域跑的，
+      // publishGlobals 会把这两个也挂成全局量，书源里的 `Packages.` / 裸 `javax.` 才认
+      Packages: pkg,
+      javax: pkg.javax,
       cache: cache,
       source: sourceApi(),
       book: ctx.book,
@@ -791,6 +1053,8 @@
   /** java.* 门面（对应阅读的 AnalyzeRule 自己） */
   function javaApi(ctx) {
     var api = {
+      // `new java.lang.String(bytes, 'UTF-8')` —— 解密类 jsLib 用它把 byte[] 转字符串
+      lang: { String: javaLangString },
       ajax: function (url, header) { return ajax(url, header); },
       connect: function (url, header) { return connect(url, header); },
       /**
@@ -1417,6 +1681,26 @@
     }
   }
 
+  /**
+   * 这一次要用哪一组规则
+   *
+   * 发现（explore）在阅读里是**会退回搜索规则**的：exploreUrl 有、ruleExplore 却空
+   * 的时候，用 ruleSearch 去解析发现页。导出的书源里这种情况很常见 —— 有的把
+   * ruleExplore 写成空对象，有的干脆是个空数组（`"ruleExplore": []`）。阅读 BookList.kt
+   * 的判据是 `getExploreRule().bookList.isNullOrBlank() -> getSearchRule()`，这里照抄。
+   *
+   * 不退回的后果是「分类列得出来、点进去一本没有」，而且**不报错**，很难查。
+   */
+  function searchRulesFor(source, isExplore) {
+    if (!isExplore) { return source.ruleSearch || {}; }
+    var explore = source.ruleExplore;
+    var list = explore ? explore.bookList : null;
+    if (list !== null && list !== undefined && String(list).trim().length > 0) {
+      return explore;
+    }
+    return source.ruleSearch || {};
+  }
+
   /** 搜索 / 发现：走 searchUrl / exploreUrl 拿到列表页，再按 ruleSearch / ruleExplore 拆条目 */
   function doSearch(job, isExplore) {
     var source = job.source;
@@ -1435,7 +1719,7 @@
     ctx.src = body;
     ctx.baseUrl = typeof url === 'string' && url.indexOf('http') === 0 ? url : String(source.bookSourceUrl || '');
 
-    var rules = isExplore ? source.ruleExplore : source.ruleSearch;
+    var rules = searchRulesFor(source, isExplore);
     var elements = listField(rules, 'bookList', ctx);
     var out = [];
     for (var i = 0; i < elements.length && i < 200; i++) {
@@ -1463,6 +1747,35 @@
     return out;
   }
 
+  /**
+   * 地址里的**可选段** `<,_{{page}}>`
+   *
+   * 书源这么写的意思是「第一页没有这一段」—— 阅读的规则说明里给的就是它，
+   * 等价于 `{{page - 1 == 0 ? "": page}}`。例如 `/booklist/1<,_{{page}}>.html`：
+   * 第一页是 `/booklist/1.html`，第二页起才是 `/booklist/1_2.html`。
+   *
+   * 引擎原先不认这个语法：`{{page}}` 照样被替换成 1，地址里带着 `<,1>` 就去请求了 ——
+   * 幻听网这类源于是**第一页就 404**，看着像「站点挂了」，其实是地址拼错。
+   *
+   * `<js>` / `</js>` 与 `@js:` 里的比较运算符不能动，所以只认「像可选段」的：
+   * 首项为空（`,xxx`）或内含 `{{...}}`。
+   */
+  function resolveOptionalSegments(text, page) {
+    var s = String(text || '');
+    if (s.indexOf('<') < 0) { return s; }
+    return s.replace(/<([^<>]*)>/g, function (whole, inner) {
+      var body = String(inner);
+      if (body.charAt(0) !== ',' && body.indexOf('{{') < 0) { return whole; }
+      if (Number(page) <= 1) { return ''; }
+      // 第一页以外：那个空首项是「第一页的形态」，跳过它取第一个有内容的候选
+      var alts = body.split(',');
+      for (var i = 0; i < alts.length; i++) {
+        if (String(alts[i]).trim().length > 0) { return alts[i]; }
+      }
+      return '';
+    });
+  }
+
   /** 书源地址可能是相对路径：优先用书源自己的域名拼 */
   function buildUrl(rawRule, ctx, jsOnly, explicitUrl) {
     var text = String(rawRule || '').trim();
@@ -1483,7 +1796,7 @@
       var v2 = runJS(code2, ctx);
       return v2 === null || v2 === undefined ? '' : String(v2).trim();
     }
-    var made = makeUpRule(text, ctx, jsOnly).trim();
+    var made = makeUpRule(resolveOptionalSegments(text, ctx.page), ctx, jsOnly).trim();
     // 搜索 / 发现地址允许写成相对路径（`/search.php?...`），用书源自己的站址补全
     if (made.length > 0 && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(made)) {
       made = absolute(String(lastSourceUrl() || ''), made);
@@ -1695,31 +2008,43 @@
 
   // ============================================================ 10. 入口
 
+  /**
+   * exploreUrl → 分类表（**与 BookEngine.exploreCategories 同一口径**，改一处要改两处）
+   *
+   * 两种静态写法：JSON 数组，与「标题::地址」。后者**用 `&&` 或换行隔开都算**
+   * （56听书的分类表整条都在一行里、用 `&&` 串起来）；`url` 为空的是分组标题，跳过。
+   * `@js:` 那种整段脚本自己生成分类表的写法这里不处理（要跑沙箱，见 BookEngine 的说明）。
+   */
   function parseExplore(source) {
     var raw = String(source.exploreUrl || '').trim();
     var out = [];
     if (raw.length === 0) { return out; }
     if (raw.charAt(0) === '[') {
-      try {
-        var arr = JSON.parse(raw);
+      // 宽松解析：分类表里带尾逗号很常见（幸福听书整张表最后一项后面就多一个逗号），
+      // 阅读的 Gson 吃得下，严格的 JSON.parse 会直接抛
+      var arr = parseLooseJson(raw);
+      if (arr && arr.length !== undefined) {
         for (var i = 0; i < arr.length; i++) {
           var it = arr[i];
           if (!it) { continue; }
-          var title = String(it.title || '');
-          var url = String(it.url || '');
-          if (title.length === 0) { continue; }
+          var title = String(it.title || '').trim();
+          var url = String(it.url || '').trim();
+          if (title.length === 0 || url.length === 0) { continue; }
           out.push({ title: title, url: url });
         }
         return out;
-      } catch (e) { /* 退回逐行格式 */ }
+      }
     }
-    var lines = raw.split('\n');
+    var lines = raw.split(/&&|\n/);
     for (var j = 0; j < lines.length; j++) {
       var line = String(lines[j]).trim();
       if (line.length === 0) { continue; }
       var idx = line.indexOf('::');
       if (idx < 0) { continue; }
-      out.push({ title: line.slice(0, idx).trim(), url: line.slice(idx + 2).trim() });
+      var t = line.slice(0, idx).trim();
+      var u = line.slice(idx + 2).trim();
+      if (t.length === 0 || u.length === 0) { continue; }
+      out.push({ title: t, url: u });
     }
     return out;
   }

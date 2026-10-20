@@ -242,3 +242,66 @@ export function publishedMiniBarWidth(windowWidth: number, miniExpanded: boolean
   }
   return barMetricsFor(windowWidth, miniExpanded).miniBarWidth;
 }
+
+// ---------------------------------------------------------------- HdsTabs 迷你栏的分档宽度
+
+/**
+ * HDS 写死的迷你栏宽度上限
+ *
+ * 官方文档（HdsTabs 的 `miniBarWidth`）：「迷你栏**展开时**，分档宽度。最大宽度不超过 328vp。」
+ * 分档口径与页签栏相同：< 440vp / 440–600vp / ≥ 840vp（或 600–840vp 且高宽比 > 0.8）。
+ */
+export const MINI_BAR_WIDTH_MAX: number = 328;
+
+/** 迷你栏展开态的三个分档宽度 */
+export interface MiniBarWidthTiers {
+  smallWidth: number;
+  mediumWidth: number;
+  largeWidth: number;
+}
+
+/**
+ * HdsTabs 迷你栏展开时该给多宽（三个分档一次算完）
+ *
+ * 为什么要自己给：不声明 `miniBarWidth` 就等于把宽度交给 HDS 的默认值，而那个默认值
+ * 只保证「装得下内容」—— 实测展开态就是圆封面 + 三个控制钮的自然宽（≈200vp），
+ * **不随窗口变宽而变长**。偏偏歌名那一列是 `layoutWeight(1)`（见 views/MiniBar.ets），
+ * 按内容量宽时它自己一分宽度都拿不到，于是歌名被截成一两个字、右边整条空间空着。
+ * 官方示例里的迷你栏内容只有一颗 48 的圆钮加一行字，正是靠「内容多宽就多宽」才看着正常，
+ * 我们这种「封面 + 歌名 + 三个钮」的排版必须自己把宽度说出来。
+ *
+ * **每一档按它自己那条居中规则留位置** —— 官方文档「迷你栏和页签栏处于左右布局场景」一节
+ * 对三个宽度档给的是**三条不同的规则**，这也是这里唯一容易写错的地方：
+ *   - 小档（< 440vp）：「页签栏和迷你栏将**整体**底部居中」→ 整组（圆钮 + 缝 + 迷你栏）
+ *     一起居中，所以只要整组放进左右边距之内就够了；
+ *   - 中档（440–600vp）：「**展开的**页签栏或迷你栏将底部居中」→ 折叠的那条**仍然贴在
+ *     左边距上**（实机上就是圆钮钉在左边、展开的迷你栏单独居中），所以除了左右边距，
+ *     还要在**两侧各**再让出「边距 + 圆钮 + 缝」—— 迷你栏居中后左端正好落在圆钮右边缘上
+ *     就是这个原因（实机反馈「和左边缩回去的按钮重叠、中间没留间距」）；
+ *   - 大档（≥ 600vp）：两条栏**同时展开**、整组居中 → 先让出页签栏声明的那一档宽度，
+ *     再两侧留边距。边距取 HDS 在 600vp 以上的最小值 24vp（> 840vp 它给 32vp，更保守）。
+ *
+ * 圆钮宽度按「一颗圆钮 = 栏高」取 {@link MINI_BAR_COLLAPSED}（56vp），缝取与页内那条
+ * 迷你栏同一个常量 {@link BAR_GAP}，HDS 在 < 600vp 的默认边距是 16vp。
+ *
+ * 窗口宽 0（还没量到）时按 360vp 的手机算：宁可先给窄，量到之后壳层会重算。
+ *
+ * 之前这里是一律不声明 —— 那一版之所以坏，是因为曾经给**所有档**塞过同一个 286~328：
+ * 小档（手机 360vp）可用宽度只有 328vp，286 + 56 + 8 已经放不下，就在页签栏右边压出一条。
+ * 现在按档算，并且中档不再套用小档的算法（中档是「展开那条单独居中」，要两侧都让）。
+ *
+ * @param windowWidth 窗口宽度（vp）；0 = 还没量到
+ * @param tabBarLargeWidth 大档下页签栏声明给 HDS 的宽度（见 Index.ets 的 barWidth.largeWidth）
+ */
+export function miniBarWidthTiersFor(windowWidth: number, tabBarLargeWidth: number): MiniBarWidthTiers {
+  const w: number = windowWidth > 0 ? windowWidth : 360;
+  /** HDS 在 < 600vp 的默认栏边距 */
+  const side: number = 16;
+  // 小档：整组居中 → 让出一颗圆钮和一条缝，两侧对称留边距
+  const groupCentered: number = clamp(w - side * 2 - MINI_BAR_COLLAPSED - BAR_GAP, MINI_BAR_WIDTH_MIN, MINI_BAR_WIDTH_MAX);
+  // 中档：展开的那条**单独**居中，折叠的圆钮还钉在左边距上 → 左右各让一份「边距 + 圆钮 + 缝」
+  const miniCentered: number = clamp(w - (side + MINI_BAR_COLLAPSED + BAR_GAP) * 2, MINI_BAR_WIDTH_MIN, MINI_BAR_WIDTH_MAX);
+  // 大档：两条同时展开、整组居中 → 先让出页签栏，再两侧留边距
+  const bothExpanded: number = clamp(w - 24 * 2 - tabBarLargeWidth - BAR_GAP, MINI_BAR_WIDTH_MIN, MINI_BAR_WIDTH_MAX);
+  return { smallWidth: groupCentered, mediumWidth: miniCentered, largeWidth: bothExpanded };
+}

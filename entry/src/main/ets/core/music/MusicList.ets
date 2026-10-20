@@ -1,20 +1,24 @@
 import { LxRequestOptions, lxRequest } from '../source/LxHttp';
 import {
-  aes128EcbPkcs7DecryptBytes,
   aes128EcbPkcs7EncryptBytes,
-  bytesToUtf8,
   fromBase64,
   md5Hex,
   toBase64,
   utf8Bytes,
 } from './LxCrypto';
+import { decodeAes128EcbPkcs7Text } from './PlatformCrypto';
 import {
   LxMusicInfo,
   LxQualityItem,
+  QS_APP_HEADERS,
+  appendWyExtendQualities,
   decodeName,
   formatPlayTime,
   formatSingerName,
   mgImageUrl,
+  qsCoverOf,
+  qsDeviceQuery,
+  qsTrackToInfo,
   sizeFormate,
 } from './MusicSearch';
 import { musicIdOf } from './MusicId';
@@ -31,8 +35,11 @@ import { musicIdOf } from './MusicId';
  *
  * ⚠️ 网易(wy)：洛雪走 weapi（AES-CBC 双层 + RSA）与 linuxapi，本工程没有移植这套
  * 签名（RSA 未实现），且洛雪那边的 wy 端点已被标记为过期。这里改用网易的明文 web 接口
- * （/api/playlist/list、/api/v6/playlist/detail）做「尽力而为」的实现，可能失效；
- * 失效时界面会显示该平台的错误信息，不影响其它来源。
+ * （/api/playlist/list、/api/v6/playlist/detail、/api/song/detail）做「尽力而为」的实现，
+ * 可能失效；失效时界面会显示该平台的错误信息，不影响其它来源。
+ *
+ * 明文接口有两个坑，细节见 WY_HEADERS 与 wyPlaylistDetail 的注释：请求必须带
+ * `Cookie: os=pc`，且取歌要以 `trackIds` 为准（`tracks` 会被砍成开头的试听预览）。
  */
 
 // ------------------------------------------------------------------ 类型
@@ -92,7 +99,7 @@ export interface OnlineRoute {
 }
 
 /** 支持歌单广场与排行榜的平台（与内置搜索保持一致） */
-export const LIST_PLATFORMS: string[] = ['kw', 'kg', 'mg', 'tx', 'wy'];
+export const LIST_PLATFORMS: string[] = ['kw', 'kg', 'mg', 'tx', 'wy', 'qs'];
 
 export const PLATFORM_NAMES: Record<string, string> = {
   'kw': '酷我',
@@ -100,6 +107,8 @@ export const PLATFORM_NAMES: Record<string, string> = {
   'mg': '咪咕',
   'tx': 'QQ',
   'wy': '网易',
+  // 汽水音乐：只有内置搜索与播放（见 MusicSearch 的 qs 分支），歌单广场 / 榜单没接
+  'qs': '汽水',
 };
 
 export function platformName(id: string): string {
@@ -425,6 +434,10 @@ export function sortListOf(source: string): LxSortItem[] {
   if (source === 'wy') {
     return WY_SORTS;
   }
+  if (source === 'qs') {
+    // 汽水只有一条「推荐」流（发现页），没有分类页签
+    return QS_SORTS;
+  }
   return [];
 }
 
@@ -446,6 +459,9 @@ export async function getRecommendPlaylists(source: string, sortId: string, page
   if (source === 'wy') {
     return await wyPlaylists(page);
   }
+  if (source === 'qs') {
+    return await qsPlaylists(page);
+  }
   throw new Error(`暂不支持该平台的推荐歌单：${source}`);
 }
 
@@ -462,10 +478,13 @@ export async function getPlaylistDetail(source: string, id: string, page: number
     return await mgPlaylistDetail(id, page);
   }
   if (source === 'tx') {
-    return await txPlaylistDetail(id);
+    return await txPlaylistDetail(id, page);
   }
   if (source === 'wy') {
     return await wyPlaylistDetail(id, page, '');
+  }
+  if (source === 'qs') {
+    return await qsPlaylistDetail(id, page);
   }
   throw new Error(`暂不支持该平台的歌单：${source}`);
 }
@@ -550,28 +569,307 @@ export function getBoards(source: string): LxBoardItem[] {  if (source === 'kw')
   if (source === 'wy') {
     return WY_BOARDS;
   }
+  if (source === 'qs') {
+    return QS_BOARDS;
+  }
   return [];
 }
 
-/** 榜单里的歌曲 */
+/**
+ * 榜单里的歌曲
+ *
+ * `limit > 0` 时**只取前 limit 首**（首页那几行只要前几首）：各平台的榜单接口一次回的
+ * 量差得很远 —— 酷我 rn=100（实测 35 万字符加密响应 / 25 万字节 JSON）、酷狗 100、
+ * QQ 300、**网易 n=1000**，首页为了三行歌把整张榜拉回来既慢又占内存。
+ * `limit = 0`（默认）就是整页，给「榜单页」用。
+ */
 export async function getBoardSongs(source: string, bangid: string, page: number, name: string,
-  ): Promise<LxListDetail> {
+  limit: number = 0): Promise<LxListDetail> {
   if (source === 'kw') {
-    return await kwBoardSongs(bangid, page, name);
+    return await kwBoardSongs(bangid, page, name, limit);
   }
   if (source === 'kg') {
-    return await kgBoardSongs(bangid, page, name);
+    return await kgBoardSongs(bangid, page, name, limit);
   }
   if (source === 'mg') {
+    // 咪咕这个接口没有每页条数参数（needAll=0 已经是不取全量），忽略 limit
     return await mgBoardSongs(bangid, name);
   }
   if (source === 'tx') {
-    return await txBoardSongs(bangid, name);
+    return await txBoardSongs(bangid, name, limit);
   }
   if (source === 'wy') {
-    return await wyPlaylistDetail(bangid, page, name);
+    return await wyPlaylistDetail(bangid, page, name, limit);
+  }
+  if (source === 'qs') {
+    return await qsBoardSongs(bangid, page, name, limit);
   }
   throw new Error(`暂不支持该平台的排行榜：${source}`);
+}
+
+// ================================================================== 汽水 qs
+
+/** 汽水 App 侧 Luna 主机（搜索 / 发现页 / 歌单详情 / 评论都在它下面，见 MusicSearch 顶部说明） */
+const QS_LUNA: string = 'https://beta-luna.douyin.com';
+const QS_SORTS: LxSortItem[] = [{ name: '推荐', tid: 'recommend', id: 'recommend' }];
+/**
+ * 汽水的三张榜（都在发现页的 discover_top_song_list 块里，各 50 首，每周四更新）
+ *
+ * bangid 用我们自己的短标识（hot/new/west），取歌时按它对到块的标题 —— 不写死
+ * inner_block_id：那是服务端下发的，换版本 / 换区域可能变。
+ */
+const QS_BOARDS: LxBoardItem[] = [
+  { id: 'qs_hot', name: '热歌榜', bangid: 'hot', source: 'qs' },
+  { id: 'qs_new', name: '新歌榜', bangid: 'new', source: 'qs' },
+  { id: 'qs_west', name: '欧美榜', bangid: 'west', source: 'qs' },
+];
+
+/** 汽水各接口的请求体（ArkTS 不允许「无类型对象字面量」，所以逐个声明） */
+interface QsMixPayload {
+  count: number;
+}
+
+interface QsDetailPayload {
+  playlist_id: string;
+  count: number;
+  cursor?: string;
+  session_id?: string;
+}
+
+interface QsDiscoverPayload {
+  first_request?: boolean;
+}
+
+async function qsPost(path: string, payload: Object,
+  label: string): Promise<Record<string, Object>> {
+  return await fetchRecord(`${QS_LUNA}${path}?${qsDeviceQuery()}`, {
+    method: 'post',
+    headers: QS_APP_HEADERS,
+    body: payload,
+  }, label);
+}
+
+/** 汽水歌单的作者（发现页多数歌单不带 owner，带的时候是 nickname / name） */
+function qsOwnerName(pl: Record<string, Object>): string {
+  const owner: Record<string, Object> = asRecord(pl['owner']);
+  let name: string = asString(owner['nickname']);
+  if (name.length === 0) {
+    name = asString(owner['name']);
+  }
+  if (name.length === 0) {
+    name = asString(asRecord(pl['owner_info'])['nickname']);
+  }
+  return name;
+}
+
+function qsPlaylistTitle(pl: Record<string, Object>): string {
+  const title: string = asString(pl['title']);
+  return title.length > 0 ? title : asString(pl['name']);
+}
+
+/** 汽水歌单 -> 歌单卡（发现页的一批与歌单搜索共用这一个映射） */
+function qsPlaylistItemOf(pl: Record<string, Object>): LxPlaylistItem | null {
+  const id: string = asString(pl['id']);
+  if (id.length === 0) {
+    return null;
+  }
+  return {
+    id: id,
+    name: qsPlaylistTitle(pl),
+    author: qsOwnerName(pl),
+    img: qsCoverOf(asRecord(pl['url_cover'])),
+    desc: descText(asString(pl['desc'])),
+    // 汽水给的是收藏数（stats.count_collected），不是播放量：不拿它冒充播放量，卡片退成显示作者
+    playCount: '',
+    total: asNumber(pl['count_tracks']),
+    time: '',
+    source: 'qs',
+  };
+}
+
+function qsListInfoOf(pl: Record<string, Object>): LxListInfo {
+  return {
+    name: qsPlaylistTitle(pl),
+    img: qsCoverOf(asRecord(pl['url_cover'])),
+    desc: descText(asString(pl['desc'])),
+    author: qsOwnerName(pl),
+    playCount: '',
+  };
+}
+
+/**
+ * 汽水的推荐歌单（广场）
+ *
+ * 走 `/luna/discover/mix`：一次 count=30 能回 30 张左右的歌单块。它虽然报 has_more，
+ * 但**顶层没有可用的 next_cursor / session_id**（实测都是空），所以只出第一页；
+ * 广场滚到底就自然停住，不装作还能翻。
+ */
+async function qsPlaylists(page: number): Promise<LxPlaylistItem[]> {
+  if (page > 1) {
+    return [];
+  }
+  const mixPayload: QsMixPayload = { count: 30 };
+  const body: Record<string, Object> = await qsPost('/luna/discover/mix', mixPayload, '汽水推荐歌单');
+  const out: LxPlaylistItem[] = [];
+  const seen: Set<string> = new Set<string>();
+  for (const blockRaw of asObjectArray(body['inner_block'])) {
+    for (const resRaw of asObjectArray(asRecord(blockRaw)['resources'])) {
+      const entity: Record<string, Object> = asRecord(asRecord(resRaw)['entity']);
+      const item: LxPlaylistItem | null = qsPlaylistItemOf(asRecord(entity['playlist']));
+      if (item !== null && !seen.has(item.id)) {
+        seen.add(item.id);
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
+/** 歌单详情的翻页现场：cursor / session_id 都由上一页的响应带出来（汽水是游标分页） */
+let qsDetailKey: string = '';
+let qsDetailCursor: string = '';
+let qsDetailSession: string = '';
+
+/**
+ * 汽水歌单详情（`/luna/playlist/detail`）
+ *
+ * 分页是「响应给下一跳的 cursor + session_id」，不是页码：第一页拿到的 next_cursor
+ * 就是第二页的入参。游标按歌单 id 记在模块里（getPlaylistDetailAll 是顺序翻页的）；
+ * 换了歌单或回到第一页就重置。
+ */
+async function qsPlaylistDetail(id: string, page: number): Promise<LxListDetail> {
+  if (page <= 1 || id !== qsDetailKey) {
+    qsDetailKey = id;
+    qsDetailCursor = '';
+    qsDetailSession = '';
+  }
+  const payload: QsDetailPayload = {
+    playlist_id: id,
+    count: 50,
+  };
+  if (qsDetailCursor.length > 0) {
+    payload.cursor = qsDetailCursor;
+  }
+  if (qsDetailSession.length > 0) {
+    payload.session_id = qsDetailSession;
+  }
+  const body: Record<string, Object> = await qsPost('/luna/playlist/detail', payload, '汽水歌单详情');
+  const pl: Record<string, Object> = asRecord(body['playlist']);
+  qsDetailCursor = asString(body['next_cursor']);
+  qsDetailSession = asString(body['session_id']);
+  const songs: LxMusicInfo[] = [];
+  for (const resRaw of asObjectArray(body['media_resources'])) {
+    const entity: Record<string, Object> = asRecord(asRecord(resRaw)['entity']);
+    const info: LxMusicInfo | null = qsTrackToInfo(asRecord(entity['track']));
+    if (info !== null) {
+      songs.push(info);
+    }
+  }
+  const total: number = asNumber(pl['count_tracks']);
+  return { list: songs, total: total > 0 ? total : songs.length, info: qsListInfoOf(pl) };
+}
+
+function qsBoardTitle(bangid: string): string {
+  if (bangid === 'hot') {
+    return '热歌榜';
+  }
+  if (bangid === 'new') {
+    return '新歌榜';
+  }
+  if (bangid === 'west') {
+    return '欧美榜';
+  }
+  return '';
+}
+
+/** 从发现页响应里取出全部榜单块（discover_top_song_list 的 inner_block） */
+function qsChartBlocks(body: Record<string, Object>): Object[] {
+  const out: Object[] = [];
+  for (const blockRaw of asObjectArray(body['blocks'])) {
+    const block: Record<string, Object> = asRecord(blockRaw);
+    if (asString(block['type']) !== 'discover_top_song_list') {
+      continue;
+    }
+    for (const chartRaw of asObjectArray(block['inner_block'])) {
+      out.push(chartRaw);
+    }
+  }
+  return out;
+}
+
+/**
+ * 汽水榜单里的歌
+ *
+ * 汽水没有「按榜取歌」的独立接口：三张榜整块塞在发现页的 discover_top_song_list 里，
+ * 每张 50 首一次给全。所以这里拉一次发现页、按标题挑出那张榜；page>1 直接空（没有下一页）。
+ */
+/**
+ * 发现页响应的短缓存
+ *
+ * 汽水三张榜整块塞在同一个发现页响应里（约 1.6MB），推荐页是「一栏一栏懒加载」的，
+ * 不缓存就会为三张榜连拉三次；缓存 60 秒足够一次进页面的三栏共用，也不至于让榜单太旧。
+ */
+let qsDiscoverCacheAt: number = 0;
+let qsDiscoverCache: Record<string, Object> = {};
+
+async function qsDiscoverBody(label: string): Promise<Record<string, Object>> {
+  const now: number = Date.now();
+  if (qsDiscoverCacheAt > 0 && now - qsDiscoverCacheAt < 60000
+    && Object.keys(qsDiscoverCache).length > 0) {
+    return qsDiscoverCache;
+  }
+  const firstPayload: QsDiscoverPayload = { first_request: true };
+  let body: Record<string, Object> = await qsPost('/luna/discover', firstPayload, label);
+  if (qsChartBlocks(body).length === 0) {
+    // 发现页偶发空响应（限流）：再问一次，别让榜单页直接报错
+    const retryPayload: QsDiscoverPayload = {};
+    body = await qsPost('/luna/discover', retryPayload, label);
+  }
+  if (Object.keys(body).length > 0) {
+    qsDiscoverCache = body;
+    qsDiscoverCacheAt = now;
+  }
+  return body;
+}
+
+async function qsBoardSongs(bangid: string, page: number, name: string,
+  limit: number): Promise<LxListDetail> {
+  if (page > 1) {
+    return { list: [], total: 0, info: emptyListInfo(name) };
+  }
+  const body: Record<string, Object> = await qsDiscoverBody('汽水榜单');
+  const charts: Object[] = qsChartBlocks(body);
+  const wanted: string = qsBoardTitle(bangid);
+  let chart: Record<string, Object> = {};
+  for (const chartRaw of charts) {
+    const one: Record<string, Object> = asRecord(chartRaw);
+    const title: string = asString(one['title']);
+    if ((wanted.length > 0 && title === wanted)
+      || (wanted.length === 0 && name.length > 0 && title === name)) {
+      chart = one;
+      break;
+    }
+  }
+  if (Object.keys(chart).length === 0) {
+    throw new Error('汽水榜单没有这张榜了（接口可能改版）');
+  }
+  const songs: LxMusicInfo[] = [];
+  for (const resRaw of asObjectArray(chart['resources'])) {
+    const ranked: Record<string, Object> = asRecord(asRecord(asRecord(resRaw)['entity'])['ranked_track']);
+    const info: LxMusicInfo | null = qsTrackToInfo(asRecord(ranked['track']));
+    if (info !== null) {
+      songs.push(info);
+    }
+  }
+  const list: LxMusicInfo[] = limit > 0 && songs.length > limit ? songs.slice(0, limit) : songs;
+  const info: LxListInfo = {
+    name: asString(chart['title']),
+    img: '',
+    desc: descText(asString(chart['desc'])),
+    author: '',
+    playCount: '',
+  };
+  return { list: list, total: songs.length, info: info };
 }
 
 // ================================================================== 酷我 kw
@@ -731,14 +1029,22 @@ function kwBuildWbdParam(requestBody: Record<string, Object>): string {
   return `data=${encodeURIComponent(cipher)}&time=${time}&appId=${KW_WBD_APP_ID}&sign=${sign}`;
 }
 
+/**
+ * 解出榜单响应（服务端回的是加密过的 base64 文本）
+ *
+ * **解密走 `PlatformCrypto` 的原生实现**：这份响应实测 35 万字符、解出 25 万字节 JSON，
+ * 纯 ArkTS 手写 AES 要跑一万多个块、主线程卡好几秒（2026-10-13 实机反馈）。
+ * 请求侧那几个字节的加密（`kwBuildWbdParam`）留在 `LxCrypto` 的纯实现里，
+ * 由主机单测跟 node:crypto 的向量对齐。
+ */
 function kwDecodeWbd(text: string): Record<string, Object> {
   const keyBytes: number[] = fromBase64(KW_WBD_KEY);
-  const cipherBytes: number[] = fromBase64(decodeURIComponent(text.trim()));
-  const plainBytes: number[] = aes128EcbPkcs7DecryptBytes(keyBytes, cipherBytes);
-  return JSON.parse(bytesToUtf8(plainBytes)) as Record<string, Object>;
+  const plain: string = decodeAes128EcbPkcs7Text(keyBytes, decodeURIComponent(text.trim()));
+  return JSON.parse(plain) as Record<string, Object>;
 }
 
-async function kwBoardSongs(bangid: string, page: number, name: string): Promise<LxListDetail> {
+async function kwBoardSongs(bangid: string, page: number, name: string,
+  limit: number = 0): Promise<LxListDetail> {
   const requestBody: Record<string, Object> = {
     'uid': '',
     'devId': '',
@@ -747,7 +1053,7 @@ async function kwBoardSongs(bangid: string, page: number, name: string): Promise
     'carSource': 'kwplayercar_ar_6.0.1.0_apk_keluze.apk',
     'id': bangid,
     'pn': page - 1,
-    'rn': 100,
+    'rn': limit > 0 ? limit : 100,
   };
   const url: string = `https://wbd.kuwo.cn/api/bd/bang/bang_info?${kwBuildWbdParam(requestBody)}`;
   const result: FetchResult = await httpFetch(url, undefined);
@@ -793,6 +1099,14 @@ const KG_SPECIAL_INFO = /global = {[\s\S]+?name: "(.+)"[\s\S]+?pic: "(.+)"[\s\S]
 const KG_DESC = /id="specailIntroduceWrap">([\s\S]*?)<\/div>/;
 /** 酷狗 gateway 的固定 key（照抄 kg/songList.js 的 createTask） */
 const KG_GATEWAY_KEY: string = 'OIlwieks28dk2k092lksi2UIkp';
+/**
+ * 酷狗 App 的 UA
+ *
+ * 歌单页（/songlist/gcid_xxx/）按 UA 给两套完全不同的页面：桌面 UA 给的是老的
+ * 服务端渲染页（里面没有 window.$output），移动/App UA 才是那套带 $output 的 H5。
+ * 所以取用户歌单信息时必须带上它 —— 不然后果就是「页面里找不到歌单数据」。
+ */
+const KG_APP_UA: string = 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi';
 
 async function kgPlaylists(sortId: string, page: number): Promise<LxPlaylistItem[]> {
   const url: string = 'http://www2.kugou.kugou.com/yueku/v9/special/getSpecial' +
@@ -831,10 +1145,86 @@ function kgFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
   return list;
 }
 
+/** 酷狗用户歌单（gcid）解析出来的东西：specialid + 歌单页上那份元信息 */
+interface KgGcidInfo {
+  specialId: string;
+  name: string;
+  img: string;
+  desc: string;
+  author: string;
+}
+
+/**
+ * 酷狗用户歌单（gcid_xxx）-> 精选集 specialid
+ *
+ * 酷狗有两套歌单：精选集（specialid，网页 /yy/special/single/<id>.html 那条路）与
+ * **用户歌单**（global_collection_id，即 gcid_xxx，App 里「我的歌单」分享出来的就是它）。
+ * 用户歌单没有直接的歌曲接口，但它的歌单页里藏着 window.$output：
+ *   info.listinfo = { name, pic, intro, count, specialid }
+ * 也就是说每张用户歌单背后都对应一个 specialid，拿到它就能回到精选集那条路取全部歌
+ * （实测 52 首的用户歌单：specialid 页面 52/52，名字封面也都在）。
+ *
+ * 页面里的 $output.songs 只有前 10 首（那是给首屏用的预览），不能当全量用。
+ */
+async function kgGcidInfo(gcid: string): Promise<KgGcidInfo> {
+  const url: string = `https://m.kugou.com/songlist/${encodeURIComponent(gcid)}/`;
+  const headers: Record<string, string> = { 'User-Agent': KG_APP_UA };
+  const result: FetchResult = await httpFetch(url, { rawText: true, headers: headers });
+  const html: string = resultText(result, '酷狗歌单页');
+  const output: Record<string, Object> | null = kgPageOutput(html);
+  if (output === null) {
+    throw new Error('酷狗用户歌单解析失败（页面结构可能已变）');
+  }
+  const listinfo: Record<string, Object> = asRecord(asRecord(output['info'])['listinfo']);
+  // 封面地址里带 {size} 占位符，必须换掉才是个能用的 URL
+  const pic: string = asString(listinfo['pic']).split('{size}').join('400');
+  return {
+    specialId: asString(listinfo['specialid']),
+    name: decodeName(asString(listinfo['name'])),
+    img: pic,
+    desc: descText(asString(listinfo['intro'])),
+    author: decodeName(asString(listinfo['list_create_username'])),
+  };
+}
+
+/** 从歌单页 HTML 里取出 window.$output 那段 JSON；取不到返回 null */
+function kgPageOutput(html: string): Record<string, Object> | null {
+  const marker: string = 'window.$output = ';
+  const at: number = html.indexOf(marker);
+  if (at < 0) {
+    return null;
+  }
+  const start: number = at + marker.length;
+  const end: number = html.indexOf('</script>', start);
+  if (end < 0) {
+    return null;
+  }
+  let json: string = html.substring(start, end).trim();
+  if (json.endsWith(';')) {
+    json = json.substring(0, json.length - 1).trim();
+  }
+  try {
+    const parsed: Object = JSON.parse(json) as Object;
+    const record: Record<string, Object> = asRecord(parsed);
+    return Object.keys(record).length > 0 ? record : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   let id: string = rawId;
   if (id.startsWith('id_')) {
     id = id.substring('id_'.length);
+  }
+  // 用户歌单先换成 specialid；顺手把歌单页上的元信息留作兜底（精选集页面有时缺名字/简介）
+  let gcid: KgGcidInfo | null = null;
+  if (id.startsWith('gcid_')) {
+    gcid = await kgGcidInfo(id);
+    if (gcid.specialId.length === 0) {
+      throw new Error('酷狗用户歌单解析失败：可能是私密歌单，或歌单页结构已变');
+    }
+    id = gcid.specialId;
   }
   const url: string = `http://www2.kugou.kugou.com/yueku/v9/special/single/${encodeURIComponent(id)}-5-9999.html`;
   const result: FetchResult = await httpFetch(url, undefined);
@@ -847,11 +1237,21 @@ async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   const songs: LxMusicInfo[] = await kgSongsByHash(hashes);
   const infoMatch: RegExpMatchArray | null = html.match(KG_SPECIAL_INFO);
   const descMatch: RegExpMatchArray | null = html.match(KG_DESC);
+  let fallbackName: string = '';
+  let fallbackImg: string = '';
+  let fallbackDesc: string = '';
+  let fallbackAuthor: string = '';
+  if (gcid !== null) {
+    fallbackName = gcid.name;
+    fallbackImg = gcid.img;
+    fallbackDesc = gcid.desc;
+    fallbackAuthor = gcid.author;
+  }
   const info: LxListInfo = {
-    name: infoMatch !== null ? infoMatch[1] : '',
-    img: infoMatch !== null ? infoMatch[2] : '',
-    desc: descMatch !== null ? descText(descMatch[1]) : '',
-    author: '',
+    name: infoMatch !== null && infoMatch[1].length > 0 ? infoMatch[1] : fallbackName,
+    img: infoMatch !== null && infoMatch[2].length > 0 ? infoMatch[2] : fallbackImg,
+    desc: descMatch !== null ? descText(descMatch[1]) : fallbackDesc,
+    author: fallbackAuthor,
     playCount: '',
   };
   return { list: songs, total: songs.length, info: info };
@@ -899,7 +1299,7 @@ async function kgSongsByHash(hashes: Object[]): Promise<LxMusicInfo[]> {
       'KG-RC': '1',
       'KG-Fake': '0',
       'KG-RF': '00869891',
-      'User-Agent': 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi',
+      'User-Agent': KG_APP_UA,
       'x-router': 'kmr.service.kugou.com',
     };
     const resp: Record<string, Object> = await fetchRecord(
@@ -972,9 +1372,10 @@ function kgFilterGatewaySongs(rawList: Object[]): LxMusicInfo[] {
   return list;
 }
 
-async function kgBoardSongs(bangid: string, page: number, name: string): Promise<LxListDetail> {
+async function kgBoardSongs(bangid: string, page: number, name: string,
+  limit: number = 0): Promise<LxListDetail> {
   const url: string = 'http://mobilecdnbj.kugou.com/api/v3/rank/song' +
-    `?version=9108&ranktype=1&plat=0&pagesize=100&area_code=1&page=${page}` +
+    `?version=9108&ranktype=1&plat=0&pagesize=${limit > 0 ? limit : 100}&area_code=1&page=${page}` +
     `&rankid=${encodeURIComponent(bangid)}&with_res_tag=0&show_portrait_mv=1`;
   const body: Record<string, Object> = await fetchRecord(url, undefined, '酷狗榜单');
   if (asNumber(body['errcode']) !== 0) {
@@ -1153,6 +1554,14 @@ async function mgPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   };
 }
 
+/**
+ * 咪咕的格式代号 -> 本工程的音质档位
+ *
+ * **24bit 的代号是 `ZQ24`，不是 `ZQ`**（接口实测：`PQ` / `HQ` / `SQ` / `ZQ24`）。
+ * 这里原先只认 `ZQ`，于是在线歌单 / 榜单 / 歌单导入这些走 MusicList 的路径全都拿不到
+ * `flac24bit` 这一档（搜索结果与歌手页走的是 MusicSearch / MusicArtist，那边是对的）。
+ * `ZQ` 一并留着只是兜底，防止哪天接口真的改回这个写法。
+ */
 function mgFormatToQuality(formatType: string): string {
   if (formatType === 'PQ') {
     return '128k';
@@ -1163,9 +1572,10 @@ function mgFormatToQuality(formatType: string): string {
   if (formatType === 'SQ') {
     return 'flac';
   }
-  if (formatType === 'ZQ') {
+  if (formatType === 'ZQ24' || formatType === 'ZQ') {
     return 'flac24bit';
   }
+  // AV3A 是咪咕自己的环绕声封装，本站放不了，不当成一档音质
   return '';
 }
 
@@ -1442,23 +1852,33 @@ function txFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
  * 两条路都留着，但顺序与洛雪相反：洛雪先打老的 fcg_ucc_getcdinfo_byids_cp、
  * 失败再走新版 musicu；实测老接口已经下线（code=-1，见 tools/live_list_probe.js），
  * 所以这里新版优先、老接口兜底。两条路的 songlist 是同一套字段，共用 txFilterSongs。
+ *
+ * **必须真翻页**：新版接口一次最多给 song_num 首（实测传 1000 只回 999 首），而 QQ 上
+ * 上千首的歌单并不少见（实测过一张 1919 首的）。早先这里把整张歌单当成一页取、
+ * page 参数直接丢掉，getPlaylistDetailAll 第二页拿到的还是同一批歌，判定「没有新歌」
+ * 就停了 —— 于是超过 1000 首的部分被**静默丢掉**（不报错、歌单名也对，只是少了）。
+ * 现在按 song_begin = (page-1) * 每页条数 真翻页。
  */
-async function txPlaylistDetail(id: string): Promise<LxListDetail> {
+async function txPlaylistDetail(id: string, page: number): Promise<LxListDetail> {
+  // 老接口不分页（一次给全），只有第一页才值得退回它：后面的页退回会把整张歌单再给一遍
+  if (page > 1) {
+    return await txPlaylistDetailMusicu(id, page);
+  }
   try {
-    return await txPlaylistDetailMusicu(id);
+    return await txPlaylistDetailMusicu(id, page);
   } catch (e) {
     return await txPlaylistDetailLegacy(id);
   }
 }
 
 /** 新版：music.srfDissInfo.aiDissInfo / uniform_get_Dissinfo（洛雪 tx/songList.js 的 getListDetail2） */
-async function txPlaylistDetailMusicu(id: string): Promise<LxListDetail> {
+async function txPlaylistDetailMusicu(id: string, page: number): Promise<LxListDetail> {
   const param: TxDissInfoParam = {
     disstid: asNumber(id),
     userinfo: 1,
     tag: 1,
     orderlist: 1,
-    song_begin: 0,
+    song_begin: (page > 0 ? page - 1 : 0) * TX_DISS_SONG_NUM,
     song_num: TX_DISS_SONG_NUM,
     onlysonglist: 0,
     enc_host_uin: '',
@@ -1492,9 +1912,14 @@ async function txPlaylistDetailMusicu(id: string): Promise<LxListDetail> {
   const req: Record<string, Object> = asRecord(body['req_1']);
   const data: Record<string, Object> = asRecord(req['data']);
   const songs: Object[] = asObjectArray(data['songlist']);
-  if (asNumber(req['code']) !== 0 || songs.length === 0) {
+  if (asNumber(req['code']) !== 0) {
     throw new Error('QQ 歌单详情接口没取到歌曲');
   }
+  if (songs.length === 0 && page <= 1) {
+    throw new Error('QQ 歌单详情接口没取到歌曲');
+  }
+  // 翻到最后一页之后（歌单被改短、或 total 与页数对不齐时）接口仍回 code=0、songlist 为空：
+  // 这是「没有下一页」，不是失败 —— 交给 getPlaylistDetailAll 的「没有新歌」判定收尾
   const dir: Record<string, Object> = asRecord(data['dirinfo']);
   const total: number = asNumber(data['total_song_num']);
   const info: LxListInfo = {
@@ -1614,11 +2039,12 @@ async function txBoardPeriod(bangid: string): Promise<string> {
   }
 }
 
-async function txBoardSongs(bangid: string, name: string): Promise<LxListDetail> {
+async function txBoardSongs(bangid: string, name: string,
+  limit: number = 0): Promise<LxListDetail> {
   const period: string = await txBoardPeriod(bangid);
   const param: TxToplistParam = {
     topid: Number.parseInt(bangid, 10),
-    num: 300,
+    num: limit > 0 ? limit : 300,
   };
   if (period.length > 0) {
     param.period = period;
@@ -1647,11 +2073,21 @@ async function txBoardSongs(bangid: string, name: string): Promise<LxListDetail>
 const WY_SORTS: LxSortItem[] = [
   { name: '最热', tid: 'hot', id: 'hot' },
 ];
+/**
+ * 网易明文接口（歌单广场 /api/playlist/list、歌单详情 /api/v6/playlist/detail、
+ * 歌曲详情 /api/song/detail）的公共请求头。
+ *
+ * `Cookie: os=pc` 这一行是必需的，不是可有可无的装饰：不带它，歌单详情返回的
+ * `playlist.tracks` 会被砍成开头若干首的「试听预览」——实测普通用户歌单恒 10 首、
+ * 「我喜欢的音乐」6 首（同一次请求里 `playlist.trackIds` 却是完整的一整份）。
+ * 这个 cookie 只声明客户端形态，不需要登录态（把 `MUSIC_U` 写空串没有用）。
+ */
 const WY_HEADERS: Record<string, string> = {
   'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
     'Chrome/60.0.3112.90 Safari/537.36',
   'Referer': 'https://music.163.com/',
   'Origin': 'https://music.163.com',
+  'Cookie': 'os=pc',
 };
 
 /**
@@ -1696,14 +2132,26 @@ function wyFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
   return list;
 }
 
+/** 网易歌曲详情（/api/song/detail）一批最多塞多少 id（照洛雪与同工作区 RzdMusic 的做法按 100 批） */
+const WY_SONG_BATCH: number = 100;
+
 /**
  * 网易歌单/榜单歌曲：明文 /api/v6/playlist/detail（榜单就是一个特殊歌单）。
  * 响应里有 playlist.tracks 与顶层 privileges，正好配成一份带音质的歌曲列表。
+ *
+ * ⚠️ 这里必须按 `trackIds` 取歌，不能只信 `tracks`：网易对「非官方歌单」会把
+ * `tracks` 砍成开头若干首（带 `Cookie: os=pc` 之后实测才是全量，见 WY_HEADERS；
+ * 万一 cookie 那条路又被封，缺的那批就在这里按 id 补回来）。完整曲目 id 一直在
+ * 同响应的 `playlist.trackIds` 里 —— 原实现只拿它算了 `total`，于是出现
+ * 「共 27 首」却只有 10 行、导入只落 10 首这种事。
  */
-async function wyPlaylistDetail(id: string, page: number, name: string): Promise<LxListDetail> {
+async function wyPlaylistDetail(id: string, page: number, name: string,
+  limit: number = 0): Promise<LxListDetail> {
   // 这个接口一次最多给 1000 首，够一屏歌单用，不做分页
   void page;
-  const url: string = `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=1000&s=8`;
+  const size: number = limit > 0 ? limit : 1000;
+  const url: string =
+    `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=${size}&s=8`;
   const body: Record<string, Object> = await fetchRecord(url, { headers: WY_HEADERS }, '网易歌单详情');
   if (asNumber(body['code']) !== 200) {
     throw new Error('网易歌单详情接口返回异常');
@@ -1711,6 +2159,18 @@ async function wyPlaylistDetail(id: string, page: number, name: string): Promise
   const playlist: Record<string, Object> = asRecord(body['playlist']);
   const songs: LxMusicInfo[] = wyFilterSongs(asObjectArray(playlist['tracks']),
     asObjectArray(body['privileges']));
+  const trackIds: string[] = wyTrackIdsOf(playlist['trackIds']);
+  /**
+   * 限量取（首页那几行）时**不要按 trackIds 补齐**：榜单的 trackIds 是完整的几百首，
+   * 补齐会把整张榜用 `/api/song/detail` 一批批拉回来 —— 越限越慢。
+   */
+  const missing: string[] = limit > 0 ? [] : wyMissingTrackIds(trackIds, songs);
+  if (missing.length > 0) {
+    const rest: LxMusicInfo[] = await wySongsByIds(missing);
+    for (const song of rest) {
+      songs.push(song);
+    }
+  }
   let infoName: string = asString(playlist['name']);
   if (infoName.length === 0) {
     infoName = name;
@@ -1722,9 +2182,140 @@ async function wyPlaylistDetail(id: string, page: number, name: string): Promise
     author: asString(asRecord(playlist['creator'])['nickname']),
     playCount: formatPlayCount(asNumber(playlist['playCount'])),
   };
-  const trackIds: Object[] = asObjectArray(playlist['trackIds']);
   const total: number = trackIds.length > 0 ? trackIds.length : songs.length;
   return { list: songs, total: total, info: info };
+}
+
+/** `trackIds` 是一串 `{id}`，按原顺序取出字符串 id（丢空、去重） */
+function wyTrackIdsOf(raw: Object | undefined): string[] {
+  const out: string[] = [];
+  const seen: Set<string> = new Set<string>();
+  for (const item of asObjectArray(raw)) {
+    const id: string = asString(asRecord(item)['id']);
+    if (id.length > 0 && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/**
+ * `trackIds` 里还没出现在 `songs` 里的那些 id —— 接口截断时就是要补的这批。
+ *
+ * 补回来的歌是接在 `songs` 后面的，顺序正好对：`tracks` 就是 `trackIds` 的前缀
+ * （网易按歌单顺序回前若干首），接上剩下的就是完整歌单顺序。
+ */
+function wyMissingTrackIds(trackIds: string[], songs: LxMusicInfo[]): string[] {
+  if (trackIds.length <= songs.length) {
+    return [];
+  }
+  const have: Set<string> = new Set<string>();
+  for (const song of songs) {
+    have.add(song.songmid);
+  }
+  const missing: string[] = [];
+  for (const id of trackIds) {
+    if (!have.has(id)) {
+      missing.push(id);
+    }
+  }
+  return missing;
+}
+
+/**
+ * 老格式歌曲折成 v6 详情那套字段名。
+ *
+ * 同一首歌，两颗接口给的字段名不一样：
+ *   /api/v6/playlist/detail 的 tracks：`ar` / `al` / `dt` / `l` / `m` / `h` / `sq` / `hr`
+ *   /api/song/detail 的 songs ：`artists` / `album` / `duration` / `lMusic` / `mMusic` / `hMusic` / `sqMusic` / `hrMusic`
+ * 折过去之后就能跟 tracks 一样丢给 wyFilterSongs，不必再维护第二套组歌逻辑。
+ * 两边字段都在时以 v6 的写法为准，那时这层等于透明（接口哪天统一了也不用改这里）。
+ */
+function wyNormalizeSong(raw: Object): Record<string, Object> {
+  const item: Record<string, Object> = asRecord(raw);
+  const out: Record<string, Object> = {};
+  for (const key of Object.keys(item)) {
+    out[key] = item[key];
+  }
+  const aliases: string[][] = [
+    ['ar', 'artists'], ['al', 'album'], ['dt', 'duration'],
+    ['l', 'lMusic'], ['m', 'mMusic'], ['h', 'hMusic'], ['sq', 'sqMusic'], ['hr', 'hrMusic'],
+  ];
+  for (const pair of aliases) {
+    if (out[pair[0]] === undefined && item[pair[1]] !== undefined) {
+      out[pair[0]] = item[pair[1]];
+    }
+  }
+  return out;
+}
+
+/**
+ * 由老格式的 lMusic/mMusic/hMusic/sqMusic/hrMusic 反推一个 v6 那样的 privilege（音质档位）。
+ *
+ * `/api/song/detail` 不返回 privileges，而 wyFilterSongs 是靠 privilege 决定列哪几档音质的，
+ * 不给的话补回来的歌会缺音质标记（能播，但列表上看不出有 320k / 无损）。
+ * 有哪一档就报到哪一档；这只是一个上限，真正能不能放还是播放时由源规则按 id 去问。
+ */
+function wyPrivilegeOf(song: Record<string, Object>): Record<string, Object> {
+  const hires: number = wyBitrateOf(song, 'hr');
+  const lossless: number = wyBitrateOf(song, 'sq');
+  let maxbr: number = 0;
+  if (hires > 0 || lossless > 0) {
+    maxbr = 999000;
+  } else if (wyBitrateOf(song, 'h') > 0) {
+    maxbr = 320000;
+  } else if (wyBitrateOf(song, 'm') > 0) {
+    maxbr = 192000;
+  } else if (wyBitrateOf(song, 'l') > 0) {
+    maxbr = 128000;
+  }
+  return {
+    'id': asString(song['id']),
+    'maxbr': maxbr,
+    'maxBrLevel': hires > 0 ? 'hires' : '',
+  };
+}
+
+/** 某一档音频对象的码率（0 = 这档没有） */
+function wyBitrateOf(song: Record<string, Object>, key: string): number {
+  return asNumber(asRecord(song[key])['bitrate']);
+}
+
+/**
+ * 按 id 批量取歌（明文 /api/song/detail），补 tracks 被截断时缺的那些。
+ *
+ * 这个接口回的是老 schema（见 wyNormalizeSong），且不带 privileges（音质档位自己推）。
+ * 单批失败只跳过这一批：能补多少补多少，不因为补歌失败把整张歌单变成错误。
+ */
+async function wySongsByIds(ids: string[]): Promise<LxMusicInfo[]> {
+  const out: LxMusicInfo[] = [];
+  for (let start = 0; start < ids.length; start += WY_SONG_BATCH) {
+    const batch: string[] = ids.slice(start, start + WY_SONG_BATCH);
+    const queries: string[] = [];
+    for (const id of batch) {
+      queries.push(`{"id":${id}}`);
+    }
+    const url: string = `https://music.163.com/api/song/detail?ids=` +
+      `${encodeURIComponent(JSON.stringify(batch))}&c=${encodeURIComponent(`[${queries.join(',')}]`)}`;
+    try {
+      const body: Record<string, Object> = await fetchRecord(url, { headers: WY_HEADERS }, '网易歌曲详情');
+      const songs: Object[] = [];
+      const privileges: Object[] = [];
+      const given: Object[] = asObjectArray(body['privileges']);
+      for (const one of asObjectArray(body['songs'])) {
+        const song: Record<string, Object> = wyNormalizeSong(one);
+        songs.push(song);
+        privileges.push(given.length > 0 ? wyFindPrivilege(given, asString(song['id'])) : wyPrivilegeOf(song));
+      }
+      for (const song of wyFilterSongs(songs, privileges)) {
+        out.push(song);
+      }
+    } catch (e) {
+      // 这一批没补到就算了，剩下的还能用
+    }
+  }
+  return out;
 }
 
 function wyFilterSongs(rawList: Object[], privileges: Object[]): LxMusicInfo[] {
@@ -1750,6 +2341,9 @@ function wyFilterSongs(rawList: Object[], privileges: Object[]): LxMusicInfo[] {
     if (maxBr === 999000 || maxBr === 320000 || maxBr === 192000 || maxBr === 128000) {
       addType(types, map, '128k', wySizeOf(item, 'l'), '');
     }
+    // 拓展档（母带 / 沉浸声 / 杜比全景声）与搜索那条路用同一套规则补进 _types：
+    // 设置里没开「拓展音质」时它们不参与协商，开了才会出现在播放页的音质面板里
+    appendWyExtendQualities(privilege, item, types, map);
     const album: Record<string, Object> = asRecord(item['al']);
     const pc: Record<string, Object> = asRecord(item['pc']);
     const hasPc: boolean = Object.keys(pc).length > 0;

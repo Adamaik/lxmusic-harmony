@@ -35,6 +35,7 @@
 | 网易 wy | `music.163.com/#/playlist?id=<id>`、`/playlist?id=<id>&userid=`、`/playlist/<id>/<x>/` | `listDetailLink` + `listDetailLink2` |
 | QQ tx | `y.qq.com/n/ryqq/playlist/<id>`、`i.y.qq.com/.../taoge.html?id=<id>` | `/\/playlist\/(\d+)/` + `/id=(\d+)/` |
 | 酷狗 kg | `kugou.com/yy/special/single/<id>.html` | `/^.+\/(\d+)\.html/` |
+| 酷狗 kg（用户歌单） | `m.kugou.com/songlist/gcid_<id>/?src_cid=...&uid=...` | 洛雪没有这条；本工程单独认 `gcid_`（见下方「已知限制」里的酷狗用户歌单） |
 | 酷我 kw | `kuwo.cn/playlist_detail/<id>`、`m.kuwo.cn/h5app/playlist/<id>` | `/^.+\/playlist(?:_detail)?\/(\d+)/` |
 | 咪咕 mg | `music.migu.cn/v5/#/playlist?playlistId=<id>`、`h5.nf.migu.cn/.../playlist/index.html?id=<id>`、`/v3/music/playlist/<id>` | `/^.+\/playlist\/(\d+)/` + `playlistId=(\d+)` |
 
@@ -88,8 +89,9 @@
 | --- | --- | --- |
 | 酷我 kw | 1000（`pn`/`rn`） | 正常翻页 |
 | 咪咕 mg | 30（`pageNo`/`pageSize`） | 真的在翻页，100 首 = 4 次请求 |
-| 网易 wy | 一次给全（`n=1000`，且只回可播放曲目） | 第二页原样再给一份 -> 判定无新歌即停 |
-| 酷狗 kg / QQ tx | 一次给全 | 同上 |
+| QQ tx | 1000（`song_begin`/`song_num`） | 真的在翻页（2026-10-20 起；早先一次只取 1000 首，超出部分被静默丢掉） |
+| 网易 wy | 一次给全（`n=1000`） | 第二页原样再给一份 -> 判定无新歌即停；**超过 1000 首的歌单目前只能拿到前 1000 首** |
+| 酷狗 kg | 一次给全（页面 `-5-9999`） | 同上（不含已下架 / 无授权、gateway 换不到的那几首） |
 
 页数上限 40（咪咕 ≈1200 首），避免接口异常时无限翻。
 
@@ -117,15 +119,45 @@ node tools/live_list_probe.js --detail tx 3285516001   # 指定 id
 ✅ wy  id=18129092448 「绿茵摇滚诗：英格兰世界杯回响」 total=26 取到=10
 ```
 
+> 2026-10-08 复核：上面 wy 那行的「取到=10」不是版权过滤，是网易对**匿名客户端**给的
+> 试听预览 —— 请求头里没有 `Cookie: os=pc` 时，`/api/v6/playlist/detail` 的
+> `playlist.tracks` 只回开头若干首（实测普通用户歌单恒 10 首、「我喜欢的音乐」6 首、
+> 官方榜单才是全量），同响应的 `playlist.trackIds` 一直是完整的。现已两头都修：
+> 请求头带上 `os=pc`，并且取歌以 `trackIds` 为准、缺的按 id 用 `/api/song/detail` 补。
+> 当时的探针脚本 `tools/live_list_probe.js` 只看 `tracks`，所以量到的是预览条数。
+
+2026-10-20 复核（酷狗用户歌单 + QQ 大歌单，探针已同步改成与 App 同一套逻辑）：
+
+```
+$ node tools/live_list_probe.js --detail kg gcid_3z18r5q99zaz0b6
+✅ kg  id=gcid_3z18r5q99zaz0b6  「都市茶歇 | 舒缓节奏放慢脚步」 total=52 取到=52
+     ℹ️ 用户歌单 gcid_3z18r5q99zaz0b6 -> specialid=8363749（页面 count=52）
+
+$ node tools/live_list_probe.js --detail tx 5909350456
+✅ tx  id=5909350456  「疯狂输出 | 快节奏游戏专用黑怕」 total=1919 取到=1915
+```
+
+咪咕另外单独复核过一次（12 张歌单：官方广场 + 用户自建 + 一条真实 App 分享短链 `c.migu.cn/00hLgE`）：
+歌单信息接口有名字/封面/简介，歌曲列表 `pageNo` 翻页不重不漏（`pageSize` 服务端上限 50），
+1600+ 首里没有一首因为缺 `songId` / `copyrightId` / `audioFormats` 被丢掉，全部可导入。
+
 设备侧还临时跑过一遍联网用例（解析 -> 拉全量 -> 转 SongItem -> `importPlaylist` 两次，
 断言同一个线上歌单只对应一个本地歌单），5/5 通过；这类用例依赖外网、接口会变，
 不适合长期放在单测里，验证完即删。
 
 ## 已知限制
 
-- **酷狗用户歌单**（`kugou.com/songlist/xxx/?uid=` 这种）不支持：它走的是另一套接口
-  （`global_collection_id` / `gcid_`），内置歌单详情只有「精选集」（specialid）那条路。
-- **网易**只返回当前可播放的曲目（`privileges` 里没版权的会少），`total` 仍按 `trackIds` 计，
-  所以预览里的「N 首」可能比实际导入的多。另见 `DEFECTS.md` 的 D-001（网易端点整体待复核）。
+- **酷狗用户歌单**（`kugou.com/songlist/gcid_xxx/?uid=` 这种）**已支持**（2026-10-20）：
+  它是另一套集合 id（`global_collection_id`，即 `gcid_xxx`），没有直接的歌曲接口，
+  但歌单页里藏着 `window.$output.info.listinfo.specialid` —— 拿到 specialid 就回到
+  「精选集」那条路取全量（实测 52 首的用户歌单：52/52）。两个坑：
+  1. 歌单页**必须带 App UA**（`KG_APP_UA`），桌面 UA 给的是另一套老页面，里面没有 `$output`；
+  2. `$output.songs` 只有前 10 首（首屏预览），不能当全量用，只取 `listinfo`。
+- **酷狗会少几首**：`gateway.kugou.com/v2/album_audio/audio` 对已下架 / 无授权的歌不回数据，
+  这些 hash 会从结果里消失（实测 461 首的歌单取到 449 首）。导入面板显示的是**实际取到的**
+  首数，不是页面上的 `count`；这属于平台侧的可用性，不是解析问题。
+- **网易**走的是明文 web 接口，且必须带 `Cookie: os=pc`（见 `MusicList.ets` 的 `WY_HEADERS`）：
+  不带它会拿到一份试听预览（`tracks` 只有开头 10 首左右），取歌时以 `trackIds` 为准并按
+  `/api/song/detail` 补齐缺的部分。另见 `DEFECTS.md` 的 D-001（网易端点整体待复核）。
 - **咪咕**一页 30 首，几百首的歌单要发十几次请求，导入会有明显等待（面板里有进度提示）。
 - 榜单（`bangid`）不提供导入入口：它和歌单 id 不是一回事，导成本地歌单后没法按源刷新。

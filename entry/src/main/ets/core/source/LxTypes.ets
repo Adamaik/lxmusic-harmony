@@ -5,8 +5,14 @@
  * 便于直接复用官方音源脚本（源规则）。
  */
 
-/** 音质，对应洛雪 LX.Quality */
-export type LxQuality = '128k' | '320k' | 'flac' | 'flac24bit';
+/**
+ * 音质，对应洛雪 LX.Quality
+ *
+ * 前四档是普通音质，后四档是拓展音质（Hi-Res / 全景声 / 全景声+ / 母带）：
+ * 设置里的「拓展音质」用的就是这四个值，音源声明了、并且用户开了开关才会被协商到。
+ * 早先这里只写了前四档，音源传上来的拓展档类型上就对不上（见 DEFECTS D-013）。
+ */
+export type LxQuality = '128k' | '320k' | 'flac' | 'flac24bit' | 'hires' | 'atmos' | 'atmos_plus' | 'master';
 
 /** 源脚本头部注释里声明的元信息（@name / @description / @version / @author / @homepage） */
 export interface SourceMeta {
