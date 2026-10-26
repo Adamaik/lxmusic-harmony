@@ -1,0 +1,411 @@
+/**
+ * 探索 · 心动模式刷歌页（底部页签）
+ *
+ * 交互（照抖音，单向不可回退）：
+ *   - 进页面 / 每次换歌：自动播放当前这首
+ *   - **竖向 Swiper** 翻页：下滑到下一首；翻过去就回不来（往上滑会被强制拉回当前页）
+ *   - 下滑 = 跳过这首 = 不喜欢（回写强负反馈）
+ *   - 双击封面 = 喜欢（收藏 + 强正反馈），单击 = 播放/暂停
+ *   - 一首放完播放器自动切下一首时，页面跟着走，并把上一首记成「自然播完」而非跳过
+ *
+ * 为什么用 Swiper 而不是在根容器上挂 PanGesture：
+ *   这套页面在 HdsTabs → TabContent 里，根容器的 PanGesture 实测拿不到事件
+ *   （无论下滑多长都不触发）。Swiper 是框架自己在管的翻页容器，项目里
+ *   EchoView / PlayerView 都用它，滑动可靠；「不能回翻」在 onChange 里做，
+ *   发现用户往回滑就把下标强制拨回来。
+ *
+ * 数据分工见 core/heart/HeartRadio：画像来自本地历史 + 收藏 + 本地曲库，
+ * 候选来自全网目录层（榜单 / 推荐歌单 / 艺人作品）召回的几百首；批次只在后台懒加载，
+ * 界面不显示「第几批 / 共几首」。
+ */
+
+import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
+import { K_CURRENT_ID, K_PLAYER_STATUS, PlaySession, SongItem } from '../core/player/PlaySession';
+import { ExploreCard, HeartRadio } from '../core/heart/HeartRadio';
+import { CoverStore } from '../core/music/CoverStore';
+import { C_RED, F_SUB } from '../ui/Theme';
+import { CoverArt, EmptyState } from '../ui/Widgets';
+import { I_CHEVRON_DOWN, I_DISC, I_HEART_FILLED, I_PAUSE, I_PLAY } from '../ui/Icons';
+
+/** 一批多少首（只在后台懒加载时用，界面不显示） */
+const BATCH_SIZE: number = 20;
+/** 滑到还剩几首时提前续批 */
+const REFILL_AHEAD: number = 3;
+/** 双击喜欢后那颗大红心停留多久（毫秒） */
+const HEART_FLASH_MS: number = 650;
+
+@Component
+export struct ExploreView {
+  @Prop topInset: number = 0;
+  @Prop bottomInset: number = 0;
+  @State cards: ExploreCard[] = [];
+  /** 当前是第几张；只增不减 —— 翻过去的回不来 */
+  @State index: number = 0;
+  @State loading: boolean = false;
+  /** 双击喜欢后的短暂红心 */
+  @State heartFlash: boolean = false;
+  @StorageLink(K_FAVORITE_IDS) @Watch('onFavoritesChanged') favIds: string[] = [];
+  @StorageLink(K_CURRENT_ID) @Watch('onCurrentChanged') currentId: string = '';
+  @StorageLink(K_PLAYER_STATUS) playerStatus: string = 'idle';
+  private radio: HeartRadio = new HeartRadio();
+  private swiper: SwiperController = new SwiperController();
+  /** 自己拨动 Swiper 时不要被 onChange 当成用户滑动 */
+  private snapping: boolean = false;
+
+  aboutToAppear(): void {
+    // 1) 先同步读缓存：有缓存就立刻出歌、立刻自动播，用户不用等
+    const cached: number = this.radio.prepareCached();
+    if (cached > 0) {
+      this.loading = false;
+      this.cards = this.radio.batch(BATCH_SIZE);
+      this.playCurrent();
+    } else {
+      this.loading = true;
+    }
+    // 2) 后台再拉一批新的替换池子（成功才落盘；失败就继续用缓存）
+    this.radio.refresh().then((fresh: number) => {
+      if (fresh <= 0) {
+        this.loading = false;
+        return;
+      }
+      if (this.cards.length === 0) {
+        // 首次没有缓存：刷新完才出第一批
+        this.loading = false;
+        this.cards = this.radio.batch(BATCH_SIZE);
+        this.jumpTo(0);
+        this.playCurrent();
+      }
+    }).catch(() => {
+      this.loading = false;
+    });
+  }
+
+  private card(): ExploreCard | null {
+    if (this.index < 0 || this.index >= this.cards.length) {
+      return null;
+    }
+    return this.cards[this.index];
+  }
+
+  /** 无声地把 Swiper 拨到某页（不触发「用户滑动」的处理） */
+  private jumpTo(target: number): void {
+    if (target < 0 || target >= this.cards.length || target === this.index) {
+      return;
+    }
+    this.snapping = true;
+    this.index = target;
+    this.swiper.changeIndex(target);
+    this.snapping = false;
+  }
+
+  /** 播放当前这张（换歌时 setQueueAndPlay 本身就打断了上一首） */
+  private playCurrent(): void {
+    const card: ExploreCard | null = this.card();
+    if (card === null) {
+      return;
+    }
+    const queue: SongItem[] = [];
+    for (let i = 0; i < this.cards.length; i++) {
+      queue.push(this.cards[i].item);
+    }
+    PlaySession.getInstance().setQueueAndPlay(queue, this.index);
+    this.radio.played(card.item.id);
+  }
+
+  private togglePlay(): void {
+    PlaySession.getInstance().toggle();
+  }
+
+  private playing(): boolean {
+    return this.playerStatus === 'playing';
+  }
+
+  private isFav(item: SongItem): boolean {
+    return this.radio.isLiked(item);
+  }
+
+  /** 收藏列表变了（播放器里取消收藏等）：画像同步扣掉那一笔正反馈 */
+  private onFavoritesChanged(): void {
+    this.radio.syncLikes();
+  }
+
+  /**
+   * 用户翻页（Swiper 回调）
+   *
+   * - 往后滑：上一首没被喜欢过 = 不喜欢 → 强负反馈；前进、自动播、后台续批
+   * - 往前滑：**不允许回翻**，立刻把 Swiper 拨回当前页
+   */
+  private onSwipe(next: number): void {
+    if (this.snapping || next === this.index) {
+      return;
+    }
+    if (next < this.index) {
+      // 用户想回翻：拨回当前页
+      this.snapping = true;
+      const current: number = this.index;
+      this.swiper.changeIndex(current);
+      this.snapping = false;
+      return;
+    }
+    const prev: ExploreCard | null = this.card();
+    if (prev !== null && !this.isFav(prev.item)) {
+      this.radio.dislike(prev.item.id);
+    }
+    this.index = next;
+    this.playCurrent();
+    if (this.cards.length - this.index <= REFILL_AHEAD) {
+      this.refill();
+    }
+  }
+
+  /** 后台懒加载下一批：剩余不多时悄悄续上，界面不显示批次 */
+  private refill(): void {
+    if (!this.radio.isReady || this.radio.exhausted) {
+      return;
+    }
+    const more: ExploreCard[] = this.radio.batch(BATCH_SIZE);
+    if (more.length > 0) {
+      this.cards = this.cards.concat(more);
+    }
+  }
+
+  /** 播放器切歌时跟上页面（自然播完 = 中等正反馈，不是跳过） */
+  private onCurrentChanged(): void {
+    if (this.currentId.length === 0) {
+      return;
+    }
+    const next: number = this.indexOfCard(this.currentId);
+    if (next < 0 || next === this.index) {
+      return;
+    }
+    if (next > this.index) {
+      const prev: ExploreCard | null = this.card();
+      if (prev !== null) {
+        this.radio.completed(prev.item.id);
+      }
+      this.jumpTo(next);
+    }
+  }
+
+  private indexOfCard(id: string): number {
+    for (let i = 0; i < this.cards.length; i++) {
+      if (this.cards[i].item.id === id) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 双击：喜欢 / 取消喜欢
+   *
+   * 收藏与算法回写都交给 HeartRadio：它按「歌名+歌手」认歌，
+   * 所以同一首歌在别的音源已经收藏过时不会重复加，也不会误判成"没收藏"。
+   */
+  private toggleFav(): void {
+    const card: ExploreCard | null = this.card();
+    if (card === null) {
+      return;
+    }
+    if (this.radio.isLiked(card.item)) {
+      this.radio.unlike(card.item);
+      return;
+    }
+    this.radio.like(card.item);
+    this.heartFlash = true;
+    setTimeout(() => {
+      this.heartFlash = false;
+    }, HEART_FLASH_MS);
+  }
+
+  private coverOf(item: SongItem): string {
+    return CoverStore.getInstance().coverFor(item.musicInfoJson, item.coverUrl);
+  }
+
+  // ---------------------------------------------------------------- 视图
+
+  /** 背景：封面铺满 + 压暗（与播放页同一套深色底） */
+  @Builder
+  backdrop(item: SongItem) {
+    Stack() {
+      if (this.coverOf(item).length > 0) {
+        Image(this.coverOf(item))
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover)
+          .blur(48)
+          .opacity(0.5)
+      } else {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor('#141418')
+      }
+      Column()
+        .width('100%')
+        .height('100%')
+        .linearGradient({
+          angle: 180,
+          colors: [['#66000000', 0.0], ['#B3000000', 0.5], ['#F2000000', 1.0]]
+        })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 播放钮：白色圆底 + 深色图标（与播放页主钮同一套观感） */
+  @Builder
+  playButton() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width(68)
+        .height(68)
+        .borderRadius(34)
+        .backgroundColor('#F4F4F6')
+        .shadow({ radius: 24, color: '#4DFFFFFF', offsetX: 0, offsetY: 0 })
+      SymbolGlyph(this.playing() ? I_PAUSE : I_PLAY)
+        .fontSize(26)
+        .fontColor(['#17171A'])
+    }
+    .width(68)
+    .height(68)
+    .onClick(() => {
+      this.togglePlay();
+    })
+    .accessibilityText(this.playing() ? '暂停' : '播放')
+    .accessibilityLevel('yes')
+  }
+
+  /** 一张卡：封面 / 歌名 / 歌手 / 推荐理由 / 播放钮；双击封面 = 喜欢 */
+  @Builder
+  cardPage(card: ExploreCard) {
+    Stack({ alignContent: Alignment.Center }) {
+      this.backdrop(card.item)
+
+      Column({ space: 14 }) {
+        CoverArt({
+          url: this.coverOf(card.item),
+          name: card.item.name,
+          art: card.item.art,
+          boxSize: 252,
+          radius: 20,
+        })
+          .shadow({ radius: 30, color: '#66000000', offsetX: 0, offsetY: 10 })
+          .gesture(
+            GestureGroup(GestureMode.Exclusive,
+              TapGesture({ count: 2 }).onAction(() => {
+                this.toggleFav();
+              }),
+              TapGesture({ count: 1 }).onAction(() => {
+                this.togglePlay();
+              }))
+          )
+
+        Column({ space: 6 }) {
+          Text(card.item.name)
+            .fontSize(22)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#FFFFFFFF')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(TextAlign.Center)
+          Text(card.item.singer)
+            .fontSize(14.5)
+            .fontColor('#B3FFFFFF')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(card.reason())
+            .fontSize(F_SUB)
+            .fontColor('#8CFFFFFF')
+            .maxLines(1)
+        }
+        .alignItems(HorizontalAlign.Center)
+
+        this.playButton()
+
+        Text('双击封面喜欢')
+          .fontSize(11.5)
+          .fontColor('#66FFFFFF')
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      // 上下让位：顶端是导航标题与「下滑换下一首」提示，底端是迷你播放条
+      .padding({ left: 24, right: 24, top: this.topInset + 96, bottom: this.bottomInset + 96 })
+
+      if (this.heartFlash) {
+        SymbolGlyph(I_HEART_FILLED)
+          .fontSize(96)
+          .fontColor([C_RED])
+          .opacity(0.85)
+          .hitTestBehavior(HitTestMode.None)
+      }
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 空态：没有候选时的引导 */
+  @Builder
+  emptyPage() {
+    Column() {
+      EmptyState({
+        icon: I_DISC,
+        text: this.loading ? '正在找歌…' : '这次没取到候选',
+        hint: this.loading
+          ? '按你的历史与收藏，正在从全网找你可能喜欢的歌（第一次会慢几秒）'
+          : '稍后下滑重试；若平台接口异常，也可能只是这一轮没取回来',
+        topPadding: this.topInset + 140,
+      })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#0C0C0E')
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      if (this.cards.length === 0) {
+        this.emptyPage()
+      } else {
+        // 竖向 Swiper 接管滑动：下滑换下一首（框架级翻页，不依赖根容器手势）
+        Swiper(this.swiper) {
+          ForEach(this.cards, (card: ExploreCard) => {
+            this.cardPage(card)
+          }, (card: ExploreCard) => card.item.id)
+        }
+        .vertical(true)
+        .loop(false)
+        .indicator(false)
+        .duration(260)
+        .curve(Curve.Friction)
+        .index(this.index)
+        .width('100%')
+        .height('100%')
+        .onChange((next: number) => {
+          this.onSwipe(next);
+        })
+      }
+
+      // 顶端提示：下滑换下一首（不挡手势、不挡点击）
+      if (this.cards.length > 0) {
+        Column({ space: 2 }) {
+          SymbolGlyph(I_CHEVRON_DOWN)
+            .fontSize(16)
+            .fontColor(['#99FFFFFF'])
+          Text('下滑换下一首')
+            .fontSize(12)
+            .fontColor('#99FFFFFF')
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Start)
+        .padding({ top: this.topInset + 6 })
+        .hitTestBehavior(HitTestMode.None)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#0C0C0E')
+  }
+}

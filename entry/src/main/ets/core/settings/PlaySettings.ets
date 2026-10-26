@@ -10,13 +10,16 @@ const FILE_NAME: string = 'play_settings.json';
  *
  * v2：桌面歌词默认由「开」改成「关」（见 desktopLyric 的说明），
  * 因此 v1 存档里的 desktopLyric 不再可信、按新默认处理（见 apply）。
+ * v3：新增「默认渠道」字段；老存档里没有这一项，按「自动（不指定）」处理 ——
+ * 也就是行为与加这一项之前完全一致，不替用户改既有习惯。
  */
-const SETTINGS_VERSION: number = 2;
+const SETTINGS_VERSION: number = 3;
 
 /**
  * 播放设置（设置 - 播放设置）
  *
  * 对应界面上这几项：
+ *   默认渠道（歌手页等没有渠道选择项的页面先走哪个平台）/
  *   播放音质 / 拓展音质（含 Hi-Res、全景声、全景声+、母带）/ 与其他应用同时播放 /
  *   被打断结束后自动重新播放
  *   播放页显示小歌词 / 歌词页模糊效果 / 歌词居中显示 / 歌词字号 / 歌词页不熄屏 /
@@ -95,6 +98,36 @@ export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
  */
 export const K_AUTO_RESUME_AFTER_INTERRUPT: string = 'cfg_auto_resume_after_interrupt';
 
+/**
+ * 默认渠道（默认平台）
+ *
+ * 有些页面没有「选渠道」的入口，只能替用户猜一个平台：
+ *   - 点歌手名进的歌手页（`MusicArtist.resolveArtistByName`）：认人时要先问一个平台；
+ *   - 本地 / 云端音乐的自动歌词匹配（`LyricMatch.autoMatchLyric`）：没有平台身份，
+ *     只能按顺序去平台搜。
+ * 以前这两处都是「看内容从哪来 / 写死一个平台顺序」，这一项让用户自己指定：
+ * 设了就从它开始，这个平台没有对应内容时再按原来的顺序回退，不影响能打开、能配上。
+ *
+ * 空串 = 「自动」（不指定）：保持原来的取数顺序，行为与加这一项之前一致 ——
+ * 用户没主动选之前不该悄悄改变他的使用习惯。
+ *
+ * 注意它**不是**推荐来源：首页标题栏那颗胶囊（`RecommendSettings`）与搜索页的平台
+ * 筛选各管各的，用户在那里明确选了平台，就不该被这一项盖掉。
+ */
+export const K_DEFAULT_SOURCE: string = 'cfg_default_source';
+
+/** 默认渠道的取值（第一项是空串 = 自动 = 不指定），顺序与界面上的胶囊一致 */
+export const DEFAULT_SOURCE_VALUES: string[] = ['', 'kw', 'kg', 'mg', 'tx', 'wy'];
+/**
+ * 默认渠道的界面文案，与 DEFAULT_SOURCE_VALUES 一一对应
+ *
+ * 平台只列内置接口真正支持的五家（歌手搜索 / 歌词匹配的平台范围，见
+ * `MusicArtist.ARTIST_PLATFORMS`、`LyricMatch.MATCH_PLATFORMS`）；汽水（qs）没有歌手
+ * 搜索接口，放进默认渠道会出现「选了它，歌手页却永远回退」的空档，所以不列。
+ * 文案与 `MusicList.PLATFORM_NAMES` 保持一致（这里是设置层，不反向依赖平台层）。
+ */
+export const DEFAULT_SOURCE_LABELS: string[] = ['自动', '酷我', '酷狗', '咪咕', 'QQ', '网易'];
+
 /** 落盘结构（字段全部可选：老文件里可能缺字段，缺的用默认值） */
 interface PlaySettingsData {
   version?: number;
@@ -111,6 +144,8 @@ interface PlaySettingsData {
   autoMatchLyric?: boolean;
   bluetoothLyric?: boolean;
   autoResumeAfterInterrupt?: boolean;
+  /** '' = 自动（不指定默认渠道），见 K_DEFAULT_SOURCE */
+  defaultSource?: string;
 }
 
 function clampFontSize(value: number): number {
@@ -181,6 +216,14 @@ export class PlaySettings {
    * （见 K_AUTO_RESUME_AFTER_INTERRUPT 的说明）。
    */
   private autoResumeAfterInterrupt: boolean = true;
+  /**
+   * 默认渠道，默认「自动」（空串 = 不指定）。
+   *
+   * 为什么默认不指定：这一项会改「点歌手名进哪个平台的歌手页」这种既有行为，
+   * 而它只是偏好、不是必需 —— 用户没选之前，让他看到和以前一样的结果更稳妥。
+   * 想固定一个平台的用户自己来设置里选（见 K_DEFAULT_SOURCE）。
+   */
+  private defaultSource: string = '';
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -234,6 +277,7 @@ export class PlaySettings {
       autoMatchLyric: this.autoMatchLyric,
       bluetoothLyric: this.bluetoothLyric,
       autoResumeAfterInterrupt: this.autoResumeAfterInterrupt,
+      defaultSource: this.defaultSource,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -300,6 +344,11 @@ export class PlaySettings {
     if (data.autoResumeAfterInterrupt !== undefined) {
       this.autoResumeAfterInterrupt = data.autoResumeAfterInterrupt;
     }
+    // 默认渠道：只认已知平台或空串；不认识的（以后删掉的平台 / 手改坏的存档）按自动处理
+    const defaultSource: string | undefined = data.defaultSource;
+    if (defaultSource !== undefined && DEFAULT_SOURCE_VALUES.includes(defaultSource)) {
+      this.defaultSource = defaultSource;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -322,6 +371,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
       AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, this.bluetoothLyric);
       AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, this.autoResumeAfterInterrupt);
+      AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -412,6 +462,27 @@ export class PlaySettings {
     }
     this.quality = value;
     AppStorage.setOrCreate(K_PLAY_QUALITY, value);
+    this.write();
+  }
+
+  /**
+   * 默认渠道（'' = 自动 / 不指定，见 K_DEFAULT_SOURCE）
+   *
+   * 读取方是歌手解析（`MusicArtist.resolveArtistByName`）与本地 / 云端自动歌词匹配
+   * （`LyricMatch.autoMatchLyric`）—— 它们每次用之前现读，改设置立刻生效，
+   * 不像播放音质那样在会话里缓存一份。
+   */
+  getDefaultSource(): string {
+    return this.defaultSource;
+  }
+
+  /** 选默认渠道（播放设置页的胶囊点选） */
+  setDefaultSource(value: string): void {
+    if (!DEFAULT_SOURCE_VALUES.includes(value) || value === this.defaultSource) {
+      return;
+    }
+    this.defaultSource = value;
+    AppStorage.setOrCreate(K_DEFAULT_SOURCE, value);
     this.write();
   }
 

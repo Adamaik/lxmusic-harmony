@@ -492,17 +492,21 @@ export function removeLocalSongs(items: SongItem[]): number {
   const music = LocalMusic.getInstance();
   const keys: string[] = [];
   const ids: string[] = [];
+  // 播放历史里的旧流水（v1 迁移来的）没有 SongItem id，只能按「歌名 + 歌手」认：
+  // 本地歌删掉后要让 ListenLog 把它们也从最近播放里摘掉，否则会留下点不开的幽灵行
+  const songKeys: string[] = [];
   for (const item of items) {
     const key: string = music.keyOfId(item.id);
     if (key.length > 0) {
       keys.push(key);
     }
     ids.push(item.id);
+    songKeys.push(`${item.name}\u0001${item.singer}`);
   }
   const removed: number = music.removeKeys(keys);
   if (removed > 0) {
     // 不摘掉的话，收藏 / 历史 / 队列里会留下点一下就报错的幽灵条目
-    PlaySession.getInstance().dropLocalSongs(ids);
+    PlaySession.getInstance().dropLocalSongs(ids, songKeys);
   }
   return removed;
 }

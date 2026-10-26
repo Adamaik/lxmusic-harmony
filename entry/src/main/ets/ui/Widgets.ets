@@ -157,6 +157,14 @@ export struct CoverArt {
    * 半秒后再换成真封面，比空着更难看。加载结束还没图才会走下面的兜底占位。
    */
   @Prop pending: boolean = false;
+  /**
+   * 铺满父容器（不按 boxSize 画正方形）
+   *
+   * 默认的「封面 = boxSize × boxSize 正方形」在列表小封面上是对的，但整张卡
+   * （方形榜单卡 / 分类卡）要封面铺满整卡：这里只改根节点的尺寸，图片本身仍是
+   * `ImageFit.Cover`，兜底占位也跟着铺满。`boxSize` 继续用于占位图的字号比例。
+   */
+  @Prop fill: boolean = false;
   /** 这张图加载失败 */
   @State failed: boolean = false;
 
@@ -203,8 +211,8 @@ export struct CoverArt {
           .fontColor('#D9FFFFFF')
       }
     }
-    .width(this.boxSize)
-    .height(this.boxSize)
+    .width(this.fill ? '100%' : this.boxSize)
+    .height(this.fill ? '100%' : this.boxSize)
     .borderRadius(this.radius)
     .clip(true)
     .backgroundColor('#1C1C1E')
@@ -572,16 +580,23 @@ export struct SingerLink {
   }
 }
 
-/** 页面大标题 */
+/**
+ * 页面大标题
+ *
+ * `onDark`：回响页是**固定深色**的沉浸式月报（见 views/EchoView.ets，配色不跟
+ * 系统深浅模式走，像播放页封面上的白字），压在它上面的页头标题必须是白字，
+ * 否则深色底上是一行看不见的深色字。其它页签照旧用主题的文字色。
+ */
 @Component
 export struct PageTitle {
   @Prop text: string = '';
+  @Prop onDark: boolean = false;
 
   build() {
     Text(this.text)
       .fontSize(29)
       .fontWeight(FontWeight.Bold)
-      .fontColor(C_TEXT)
+      .fontColor(this.onDark ? '#FFFFFF' : C_TEXT)
   }
 }
 

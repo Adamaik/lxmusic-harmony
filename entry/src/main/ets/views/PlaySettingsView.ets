@@ -4,8 +4,9 @@ import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/Set
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
-import { EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_RESUME_AFTER_INTERRUPT,
-  K_BLUETOOTH_LYRIC, K_DESKTOP_LYRIC,
+import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
+  EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_RESUME_AFTER_INTERRUPT,
+  K_BLUETOOTH_LYRIC, K_DEFAULT_SOURCE, K_DESKTOP_LYRIC,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
@@ -20,6 +21,14 @@ struct ExtendQualitySetting {
   @Prop options: string[] = [];
   @Prop activeIndex: number = 0;
   @Prop hint: string = '';
+  /**
+   * 开关旁边常驻的一句说明
+   *
+   * 与 `hint` 分开：`hint` 只在开关打开后（选了档位才需要看）显示，而
+   * 「需要登录 + 会员」是**决定要不要打开**的前置条件，开关关着也得看得见，
+   * 否则用户会以为打开就一定有母带（2026-10-21 用户就是被这个坑到的）。
+   */
+  @Prop note: string = '';
   onToggle: (next: boolean) => void = () => {
   };
   onPickOption: (index: number) => void = () => {
@@ -34,6 +43,9 @@ struct ExtendQualitySetting {
           this.onToggle(next);
         },
       })
+      if (this.note.length > 0) {
+        HintText({ text: this.note })
+      }
       if (this.on) {
         OptionSetting({
           label: '拓展音质档位',
@@ -56,6 +68,8 @@ struct ExtendQualitySetting {
  * 播放设置
  *
  * 对应设置页里的「播放设置」，参考图上的分区：
+ *   〇、渠道：默认渠道（自动 / 酷我 / 酷狗 / 咪咕 / QQ / 网易）——
+ *       歌手页、本地与云端自动匹配歌词这类没有渠道选择项的地方，先从这个平台取数
  *   一、音质：播放音质（128K/320K/FLAC/24Bit）、拓展音质（开关 + Hi-Res/全景声/全景声+/母带）、
  *       与其他应用同时播放、被其他应用打断结束后自动重新播放
  *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、
@@ -66,6 +80,8 @@ struct ExtendQualitySetting {
  *
  * 所有项都写进 PlaySettings（沙箱 JSON + AppStorage），改完立即落盘，重启不丢。
  * 真机上生效的路径：
+ *   - 默认渠道 -> 歌手解析（MusicArtist.resolveArtistByName）与本地 / 云端自动匹配歌词
+ *     （LyricMatch.autoMatchLyric）先从这个平台取数，取不到再按原来的顺序回退
  *   - 播放音质 / 拓展音质 -> PlaySession.negotiateQuality 解析播放链接时按候选顺序取
  *   - 与其他应用同时播放 -> LxPlayer 起播时设 audioInterruptMode、并激活「与其他应用混音」
  *     的应用级音频会话（跨应用只认后者，见 LxPlayer.applyConcurrency）
@@ -81,6 +97,8 @@ export struct PlaySettingsView {
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
   @StorageLink(K_PLAY_QUALITY) quality: string = '128k';
+  /** 默认渠道（'' = 自动 / 不指定，见 PlaySettings.K_DEFAULT_SOURCE） */
+  @StorageLink(K_DEFAULT_SOURCE) defaultSource: string = '';
   @StorageLink(K_EXTEND_QUALITY) extend: boolean = false;
   @StorageLink(K_EXTEND_QUALITY_TYPE) extendType: string = 'hires';
   @StorageLink(K_PLAY_WITH_OTHERS) playWithOthers: boolean = false;
@@ -131,6 +149,12 @@ export struct PlaySettingsView {
   private qualityIndex(): number {
     const index: number = MAIN_QUALITYS.indexOf(this.quality);
     return index < 0 ? MAIN_QUALITYS.length - 1 : index;
+  }
+
+  /** 默认渠道胶囊选中的是第几枚（存档里是空串 / 不认识的平台都落在「自动」上） */
+  private defaultSourceIndex(): number {
+    const index: number = DEFAULT_SOURCE_VALUES.indexOf(this.defaultSource);
+    return index < 0 ? 0 : index;
   }
 
   private extendIndex(): number {
@@ -200,6 +224,36 @@ export struct PlaySettingsView {
           // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
           Column().height(this.topInset + 6).width('100%')
 
+          // ------------------------------------------------ 渠道（默认渠道：没有渠道选择项的页面先走它）
+          Column({ space: 14 }) {
+            Column({ space: 8 }) {
+              OptionSetting({
+                label: '默认渠道',
+                options: DEFAULT_SOURCE_LABELS,
+                activeIndex: this.defaultSourceIndex(),
+                onPick: (index: number) => {
+                  PlaySettings.getInstance().setDefaultSource(DEFAULT_SOURCE_VALUES[index]);
+                },
+              })
+              HintText({
+                text: '「自动」= 不指定，仍按内容原本的来源平台走。选定一个平台后，'
+                  + '所有没有渠道选择项的页面都先从这个平台取数：点歌手名进的歌手页优先在这个平台'
+                  + '认人、取该歌手的歌，本地与云端音乐自动匹配歌词也先在这个平台搜；'
+                  + '这个平台没有对应内容时，再按原来的顺序回退，不会因为选了它就打不开。',
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({
+              text: '只影响这些没有渠道选择项的地方。首页标题栏的「推荐来源」胶囊、'
+                + '搜索页的平台筛选各管各的，不受这一项影响。',
+            })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
           // ------------------------------------------------ 音质（卡 + 说明是一个单元）
           Column({ space: 14 }) {
             Column({ space: 8 }) {
@@ -217,6 +271,8 @@ export struct PlaySettingsView {
                 on: this.extend,
                 options: EXTEND_QUALITY_LABELS,
                 activeIndex: this.extendIndex(),
+                note: '需要登录并有会员才能用：网易云先到「设置 - 登录音乐」登录会员账号；'
+                  + '平台不提供这一档、或当前音源没声明支持时，会自动退回「播放音质」里选的那档。',
                 hint: '这几档多数平台要会员，且要有支持它的音源；拿不到时自动退回「播放音质」里选的那档。',
                 onToggle: (next: boolean) => {
                   PlaySettings.getInstance().setExtendQuality(next);

@@ -1,4 +1,5 @@
-import { K_HISTORY_VERSION, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { K_ECHO_VERSION, ListenLog } from '../core/history/ListenLog';
 import { BottomBar } from '../ui/BottomBar';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
@@ -112,12 +113,12 @@ export struct MineView {
   /**
    * 各个库的版本号：任何一个变了，卡片上的条数与歌单列表就重算一次
    *
-   * 全部挂同一个 `refresh`：这一页的数据来自五个不同的模块（同步库 / 播放会话 /
-   * 本地音乐 / 下载管理 / 云端曲库），谁变了都得重新读一遍，没必要各写一个分支。
+   * 全部挂同一个 `refresh`：这一页的数据来自六个不同的模块（同步库 / 播放会话 /
+   * 本地音乐 / 下载管理 / 云端曲库 / 收听流水），谁变了都得重新读一遍，没必要各写一个分支。
    */
   @StorageLink(K_LIBRARY_VERSION) @Watch('refresh') libraryVersion: number = 0;
   @StorageLink(K_SYNC_DATA_VERSION) @Watch('refresh') syncVersion: number = 0;
-  @StorageLink(K_HISTORY_VERSION) @Watch('refresh') historyVersion: number = 0;
+  @StorageLink(K_ECHO_VERSION) @Watch('refresh') historyVersion: number = 0;
   @StorageLink(K_FAVORITE_IDS) @Watch('refresh') favoriteIds: string[] = [];
   @StorageLink(K_LOCAL_VERSION) @Watch('refresh') localVersion: number = 0;
   @StorageLink(K_DOWNLOAD_VERSION) @Watch('refresh') downloadVersion: number = 0;
@@ -152,7 +153,9 @@ export struct MineView {
     this.collected = CollectedPlaylists.getInstance().list();
     this.favoriteCount = library.favoritePlaylistSummary().count;
     this.localCount = LocalMusic.getInstance().songsForUi().length;
-    this.historyCount = PlaySession.getInstance().history.length;
+    // 最近播放的条数与历史页同一个口径：流水按「歌名 + 歌手」去重后的最近 100 首
+    // （原来读 PlaySession.history；那份历史已搬进 ListenLog，与回响共用）
+    this.historyCount = ListenLog.getInstance().recentSongs(100).length;
     this.downloadCount = DownloadManager.getInstance().list().length;
     this.cloudCount = WebDavLibrary.getInstance().songsForUi().length;
   }

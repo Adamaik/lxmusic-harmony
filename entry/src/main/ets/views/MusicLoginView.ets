@@ -1,0 +1,367 @@
+import { LengthMetrics } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_ON_ACCENT, C_RED, C_TEXT, C_TEXT_SUB,
+  C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD, platformColor, platformTint } from '../ui/Theme';
+import { cardWidthOf, cardColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
+import { IconGlyph, I_PERSON } from '../ui/Icons';
+import { BookLoginWeb } from '../components/BookLoginWeb';
+import { K_MUSIC_LOGGED_WY, K_MUSIC_NICK_WY, K_MUSIC_VIP_WY, MusicProfile,
+  musicAccount } from '../core/music/MusicAccount';
+
+/** 网易云的登录页（网页端；扫码 / 短信 / 账号密码都在这一页里，应用内浏览器照着走一遍即可） */
+const WY_LOGIN_URL: string = 'https://music.163.com/#/login';
+/** 网易云站址：登录后常跳到主站，抓 Cookie 时也扫一遍这里 */
+const WY_SITE_URL: string = 'https://music.163.com';
+
+/**
+ * 设置 - 登录音乐
+ *
+ * **为什么要有这一页**：网易把母带 / 沉浸声 / 杜比全景声（接口里的 `jymaster` / `sky` /
+ * `dolby`）算成**账号权益档**，匿名请求里根本不会上报（详见 core/music/MusicAccount.ets
+ * 顶部那段排查结论）。所以这一页的职责只有两件：让用户把网页登录态抓回来存好，
+ * 以及把「登录到底解锁了什么、没解锁什么」说清楚 —— 后者比前者更容易让人误解成
+ * 「登录了就一定有母带」。
+ *
+ * 登录态不另存一份：页面用 @StorageLink 订阅 MusicAccount 写进 AppStorage 的三个 key，
+ * 登录 / 退出后立刻刷新，重进页面也是真实状态。
+ *
+ * 只接网易（`wy`）；QQ / 酷狗先占位，等核心层按同一形状加平台键再接。
+ */
+@Component
+export struct MusicLoginView {
+  /** 内容让出标题栏那一段（壳层传来「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
+  @Prop topInset: number = 0;
+  @Prop bottomInset: number = 0;
+  /** 整屏覆盖层（应用内浏览器）不经过标题栏，顶 / 底安全区要由它自己避让 */
+  @Prop safeTop: number = 0;
+  @Prop safeBottom: number = 0;
+  /** 是否已登录（MusicAccount 落盘后写进 AppStorage，这里订阅） */
+  @StorageLink(K_MUSIC_LOGGED_WY) loggedIn: boolean = false;
+  @StorageLink(K_MUSIC_NICK_WY) nickname: string = '';
+  @StorageLink(K_MUSIC_VIP_WY) vip: string = '';
+  /** 应用内浏览器是否打开（bindContentCover 的开关） */
+  @State webOpen: boolean = false;
+  /** 登录 / 退出进行中：按钮禁用并显示「处理中…」，避免连点重复请求 */
+  @State busy: boolean = false;
+  /** 窗口宽度（vp）：宽屏下两张卡并排，与其它设置页同一套排布（0 = 还没量到，按手机一列） */
+  @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+
+  aboutToAppear(): void {
+    // EntryAbility 里已经 init 过；这里再调一次是保险：页面若被单独打开也不会读到空登录态
+    musicAccount().init(this.getUIContext().getHostContext() as common.Context);
+  }
+
+  /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
+  private cardsSideBySide(): boolean {
+    return cardColumnsFor(this.windowWidth) > 1;
+  }
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
+  /**
+   * 网易云这一行的状态文案
+   *
+   * 昵称 / 会员档可能拉不到（账号信息接口偶尔抽风，不影响登录态本身），
+   * 这时明确写「未知」，不把「没查到」说成「不是会员」。
+   */
+  private wyStatus(): string {
+    if (!this.loggedIn) {
+      return '未登录：登录后网易才会返回母带等权益音质';
+    }
+    const name: string = this.nickname.length > 0 ? this.nickname : '没取到昵称';
+    const vip: string = this.vip.length > 0 ? this.vip : '会员档未知';
+    return `已登录：${name} · ${vip}`;
+  }
+
+  /** 打开应用内浏览器：把站点自己的登录页装进来，扫码 / 短信 / 跳转都能走 */
+  private openWebLogin(): void {
+    if (this.busy) {
+      return;
+    }
+    this.webOpen = true;
+  }
+
+  /**
+   * 网页登录关闭
+   *
+   * Cookie 为空 = 用户点了取消 / 还没登完就退出，只提示、不改登录态；
+   * 非空则交给 MusicAccount 校验（里面会查 `MUSIC_U`，拿不到就抛中文错误）。
+   */
+  private onWebLoginClosed(cookie: string): void {
+    this.webOpen = false;
+    const text: string = cookie !== undefined && cookie !== null ? cookie.trim() : '';
+    if (text.length === 0) {
+      this.toast('没抓到 Cookie，可能还没登录成功');
+      return;
+    }
+    void this.finishLogin(text);
+  }
+
+  /** 校验并落盘登录态；成功 / 失败都给出明确 toast，不让按钮点完没反应 */
+  private async finishLogin(rawCookie: string): Promise<void> {
+    this.busy = true;
+    try {
+      const profile: MusicProfile = await musicAccount().login('wy', rawCookie);
+      if (profile.nickname.length > 0) {
+        const vip: string = profile.vip.length > 0 ? profile.vip : '会员档未知';
+        this.toast(`已登录网易云音乐：${profile.nickname}（${vip}）`);
+      } else {
+        // 账号信息没拉到不影响「已登录」：音质协商照样会带 Cookie 去问
+        this.toast('已登录网易云音乐（账号信息没拉到，不影响播放）');
+      }
+    } catch (e) {
+      this.toast(`登录失败：${(e as Error).message}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 退出先问一声：退出会让母带这类权益档退回普通档，属于用户能感知的变化 */
+  private confirmLogout(): void {
+    if (this.busy) {
+      return;
+    }
+    this.getUIContext().showAlertDialog({
+      title: '退出网易云音乐登录？',
+      message: '退出后请求不再带你的登录态，母带 / 沉浸声 / 杜比这类账号权益档会跟着消失；'
+        + '搜索、歌单、榜单这些公开接口照旧能用。随时可以再登回来。',
+      autoCancel: true,
+      buttons: [
+        { value: '取消', action: () => { } },
+        {
+          value: '退出',
+          fontColor: C_RED,
+          action: () => {
+            this.busy = true;
+            musicAccount().logout('wy');
+            this.busy = false;
+            this.toast('已退出网易云音乐登录，权益音质会退回普通档');
+          },
+        },
+      ],
+    });
+  }
+
+  // ------------------------------------------------------------ 界面片段
+
+  /** 网易云这一行：状态两行 + 右侧登录 / 退出按钮 */
+  @Builder
+  wyRow() {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width(40)
+          .height(40)
+          .borderRadius(20)
+          .backgroundColor(platformTint('wy'))
+        IconGlyph({ symbol: I_PERSON, iconSize: 22, color: platformColor('wy') })
+      }
+      .width(40)
+      .height(40)
+
+      Column({ space: 4 }) {
+        Text('网易云音乐')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+          .maxLines(1)
+        Text(this.wyStatus())
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Button(this.busy ? '处理中…' : (this.loggedIn ? '退出登录' : '登录'))
+        .fontSize(13)
+        .height(30)
+        .padding({ left: 14, right: 14 })
+        // 已登录是「撤销一个已生效的状态」，弱化成次要文字色；未登录才是要用户动手的主按钮
+        .fontColor(this.loggedIn ? C_TEXT_SUB : C_ON_ACCENT)
+        .backgroundColor(this.loggedIn ? C_FILL_SOFT_STRONG : C_RED)
+        .enabled(!this.busy)
+        .opacity(this.busy ? 0.6 : 1)
+        .onClick(() => {
+          if (this.loggedIn) {
+            this.confirmLogout();
+          } else {
+            this.openWebLogin();
+          }
+        })
+        .accessibilityText(this.loggedIn ? '退出网易云音乐登录' : '登录网易云音乐')
+        .accessibilityLevel('yes')
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+  }
+
+  /** 还没接的平台：整行置灰、不给点击，右侧只说明「敬请期待」 */
+  @Builder
+  pendingRow(name: string, source: string) {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width(40)
+          .height(40)
+          .borderRadius(20)
+          .backgroundColor(platformTint(source))
+        IconGlyph({ symbol: I_PERSON, iconSize: 22, color: C_TEXT_WEAK })
+      }
+      .width(40)
+      .height(40)
+
+      Column({ space: 4 }) {
+        Text(name)
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT_WEAK)
+          .maxLines(1)
+        Text('账号体系还没接，先不占坑')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .maxLines(1)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Text('敬请期待')
+        .fontSize(12)
+        .fontColor(C_TEXT_WEAK)
+        .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+        .backgroundColor(C_FILL_SOFT_STRONG)
+        .borderRadius(13)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+    .opacity(0.65)
+  }
+
+  /**
+   * 网页登录整屏覆盖层
+   *
+   * 用 `bindContentCover` 而不是半模态：登录页要占满屏、能滚动、还要弹系统键盘。
+   * 关掉时把抓到的 Cookie 串交回来（可能为空串），由 onWebLoginClosed 判断是取消还是登录。
+   */
+  @Builder
+  loginWebCover() {
+    BookLoginWeb({
+      title: '网易云音乐',
+      loginUrl: WY_LOGIN_URL,
+      siteUrl: WY_SITE_URL,
+      safeTop: this.safeTop,
+      safeBottom: this.safeBottom,
+      onClose: (cookie: string) => {
+        this.onWebLoginClosed(cookie);
+      },
+    })
+  }
+
+  build() {
+    Column() {
+      Scroll() {
+        /**
+         * 与其它设置页同一套骨架：顶部占位 + 卡片；宽屏两张卡并排、窄屏一列。
+         * 每张「卡 + 它下面那行说明」包成一个 Column 当一个单元，并排时不会互相插队。
+         */
+        Flex({
+          direction: this.cardsSideBySide() ? FlexDirection.Row : FlexDirection.Column,
+          wrap: this.cardsSideBySide() ? FlexWrap.Wrap : FlexWrap.NoWrap,
+          alignItems: ItemAlign.Start,
+          space: { main: LengthMetrics.vp(14), cross: LengthMetrics.vp(14) },
+        }) {
+          // 顶部占位：第一行落在透明标题栏下方，跟着内容一起滚走（用容器内边距会像被顶栏挡住）
+          Column().height(this.topInset + 6).width('100%')
+
+          // ------------------------------------------------ 说明卡：登录到底解锁什么
+          Column({ space: 14 }) {
+            Column({ space: 10 }) {
+              Text('登录能解锁什么')
+                .fontSize(F_ITEM)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(C_TEXT)
+                .width('100%')
+                .textAlign(TextAlign.Start)
+
+              Text('网易把母带、沉浸声、杜比全景声（接口里的 jymaster / sky / dolby）当成账号权益：'
+                + '不登录时接口压根不会报这几档，最高只到 FLAC 那类无损。'
+                + '登录后请求会带上你的账号，网易才愿意把它们一起报出来 —— '
+                + '之前「开了拓展音质还是只有 FLAC」，根子就在这儿。')
+                .fontSize(F_SUB)
+                .fontColor(C_TEXT_SUB)
+                .lineHeight(19)
+                .width('100%')
+                .textAlign(TextAlign.Start)
+
+              Text('但报出来不等于一定放得动：这首歌的音源自己没声明支持这一档，或者账号没有对应权益，'
+                + '播放时还是会自动退回低一档。登录解决的是「平台愿不愿意给」，'
+                + '歌本身有没有这一档，得看音源。')
+                .fontSize(F_SUB)
+                .fontColor(C_TEXT_SUB)
+                .lineHeight(19)
+                .width('100%')
+                .textAlign(TextAlign.Start)
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            Text('只保存网页登录抓回来的 Cookie（相当于本机的一张登录凭证），不保存账号密码，'
+              + '也不会发到别处；不想用了点「退出登录」就清掉。')
+              .fontSize(11.5)
+              .fontColor(C_TEXT_WEAK)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 平台列表
+          Column({ space: 14 }) {
+            Column() {
+              this.wyRow()
+
+              Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+              this.pendingRow('QQ 音乐', 'tx')
+
+              Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+              this.pendingRow('酷狗音乐', 'kg')
+            }
+            .width('100%')
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+            .clip(true)
+
+            Text('目前只有网易云能账号登录；QQ 音乐、酷狗后续按同一套接进来。'
+              + '登录后返回的权益档只在播放网易云音源时生效，别的平台各按各的规矩来。')
+              .fontSize(11.5)
+              .fontColor(C_TEXT_WEAK)
+              .width('100%')
+              .padding({ left: 4, right: 4 })
+              .textAlign(TextAlign.Start)
+          }
+          .width(cardWidthOf(this.windowWidth))
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 16 })
+      }
+      .scrollBar(BarState.Off)
+      .layoutWeight(1)
+      .align(Alignment.Top)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(C_BG)
+    // 网页登录挂在页面根节点上：覆盖层铺满窗口，不经过标题栏（safeTop / safeBottom 已交给 BookLoginWeb）
+    .bindContentCover($$this.webOpen, this.loginWebCover(), {
+      modalTransition: ModalTransition.NONE,
+    })
+  }
+}

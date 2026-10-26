@@ -106,3 +106,68 @@ export function decodeAes128EcbPkcs7Text(keyBytes: number[], cipherText: string)
   const plainBytes: number[] = aes128EcbPkcs7DecryptBytes(keyBytes, cipherBytes);
   return bytesToUtf8(plainBytes);
 }
+
+/** AES-128-CBC + PKCS7 加密（网易 weapi 用：固定 key + IV 都是 16 字节） */
+export function aes128CbcPkcs7EncryptBytes(keyBytes: number[], ivBytes: number[],
+  dataBytes: number[]): number[] {
+  if (keyBytes.length !== 16) {
+    throw new Error('AES-128 key must be 16 bytes');
+  }
+  if (ivBytes.length !== 16) {
+    throw new Error('AES CBC iv must be 16 bytes');
+  }
+  const keyBlob: cryptoFramework.DataBlob = { data: toU8(keyBytes) };
+  const key: cryptoFramework.SymKey =
+    cryptoFramework.createSymKeyGenerator('AES128').convertKeySync(keyBlob);
+  const cipher: cryptoFramework.Cipher = cryptoFramework.createCipher('AES128|CBC|PKCS7');
+  const spec: cryptoFramework.IvParamsSpec = {
+    algName: 'IvParamsSpec',
+    iv: { data: toU8(ivBytes) },
+  };
+  cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, key, spec);
+  const input: cryptoFramework.DataBlob = { data: toU8(dataBytes) };
+  return toNumbers(cipher.doFinalSync(input).data);
+}
+
+/**
+ * RSA 公钥**裸加密**（NoPadding）+ 十六进制输出
+ *
+ * 网易 weapi 的 `encSecKey` 是把 16 字节随机串用网易那把固定 RSA-1024 公钥做**无填充**
+ * 模幂后的十六进制串（公认实现里是 `forgePublicKey.encrypt(str, 'NONE')`／手写 modPow）。
+ * 这里必须用 NoPadding 而不是 PKCS1：服务端按裸 RSA 解，带填充会解出垃圾，
+ * 表现为「HTTP 200 但返回 HTML 错误页」。
+ *
+ * 裸 RSA 要求输入正好等于密钥长度（1024 位 = 128 字节），明文右对齐、左侧补 0。
+ */
+export function rsa1024NoPaddingEncryptHex(spkiDerBase64: string, dataBytes: number[]): string {
+  const generator: cryptoFramework.AsyKeyGenerator =
+    cryptoFramework.createAsyKeyGenerator('RSA1024');
+  const pubDerBlob: cryptoFramework.DataBlob = { data: toU8(fromBase64(spkiDerBase64)) };
+  const pair: cryptoFramework.KeyPair = generator.convertKeySync(pubDerBlob, null);
+  const cipher: cryptoFramework.Cipher = cryptoFramework.createCipher('RSA1024|NoPadding');
+  cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, pair.pubKey, null);
+  const blockSize: number = 128;
+  if (dataBytes.length > blockSize) {
+    throw new Error(`RSA-1024 明文超过 ${blockSize} 字节`);
+  }
+  const block: number[] = new Array<number>(blockSize);
+  for (let i = 0; i < blockSize; i++) {
+    block[i] = 0;
+  }
+  const offset: number = blockSize - dataBytes.length;
+  for (let i = 0; i < dataBytes.length; i++) {
+    block[offset + i] = dataBytes[i] & 0xFF;
+  }
+  const input: cryptoFramework.DataBlob = { data: toU8(block) };
+  return toHex(toNumbers(cipher.doFinalSync(input).data));
+}
+
+/** 字节 -> 小写十六进制串 */
+export function toHex(bytes: number[]): string {
+  const parts: string[] = new Array<string>(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    const h: string = (bytes[i] & 0xFF).toString(16);
+    parts[i] = h.length === 1 ? `0${h}` : h;
+  }
+  return parts.join('');
+}

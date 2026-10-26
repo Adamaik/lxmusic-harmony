@@ -1,4 +1,5 @@
 import listDescTest from './ListDesc.test';
+import heartModeTest from './HeartMode.test';
 import localMusicTest from './LocalMusic.test';
 import localUnitTest from './LocalUnit.test';
 import lyricMatchTest from './LyricMatch.test';
@@ -11,6 +12,7 @@ import webDavTest from './WebDav.test';
 
 export default function testsuite() {
   listDescTest();
+  heartModeTest();
   localMusicTest();
   localUnitTest();
   lyricMatchTest();

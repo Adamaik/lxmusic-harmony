@@ -49,7 +49,8 @@ export class ArtistNav {
   /**
    * 点了一位歌手名
    *
-   * @param source 这首歌的来源平台（用来去哪个平台认人，认不到会自动换别的平台）
+   * @param source 这首歌的来源平台（用来去哪个平台认人；设置里指定了「默认渠道」时
+   *               默认渠道排最前，这个平台排在它后面当回退，认不到会自动换别的平台）
    * @param singer 歌手那一行的原文，可能是「周杰伦、方文山」这种多位
    */
   open(source: string, singer: string): void {

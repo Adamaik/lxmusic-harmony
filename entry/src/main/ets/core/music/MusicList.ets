@@ -7,6 +7,7 @@ import {
   utf8Bytes,
 } from './LxCrypto';
 import { decodeAes128EcbPkcs7Text } from './PlatformCrypto';
+import { wyCsrfFromCookie, wyWeapiForm } from './WyWeapi';
 import {
   LxMusicInfo,
   LxQualityItem,
@@ -22,6 +23,7 @@ import {
   sizeFormate,
 } from './MusicSearch';
 import { musicIdOf } from './MusicId';
+import { musicCookieHeader } from './MusicAccount';
 
 /**
  * 内置「歌单广场 / 排行榜」（宿主侧）
@@ -38,7 +40,7 @@ import { musicIdOf } from './MusicId';
  * （/api/playlist/list、/api/v6/playlist/detail、/api/song/detail）做「尽力而为」的实现，
  * 可能失效；失效时界面会显示该平台的错误信息，不影响其它来源。
  *
- * 明文接口有两个坑，细节见 WY_HEADERS 与 wyPlaylistDetail 的注释：请求必须带
+ * 明文接口有两个坑，细节见 wyHeaders 与 wyPlaylistDetail 的注释：请求必须带
  * `Cookie: os=pc`，且取歌要以 `trackIds` 为准（`tracks` 会被砍成开头的试听预览）。
  */
 
@@ -320,8 +322,12 @@ function resultRecord(result: FetchResult, label: string): Record<string, Object
         return parsed as Record<string, Object>;
       }
     } catch (e) {
-      // fallthrough
+      // 落到下面统一报错
     }
+    // 解析不了就把响应开头带上：接口改成返回 HTML / 加密串时，日志里能直接看到原因
+    const text: string = body as string;
+    const head: string = text.length > 200 ? text.substring(0, 200) : text;
+    throw new Error(`${label}返回格式异常（HTTP ${result.status}）：${head}`);
   }
   throw new Error(`${label}返回格式异常（HTTP ${result.status}）`);
 }
@@ -2080,15 +2086,22 @@ const WY_SORTS: LxSortItem[] = [
  * `Cookie: os=pc` 这一行是必需的，不是可有可无的装饰：不带它，歌单详情返回的
  * `playlist.tracks` 会被砍成开头若干首的「试听预览」——实测普通用户歌单恒 10 首、
  * 「我喜欢的音乐」6 首（同一次请求里 `playlist.trackIds` 却是完整的一整份）。
- * 这个 cookie 只声明客户端形态，不需要登录态（把 `MUSIC_U` 写空串没有用）。
+ * 这个 cookie 只声明客户端形态，不需要登录态 —— 但**不能把 `MUSIC_U` 写空串**。
+ *
+ * 2026-10-21：改成函数，Cookie 由 `musicCookieHeader('wy')` 决定 —— 用户在
+ * 「设置 - 登录音乐」登录网易后，这里会带上 `MUSIC_U`，接口才会把母带 / 沉浸声 /
+ * 杜比全景声（`jymaster / sky / dolby`）这类**账号权益档**报进 `privilege.maxBrLevel`
+ * （匿名请求实测最高只到 `hires`，见 core/music/MusicAccount.ets 的说明）。
  */
-const WY_HEADERS: Record<string, string> = {
-  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
-    'Chrome/60.0.3112.90 Safari/537.36',
-  'Referer': 'https://music.163.com/',
-  'Origin': 'https://music.163.com',
-  'Cookie': 'os=pc',
-};
+function wyHeaders(): Record<string, string> {
+  return {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/60.0.3112.90 Safari/537.36',
+    'Referer': 'https://music.163.com/',
+    'Origin': 'https://music.163.com',
+    'Cookie': musicCookieHeader('wy'),
+  };
+}
 
 /**
  * 网易推荐歌单。
@@ -2104,7 +2117,7 @@ async function wyPlaylists(page: number): Promise<LxPlaylistItem[]> {
     'total': 'true',
   };
   const body: Record<string, Object> = await fetchRecord('https://music.163.com/api/playlist/list',
-    { method: 'post', headers: WY_HEADERS, form: form }, '网易歌单');
+    { method: 'post', headers: wyHeaders(), form: form }, '网易歌单');
   if (asNumber(body['code']) !== 200) {
     throw new Error('网易歌单接口返回异常');
   }
@@ -2132,6 +2145,53 @@ function wyFilterPlaylists(rawList: Object[]): LxPlaylistItem[] {
   return list;
 }
 
+/**
+ * 网易「私人推荐」歌单（每日推荐 / 私人雷达那一类）
+ *
+ * 走 **weapi**（不是明文）：公认实现 NeteaseCloudMusicApi 的 recommend_resource 模块就是
+ * `createOption(query, 'weapi')`，其 request 会把路径改写成
+ * `/weapi/v1/discovery/recommend/resource`，参数做成 `params` + `encSecKey`，
+ * 并把 Cookie 里的 `__csrf` 作为 `csrf_token` 一起加密进去。
+ *
+ * 之前这里用明文空 form POST `/api/...`：匿名请求能拿到 `code:301`（说明路径存在、缺登录），
+ * 但真登录后依然取不到 —— 因为缺了这层加密与 csrf。登录态用 `musicCookieHeader('wy')`
+ * 现拼（含 `MUSIC_U` / `__csrf`），调用方（推荐页）自己按登录态决定要不要调。
+ *
+ * 返回歌单卡片要的那几项：id / 名字 / 封面 / 播放量 / 曲目数 / 作者。
+ * 注意这个接口的播放量字段是小写 `playcount`（歌单广场用的是 `playCount`），两边都认。
+ */
+export async function getWyPersonalizedPlaylists(): Promise<LxPlaylistItem[]> {
+  const cookie: string = musicCookieHeader('wy');
+  const form: Record<string, string> = wyWeapiForm({ 'csrf_token': wyCsrfFromCookie(cookie) });
+  const body: Record<string, Object> = await fetchRecord(
+    'https://music.163.com/weapi/v1/discovery/recommend/resource',
+    { method: 'post', headers: wyHeaders(), form: form }, '网易私人推荐');
+  const code: number = asNumber(body['code']);
+  if (code !== 200) {
+    throw new Error(`网易私人推荐接口返回 code ${code}（需要登录，或登录已过期）`);
+  }
+  const out: LxPlaylistItem[] = [];
+  for (const raw of asObjectArray(body['recommend'])) {
+    const item: Record<string, Object> = asRecord(raw);
+    const play: number = asNumber(item['playcount']) > 0
+      ? asNumber(item['playcount']) : asNumber(item['playCount']);
+    // 网易这个接口的字段名与歌单广场那套不完全一样：copywriter 当简介、creator 可能没有
+    const playlist: LxPlaylistItem = {
+      id: asString(item['id']),
+      name: asString(item['name']),
+      author: asString(asRecord(item['creator'])['nickname']),
+      img: asString(item['picUrl']),
+      desc: descText(asString(item['copywriter'])),
+      playCount: formatPlayCount(play),
+      total: asNumber(item['trackCount']),
+      time: '',
+      source: 'wy',
+    };
+    out.push(playlist);
+  }
+  return out;
+}
+
 /** 网易歌曲详情（/api/song/detail）一批最多塞多少 id（照洛雪与同工作区 RzdMusic 的做法按 100 批） */
 const WY_SONG_BATCH: number = 100;
 
@@ -2140,7 +2200,7 @@ const WY_SONG_BATCH: number = 100;
  * 响应里有 playlist.tracks 与顶层 privileges，正好配成一份带音质的歌曲列表。
  *
  * ⚠️ 这里必须按 `trackIds` 取歌，不能只信 `tracks`：网易对「非官方歌单」会把
- * `tracks` 砍成开头若干首（带 `Cookie: os=pc` 之后实测才是全量，见 WY_HEADERS；
+ * `tracks` 砍成开头若干首（带 `Cookie: os=pc` 之后实测才是全量，见 wyHeaders；
  * 万一 cookie 那条路又被封，缺的那批就在这里按 id 补回来）。完整曲目 id 一直在
  * 同响应的 `playlist.trackIds` 里 —— 原实现只拿它算了 `total`，于是出现
  * 「共 27 首」却只有 10 行、导入只落 10 首这种事。
@@ -2152,7 +2212,7 @@ async function wyPlaylistDetail(id: string, page: number, name: string,
   const size: number = limit > 0 ? limit : 1000;
   const url: string =
     `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=${size}&s=8`;
-  const body: Record<string, Object> = await fetchRecord(url, { headers: WY_HEADERS }, '网易歌单详情');
+  const body: Record<string, Object> = await fetchRecord(url, { headers: wyHeaders() }, '网易歌单详情');
   if (asNumber(body['code']) !== 200) {
     throw new Error('网易歌单详情接口返回异常');
   }
@@ -2299,7 +2359,7 @@ async function wySongsByIds(ids: string[]): Promise<LxMusicInfo[]> {
     const url: string = `https://music.163.com/api/song/detail?ids=` +
       `${encodeURIComponent(JSON.stringify(batch))}&c=${encodeURIComponent(`[${queries.join(',')}]`)}`;
     try {
-      const body: Record<string, Object> = await fetchRecord(url, { headers: WY_HEADERS }, '网易歌曲详情');
+      const body: Record<string, Object> = await fetchRecord(url, { headers: wyHeaders() }, '网易歌曲详情');
       const songs: Object[] = [];
       const privileges: Object[] = [];
       const given: Object[] = asObjectArray(body['privileges']);

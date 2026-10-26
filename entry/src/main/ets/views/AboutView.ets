@@ -2,10 +2,11 @@ import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, C_DIVIDER, C_ICON_BLUE, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_ICON_BLUE, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { HintText } from '../ui/SettingWidgets';
-import { I_CHECK_CIRCLE, I_COPY, I_EXTERNAL, I_GROUP, IconGlyph } from '../ui/Icons';
+import { I_BELL, I_CHECK_CIRCLE, I_CHEVRON_RIGHT, I_COPY, I_EXTERNAL, I_GROUP, IconGlyph } from '../ui/Icons';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
+import { latestMonthDayOf, updateCount } from '../core/changelog/Changelog';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AboutView';
@@ -47,6 +48,13 @@ export struct AboutView {
   /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
+  /**
+   * 去「更新公告」页
+   *
+   * 路由由壳层实现（页面自己不认识 PAGE_*），与设置页/我的页那种「去哪」的回调同一个做法。
+   */
+  onOpenChangelog: () => void = () => {
+  };
   @State version: string = '';
   /** 群号刚复制过（给一个短暂的「已复制」反馈） */
   @State copied: boolean = false;
@@ -287,6 +295,61 @@ export struct AboutView {
     .accessibilityLevel('yes')
   }
 
+  /**
+   * 更新公告入口
+   *
+   * 副标题直接给「最近一次更新是几月几号 / 一共几次」——用户不用点进去就知道有没有新东西，
+   * 点进去看到的是从新到旧连成一条线的时间线（见 views/ChangelogView.ets）。
+   * 与反馈卡同一套行式布局：左边圆底图标、中间标题 + 副标题、右边箭头。
+   */
+  @Builder
+  changelogCard() {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        // 圆底色用 Column + 圆角，不用 Circle().fill(资源色)：fill 取不到资源时会退回黑色
+        Column()
+          .width(34)
+          .height(34)
+          .borderRadius(17)
+          .backgroundColor(C_ICON_CIRCLE)
+        IconGlyph({ symbol: I_BELL, iconSize: 19, color: C_TEXT })
+      }
+      .width(34)
+      .height(34)
+
+      Column({ space: 3 }) {
+        Text('更新公告')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        Text(`最近更新 ${latestMonthDayOf()} · 共 ${updateCount()} 次`)
+          .fontSize(11.5)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_CHEVRON })
+    }
+    .width('100%')
+    .height(70)
+    .padding({ left: 16, right: 16 })
+    .borderRadius(R_CARD)
+    .backgroundColor(C_CARD)
+    .stateStyles({
+      normal: { .backgroundColor(C_CARD) },
+      pressed: { .backgroundColor(C_PRESSED) },
+    })
+    .onClick(() => {
+      this.onOpenChangelog();
+    })
+    .accessibilityText(`查看更新公告，最近更新 ${latestMonthDayOf()}`)
+    .accessibilityLevel('yes')
+  }
+
   build() {
     Column() {
       Scroll() {
@@ -310,6 +373,12 @@ export struct AboutView {
 
           Column({ space: 14 }) {
             this.appCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // 更新公告：单独一组（宽屏时与相邻那组并排、窄屏时紧跟在应用卡片下面）
+          Column({ space: 14 }) {
+            this.changelogCard()
           }
           .width(cardWidthOf(this.windowWidth))
 

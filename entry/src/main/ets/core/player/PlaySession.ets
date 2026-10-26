@@ -27,6 +27,7 @@ import { BookEngine } from '../book/BookEngine';
 import { BookAudio, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE, bookShelfId, parseBookPayload } from '../book/BookTypes';
 import { BookShelf } from '../book/BookShelf';
 import { publishFavoriteIds } from './FavoriteIndex';
+import { intervalMs, ListenLog, ListenSong } from '../history/ListenLog';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
@@ -34,10 +35,13 @@ const DOMAIN: number = 0x0001;
 const TAG: string = 'PlaySession';
 
 /**
- * 播放会话 / 播放队列 / 播放历史
+ * 播放会话 / 播放队列
  *
  * 界面层（各视图）通过 AppStorage 里的这几个 key 订阅「当前播放」的状态，
  * 这样底部导航、迷你播放器、全屏播放器不用互相传参就能保持一致。
+ *
+ * 播放历史不在这里：它与「回响」共用 core/history/ListenLog 那唯一一份流水
+ * （原来 PlaySession 自己还存一份去重历史，同一件事写两处、还会与回响对不上）。
  *
  * 播放链路：条目里的 musicInfo（内置搜索得到）-> 导入的音源解析出播放链接 -> AVPlayer。
  * 拿到手的条目可能没有 musicInfo（比如它来自当前音源脚本不支持的平台），所以这里补了一步：
@@ -79,7 +83,8 @@ export const K_BUFFERING: string = 'ps_buffering';
  * 本地播放（下载的 / 播放缓存里的）没有缓冲事件，整首都在本地，直接按整首算。
  */
 export const K_BUFFERED_SECONDS: string = 'ps_buffered_seconds';
-export const K_HISTORY_VERSION: string = 'ps_history_version';
+// 播放历史原来有自己的版本号（K_HISTORY_VERSION），随 history 字段一起搬进了
+// core/history/ListenLog —— 历史页与「我的」计数现在订阅的是那边的 K_ECHO_VERSION。
 /**
  * 底部迷你栏是展开还是折叠。
  * HdsTabs 的 MiniBar 由 HDS 自己管宽度与动效，内容只能通过它给的
@@ -148,6 +153,12 @@ interface PersistedPlayState {
   /** 退出时的播放进度（秒） */
   position?: number;
   playMode?: string;
+  /**
+   * 旧版本存档里的播放历史
+   *
+   * **只用于读旧版本存档做一次性迁移**（见 applyPersistedState），新存档不再写它：
+   * 播放历史已经搬进 core/history/ListenLog，与回响共用同一份流水。
+   */
   history?: SongItem[];
 }
 
@@ -226,6 +237,26 @@ function isDemoEntry(item: SongItem): boolean {
   return item.id.startsWith('demo_');
 }
 
+/**
+ * 从 musicInfo JSON 里读专辑名（迁移旧播放历史用）
+ *
+ * 队列条目（SongItem）本身没有专辑字段，但真实搜索结果转成的 musicInfo 里有
+ * （洛雪那套 `albumName`）；旧历史里的条目也是同一个结构。读不到就给空串 ——
+ * 回响的专辑榜会跳过空专辑名的歌，不影响其它统计。
+ */
+function albumNameOf(musicInfoJson: string): string {
+  if (musicInfoJson.length === 0) {
+    return '';
+  }
+  try {
+    const info: Record<string, Object> = JSON.parse(musicInfoJson) as Record<string, Object>;
+    const albumName: Object = info['albumName'];
+    return typeof albumName === 'string' ? albumName : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 /** 由真实搜索结果转成队列条目 */
 export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
   const json: string = JSON.stringify(info);
@@ -264,8 +295,6 @@ export class PlaySession {
   /** 播放队列（对应洛雪的「播放列表」） */
   queue: SongItem[] = [];
   currentIndex: number = -1;
-  /** 播放历史（我的 -> 播放历史） */
-  history: SongItem[] = [];
   /** 收藏（我的 -> 收藏） */
   favorites: SongItem[] = [];
   /**
@@ -407,7 +436,7 @@ export class PlaySession {
   /**
    * 把播放现场落盘
    *
-   * 触发点都是低频的（切歌、增删队列、换播放模式、播放历史变化、退到后台），
+   * 触发点都是低频的（切歌、增删队列、换播放模式、退到后台），
    * 再加 2 秒节流：pushQueueState 在一次切歌里会被调用好几次，不节流就是反复写文件。
    */
   persistPlayState(force: boolean = false): void {
@@ -424,7 +453,6 @@ export class PlaySession {
       current: this.current,
       position: AppStorage.get<number>(K_PROGRESS) ?? 0,
       playMode: this.playMode,
-      history: this.history.slice(0, 100),
     };
     try {
       this.stateStore.write(JSON.stringify(state));
@@ -453,19 +481,20 @@ export class PlaySession {
     // 从这里开始才允许回写
     this.stateRestored = true;
     this.pushQueueState();
-    this.pushHistoryState();
   }
 
   private applyPersistedState(text: string): void {
     const state: PersistedPlayState = JSON.parse(text) as PersistedPlayState;
-    const current: SongItem | null | undefined = state.current;
-    if (state.version !== PLAY_STATE_VERSION || current === undefined || current === null
-      || current.id.length === 0 || isDemoEntry(current)) {
+    if (state.version !== PLAY_STATE_VERSION) {
       return;
     }
-    if (state.history !== undefined && state.history.length > 0) {
-      // 演示条目一并丢掉：那是早期版本铺的假歌，不该跟着现场恢复回来
-      this.history = state.history.filter((item: SongItem) => !isDemoEntry(item));
+    // 旧版本存档里带着当时的播放历史：现在历史由 ListenLog 统一记账，只能在这一刻搬一次
+    // （新存档不再写 history，所以升级后的第一次启动跑过之后就再也不会进来）
+    this.adoptLegacyHistory(state.history);
+    const current: SongItem | null | undefined = state.current;
+    if (current === undefined || current === null
+      || current.id.length === 0 || isDemoEntry(current)) {
+      return;
     }
     if (state.playMode !== undefined && state.playMode.length > 0) {
       this.playMode = state.playMode;
@@ -489,6 +518,44 @@ export class PlaySession {
       this.resumePosition = position;
       this.resumeIndex = index;
       AppStorage.setOrCreate(K_PROGRESS, position);
+    }
+  }
+
+  /**
+   * 把旧版本存档里的播放历史搬进 ListenLog（一次性迁移）
+   *
+   * v1 时播放历史存在播放现场里（只留 100 条、没有时长）；现在历史与回响共用
+   * ListenLog 那一份流水，旧数据只能趁读存档这一刻搬过去。`adoptLegacySongs` 会把
+   * 这些歌记成 playedMs=0、startedAt=0：所以它们只出现在「最近播放」里，
+   * 不进回响的月度账（回响只算听满 30 秒的记录），也不会混进听歌时长。
+   */
+  private adoptLegacyHistory(legacy: SongItem[] | undefined): void {
+    if (legacy === undefined || legacy.length === 0) {
+      return;
+    }
+    const songs: ListenSong[] = [];
+    for (const item of legacy) {
+      // 演示条目一并丢掉：那是早期版本铺的假歌，不该跟着现场恢复回来
+      if (isDemoEntry(item)) {
+        continue;
+      }
+      const song: ListenSong = {
+        id: item.id,
+        name: item.name,
+        singer: item.singer,
+        coverUrl: item.coverUrl,
+        art: item.art,
+        source: item.source,
+        quality: item.quality,
+        interval: item.interval,
+        musicInfoJson: item.musicInfoJson,
+        albumName: albumNameOf(item.musicInfoJson),
+        durationMs: intervalMs(item.interval),
+      };
+      songs.push(song);
+    }
+    if (songs.length > 0) {
+      ListenLog.getInstance().adoptLegacySongs(songs);
     }
   }
 
@@ -605,9 +672,7 @@ export class PlaySession {
       return;
     }
 
-    // 空库：只把「空」发布出去（界面上的爱心、队列计数要有个确定的初值），
-    // 播放历史也清空 —— 它是真实的使用记录，不能带任何预置内容
-    this.history = [];
+    // 空库：只把「空」发布出去（界面上的爱心、队列计数要有个确定的初值）
     this.favorites = [];
     this.publishFavorites();
     this.queue = [];
@@ -962,11 +1027,6 @@ export class PlaySession {
       isFavorite: this.isFavorite(item.id),
     };
     PlaybackService.getInstance().updateMedia(info);
-  }
-
-  private pushHistoryState(): void {
-    const version: number = AppStorage.get<number>(K_HISTORY_VERSION) ?? 0;
-    AppStorage.setOrCreate(K_HISTORY_VERSION, version + 1);
   }
 
   private setStatus(status: string, text: string = ''): void {
@@ -1387,8 +1447,9 @@ export class PlaySession {
     AppStorage.setOrCreate(K_BUFFERED_SECONDS, 0);
     this.clearLyric();
 
+    // 播放历史不在这里记：ListenTracker 盯着播放器，开播时把这首写进 ListenLog
+    // （历史与回响共用那份流水，不到 30 秒的也进历史），切歌只管换歌。
     let item: SongItem = this.queue[index];
-    this.recordHistory(item);
 
     // 本地音乐（设备里导入进来的音频）：直接读沙箱文件，不联网、不看音源脸色。
     // 位置必须在音源检查之前 —— 没导入音源的用户也要能听自己手机里的歌。
@@ -2558,7 +2619,6 @@ export class PlaySession {
     }
     this.favorites.unshift(item);
     this.publishFavorites();
-    this.pushHistoryState();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
     return true;
@@ -2615,7 +2675,6 @@ export class PlaySession {
     this.favorites = fresh.concat(this.favorites);
     const added: number = fresh.length;
     this.publishFavorites();
-    this.pushHistoryState();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
     return added;
@@ -2634,7 +2693,6 @@ export class PlaySession {
     }
     this.favorites = remains;
     this.publishFavorites();
-    this.pushHistoryState();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
     return true;
@@ -2663,7 +2721,6 @@ export class PlaySession {
     }
     this.favorites = remains;
     this.publishFavorites();
-    this.pushHistoryState();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
     return removed;
@@ -2675,7 +2732,6 @@ export class PlaySession {
     }
     this.favorites = [];
     this.publishFavorites();
-    this.pushHistoryState();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
   }
@@ -2694,8 +2750,12 @@ export class PlaySession {
    *
    * 摘掉的原因很直接 —— 文件已经删了，留着就是点一下就报错的幽灵条目。
    * 正在播的那首被删掉就停住：继续放只会对着一个不存在的文件读到错误。
+   *
+   * @param ids      这些本地条目的 SongItem.id
+   * @param songKeys 这些歌的「歌名 + 歌手」键：v1 迁移来的旧流水没有 id，
+   *                 要靠它把旧记录也从播放历史里摘掉（见 ListenLog.removeSongs）
    */
-  dropLocalSongs(ids: string[]): void {
+  dropLocalSongs(ids: string[], songKeys: string[] = []): void {
     if (ids.length === 0) {
       return;
     }
@@ -2714,15 +2774,10 @@ export class PlaySession {
       this.pushFavoriteStateToSystem();
     }
 
-    const keptHistory: SongItem[] = [];
-    for (const entry of this.history) {
-      if (!ids.includes(entry.id)) {
-        keptHistory.push(entry);
-      }
-    }
-    if (keptHistory.length !== this.history.length) {
-      this.history = keptHistory;
-    }
+    // 播放历史也摘掉：历史现在由 ListenLog 统一记，按历史行 id 删掉这些歌的全部流水
+    // （只删这一首的记录，收藏 / 队列在下面各自处理；本地文件在调这里之前已经删掉了）。
+    // 旧流水（v1 迁移）没有 id，所以再给一份「歌名 + 歌手」兜底。
+    ListenLog.getInstance().removeSongs(ids, songKeys);
 
     const keptQueue: SongItem[] = [];
     let queueChanged: boolean = false;
@@ -2760,50 +2815,9 @@ export class PlaySession {
       this.setStatus('idle', '这首歌已从本地音乐移除');
     }
 
-    this.pushHistoryState();
     this.pushQueueState();
     this.persistPlayState(true);
     this.notifyLibrary();
-  }
-
-  recordHistory(item: SongItem): void {
-    const rest: SongItem[] = [];
-    for (const entry of this.history) {
-      if (entry.name !== item.name || entry.singer !== item.singer) {
-        rest.push(entry);
-      }
-    }
-    rest.unshift(item);
-    this.history = rest.slice(0, 100);
-    this.pushHistoryState();
-    // 播放历史也是「现场」的一部分，切歌时一起落盘
-    this.persistPlayState(true);
-  }
-
-  clearHistory(): void {
-    this.history = [];
-    this.pushHistoryState();
-    this.persistPlayState(true);
-  }
-
-  /** 从播放历史里删掉几条（只删记录，文件与收藏都不动）；返回真删掉的条数 */
-  removeHistory(ids: string[]): number {
-    if (ids.length === 0) {
-      return 0;
-    }
-    const kept: SongItem[] = [];
-    for (const entry of this.history) {
-      if (!ids.includes(entry.id)) {
-        kept.push(entry);
-      }
-    }
-    const removed: number = this.history.length - kept.length;
-    if (removed > 0) {
-      this.history = kept;
-      this.pushHistoryState();
-      this.persistPlayState(true);
-    }
-    return removed;
   }
 
   formatProgress(seconds: number): string {

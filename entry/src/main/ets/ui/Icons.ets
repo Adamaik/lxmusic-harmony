@@ -165,6 +165,15 @@ export const I_ECHO: Resource = $r('sys.symbol.dot_radiowaves_left_and_right');
 export const I_ECHO_FILL: Resource = I_ECHO;
 
 /**
+ * 探索（心动模式刷歌）
+ *
+ * 波形符号：与「一首接一首往下刷」的意象一致（官方符号表里的 rhythm）。
+ * 这一枚也没有实心变体，选中态同样沿用同一枚，靠颜色区分。
+ */
+export const I_EXPLORE: Resource = $r('sys.symbol.rhythm');
+export const I_EXPLORE_FILL: Resource = I_EXPLORE;
+
+/**
  * 官方符号图标
  */
 @Component

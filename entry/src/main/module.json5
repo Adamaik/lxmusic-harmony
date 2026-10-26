@@ -30,19 +30,6 @@
         "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       },
       {
-        // 本地音乐「引用式导入」：把 Picker 选中的音频 URI 做持久化授权，重启后直接读原文件
-        // （2026-10-20 真机验证：SDK 权限定义是 system_grant / normal，与 INTERNET 同档，
-        //  不是受限 ACL，声明即生效；详情见 core/local/PersistProbe.ets 与 docs/LOCAL_MUSIC.md）
-        "name": "ohos.permission.FILE_ACCESS_PERSIST",
-        "reason": "$string:reason_file_persist",
-        "usedScene": {
-          "abilities": [
-            "EntryAbility"
-          ],
-          "when": "inuse"
-        }
-      },
-      {
         // 听歌识曲的「周围声音」来源（默认那一档）：录一段环境音去比对指纹，
         // 切到这一档才申请，不在启动时打扰用户。
         // 另一档「本机播放」（内录本机正在播放的媒体音频，用户自己在识别页上选）不需要任何权限：
@@ -63,12 +50,33 @@
       // 自己的实现（HDS 那份额外注明「依赖底层硬件，部分历史设备硬件能力不支持」），
       // 由「设置 - 外观」那一项决定开关。这里一度声明过 ohos.permission.DETECT_GESTURE
       // （自己订阅握姿，用来定位跟手为什么没生效），定位做完已经连同那套自研感知一并删掉。
-      // 这里原本还声明了 ohos.permission.FILE_ACCESS_PERSIST（持久化目录授权），2026-09 因为
-      // 「它属于受限 ACL 权限，自动生成的调试 Profile 里没有 allowed-acls，声明了只是摆设」
-      // 被删掉；2026-10-20 复核 SDK 的 PermissionDefinitions.json 发现这个判断是错的：
-      // 它是 system_grant / availableLevel=normal / availableType=NORMAL，与 INTERNET 同档，
-      // 不需要 ACL，声明即生效（真机验证见 core/local/PersistProbe.ets）。现已按「本地音乐
-      // 引用式导入」的需要重新声明，见上面 requestPermissions 里那条。
+      //
+      // ---------------------------------------------------------------- 本地音乐「引用式导入」的权限
+      // 「不复制、只记 URI」需要 ohos.permission.FILE_ACCESS_PERSIST + fileShare.persistPermission，
+      // 代码已经实现并**真机验证过**（core/local/LocalAccess.ets、docs/LOCAL_MUSIC.md 第 2 节）：
+      // 声明它之后，调试包上 checkAccessToken=GRANTED、persist/activate/直接读原文件全部通过。
+      //
+      // 但**这条权限这里先不声明**：上架前检测（软件包管理 →「ACL 权限声明一致性」）把它算作
+      // 受限 ACL 权限，要求**签名 Profile 的 allowed-acls 里也有**这一条，一一对应才算过。
+      // 自动生成的调试 Profile 里没有（调试证书默认放开 ACL，所以真机调试没事），于是 release
+      // 包一检测就是红叉、卡住上传。官方口径（华为开发者问答 2024-12 / 2025-02 两例）：
+      // 受限 ACL 权限要**先在 AGC 申请**，批准后用重新生成的 release Profile 才带 allowed-acls。
+      //
+      // 所以当前策略：不声明 → 检测通过；运行时 LocalAccess 的 granted() 为 false，
+      // 本地音乐导入**自动退回「复制进沙箱」**（2026-10 之前的老方案），功能不会坏。
+      //
+      // 等 AGC 把这个受限权限批下来之后，恢复「引用式导入」只需要做两件事：
+      //   1) 把下面这段加回 requestPermissions（代码一行都不用改）：
+      //        { "name": "ohos.permission.FILE_ACCESS_PERSIST",
+      //          "reason": "$string:reason_file_persist",
+      //          "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" } }
+      //   2) 签名换成带 allowed-acls 的 release Profile（AGC 里重新生成），重新跑上架检测。
+      // 另外 strings 里的 reason_file_persist 先留着，恢复时直接引用。
+      //
+      // 另一条不需要任何权限、也能「不复制」的路（后续可选）：Picker 的
+      // multiAuthMode + multiUriArray 批量授权 —— 冷启动后一次性弹系统确认页重新授权
+      // 存过的 URI，代价是每次冷启动要用户点一次确认，见 docs/LOCAL_MUSIC.md 第 2 节末尾。
+      //
       // 下载写文件仍然走系统保存对话框（DocumentViewPicker.save），那条路不需要这个权限，
       // 见 openTarget。
     ],

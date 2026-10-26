@@ -4,6 +4,7 @@ import { I_BOOK, I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, 
   I_VOLUME, IconGlyph } from '../ui/Icons';
 import { TopFade } from '../ui/Widgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
+import { K_MUSIC_LOGGED_WY, K_MUSIC_NICK_WY, K_MUSIC_VIP_WY } from '../core/music/MusicAccount';
 
 /** 设置项 */
 interface SettingRowDef {
@@ -138,6 +139,19 @@ export struct SettingsView {
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
    */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+  /** 音乐平台登录态（设置卡上直接显示结果，省得每次点进登录页才知道登没登） */
+  @StorageLink(K_MUSIC_LOGGED_WY) musicLogged: boolean = false;
+  @StorageLink(K_MUSIC_NICK_WY) musicNick: string = '';
+  @StorageLink(K_MUSIC_VIP_WY) musicVip: string = '';
+
+  /** 「登录音乐」那张卡的副标题：未登录说清楚登录能换到什么，已登录直接报账号 */
+  private loginSubtitle(): string {
+    if (!this.musicLogged) {
+      return '网易云未登录 · 登录后接口才返回母带等权益音质';
+    }
+    const name: string = this.musicNick.length > 0 ? this.musicNick : '网易云账号';
+    return this.musicVip.length > 0 ? `已登录：${name} · ${this.musicVip}` : `已登录：${name}`;
+  }
 
   /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
   private cardsSideBySide(): boolean {
@@ -243,7 +257,7 @@ export struct SettingsView {
                 .fontColor(C_TEXT)
                 .width('100%')
                 .textAlign(TextAlign.Start)
-              Text('网易云 / QQ / 酷狗账号，扫码或 Cookie 登录')
+              Text(this.loginSubtitle())
                 .fontSize(F_SUB)
                 .fontColor(C_TEXT_WEAK)
                 .maxLines(1)

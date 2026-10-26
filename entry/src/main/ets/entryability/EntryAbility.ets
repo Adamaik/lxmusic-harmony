@@ -24,6 +24,8 @@ import { ListenSettings } from '../core/settings/ListenSettings';
 import { RecognizeSettings } from '../core/settings/RecognizeSettings';
 import { DownloadSettings } from '../core/download/DownloadSettings';
 import { DownloadManager, K_APP_FOREGROUND } from '../core/download/DownloadManager';
+import { musicAccount } from '../core/music/MusicAccount';
+import { HeartCache } from '../core/heart/HeartCache';
 
 const DOMAIN = 0x0000;
 
@@ -38,6 +40,8 @@ export default class EntryAbility extends UIAbility {
     // 本地音乐库：要读回导入过的索引（歌单 / 收藏里属于本地歌的那部分也挂在它上面），
     // 必须早于 SyncManager.init —— 音乐库镜像到界面时会读这份侧表
     LocalMusic.getInstance().init(this.context);
+    // 心动模式（探索页）的候选池缓存：进页面先读它秒出歌，后台再刷新
+    HeartCache.getInstance().init(this.context);
     // 云端音乐库（WebDAV）：同样有自己的索引与歌单侧表，也要早于 SyncManager.init
     WebDavLibrary.getInstance().init(this.context);
     // 同步模块也要 Context：读配置、落音乐库、找 gzip 的临时目录，越早准备越好
@@ -84,6 +88,10 @@ export default class EntryAbility extends UIAbility {
     // 收藏歌单（歌单级的收藏，纯本地）：要早于界面创建 —— 「我的」页歌单卡那一段
     // 与歌单详情页那颗「收藏歌单」钮都订阅它发布的版本号
     CollectedPlaylists.getInstance().init(this.context);
+    // 音乐平台账号（目前是网易）：要早于界面创建 —— 「设置 - 登录音乐」页与设置卡
+    // 用 @StorageLink 订阅登录状态；且网易请求侧要在第一次请求之前就能读到 Cookie
+    // （登录后接口才会返回母带 / 沉浸声 / 杜比这类账号权益音质档）
+    musicAccount().init(this.context);
   }
 
   onDestroy(): void {

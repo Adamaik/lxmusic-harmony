@@ -1,4 +1,5 @@
-import { K_HISTORY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { K_ECHO_VERSION, ListenLog, ListenSong, listenItemId } from '../core/history/ListenLog';
 import { SyncManager } from '../core/sync/SyncManager';
 import { C_RED } from '../ui/Theme';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
@@ -11,6 +12,29 @@ import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 const HISTORY_ACTIONS: string[] = ['收藏', '加入播放列表', '加入歌单'];
 
 /**
+ * 流水里的一首歌（ListenSong）→ 列表里的条目（SongItem）
+ *
+ * 列表、多选、收藏 / 入歌单 / 续播那一套都是按 SongItem 走的（见 SongListPane 与
+ * ui/Selection），流水里的 ListenSong 多带了专辑与总时长，转一道就好。id 用
+ * listenItemId：老记录没有队列条目 id，它按「来源 + 歌名 + 歌手」拼一个稳定的值，
+ * 多选与删除都按它认人。
+ */
+function songItemOf(song: ListenSong): SongItem {
+  const item: SongItem = {
+    id: listenItemId(song),
+    name: song.name,
+    singer: song.singer,
+    coverUrl: song.coverUrl,
+    art: song.art,
+    source: song.source,
+    quality: song.quality,
+    interval: song.interval,
+    musicInfoJson: song.musicInfoJson,
+  };
+  return item;
+}
+
+/**
  * 播放历史（「我的」页那一排快捷入口里的「最近播放」）
  *
  * 原来它是「我的」页里的一个分段，跟着分段胶囊切换；现在这一页独立成子页面
@@ -18,6 +42,10 @@ const HISTORY_ACTIONS: string[] = ['收藏', '加入播放列表', '加入歌单
  *
  * 逻辑与原分段逐条一致：长按任意一行进多选，批量收藏 / 入歌单 / 入播放列表，
  * 以及只删播放记录（收藏、下载、本地文件都不动）。
+ *
+ * 数据来自 core/history/ListenLog 的流水（与「回响」共用唯一一份）：按「歌名 + 歌手」
+ * 去重取最近 100 首。不到 30 秒的记录也在其中 —— 30 秒门槛只用来筛回响，
+ * 「最近播放」要显示真的点开听过的歌。
  */
 @Component
 export struct HistoryView {
@@ -32,13 +60,13 @@ export struct HistoryView {
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
   @State pickerOpen: boolean = false;
   @State candidates: PlaylistSummary[] = [];
-  @StorageLink(K_HISTORY_VERSION) @Watch('onHistoryChanged') historyVersion: number = 0;
+  @StorageLink(K_ECHO_VERSION) @Watch('onHistoryChanged') historyVersion: number = 0;
 
   aboutToAppear(): void {
     this.refresh();
   }
 
-  /** 播放历史在别处（比如播放器）被改动时同步过来 */
+  /** 流水变了（播放器收尾一条 / 别处删了记录 / 清空）就重读一次 */
   onHistoryChanged(): void {
     this.refresh();
     // 历史变了就把已经不在列表里的勾选摘掉，否则「删除 3 条」会带着幽灵条目算数
@@ -54,8 +82,15 @@ export struct HistoryView {
     }
   }
 
+  /**
+   * 从流水读最近 100 首（按「歌名 + 歌手」去重、新的在前）
+   *
+   * 以前直接拿 PlaySession.history；现在历史与回响共用 ListenLog 那一份流水，
+   * 这里不再需要自己维护一份去重列表。
+   */
   private refresh(): void {
-    this.history = PlaySession.getInstance().history;
+    this.history = ListenLog.getInstance().recentSongs(100)
+      .map((song: ListenSong): SongItem => songItemOf(song));
   }
 
   // ------------------------------------------------------------ 多选
@@ -151,10 +186,11 @@ export struct HistoryView {
           value: '删除',
           fontColor: C_RED,
           action: () => {
-            const removed: number = PlaySession.getInstance().removeHistory(ids);
+            // 删的是流水里这首歌的全部记录（按历史行 id 认），否则去重后它还会冒出来
+            const removed: number = ListenLog.getInstance().removeSongs(ids);
             this.exitSelecting();
             this.refresh();
-            this.toast(`已删除 ${removed} 条播放记录`);
+            this.toast(removed > 0 ? `已删除 ${removed} 条播放记录` : '没有可删除的记录');
           },
         },
       ],

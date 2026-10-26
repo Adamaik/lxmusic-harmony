@@ -15,6 +15,7 @@ import { CapsuleSegment } from '../ui/CapsuleSegment';
 import { I_BOOK, I_BOOKSHELF, I_CHEVRON_DOWN, I_CHEVRON_RIGHT, I_CLOSE, I_IMPORT, I_REFRESH,
   I_SEARCH, I_TRASH, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, SectionTitle } from '../ui/Widgets';
+import { TileCard } from '../ui/TileCard';
 import { CONTENT_MAX_WIDTH, contentColumnsFor, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED } from '../ui/Layout';
 
 const DOMAIN: number = 0x0001;
@@ -101,74 +102,8 @@ export struct BookRow {
   }
 }
 
-/** 分类卡片的配色（按分类顺序循环取，同一个源每次进来颜色不变） */
-const CAT_COLORS: string[][] = [
-  ['#7B6CF6', '#4E3FD6'],
-  ['#3FD07A', '#17A94F'],
-  ['#FF7A59', '#E2432F'],
-  ['#4FA8FF', '#1E6FD9'],
-  ['#FFB13D', '#E0810F'],
-  ['#F26DB4', '#C22C86'],
-];
-
-function catColors(index: number): string[] {
-  return CAT_COLORS[index % CAT_COLORS.length];
-}
-
 /** 分类卡片的高度：横滑那一排与卡片本身共用 */
 const CAT_CARD_H: number = 84;
-
-/**
- * 分类卡片（发现页那排横滑卡片）
- *
- * 画法照首页推荐的榜单卡片（见 views/RecommendView.ets 的 RankCard）：渐变底 + 底部压暗
- * + 白字，只是小一号 —— 分类名就两到四个字，做成长条卡片比药丸好扫，颜色也帮着记位置。
- * 点一下 = 把下面的书单换成这个分类；选中态加一圈白边。
- */
-@Component
-struct CategoryCard {
-  @Prop title: string = '';
-  @Prop colorA: string = '#7B6CF6';
-  @Prop colorB: string = '#4E3FD6';
-  @Prop cardWidth: number = 118;
-  @Prop selected: boolean = false;
-  onTap: () => void = () => {
-  };
-
-  build() {
-    Stack({ alignContent: Alignment.BottomStart }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({ angle: 160, colors: [[this.colorA, 0.0], [this.colorB, 1.0]] })
-      // 底部压暗，白字才跳得出来
-      Column()
-        .width('100%')
-        .height('60%')
-        .linearGradient({ angle: 0, colors: [['#00000000', 0.0], ['#59000000', 1.0]] })
-      Text(this.title)
-        .fontSize(14)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Color.White)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .textShadow({ radius: 10, color: '#33000000', offsetX: 0, offsetY: 2 })
-        .padding({ left: 11, right: 11, bottom: 10 })
-    }
-    .width(this.cardWidth)
-    .height(CAT_CARD_H)
-    .borderRadius(18)
-    .clip(true)
-    .border({ width: this.selected ? 2 : 0, color: '#FFFFFF' })
-    .shadow({ radius: 12, color: '#1A000000', offsetX: 0, offsetY: 5 })
-    .onClick(() => {
-      this.onTap();
-    })
-    .accessibilityGroup(true)
-    .accessibilityText(this.selected ? `分类 ${this.title}，已选中` : `分类 ${this.title}`)
-    .accessibilityLevel('yes')
-  }
-}
 
 /**
  * 听书页
@@ -885,6 +820,11 @@ export struct ListenView {
    * 上一版这里是几十上百个分类胶囊挤成一片药丸墙 —— 导一个书源合集进来就是近百个，
    * 既看不出是什么、也翻不到底。分类卡片横滑（一屏扫得完、颜色帮着记位置），
    * 换源交给「分类」那一行右侧的下拉胶囊（几个源，不是几十个分类）。
+   *
+   * 2026-10-21：卡片从「按下标循环的高饱和渐变」改成主题玻璃卡（`ui/TileCard.ets`）。
+   * 听书分类没有真实封面可用，所以走玻璃卡那一支：白卡 + 极淡红晕染 + 首字水印 +
+   * 深色字，选中态用强调红描边；和应用的浅灰底 / 白卡 / 红强调是一套语言，
+   * 不再是那排彩虹色块。
    */
   @Builder
   discoverPane() {
@@ -913,11 +853,12 @@ export struct ListenView {
           List({ space: 10 }) {
             ForEach(this.cats, (cat: BookExploreCategory, index: number) => {
               ListItem() {
-                CategoryCard({
+                TileCard({
                   title: cat.title,
-                  colorA: catColors(index)[0],
-                  colorB: catColors(index)[1],
+                  coverUrl: '',
                   cardWidth: this.catCardWidth(),
+                  cardHeight: CAT_CARD_H,
+                  radius: 18,
                   selected: this.catIndex === index,
                   onTap: () => {
                     void this.loadCategory(index, 1);
@@ -925,7 +866,7 @@ export struct ListenView {
                 })
               }
               // 选中态拼进 key：ForEach 对 key 没变的条目**不会重跑生成器**，
-              // 只靠 @Prop 传不过去，选中的白边就永远不出现（与书源列表那颗登录按钮同理）
+              // 只靠 @Prop 传不过去，选中的红边就永远不出现（与书源列表那颗登录按钮同理）
             }, (cat: BookExploreCategory, index: number) =>
               `${index}_${cat.title}_${this.catIndex === index ? 'on' : 'off'}`)
           }

@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LxPlayer, LxPlayerStatus } from '../player/LxPlayer';
 import { PlaySession, SongItem } from '../player/PlaySession';
-import { COUNTED_MS, ListenLog, ListenRecord } from './ListenLog';
+import { intervalMs, ListenLog, ListenRecord, ListenSong } from './ListenLog';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'ListenTracker';
@@ -15,10 +15,51 @@ const TAG: string = 'ListenTracker';
 const CHECKPOINT_MS: number = 60000;
 
 /**
- * 收听时长的记账（回响的数据来源）
+ * 从 musicInfo JSON 里读专辑名
  *
- * 盯着播放器算两件事：**这一首听了多久**、**什么时候算一首听完**（见 ListenLog 的
- * COUNTED_MS：听满 30 秒才进账）。
+ * 队列条目（SongItem）本身没有专辑字段，但真实搜索结果转成的 musicInfo 里有
+ * （洛雪那套 `albumName`）；本地歌 / 云端歌的 musicInfo 也是同一个结构（见
+ * core/local/LocalMusic 与 core/webdav/WebDavLibrary）。读不到就当空串 ——
+ * 回响的专辑榜会把空专辑名的歌跳过，不影响其它榜。
+ */
+function albumOf(item: SongItem): string {
+  if (item.musicInfoJson.length === 0) {
+    return '';
+  }
+  try {
+    const info: Record<string, Object> = JSON.parse(item.musicInfoJson) as Record<string, Object>;
+    const album: Object = info['albumName'];
+    return typeof album === 'string' ? album : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/** 队列条目 → 流水里的歌曲快照（一次性把历史与回响要用到的字段都带全） */
+function songOf(item: SongItem): ListenSong {
+  const song: ListenSong = {
+    id: item.id,
+    name: item.name,
+    singer: item.singer,
+    coverUrl: item.coverUrl,
+    art: item.art,
+    source: item.source,
+    quality: item.quality,
+    interval: item.interval,
+    musicInfoJson: item.musicInfoJson,
+    albumName: albumOf(item),
+    durationMs: intervalMs(item.interval),
+  };
+  return song;
+}
+
+/**
+ * 收听时长的记账（回响与播放历史共用的数据来源）
+ *
+ * 盯着播放器算两件事：**这一首听了多久**、**这一条什么时候收尾**。
+ * 收尾后记录**全部留在流水里**（不到 1 秒的残片除外）：播放历史要显示「听过但没
+ * 听够」的歌，回响那边再按「听满 30 秒」自己筛（见 ListenLog.countedOf）——
+ * 30 秒门槛只在一个地方定义，不再出现两套口径。
  *
  * 记账口径：
  *   - 只算「真的在出声」的时间：`playing` 才走表，暂停 / 缓冲 / 加载都停表，
@@ -66,8 +107,8 @@ export class ListenTracker {
     player.addBufferListener((buffering: boolean): void => {
       this.onBuffer(buffering);
     });
-    player.addTimeListener((): void => {
-      this.onTime();
+    player.addTimeListener((currentMs: number, durationMs: number): void => {
+      this.onTime(durationMs);
     });
     hilog.info(DOMAIN, TAG, 'listen tracker wired');
   }
@@ -96,6 +137,13 @@ export class ListenTracker {
       return;
     }
     this.pauseClock();
+    if (status === 'paused') {
+      // 暂停那一刻把已听时长落盘并通知界面：不加这一步的话，暂停后切到回响 / 最近播放
+      // 看到的还是上一次落盘的数字（播放中每 60 秒才落一次），正在听的这首也要等
+      // 切歌后才在历史里出现。暂停是低频事件，多写一次文件的代价可以忽略。
+      ListenLog.getInstance().checkpoint();
+      return;
+    }
     if (status === 'idle' || status === 'stopped' || status === 'error') {
       // 真的停了（不是暂停）：这一首到此为止
       this.commitIfSongChanged();
@@ -113,7 +161,20 @@ export class ListenTracker {
     }
   }
 
-  private onTime(): void {
+  /**
+   * 播放进度回调
+   *
+   * @param durationMs AVPlayer 报的这首歌真实时长（毫秒，0 = 还没拿到）
+   *
+   * 时长一定要记在流水上：完播率是「系统自己记录、自己算」的指标，不能依赖音源给没给
+   * `interval`（很多音源 / 本地文件没有时长字段）。AVPlayer 在解析出文件后就会报真实
+   * 时长，这里取「目前见到的最大值」写进正在听的这一条（流媒体时长可能先给 0 再补上，
+   * 偶尔也会有抖动，只增不减最稳）。
+   */
+  private onTime(durationMs: number): void {
+    if (this.open !== null && durationMs > 0 && durationMs > this.open.durationMs) {
+      this.open.durationMs = durationMs;
+    }
     if (this.playingSince === 0 || this.open === null) {
       return;
     }
@@ -159,20 +220,10 @@ export class ListenTracker {
     if (this.open !== null && this.openKey === key) {
       return;
     }
-    const record: ListenRecord = {
-      startedAt: Date.now(),
-      name: item.name,
-      singer: item.singer,
-      coverUrl: item.coverUrl,
-      art: item.art,
-      source: item.source,
-      playedMs: 0,
-    };
-    this.open = record;
-    this.openKey = key;
     this.lastWriteAt = Date.now();
     hilog.info(DOMAIN, TAG, 'begin listening record: %{public}s', item.name);
-    ListenLog.getInstance().begin(record);
+    this.open = ListenLog.getInstance().begin(songOf(item));
+    this.openKey = key;
   }
 
   /** 当前这首歌已经不是正在听的那一首时收尾（切歌 / 播完 / 停了） */
@@ -188,7 +239,7 @@ export class ListenTracker {
     this.commit();
   }
 
-  /** 收尾正在听的那一条：听满 {@link COUNTED_MS} 的留下，不到的直接丢掉 */
+  /** 收尾正在听的那一条：不到 1 秒的残片摘掉，其余留在流水里（见 ListenLog.close） */
   private commit(): void {
     const record: ListenRecord | null = this.open;
     this.open = null;
@@ -197,7 +248,7 @@ export class ListenTracker {
       return;
     }
     hilog.info(DOMAIN, TAG, 'close listening record: %{public}s played=%{public}dms',
-      record.name, record.playedMs);
+      record.songKey, record.playedMs);
     ListenLog.getInstance().close(record);
   }
 }

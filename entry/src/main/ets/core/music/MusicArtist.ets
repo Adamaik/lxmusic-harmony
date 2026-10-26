@@ -4,6 +4,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
 import { asNumber, asObjectArray, asRecord, asString } from './PlatformHttp';
 import { md5Hex } from './LxCrypto';
+import { musicCookieHeader } from './MusicAccount';
+import { PlaySettings } from '../settings/PlaySettings';
 import { LxMusicInfo, LxQualityItem, LxSearchPage, SINGER_SEPARATORS, appendWyExtendQualities,
   formatPlayTime, mgImageUrl, sizeFormate } from './MusicSearch';
 
@@ -1176,15 +1178,24 @@ function txSingerNames(singers: Object[]): string {
 const WY_UA: string =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
 
-const WY_HEADERS: Record<string, string> = {
-  'User-Agent': WY_UA,
-  'Referer': 'https://music.163.com/',
-  // appver 是这几个老 api 的「最低门槛」：不带会被当成过期的网页端直接回空
-  'Cookie': 'appver=2.0.2',
-};
+/**
+ * 网易歌手接口的请求头
+ *
+ * 必须是**函数**而不是模块级常量：常量在模块被导入时就求值，那时账号可能还没登录
+ * （甚至还没从磁盘读回来），登录后再请求也永远带不上 MUSIC_U。改成每次请求现拼。
+ */
+function wyHeaders(): Record<string, string> {
+  return {
+    'User-Agent': WY_UA,
+    'Referer': 'https://music.163.com/',
+    // appver 是这几个老 api 的「最低门槛」：不带会被当成过期的网页端直接回空。
+    // 后面接登录态（musicCookieHeader）：登录后歌手页的歌才可能带母带 / 全景声档。
+    'Cookie': `appver=2.0.2; ${musicCookieHeader('wy')}`,
+  };
+}
 
 async function wyGet(url: string, what: string): Promise<Record<string, Object>> {
-  const resp: LxResponse = await httpGet(url, WY_HEADERS, what);
+  const resp: LxResponse = await httpGet(url, wyHeaders(), what);
   const body: Record<string, Object> = bodyRecord(resp, what);
   if (asNumber(body['code']) !== 200) {
     throw new Error(`${what}接口返回 code ${asNumber(body['code'])}`);
@@ -1689,30 +1700,52 @@ export function artistCandidatesOf(source: string, singer: string): ArtistCandid
 }
 
 /**
- * 拿名字认一位歌手：先问这首歌自己那个平台，认不到再按 `ARTIST_PLATFORMS` 的顺序问其余的
+ * 「默认渠道里没有这个人」的本次进程内备忘
  *
- * 为什么不止问一个平台：歌曲来源是「这首歌从哪搜到的」，不一定等于「这位歌手
- * 在那个平台能被搜到」—— 一首从酷我听来的歌，歌手页却可能只有酷狗认（酷我的
- * 歌手搜索接口挂了、或那位歌手在酷我上没有独立条目）。认到就开，认不到才作罢。
+ * 默认渠道只是偏好，认不到要退回缓存里那份或别的平台。没有这条备忘的话，
+ * 每次点开同一位歌手都会先去默认渠道白搜一次 —— 缓存里那个人永远不是默认平台的
+ * （比如设置改成酷我之后，以前在网易认到的那位），于是每次都要重新试一遍。
  *
- * 只认**名字完全一致**的（同一套 `artistNameKey` 归一化）：宁可告诉用户
- * 「没找到这位歌手」，也别把他带到同名的另一个人那里。
- *
- * 认过一次就落盘（见上面的 ArtistStore）：同一个名字再来问，直接拿缓存、不联网。
+ * 只记在内存里、重启即清：某一次平台接口抽风不该被当成「这个人不存在」永久记住
+ * （与 ArtistStore「只缓存认到了的」同一个道理）。
  */
-export async function resolveArtistByName(name: string, preferredSource: string = ''): Promise<LxArtist | null> {
-  const text: string = name.trim();
-  if (text.length === 0) {
-    return null;
+const defaultSourceMisses: string[] = [];
+const DEFAULT_SOURCE_MISS_MAX: number = 200;
+
+function missKey(source: string, nameKey: string): string {
+  return `${source}|${nameKey}`;
+}
+
+function rememberDefaultSourceMiss(source: string, nameKey: string): void {
+  const key: string = missKey(source, nameKey);
+  if (defaultSourceMisses.includes(key)) {
+    return;
   }
-  // 1) 认过的直接给（含头像地址）：列表页一进去要给每位解析头像，这一层命中就完全不用联网
-  const cached: LxArtist | null = ArtistStore.getInstance().get(text);
-  if (cached !== null) {
-    return cached;
+  defaultSourceMisses.push(key);
+  if (defaultSourceMisses.length > DEFAULT_SOURCE_MISS_MAX) {
+    defaultSourceMisses.shift();
   }
-  // 2) 没认过：按「这首歌的平台 -> 其余平台」的顺序问一遍
+}
+
+function defaultSourceMissed(source: string, nameKey: string): boolean {
+  return defaultSourceMisses.includes(missKey(source, nameKey));
+}
+
+/**
+ * 打开歌手页时的「先问哪个平台」顺序
+ *
+ * 设置里指定了默认渠道（见 `PlaySettings.K_DEFAULT_SOURCE`）就把它排最前 ——
+ * 「点歌手名 -> 歌手主页」这类入口没有渠道选择项，默认渠道正是为它们准备的。
+ * 没指定时保持原来的顺序：先问这首歌自己那个平台，再按 `ARTIST_PLATFORMS`。
+ * 默认渠道认不到这位歌手时，后面还有「这首歌的平台 + 其余平台」兜底，不会因此打不开。
+ */
+export function artistSourceOrder(preferredSource: string): string[] {
   const order: string[] = [];
-  if (preferredSource.length > 0) {
+  const fallback: string = PlaySettings.getInstance().getDefaultSource();
+  if (fallback.length > 0) {
+    order.push(fallback);
+  }
+  if (preferredSource.length > 0 && !order.includes(preferredSource)) {
     order.push(preferredSource);
   }
   for (const source of ARTIST_PLATFORMS) {
@@ -1720,15 +1753,90 @@ export async function resolveArtistByName(name: string, preferredSource: string 
       order.push(source);
     }
   }
-  for (const source of order) {
-    try {
-      const found: LxArtist | null = await findArtistByName(source, text);
-      if (found !== null) {
-        ArtistStore.getInstance().put(found);
-        return found;
-      }
-    } catch (e) {
-      // 这个平台没通就换下一个（歌手页的入口不该因为某一个平台的接口挂了就整条断掉）
+  return order;
+}
+
+/**
+ * 「点歌手名、要立刻开页」那一步能不能直接用缓存
+ *
+ * 默认渠道设了之后，缓存里若不是在默认渠道认到的人，就不能直接开 ——
+ * 得先按默认渠道再认一次（见 `resolveArtistByName`）。把这套判断收在这里，
+ * 壳层不必自己读设置、也不必知道缓存长什么样。
+ */
+export function cachedArtistForOpen(name: string): LxArtist | null {
+  const cached: LxArtist | null = ArtistStore.getInstance().get(name);
+  if (cached === null) {
+    return null;
+  }
+  const preferred: string = PlaySettings.getInstance().getDefaultSource();
+  if (preferred.length === 0 || cached.source === preferred
+    || defaultSourceMissed(preferred, artistNameKey(name))) {
+    return cached;
+  }
+  return null;
+}
+
+/** 在某个平台上按名字认人；接口不通 / 搜索失败都当「没认到」，交给下一个平台 */
+async function findArtistSafe(source: string, name: string): Promise<LxArtist | null> {
+  try {
+    return await findArtistByName(source, name);
+  } catch (e) {
+    // 这个平台没通就换下一个（歌手页的入口不该因为某一个平台的接口挂了就整条断掉）
+    return null;
+  }
+}
+
+/**
+ * 拿名字认一位歌手
+ *
+ * 问平台的顺序（见 `artistSourceOrder`）：默认渠道 -> 这首歌自己那个平台 -> 其余平台。
+ *
+ * 为什么不止问一个平台：歌曲来源是「这首歌从哪搜到的」，不一定等于「这位歌手能在
+ * 哪个平台被搜到」—— 一首从酷我听来的歌，歌手页却可能只有酷狗认（酷我的歌手搜索
+ * 接口挂了、或那位歌手在酷我上没有独立条目）。默认渠道同理，它是用户的偏好、
+ * 不是硬性绑定，所以认不到时后面还有这首歌的平台与其余平台兜底。
+ *
+ * 只认**名字完全一致**的（同一套 `artistNameKey` 归一化）：宁可告诉用户
+ * 「没找到这位歌手」，也别把他带到同名的另一个人那里。
+ *
+ * 缓存（见上面的 ArtistStore）按名字存、且只记认到了的。命中缓存通常是直接给，
+ * 但如果缓存里那个人是在别的平台认到的、而用户现在指定了默认渠道，就先按默认渠道
+ * 再认一次 —— 否则「改了默认渠道，点开还是老平台」会让人以为设置没生效。
+ * 默认渠道认不到（或这次网络没通）就退回缓存里那份，不会因此点不进去。
+ */
+export async function resolveArtistByName(name: string, preferredSource: string = ''): Promise<LxArtist | null> {
+  const text: string = name.trim();
+  if (text.length === 0) {
+    return null;
+  }
+  const nameKey: string = artistNameKey(text);
+  const preferred: string = PlaySettings.getInstance().getDefaultSource();
+  // 1) 缓存命中：通常是直接给（列表页一进去要给每位解析头像，这一层命中就完全不用联网）
+  const cached: LxArtist | null = ArtistStore.getInstance().get(text);
+  if (cached !== null) {
+    if (preferred.length === 0 || cached.source === preferred || defaultSourceMissed(preferred, nameKey)) {
+      return cached;
+    }
+    const found: LxArtist | null = await findArtistSafe(preferred, text);
+    if (found !== null) {
+      ArtistStore.getInstance().put(found);
+      return found;
+    }
+    rememberDefaultSourceMiss(preferred, nameKey);
+    return cached;
+  }
+  // 2) 没认过：按「默认渠道 -> 这首歌的平台 -> 其余平台」问一遍
+  for (const source of artistSourceOrder(preferredSource)) {
+    if (source === preferred && defaultSourceMissed(preferred, nameKey)) {
+      continue;
+    }
+    const found: LxArtist | null = await findArtistSafe(source, text);
+    if (found !== null) {
+      ArtistStore.getInstance().put(found);
+      return found;
+    }
+    if (source === preferred) {
+      rememberDefaultSourceMiss(preferred, nameKey);
     }
   }
   return null;

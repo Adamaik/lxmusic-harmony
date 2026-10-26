@@ -1,6 +1,6 @@
 import {
   LIST_PLATFORMS, LxBoardItem, LxListDetail, LxPlaylistItem, LxSortItem, OnlineRoute,
-  getBoardSongs, getBoards, getRecommendPlaylists, sortListOf,
+  getBoardSongs, getBoards, getRecommendPlaylists, getWyPersonalizedPlaylists, sortListOf,
 } from '../core/music/MusicList';
 import { PlaySession, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { BottomBar } from '../ui/BottomBar';
@@ -16,8 +16,10 @@ import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { LxArtist, resolveArtistByName, splitSingerNames } from '../core/music/MusicArtist';
 import { ArtistNav } from '../ui/ArtistNav';
 import { PlaylistCard, PlaylistRow, PlaylistRowSource } from '../ui/PlaylistGrid';
+import { TileCard } from '../ui/TileCard';
 import { K_RECOMMEND_SOURCE } from '../core/settings/RecommendSettings';
 import { K_WINDOW_WIDTH } from '../ui/Layout';
+import { K_MUSIC_LOGGED_WY } from '../core/music/MusicAccount';
 
 /**
  * 推荐页（三个胶囊各是一套版面，全部照用户给的华为音乐截图）
@@ -30,7 +32,7 @@ import { K_WINDOW_WIDTH } from '../ui/Layout';
  *        · 新歌精选（几行歌 + 收藏），「更多」进新歌榜；
  *        · 歌单·漫游（两列大卡），「更多」进「全部歌单」页；
  *   ② 歌单：**歌单分类**（= 平台的排序，一横排卡）+ **歌单广场**（两列大卡，滑到底翻页）；
- *   ③ 排行榜：**官方榜**（每张榜一张白卡：榜名 + 封面 + 三行）+ **精选榜**（其余榜单两列渐变卡）。
+ *   ③ 排行榜：**官方榜**（每张榜一张白卡：榜名 + 封面 + 三行）+ **精选榜**（其余榜单两列封面卡）。
  *
  * **每个分区都能点进「全部」**：歌单区 → 「全部歌单」页（平台 × 排序的全量，翻页）；
  * 排行榜每张榜 → 榜单页（全量歌曲）；新歌精选 → 新歌榜页；歌单·漫游 → 「全部歌单」页。
@@ -38,12 +40,22 @@ import { K_WINDOW_WIDTH } from '../ui/Layout';
  * 华为首页里那些运营策展区（旋律旅程 / 数字专辑 / 热点追踪 / 影廊…）宿主没有对应接口，
  * 没有拿别的数据硬凑标题。
  *
+ * **卡片形态与配色**（2026-10-21 重做）：歌手分类 / 歌单分类 / 精选榜原先按数组下标循环取
+ * 6 组高饱和纯色渐变（红 / 蓝 / 紫 / 橙 / 粉 / 绿），一屏七八张彩虹块，和本应用
+ * 「浅灰底 + 白卡 + 洛雪红 + 玻璃层」的主题完全不是一个语言（用户反馈「纯色和软件主题不搭」）。
+ * 现在三处都改用共用组件 `ui/TileCard.ets`，只有两种形态：
+ *   - **有真实封面**（榜单榜首封面）→ 封面铺满 + 底部压暗 + 白字，跟推荐歌曲大卡同一观感；
+ *   - **没有封面**（平台歌单分类这种纯文字档位）→ 主题玻璃卡：白卡 + 极淡红晕染 + 深色字。
+ * 选中态一律用强调红描边，颜色只剩「选中」一个语义，不再靠换配色区分。
+ *
  * **懒加载与主线程纪律**（2026-10-13 实机反馈「切平台卡好久、甚至闪退」之后定的）：
  *   - 开页只取首屏要用的（推荐歌曲那一张榜），其余滚进可视区才发请求
  *     （`onVisibleAreaChange`，**不能用 `onAppear`**：外层 List 是 ForEach，开页时
  *     每一块都会回调一次）；
  *   - 一行多卡 / 两列网格都用 `LazyForEach` + 数据源，只建可视区那几张那几行；
  *   - 榜单每一张单独懒加载（横滑到哪张取哪张），且一张榜最多转前 `BOARD_SONGS_MAX` 首；
+ *   - 分类卡 / 精选榜卡上的封面也单独懒加载，而且**一次只要 1 首**（见 ensureBoardCover）：
+ *     卡滚进可视区才发请求，失败就落玻璃卡，绝不为了一个封面把整张榜拉回来；
  *   - 没数据时一律摆灰块骨架（尺寸照真卡给），不给「空栏 + 一句话」。
  */
 
@@ -117,20 +129,6 @@ const MORE_SORT: string = 'sort';
 const MORE_NEW_SONG: string = 'newSong';
 const MORE_ROAM: string = 'roam';
 
-/** 渐变卡（歌单分类 / 精选榜）的配色，按序循环取 */
-const TILE_COLORS: string[][] = [
-  ['#E2432F', '#B3201A'],
-  ['#4FA8FF', '#1E6FD9'],
-  ['#7B6CF6', '#4E3FD6'],
-  ['#FFB13D', '#E0810F'],
-  ['#F26DB4', '#C22C86'],
-  ['#3FD07A', '#17A94F'],
-];
-
-function tileColors(index: number): string[] {
-  return TILE_COLORS[index % TILE_COLORS.length];
-}
-
 /** 骨架块 / 行下标要用几个：[0, 1, 2, … n-1]（ForEach 只吃数组） */
 function boneIndexes(n: number): number[] {
   const out: number[] = [];
@@ -152,6 +150,16 @@ class BoardColumn {
   asked: boolean = false;
   loading: boolean = false;
   failed: boolean = false;
+  /**
+   * 只给「卡面封面」用的那一张（见 ensureBoardCover）
+   *
+   * 精选榜 / 歌手分类卡要的只是一张图，不能为了它把整张榜取回来，所以另开一条
+   * `limit=1` 的轻请求：`songs` 到货后优先用 `songs[0]` 的封面，这里只是兜底。
+   */
+  cover: string = '';
+  /** 封面问过没有（与 `asked` 分开：整榜取歌和取封面是两条独立的请求） */
+  coverAsked: boolean = false;
+  coverLoading: boolean = false;
   /** 异步回来之后让这一栏重建一次（ForEach 的 key 带着它） */
   version: number = 0;
 }
@@ -289,6 +297,17 @@ export struct RecommendView {
   @State refreshing: boolean = false;
   @State error: string = '';
   /**
+   * 网易登录态：登录后才有「私人推荐 / 私人雷达」这类账号歌单
+   *
+   * 这一块只在「推荐来源 = 网易云」且已登录时出现（接口 `recommend/resource`
+   * 匿名直接回 301，见 MusicList.getWyPersonalizedPlaylists 的说明）。
+   * 登录 / 退出可能发生在本页停留期间（去设置页登录再回来），所以要 Watch 清缓存重取。
+   */
+  @StorageLink(K_MUSIC_LOGGED_WY) @Watch('onLoginChanged') wyLogged: boolean = false;
+  @State wyRec: LxPlaylistItem[] = [];
+  @State wyRecAsked: boolean = false;
+  @State wyRecFailed: boolean = false;
+  /**
    * 封面懒解析好后版本号会变，订阅它把歌行重画一遍
    *
    * 榜单接口回来的歌**很多是没有封面的**（酷狗榜单 `img` 直接给空串），列表里要用
@@ -337,6 +356,15 @@ export struct RecommendView {
     this.plazaError = '';
     this.plazaAsked = false;
     this.catIndex = 0;
+    // 私人推荐跟平台 / 登录态绑着：换平台或下拉刷新都重新取（问过标记一起清）
+    this.wyRec = [];
+    this.wyRecAsked = false;
+    this.wyRecFailed = false;
+    // 刷新后那块 ListItem 不一定再触发一次 onVisibleAreaChange（它本来就在可视区），
+    // 所以这里主动补一次取数；未登录 / 非网易来源时 ensureWyRec 自己会跳过
+    if (this.platform === 'wy' && this.wyLogged) {
+      this.ensureWyRec();
+    }
 
     const sections: SortSection[] = [];
     for (const sort of this.sorts) {
@@ -360,6 +388,52 @@ export struct RecommendView {
     this.artistRows = [];
     this.refreshing = false;
     await this.loadBoardColumn(this.heroIndex);
+  }
+
+  // ------------------------------------------------------------ 网易私人推荐（登录态）
+
+  /**
+   * 登录状态变了：把私人推荐清掉重取
+   *
+   * 登录 / 退出都可能发生在用户去「设置 - 登录音乐」再回来的这段时间里；旧数据
+   * （尤其是退出后还挂着的私人歌单）不能继续显示。重新登录后立即取一次，不必等滚动。
+   */
+  private onLoginChanged(): void {
+    this.wyRec = [];
+    this.wyRecAsked = false;
+    this.wyRecFailed = false;
+    if (this.platform === 'wy' && this.wyLogged) {
+      this.ensureWyRec();
+    }
+  }
+
+  /** 私人推荐那一块露出来了才取：未登录 / 非网易来源一个请求都不发 */
+  private ensureWyRec(): void {
+    if (this.platform !== 'wy' || !this.wyLogged || this.wyRecAsked) {
+      return;
+    }
+    this.wyRecAsked = true;
+    void this.loadWyRec();
+  }
+
+  /**
+   * 拉网易私人推荐歌单（每日推荐 / 私人雷达那一类）
+   *
+   * 失败只把这一块标成「取不到」：它是首页的加分项，接口挂了不能让整页跟着报错。
+   * 登录过期是最常见的失败原因，所以失败文案直接提示去「设置 - 登录音乐」重登。
+   */
+  private async loadWyRec(): Promise<void> {
+    try {
+      this.wyRec = await getWyPersonalizedPlaylists();
+      // 成功也留一行：能区分「接口通了但返回空列表」和「请求失败」两种不同问题
+      console.info(`wy personal recommend ok: ${this.wyRec.length}`);
+    } catch (e) {
+      this.wyRecFailed = true;
+      // 失败原因留在日志里：code 301 = 登录态失效（要重登），其它 code / 加密异常另查。
+      // Error 直接 JSON.stringify 会得到 {}，所以取 message。
+      const message: string = e instanceof Error ? e.message : JSON.stringify(e);
+      console.error(`wy personal recommend failed: ${message}`);
+    }
   }
 
   /** 官方榜要哪几张榜（按 OFFICIAL_NAMES 找，缺的用平台榜单前几张补齐）：在 boardColumns 里的下标 */
@@ -401,13 +475,18 @@ export struct RecommendView {
     return this.boardColumns.slice(0, TOP_LIST_BOARDS);
   }
 
-  /** 精选榜（官方榜之外剩下的榜单）第 row 行的榜单 */
-  private hotBoardsOfRow(row: number): LxBoardItem[] {
+  /**
+   * 精选榜（官方榜之外剩下的榜单）第 row 行的榜单：**返回 boardColumns 的下标**
+   *
+   * 返回下标而不是 `LxBoardItem`：卡片要按它在 boardColumns 里的位置去懒加载封面
+   * （见 ensureBoardCover），拿对象还得反查下标，不如直接给。
+   */
+  private hotBoardsOfRow(row: number): number[] {
     const official: number[] = this.pickOfficialIndexes();
-    const rest: LxBoardItem[] = [];
+    const rest: number[] = [];
     for (let i = 0; i < this.boardColumns.length; i++) {
       if (!official.includes(i)) {
-        rest.push(this.boardColumns[i].board);
+        rest.push(i);
       }
     }
     const cols: number = this.gridCols();
@@ -420,10 +499,25 @@ export struct RecommendView {
     return boneIndexes(Math.max(0, Math.ceil(count / this.gridCols())));
   }
 
-  /** 精选榜每一行的 ForEach key（带上这一行第一张榜的 id，换平台行数相同时才会重建） */
+  /**
+   * 精选榜每一行的 ForEach key（带上这一行第一张榜的 id + **各列的 version**）
+   *
+   * 只带 bangid 不够：封面是异步回来的，版本号不变的话卡面不会重建，封面永远出不来。
+   */
   private hotRowKey(row: number): string {
-    const first: LxBoardItem[] = this.hotBoardsOfRow(row);
-    return first.length > 0 ? `hotrow_${row}_${first[0].bangid}` : `hotrow_${row}_empty`;
+    const ats: number[] = this.hotBoardsOfRow(row);
+    if (ats.length === 0) {
+      return `hotrow_${row}_empty`;
+    }
+    const first: BoardColumn = this.boardColumns[ats[0]];
+    const versions: string = ats.map((at: number) => `${this.boardColumns[at].version}`).join('_');
+    return `hotrow_${row}_${first.board.bangid}_${versions}`;
+  }
+
+  /** 精选榜一张卡的 ForEach key（带这张榜的 version：封面回来之后卡面才会重建） */
+  private hotTileKey(at: number): string {
+    const column: BoardColumn = this.boardColumns[at];
+    return `hot_${column.board.bangid}_${column.version}`;
   }
 
   /** 精选页「新歌精选」用哪一栏（新歌榜优先，没有就官方榜第一栏）；-1 = 这个平台没有 */
@@ -506,6 +600,34 @@ export struct RecommendView {
     }
     const name: string = this.boardColumns[at].board.name;
     return name.endsWith('榜') ? name.substring(0, name.length - 1) : name;
+  }
+
+  /** 第 index 张歌手分类卡对应哪张榜（boardColumns 下标；越界 / -1 = 没有，卡面落玻璃卡） */
+  private artistCatBoardAt(index: number): number {
+    if (index < 0 || index >= this.artistCats.length) {
+      return -1;
+    }
+    const at: number = this.artistCats[index];
+    return at >= 0 && at < this.boardColumns.length ? at : -1;
+  }
+
+  /** 第 index 张歌手分类卡的封面（对应榜的第一首封面；没有就空串 → 玻璃卡） */
+  private artistCatCover(index: number): string {
+    const at: number = this.artistCatBoardAt(index);
+    return at >= 0 ? this.boardCover(this.boardColumns[at]) : '';
+  }
+
+  /**
+   * 歌手分类卡的 ForEach key：带对应榜的 version（封面回来才重建）+ **选中态**
+   *
+   * 选中态也得拼进 key：ForEach 对 key 没变的条目**不会重跑生成器**，`selected` 这个
+   * @Prop 传不进去，红边就永远不出现（与 ListenView 分类卡那条注释同一个坑）。
+   */
+  private artistCatKey(index: number): string {
+    const at: number = this.artistCatBoardAt(index);
+    const version: number = at >= 0 ? this.boardColumns[at].version : 0;
+    const on: string = this.artistCatIndex === index ? 'on' : 'off';
+    return `acat_${index}_${at}_${version}_${on}`;
   }
 
   /** 歌手一栏露出来了：先把这一榜的歌取回来（去重歌手要等它到） */
@@ -653,6 +775,70 @@ export struct RecommendView {
         this.buildArtistRows();
       }
     }
+  }
+
+  // ------------------------------------------------------------ 卡面封面（只取一首）
+
+  /**
+   * 这张卡露出来了：没有封面才去补一张
+   *
+   * 与 `ensureBoardSongs` 分开：整榜取歌是「点进榜单 / 看三行歌」才需要的重活，
+   * 精选榜和歌手分类卡只要一张图。已经有歌了就直接用 `songs[0]` 的封面，
+   * 不再多发一次请求（见 boardCover）。
+   */
+  private ensureBoardCover(index: number): void {
+    if (index < 0 || index >= this.boardColumns.length) {
+      return;
+    }
+    const column: BoardColumn = this.boardColumns[index];
+    if (column.songs.length > 0 || column.cover.length > 0) {
+      return;
+    }
+    if (column.coverAsked || column.coverLoading) {
+      return;
+    }
+    // 问过了（不是拿到了）：失败也记着，免得「失败 → 重建 → 再问」转成请求风暴
+    column.coverAsked = true;
+    void this.loadBoardCover(index);
+  }
+
+  /**
+   * 只为卡面取**一首**歌，用它的封面
+   *
+   * 走 `getBoardSongs(..., limit = 1)`：各平台榜单接口一次回的量差很远（酷我 100、
+   * 酷狗 100、QQ 300、网易 1000），为了一个卡面把整张榜拉回来正是之前卡死那个坑
+   * （见 MusicList.ets 里 getBoardSongs 的说明）。失败就保持空 —— 卡面自动落成玻璃卡，
+   * 不弹错、不重试。
+   */
+  private async loadBoardCover(index: number): Promise<void> {
+    if (index < 0 || index >= this.boardColumns.length) {
+      return;
+    }
+    const column: BoardColumn = this.boardColumns[index];
+    column.coverLoading = true;
+    try {
+      const detail: LxListDetail = await getBoardSongs(column.board.source, column.board.bangid, 1,
+        column.board.name, 1);
+      if (detail.list.length > 0) {
+        const song: SongItem = songFromSearch(detail.list[0], PlaySession.getInstance().quality);
+        // 封面可能还要走 CoverStore 现解（酷狗榜单 img 常给空串，见 songCover）
+        column.cover = this.songCover(song);
+      }
+    } catch (e) {
+      column.cover = '';
+    } finally {
+      column.coverLoading = false;
+      column.version = column.version + 1;
+      this.boardColumns = this.boardColumns.slice();
+    }
+  }
+
+  /** 卡面该用哪张封面：整榜的歌已经到了就顺手用第一首，否则用专门取回来的那张 */
+  private boardCover(column: BoardColumn): string {
+    if (column.songs.length > 0) {
+      return this.songCover(column.songs[0]);
+    }
+    return column.cover;
   }
 
   // ------------------------------------------------------------ 精选页的排序分区
@@ -1549,7 +1735,7 @@ export struct RecommendView {
 
   // -------------------------------------------------- ①' 歌手：分类 + 热门歌手
 
-  /** 歌手一栏的标题 + 分类卡（与歌单分类同一种渐变卡，点哪张换哪一档） */
+  /** 歌手一栏的标题 + 分类卡（封面卡 / 玻璃卡，点哪张换哪一档） */
   @Builder
   artistHead() {
     Column() {
@@ -1560,12 +1746,12 @@ export struct RecommendView {
           ListItem() {
             this.artistCatCard(index)
           }
-        }, (at: number, index: number) => `acat_${index}_${at}`)
+        }, (at: number, index: number) => this.artistCatKey(index))
       }
       .scrollBar(BarState.Off)
       .listDirection(Axis.Horizontal)
       .width('100%')
-      .height(76)
+      .height(120)
       .padding({ left: PAGE_PAD, right: PAGE_PAD })
 
       this.sectionTitle('热门歌手', 8)
@@ -1579,37 +1765,34 @@ export struct RecommendView {
     })
   }
 
-  /** 一张歌手分类卡（选中那张描红边） */
+  /**
+   * 一张歌手分类卡（2026-10-21 重做：纯色渐变块 → 封面卡 / 玻璃卡，见文件头「卡片形态」）
+   *
+   * 卡面用该分类对应榜单的第一首封面，走 `limit=1` 的轻请求（见 ensureBoardCover）；
+   * 封面还没回来 / 取不到就自动落成主题玻璃卡，版面不跳，也不会为了一个封面拉整张榜。
+   */
   @Builder
   artistCatCard(index: number) {
-    Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({
-          angle: 160,
-          colors: [[tileColors(index)[0], 0.0], [tileColors(index)[1], 1.0]],
-        })
-      Text(this.artistCatName(index))
-        .fontSize(15)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Color.White)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .textAlign(TextAlign.Center)
-        .width('100%')
-        .padding({ left: 8, right: 8 })
+    Column() {
+      TileCard({
+        title: this.artistCatName(index),
+        coverUrl: this.artistCatCover(index),
+        cardWidth: 112,
+        cardHeight: 112,
+        radius: 12,
+        selected: this.artistCatIndex === index,
+        showPlay: false,
+        onTap: () => {
+          this.switchArtistCat(index);
+        },
+      })
     }
-    .width(112)
-    .height(72)
-    .borderRadius(12)
-    .clip(true)
-    .border({ width: this.artistCatIndex === index ? 2 : 0, color: C_RED })
-    .onClick(() => {
-      this.switchArtistCat(index);
+    // 这一张露出来了才去补封面（横向 List 滚出屏幕的卡同样会回调，见 topListColumn 那段说明）
+    .onVisibleAreaChange([0.0, 0.05], (isVisible: boolean) => {
+      if (isVisible) {
+        this.ensureBoardCover(this.artistCatBoardAt(index));
+      }
     })
-    .accessibilityText(`${this.artistCatName(index)}${this.artistCatIndex === index ? '，已选中' : ''}`)
-    .accessibilityLevel('yes')
   }
 
   /** 一位歌手一行：圆头像 + 名字（+ 别名）+ 歌曲数胶囊 + 箭头 */
@@ -1704,48 +1887,41 @@ export struct RecommendView {
           ListItem() {
             this.catCard(sort, index)
           }
-        }, (sort: LxSortItem, index: number) => `cat_${index}_${sort.id}`)
+          // 选中态拼进 key：ForEach 对 key 没变的条目不会重跑生成器，只靠 @Prop 传不过去，
+          // 点哪张都不出红边（见 ListenView 分类卡那条注释）
+        }, (sort: LxSortItem, index: number) =>
+          `cat_${index}_${sort.id}_${this.catIndex === index ? 'on' : 'off'}`)
       }
       .scrollBar(BarState.Off)
       .listDirection(Axis.Horizontal)
       .width('100%')
-      .height(76)
+      .height(120)
       .padding({ left: PAGE_PAD, right: PAGE_PAD })
     }
     .width('100%')
   }
 
-  /** 一张分类卡（选中那张描一圈红边） */
+  /**
+   * 一张歌单分类卡（2026-10-21 重做：纯色渐变块 → 主题玻璃卡，见文件头「卡片形态」）
+   *
+   * 平台的「排序」只是纯文字档位，没有现成封面，所以固定走 TileCard 的玻璃卡形态
+   * （`coverUrl: ''`）。**不为了卡面额外发歌单请求**：这一档的内容下面广场本来就要取，
+   * 为了一张图多打一次接口不值。
+   */
   @Builder
   catCard(sort: LxSortItem, index: number) {
-    Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({
-          angle: 160,
-          colors: [[tileColors(index)[0], 0.0], [tileColors(index)[1], 1.0]],
-        })
-      Text(sort.name)
-        .fontSize(15)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Color.White)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .textAlign(TextAlign.Center)
-        .width('100%')
-        .padding({ left: 8, right: 8 })
-    }
-    .width(112)
-    .height(72)
-    .borderRadius(12)
-    .clip(true)
-    .border({ width: this.catIndex === index ? 2 : 0, color: C_RED })
-    .onClick(() => {
-      this.switchCat(index);
+    TileCard({
+      title: sort.name,
+      coverUrl: '',
+      cardWidth: 112,
+      cardHeight: 112,
+      radius: 12,
+      selected: this.catIndex === index,
+      showPlay: false,
+      onTap: () => {
+        this.switchCat(index);
+      },
     })
-    .accessibilityText(`${sort.name}${this.catIndex === index ? '，已选中' : ''}`)
-    .accessibilityLevel('yes')
   }
 
   // -------------------------------------------------- ③ 排行榜：官方榜 + 精选榜
@@ -1894,55 +2070,35 @@ export struct RecommendView {
   }
 
   /**
-   * 精选榜一张渐变卡
+   * 精选榜一张封面卡（2026-10-21 重做：纯色渐变块 → 封面卡）
    *
-   * 播放钮同样压在**左下角**：套一层铺满的 Stack 用 alignContent(BottomStart) 定位，
-   * 不能用 `.align(...)`（见 coverWithPlay 里那段说明）。渐变卡上是白三角（不加深色圆底），
-   * 并加一层底部压暗，钮和白字都压得住。
+   * 卡面用这张榜首的第一首封面，走 `limit=1` 的轻请求（见 ensureBoardCover）；
+   * 没封面 / 还没回来就自动落成主题玻璃卡，所以卡面永远不会是空块。
+   * 播放钮由 TileCard 收在右下角跟着文字走，不再像旧渐变卡那样单独用 Stack 定位。
    */
   @Builder
-  hotBoardTile(board: LxBoardItem, index: number) {
-    Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({
-          angle: 160,
-          colors: [[tileColors(index)[0], 0.0], [tileColors(index)[1], 1.0]],
-        })
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({ angle: 0, colors: [['#00000000', 0.4], ['#59000000', 1.0]] })
-
-      Text(board.name)
-        .fontSize(19)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(Color.White)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .textAlign(TextAlign.Center)
-        .width('100%')
-        .padding({ left: 12, right: 12, bottom: 10 })
-
-      Stack({ alignContent: Alignment.BottomStart }) {
-        IconGlyph({ symbol: I_PLAY, iconSize: 13, color: '#FFFFFF' })
-      }
-      .width('100%')
-      .height('100%')
-      .padding({ left: 10, bottom: 9 })
+  hotBoardTile(at: number, index: number) {
+    Column() {
+      TileCard({
+        title: this.boardColumns[at].board.name,
+        coverUrl: this.boardCover(this.boardColumns[at]),
+        cardWidth: this.gridCardWidth(),
+        cardHeight: this.gridCardWidth(),
+        radius: 14,
+        selected: false,
+        showPlay: this.boardCover(this.boardColumns[at]).length > 0,
+        onTap: () => {
+          this.openBoard(this.boardColumns[at].board);
+        },
+      })
     }
-    .width(this.gridCardWidth())
-    .height(96)
-    .borderRadius(14)
-    .clip(true)
+    // 卡间距挂在外层（TileCard 自带宽度）；这一张露出来了才去补封面
     .margin({ right: this.laneGap(index) })
-    .onClick(() => {
-      this.openBoard(board);
+    .onVisibleAreaChange([0.0, 0.05], (isVisible: boolean) => {
+      if (isVisible) {
+        this.ensureBoardCover(at);
+      }
     })
-    .accessibilityText(`${board.name}，查看完整榜单`)
-    .accessibilityLevel('yes')
   }
 
   // -------------------------------------------------- 歌单广场（两列网格）
@@ -1995,6 +2151,65 @@ export struct RecommendView {
   }
 
   // -------------------------------------------------- 各胶囊的正文
+
+  // -------------------------------------------------- 网易私人推荐
+
+  /**
+   * 网易云登录后的「私人推荐」
+   *
+   * 位置在分类胶囊下面、精选正文第一块：私人推荐 / 私人雷达这类歌单只有登录账号后
+   * 网易才会给（匿名接口直接回 301），和平台公开榜单不是一个数据口径，所以单独一块，
+   * 不并进「歌单分类 / 歌单广场」。未登录或推荐来源不是网易时整块不渲染。
+   */
+  @Builder
+  wyPrivateSection() {
+    Column() {
+      this.sectionTitle('私人推荐', 4)
+
+      if (this.wyRec.length === 0) {
+        if (this.wyRecFailed) {
+          Text('私人推荐暂时取不到（登录可能已过期，去「设置 - 登录音乐」重新登录试试）')
+            .fontSize(CARD_META_SIZE)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
+        } else {
+          Row({ space: CARD_GAP }) {
+            ForEach(boneIndexes(this.gridCols()), () => {
+              this.bone(this.gridCardWidth(), this.gridCardWidth(), 12)
+            }, (i: number) => `wyrecbone_${i}`)
+          }
+          .width('100%')
+          .padding({ left: PAGE_PAD, right: PAGE_PAD })
+        }
+      } else {
+        List({ space: CARD_GAP }) {
+          ForEach(this.wyRec, (item: LxPlaylistItem) => {
+            ListItem() {
+              PlaylistCard({
+                title: item.name,
+                coverUrl: item.img,
+                meta: this.cardMeta(item),
+                coverBox: this.gridCardWidth(),
+                onOpen: () => {
+                  this.openPlaylist(item);
+                },
+              })
+            }
+            .width(this.gridCardWidth())
+          }, (item: LxPlaylistItem) => `wyrec_${item.id}`)
+        }
+        .scrollBar(BarState.Off)
+        .listDirection(Axis.Horizontal)
+        .width('100%')
+        .height(this.gridCardWidth() + 50)
+        .padding({ left: PAGE_PAD, right: PAGE_PAD })
+      }
+    }
+    .width('100%')
+  }
 
   /** ① 精选：分区信息流 */
   @Builder
@@ -2101,7 +2316,7 @@ export struct RecommendView {
     }
   }
 
-  /** ③ 排行榜：官方榜卡片 + 精选榜渐变卡 */
+  /** ③ 排行榜：官方榜卡片 + 精选榜封面卡 */
   @Builder
   boardBody() {
     ListItem() {
@@ -2111,9 +2326,9 @@ export struct RecommendView {
     ForEach(this.hotRowIndexes(), (row: number) => {
       ListItem() {
         Row({ space: CARD_GAP }) {
-          ForEach(this.hotBoardsOfRow(row), (board: LxBoardItem, index: number) => {
-            this.hotBoardTile(board, index)
-          }, (board: LxBoardItem) => `hot_${board.bangid}`)
+          ForEach(this.hotBoardsOfRow(row), (at: number, index: number) => {
+            this.hotBoardTile(at, index)
+          }, (at: number) => this.hotTileKey(at))
         }
         .width('100%')
         .padding({ left: PAGE_PAD, right: PAGE_PAD })
@@ -2186,6 +2401,18 @@ export struct RecommendView {
             // ------------------------------------------------ 分类胶囊
             ListItem() {
               this.chipRow()
+            }
+
+            // ------------------------------------------------ 网易私人推荐（登录后才有）
+            if (this.platform === 'wy' && this.wyLogged && this.tab === TAB_FEATURED) {
+              ListItem() {
+                this.wyPrivateSection()
+              }
+              .onVisibleAreaChange([0.0, 0.05], (isVisible: boolean) => {
+                if (isVisible) {
+                  this.ensureWyRec();
+                }
+              })
             }
 
             // ------------------------------------------------ 各胶囊的正文

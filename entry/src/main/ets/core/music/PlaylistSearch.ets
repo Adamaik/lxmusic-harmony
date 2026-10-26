@@ -1,7 +1,8 @@
-import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
+﻿import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
 import { LxPlaylistItem, descText } from './MusicList';
 import { MG_DEVICE_ID, QS_APP_HEADERS, createMgSignature, decodeName, qsCoverOf,
   qsDeviceQuery, similar } from './MusicSearch';
+import { musicCookieHeader } from './MusicAccount';
 
 /**
  * 内置「歌单搜索」（宿主侧）
@@ -367,20 +368,30 @@ async function searchTxPlaylists(keyword: string, page: number, limit: number): 
  * 网易的歌单搜索走**明文** GET（与歌单广场同一套思路，见 MusicList 顶部说明）：
  * `/api/search/get/web?type=1000` 不用 eapi 加密、不要登录，带 `Cookie: os=pc` 即可。
  * 歌曲搜索那条 eapi 链路仍是不通的（D-001），但这条是另一条接口，实测能回结果。
+ * Cookie 改由 musicCookieHeader 统一给：歌单搜索本身不吃登录态，但同一个请求头
+ * 在登录后会带上 MUSIC_U，接口返回的歌单里那些歌的音质档才可能包含权益档。
  */
-const WY_SEARCH_HEADERS: Record<string, string> = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-    + 'Chrome/60.0.3112.90 Safari/537.36',
-  'Referer': 'https://music.163.com/',
-  'Cookie': 'os=pc',
-};
+/**
+ * 网易歌单搜索的请求头
+ *
+ * 函数而不是常量：常量在导入时求值，登录态还没读回来，登录后也不会更新
+ * （见 MusicArtist 里同一处说明）。
+ */
+function wySearchHeaders(): Record<string, string> {
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+      + 'Chrome/60.0.3112.90 Safari/537.36',
+    'Referer': 'https://music.163.com/',
+    'Cookie': musicCookieHeader('wy'),
+  };
+}
 
 async function searchWyPlaylists(keyword: string, page: number, limit: number): Promise<LxPlaylistPlatformResult> {
   const offset: number = limit * (page - 1);
   const url: string =
     'https://music.163.com/api/search/get/web?csrf_token=' +
     `&s=${encodeURIComponent(keyword)}&type=1000&offset=${offset}&total=true&limit=${limit}`;
-  const body: Record<string, Object> = parseRecord(await requestText(url, WY_SEARCH_HEADERS), '网易');
+  const body: Record<string, Object> = parseRecord(await requestText(url, wySearchHeaders()), '网易');
   const code: number = asNumber(body['code']);
   if (code !== 0 && code !== 200) {
     throw new Error(`网易接口返回 code ${code}`);

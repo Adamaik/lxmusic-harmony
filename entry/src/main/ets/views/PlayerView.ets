@@ -23,7 +23,8 @@ import { HdsEdgeFlowLight } from '../ui/Hds';
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
-import { LOCAL_QUALITY_MARK, isFileQuality, qualityLabel, switchableQualitys } from '../core/music/Quality';
+import { LOCAL_QUALITY_MARK, isExtendedQuality, isFileQuality, qualityLabel, switchableQualitys } from '../core/music/Quality';
+import { PlaySettings } from '../core/settings/PlaySettings';
 import { isWideWindow } from '../ui/Layout';
 
 function formatTime(seconds: number): string {
@@ -656,6 +657,37 @@ export struct PlayerView {
   }
 
   /**
+   * 开了拓展音质、但这首歌 / 当前音源没有任何拓展档时的一句说明（空串 = 不用显示）
+   *
+   * 用户反馈「设置里开了母带，播放网易云还是只有 FLAC」（2026-10-21）：拓展音质开关
+   * 只是放宽协商的候选上限，最终能不能列出来还取决于两件事 ——
+   *   1. 这首歌的数据里有这一档：网易把母带 / 沉浸声 / 杜比（jymaster / sky / dolby）
+   *      报成**账号权益档**，匿名请求最高只到 hires；要在「设置 - 登录音乐」登录
+   *      会员账号后才会返回（见 core/music/MusicAccount.ets）；
+   *   2. 当前音源声明支持这一档：多数第三方音源只声明到 flac / flac24bit。
+   * 不说明的话用户只会看到「开关开了却没效果」，所以这里如实说一句。
+   */
+  private extendHint(): string {
+    if (!PlaySettings.getInstance().isExtendQuality()) {
+      return '';
+    }
+    if (isFileQuality(this.quality) || PlaySession.getInstance().current === null) {
+      return '';
+    }
+    for (const quality of this.qualityOptions()) {
+      if (isExtendedQuality(quality)) {
+        return '';
+      }
+    }
+    const item: SongItem | null = PlaySession.getInstance().current;
+    if (item !== null && item.source === 'wy') {
+      return '已开启拓展音质，但这首歌没有更高档：网易的母带 / 全景声 / 沉浸声是会员账号权益档，'
+        + '未登录不会上报（去「设置 - 登录音乐」登录网易云），且当前音源要声明支持该档。';
+    }
+    return '已开启拓展音质，但这首歌 / 当前音源没有更高档可选（音源要声明支持 Hi-Res、母带等档）。';
+  }
+
+  /**
    * 没得切时的那句说明
    *
    * 三种情况各说各的：本地文件、云端文件（音质由文件本身决定），
@@ -781,6 +813,17 @@ export struct PlayerView {
           .textAlign(TextAlign.Center)
           .lineHeight(19)
           .padding({ left: 24, right: 24, top: 2, bottom: 16 })
+      }
+
+      // 拓展音质开着却一档都没列出来时，说清楚为什么（见 extendHint）
+      if (this.extendHint().length > 0) {
+        Text(this.extendHint())
+          .fontSize(11.5)
+          .fontColor('#66FFFFFF')
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .lineHeight(16)
+          .padding({ left: 24, right: 24, top: 6, bottom: 8 })
       }
 
       Divider()

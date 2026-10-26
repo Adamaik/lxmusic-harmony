@@ -27,10 +27,11 @@ import { BAR_ONE_ROW, BAR_TWO_ROWS, BottomBar, K_BAR_LAYOUT, twoRowLayoutSupport
 import { PageTitle, RoundIconButton, WidePane } from '../ui/Widgets';
 import { AppearanceSettingsView } from '../views/AppearanceSettingsView';
 import { AboutView } from '../views/AboutView';
+import { ChangelogView } from '../views/ChangelogView';
 import { WebDavSettingsView } from '../views/WebDavSettingsView';
 import { ListenSettingsView } from '../views/ListenSettingsView';
-import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_ECHO, I_ECHO_FILL, I_HOME, I_HOME_FILL,
-  I_IDENTIFY, I_PERSON, I_PERSON_FILL, I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
+import { I_BOOK, I_BOOK_FILL, I_CHEVRON_DOWN, I_CLOSE, I_ECHO, I_ECHO_FILL, I_EXPLORE, I_EXPLORE_FILL,
+  I_HOME, I_HOME_FILL, I_IDENTIFY, I_PERSON, I_PERSON_FILL, I_SEARCH, I_SELECT_ALL, IconGlyph } from '../ui/Icons';
 import { MiniBarView } from '../views/MiniBar';
 import { BookSandboxHost } from '../components/BookSandboxHost';
 import { BookDetailView } from '../views/BookDetailView';
@@ -52,14 +53,16 @@ import { WebDavPane } from '../views/WebDavView';
 import { K_RECOMMEND_SOURCE, RecommendSettings } from '../core/settings/RecommendSettings';
 import { K_HIDE_LISTEN_TAB } from '../core/settings/ListenSettings';
 import { RecommendView } from '../views/RecommendView';
+import { ExploreView } from '../views/ExploreView';
 import { RecognizeView } from '../views/RecognizeView';
 import { SearchView } from '../views/SearchView';
 import { ArtistView } from '../views/ArtistView';
 import { ArtistPickerView } from '../views/ArtistPickerView';
 import { ArtistNav } from '../ui/ArtistNav';
-import { ArtistCandidate, artistCandidatesOf, cachedArtistOf, LxArtist,
+import { ArtistCandidate, artistCandidatesOf, cachedArtistForOpen, LxArtist,
   resolveArtistByName } from '../core/music/MusicArtist';
 import { SettingsView } from '../views/SettingsView';
+import { MusicLoginView } from '../views/MusicLoginView';
 import { SourceSettingsView } from '../views/SourceSettingsView';
 import { SyncModeContent } from '../views/SyncModeSheet';
 import { SyncSettingsView } from '../views/SyncSettingsView';
@@ -92,8 +95,12 @@ const PAGE_ONLINE: string = 'online';
 const PAGE_WEBDAV: string = 'webdav';
 /** 关于（作者 / 开源协议 / 仓库地址 / 反馈渠道） */
 const PAGE_ABOUT: string = 'about';
+/** 更新公告（帮助和反馈 → 更新公告）：从新到旧连成一条时间线 */
+const PAGE_CHANGELOG: string = 'changelog';
 /** 设置（「我的」页那张卡的「设置」；原来是底部的一个页签，现在从「我的」里进） */
 const PAGE_SETTINGS: string = 'settings';
+/** 登录音乐（设置 - 登录音乐卡）：网易云账号登录，登录后接口才返回母带等权益音质档 */
+const PAGE_LOGIN: string = 'login';
 /** 播放历史（「我的」页快捷入口里的「最近播放」） */
 const PAGE_HISTORY: string = 'history';
 /** 全部歌单（推荐页分区标题右边「更多」进来的那一页） */
@@ -151,16 +158,19 @@ interface TabDef {
  * 看得出来。它不动栏里的次序，折叠成的那颗球永远是那一组的左端元素。
  */
 const TAB_KEY_HOME: string = 'home';
+const TAB_KEY_EXPLORE: string = 'explore';
 const TAB_KEY_LISTEN: string = 'listen';
 const TAB_KEY_ECHO: string = 'echo';
 const TAB_KEY_MINE: string = 'mine';
 
 const TAB_HOME: TabDef = { key: TAB_KEY_HOME, icon: I_HOME, iconActive: I_HOME_FILL, label: '推荐' };
+/** 探索：心动模式刷歌（一屏一首、下拉换一批），见 views/ExploreView.ets */
+const TAB_EXPLORE: TabDef = { key: TAB_KEY_EXPLORE, icon: I_EXPLORE, iconActive: I_EXPLORE_FILL, label: '探索' };
 const TAB_LISTEN: TabDef = { key: TAB_KEY_LISTEN, icon: I_BOOK, iconActive: I_BOOK_FILL, label: '听书' };
 const TAB_ECHO: TabDef = { key: TAB_KEY_ECHO, icon: I_ECHO, iconActive: I_ECHO_FILL, label: '回响' };
 const TAB_MINE: TabDef = { key: TAB_KEY_MINE, icon: I_PERSON, iconActive: I_PERSON_FILL, label: '我的' };
 
-const TABS: TabDef[] = [TAB_HOME, TAB_LISTEN, TAB_ECHO, TAB_MINE];
+const TABS: TabDef[] = [TAB_HOME, TAB_EXPLORE, TAB_LISTEN, TAB_ECHO, TAB_MINE];
 
 /**
  * 底栏那份日志（HDS 的样式回调与滚动联动各打一行，`hdc shell hilog | grep BottomBar` 能查到）
@@ -529,9 +539,11 @@ struct Index {
   /**
    * 状态栏字色
    *
-   * 两种情况下要白字：**播放页弹出来的时候**（那一层是深色封面）、以及**深色模式**下
-   * （状态栏压在深色页面上）。之前只判了播放页，深色模式下状态栏一直是黑字 ——
-   * 黑字压在近黑底上，就是「看不见时间/电量」。
+   * 三种情况下要白字：**播放页弹出来的时候**（那一层是深色封面）、**深色模式**下
+   * （状态栏压在深色页面上）、以及**停在回响页签**时（回响是固定深色的沉浸式月报，
+   * 见 views/EchoView.ets —— 它不跟系统深浅模式走，浅色模式下也是深色底）。
+   * 之前只判了播放页，深色模式下状态栏一直是黑字 —— 黑字压在近黑底上，
+   * 就是「看不见时间/电量」。
    */
   private applyStatusBarColor(playerOpen: boolean): void {
     const win = this.mainWindow;
@@ -539,8 +551,9 @@ struct Index {
       return;
     }
     try {
+      const onDarkPage: boolean = this.isDarkMode() || this.activeTabKey === TAB_KEY_ECHO;
       win.setWindowSystemBarProperties({
-        statusBarContentColor: (playerOpen || this.isDarkMode()) ? '#FFFFFF' : '#000000',
+        statusBarContentColor: (playerOpen || onDarkPage) ? '#FFFFFF' : '#000000',
       });
     } catch (e) {
       // 忽略：部分设备不支持单独改内容色
@@ -735,7 +748,7 @@ struct Index {
    * {@link tabDefOf} 按 key 取（key 不随显隐变），绝不把下标当身份传来传去。
    */
   private visibleTabDefs(): TabDef[] {
-    return this.hideListenTab ? [TAB_HOME, TAB_ECHO, TAB_MINE] : TABS;
+    return this.hideListenTab ? [TAB_HOME, TAB_EXPLORE, TAB_ECHO, TAB_MINE] : TABS;
   }
 
   /** 某个身份（key）对应的页签定义 */
@@ -771,6 +784,9 @@ struct Index {
       return;
     }
     this.activeTabKey = defs[index].key;
+    // 页签一换，压在页面上的状态栏底色就变了：回响页是固定深色，要白字；
+    // 其余页签看系统深浅模式（见 applyStatusBarColor）
+    this.applyStatusBarColor(this.playerOpen);
   }
 
   /** 页签选中态用的强调色 / 未选中态的图标 token（比的是身份，不是下标） */
@@ -918,10 +934,13 @@ struct Index {
   homeHeader() {
     Row({ space: 10 }) {
       // 标题按页签取：回响是「10 月 · 回响」（月份跟着它的选择器变，见 echoTitle），
-      // 其余直接用页签自己的名字
-      PageTitle({ text: this.activeTabKey === TAB_KEY_ECHO
-        ? this.echoTitle
-        : this.tabDefOf(this.activeTabKey).label })
+      // 其余直接用页签自己的名字。回响是固定深色的月报页，标题要转白字（onDark）。
+      PageTitle({
+        text: this.activeTabKey === TAB_KEY_ECHO
+          ? this.echoTitle
+          : this.tabDefOf(this.activeTabKey).label,
+        onDark: this.activeTabKey === TAB_KEY_ECHO,
+      })
       Blank()
       if (this.activeTabKey === TAB_KEY_HOME) {
         this.sourcePicker()
@@ -1186,8 +1205,11 @@ struct Index {
    */
   private async resolveAndOpenArtist(source: string, name: string): Promise<void> {
     // 认过的歌手直接开，不闪那句「正在查找歌手…」：从歌手列表页点进来时几乎总是命中
-    // （那一页进去时已经挨个认过一遍，结果落盘了，见 MusicArtist 的 ArtistStore）
-    const known: LxArtist | null = cachedArtistOf(name);
+    // （那一页进去时已经挨个认过一遍，结果落盘了，见 MusicArtist 的 ArtistStore）。
+    // 注意这里问的是 cachedArtistForOpen 而不是缓存本身：设置里指定了默认渠道、而缓存里
+    // 那位是在别的平台认到的时，它会返回 null，让下面照默认渠道再认一次 ——
+    // 否则「改了默认渠道，点开还是老平台」。
+    const known: LxArtist | null = cachedArtistForOpen(name);
     if (known !== null) {
       this.openArtist(known);
       return;
@@ -1257,6 +1279,11 @@ struct Index {
     }
     if (action === 'settings') {
       this.go(PAGE_SETTINGS);
+      return;
+    }
+    if (action === 'login') {
+      // 设置页 / 我的页的「登录音乐」：网易云账号登录（登录后母带等权益档才会出现）
+      this.go(PAGE_LOGIN);
       return;
     }
     // 「我的」页那一排快捷入口：收藏进内置那张收藏歌单的详情，其余四样各自是一页
@@ -1576,10 +1603,24 @@ struct Index {
     } else if (name === PAGE_ABOUT) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
-          AboutView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+          AboutView({
+            bottomInset: this.bottomInset,
+            topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+            onOpenChangelog: () => {
+              this.go(PAGE_CHANGELOG);
+            },
+          })
         }
       }
       .titleBar(this.titleBarOptions('关于'))
+    } else if (name === PAGE_CHANGELOG) {
+      // 更新公告：滚动内容页，与各设置页同一套让位方式（页面自己带会跟着滚走的顶部占位）
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          ChangelogView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+        }
+      }
+      .titleBar(this.titleBarOptions('更新公告'))
     } else if (name === PAGE_SETTINGS) {
       // 「我的」页那张卡的「设置」：内容就是原来的设置页（它原来是一个页签），
       // 所以让位方式与页签时一样 —— 页面内部自己带顶部占位与渐隐，这里不再套 fadeTop
@@ -1596,6 +1637,20 @@ struct Index {
         }
       }
       .titleBar(this.titleBarOptions('设置'))
+    } else if (name === PAGE_LOGIN) {
+      // 登录音乐：网易云账号登录页（网页登录是整屏覆盖层，不经过标题栏，
+      // 所以另给一份纯状态栏 / 手势条高度，由页面自己补留白）
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          MusicLoginView({
+            topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+            bottomInset: this.bottomInset,
+            safeTop: this.topInset,
+            safeBottom: this.bottomInset,
+          })
+        }
+      }
+      .titleBar(this.titleBarOptions('登录音乐'))
     } else if (name === PAGE_HISTORY) {
       HdsNavDestination() {
         WidePane() {
@@ -1849,6 +1904,22 @@ struct Index {
           .tabBar(this.tabBarItem(TAB_KEY_HOME))
 
           /**
+           * 探索：心动模式刷歌（一屏一首、竖向滑动切换、顶部下拉换一批）
+           *
+           * 内容铺满窗口，页内自带顶栏让位与空态引导（见 views/ExploreView.ets）。
+           * 它紧挨着「推荐」：左边两栏是内容（刷歌 / 逛平台），右边是听书与我的账。
+           */
+          TabContent() {
+            WidePane() {
+              ExploreView({
+                topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
+                bottomInset: this.bottomInset + 96,
+              })
+            }
+          }
+          .tabBar(this.tabBarItem(TAB_KEY_EXPLORE))
+
+          /**
            * 听书这一栏可以在「设置 - 听书」里隐藏（见 hideListenTab）
            *
            * 整块 TabContent 一起不摆：栏里的那一项与它的内容一起没掉，导航栏只剩推荐与我的。
@@ -1918,7 +1989,17 @@ struct Index {
         .vertical(false)
         .barMode(BarMode.Fixed)
         .barOverlap(true)
-        .scrollable(true)
+        /**
+         * 左右滑动切页签：**回响页签下要关掉**
+         *
+         * HdsTabs 的 `scrollable` 是「能不能左右滑动切换页签」（见 HDS 声明里的
+         * "page switching can be performed by sliding left and right"）。回响页的
+         * Top3 是一个要横向拖动的 3D 轮播：页签级滑动会把这个横向拖动抢走，
+         * 表现就是「滑了没反应 / 直接换了页面」。所以停在回响页时关掉页签滑动，
+         * 让横向手势归轮播（专辑横条那种横向 Scroll 本来就有嵌套滚动协商，不受影响）。
+         * 其它页签照旧开着 —— 底栏还在，切页签不受影响。
+         */
+        .scrollable(this.activeTabKey !== TAB_KEY_ECHO)
         // 高度写死成与自绘迷你栏同一个常量：两边必须一样高，观感才统一
         .barHeight(HDS_BAR_HEIGHT)
         .zIndex(1)

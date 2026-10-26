@@ -84,6 +84,31 @@ start: READ OK size=4673028
   `ohos.fileshare.supportPreservePersistentPermission` 保留，本项目暂未启用）；
 - 换来的是：设备上只存一份、删条目不误删用户文件。
 
+### 上架限制：release 包要先在 AGC 申请这条 ACL（2026-10-21）
+
+真机验证通过 ≠ 能上架。**上架前检测 →「ACL 权限声明一致性」会红**：
+
+```
+受限ACL权限                          软件包内是否存在    Profile文件内是否存在
+ohos.permission.FILE_ACCESS_PERSIST      ✅                    ❌
+```
+
+规则是「包内声明的 ACL 权限」与「签名 Profile 的 `allowed-acls`」必须一一对应。
+调试证书默认放开 ACL（所以真机调试完全正常），**release 证书必须先在 AGC 申请该受限权限、
+再用重新生成的 Profile** 才会带上它（官方社区答复，2024-12 / 2025-02 两例）。
+
+因此当前 `module.json5` **有意不声明**这条权限，检测才能过；运行时
+`LocalAccess.granted()` 返回 false，本地音乐导入**自动退回「复制进沙箱」**，功能不会坏。
+恢复引用式导入的步骤（AGC 批下来之后，代码零改动）：
+
+1. 把 `requestPermissions` 里 `FILE_ACCESS_PERSIST` 那条加回去（模板见 `module.json5` 注释）；
+2. 换成带 `allowed-acls` 的 release Profile，重跑上架检测。
+
+**不申请 ACL 的备选**（后续可选，未实现）：Picker 的 `multiAuthMode + multiUriArray`
+批量授权 —— 条目照旧只存 URI，冷启动后当用户第一次要用本地音乐时，一次性弹系统的
+「批量授权」页让它重新授权这些 URI。全程零权限，代价是每次冷启动要用户点一次确认。
+（API 15 起支持、标注「手机可用」，见 `@ohos.file.picker` 的 `DocumentSelectOptions`。）
+
 ## 3. 怎么选文件（只有一个入口：文件管理的音频聚合视图）
 
 三方应用在**手机**上能拿到的用户音频文件只有一条路：「自己扫全盘」在设计上就不存在

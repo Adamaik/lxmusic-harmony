@@ -1,5 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LxMusicInfo, searchMusic } from '../music/MusicSearch';
+import { PlaySettings } from '../settings/PlaySettings';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LyricMatch';
@@ -17,7 +18,12 @@ const TAG: string = 'LyricMatch';
  * 交给用户在播放页手动选（见 views/LyricMatchSheet.ets）。
  */
 
-/** 参与匹配的平台，按「搜索接口稳定程度」排序；某个平台搜不动会跳到下一个 */
+/**
+ * 参与匹配的平台，按「搜索接口稳定程度」排序；某个平台搜不动会跳到下一个
+ *
+ * 这只是**顺序**：设置里指定了默认渠道时，实际先问的是默认渠道（见 `matchSourceOrder`），
+ * 这里保持不动、作为默认渠道之后的那一段。
+ */
 export const MATCH_PLATFORMS: string[] = ['kw', 'kg', 'tx', 'mg', 'wy'];
 
 /** 平台名（显示用） */
@@ -275,7 +281,29 @@ export async function searchCandidates(keyword: string, platform: string): Promi
 }
 
 /**
- * 自动匹配：按 MATCH_PLATFORMS 逐个平台试，找到一条够格的就用它
+ * 自动匹配实际要问的平台顺序
+ *
+ * 本地歌与云端歌没有平台身份，「去哪个平台找词」纯靠猜。设置里指定了默认渠道
+ * （设置 - 播放设置 - 默认渠道）就把它排最前：用户常听的平台，同一首歌在那里
+ * 更可能对得上（版本、时长、歌词格式都一致）；默认渠道没有够格的匹配
+ * （「宁缺勿错」那套判定），再按 MATCH_PLATFORMS 的老顺序问其余平台。
+ */
+export function matchSourceOrder(): string[] {
+  const order: string[] = [];
+  const preferred: string = PlaySettings.getInstance().getDefaultSource();
+  if (preferred.length > 0) {
+    order.push(preferred);
+  }
+  for (const platform of MATCH_PLATFORMS) {
+    if (!order.includes(platform)) {
+      order.push(platform);
+    }
+  }
+  return order;
+}
+
+/**
+ * 自动匹配：按 `matchSourceOrder()` 逐个平台试，找到一条够格的就用它
  *
  * 某个平台搜不动（网络、接口下线）只记一条日志就换下一个 ——
  * 内置搜索里的网易端点就一直标着「待复核」。
@@ -287,7 +315,7 @@ export async function autoMatchLyric(name: string, singer: string,
   }
   const keyword: string = singer.trim().length > 0 ? `${name} ${singer}` : name;
   let searched: boolean = false;
-  for (const platform of MATCH_PLATFORMS) {
+  for (const platform of matchSourceOrder()) {
     let results: LxMusicInfo[] = [];
     try {
       results = await searchCandidates(keyword, platform);

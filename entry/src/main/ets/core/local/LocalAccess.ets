@@ -19,13 +19,21 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
  *   - `canIUse('SystemCapability.FileManagement.AppFileService.FolderAuthorization')` = true，
  *     手机上有这个能力位；
  *   - `ohos.permission.FILE_ACCESS_PERSIST` 在 SDK 权限表里是 system_grant / normal，
- *     **不是受限 ACL**，`module.json5` 里声明即授予（实测 checkAccessToken = GRANTED）；
- *   - 真机全链路：persist OK → 杀进程 → checkPersistentPermission=[true] → activate OK →
- *     `fs.openSync(uri)` 读到原文件（4673028 字节），没有再弹选择器。
- * 之前 `docs/LOCAL_MUSIC.md` 与派音项目的注释都判断「手机上要受限 ACL、申请不下来」，
- * 那个结论是错的，本文与 docs 已更正。
+ *     `module.json5` 里声明后**调试包**即授予（实测 checkAccessToken = GRANTED），
+ *     persist / activate / 直接读原文件的全链路通过（persist OK → 杀进程 →
+ *     checkPersistentPermission=[true] → activate OK → 读到原文件 4673028 字节）；
+ *   - 但**上架前检测**把它归为「受限 ACL」，要求签名 Profile 的 `allowed-acls` 里也有它，
+ *     否则 release 包会卡在「ACL 权限声明一致性」（调试证书默认放开 ACL，所以调试不受影响）。
  *
- * 能力位或权限缺失的设备（理论上只有非常老/受限的形态）：`supported()` 会返回 false，
+ * **当前这一版故意没有声明该权限**（完整说明见 `module.json5` 里 requestPermissions 下面的注释）：
+ * 上架检测能过，代价是本文件的 `granted()` 返回 false、导入自动退回「复制进沙箱」。
+ * 等 AGC 批下这个受限权限、换成带 `allowed-acls` 的 release Profile 后，把声明加回去即可，
+ * 这里不需要改一行 —— `persist/ensure/warmUp` 会自动重新生效。
+ *
+ * 之前 `docs/LOCAL_MUSIC.md` 与派音项目的注释都判断「手机上要受限 ACL、申请不下来」：
+ * 「运行时不能用」是错的（调试包实测可用），「上架要 ACL」这半句则成立；docs 已按此更正。
+ *
+ * 能力位或权限缺失的设备/构建：`supported()` / `granted()` 会返回 false，
  * 导入自动退回「复制进沙箱」，不会把功能弄成一半坏掉。
  */
 const DOMAIN: number = 0x0001;

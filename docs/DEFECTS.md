@@ -919,6 +919,59 @@ status=true
 
 ---
 
+## D-015 · 开了「母带」扩展音质，网易云歌最高还是只有 FLAC
+
+| 项 | 内容 |
+| --- | --- |
+| 状态 | **已修**（2026-10-21，待真机 + 会员账号验收） |
+| 优先级 | P1（用户可见：设置里开了母带，播放页面板最高只到 FLAC） |
+| 发现日期 | 2026-10-21 |
+| 发现方式 | 用户截图反馈「不是开了母带扩展音质了吗？为什么播放网易云音乐的时候，最高还是只有 FLAC？」 |
+
+### 根因
+
+面板档位 = **设置候选档** ∩ **歌曲 `_types`** ∩ **当前音源声明的 `qualitys`**
+（`Quality.switchableQualitys`）。D-014 修好了第三项的上游（沙箱白名单），但前两项还卡着：
+
+1. **网易的母带 / 沉浸声 / 杜比全景声是账号权益档，匿名请求根本不上报。**
+   实测（2026-10-21，明文 `/api/v6/playlist/detail` + eapi 搜索，热歌榜 / 新歌榜 /
+   黑胶VIP爱听榜各 100 首）`privilege.maxBrLevel` 只出现
+   `standard / higher / exhigh / lossless / hires`，`jymaster / sky / dolby` **0 条**；
+   同一份 `privilege` 里 `plLevel / dlLevel` 是 `none` / `exhigh`（账号权益位）。
+   也就是说未登录时接口最多只会说「这首歌有 hires」，母带档压根不在数据里。
+2. **工程里没有任何音乐账号登录态**：网易请求头固定 `Cookie: os=pc`（`MusicList` 的
+   `WY_HEADERS`），而「设置 - 登录音乐」入口只是个空壳 —— `onNavigate('login')` 在
+   `Index.ets` 里没分支，落到「该功能暂未接入」。所以第一项的数据永远拿不到。
+3. 另外「扩展音质」开关只是放宽协商候选上限，不改变「平台给什么档、音源声明什么档」；
+   多数第三方音源只声明到 `flac` / `flac24bit`，即使平台报了母带也会被交集过滤。
+
+### 修复
+
+| 位置 | 改动 |
+| --- | --- |
+| `core/music/MusicAccount.ets` | 新增：网易登录态（`MUSIC_U`）落盘 `filesDir/music_login.json` + AppStorage（`K_MUSIC_LOGGED_WY` / `K_MUSIC_NICK_WY` / `K_MUSIC_VIP_WY`）；`login()` 校验真有 `MUSIC_U`，并用 `/api/nuser/account/get` 拉昵称 / 会员档；`musicCookieHeader('wy')` 给请求侧统一取 Cookie（未登录仍是 `os=pc`，不塞空 `MUSIC_U`） |
+| `views/MusicLoginView.ets` | 新增「登录音乐」页：网易云应用内网页登录（复用 `BookLoginWeb` 抓 Cookie）、登录状态 / 昵称 / 会员档展示、退出确认；QQ / 酷狗先占位 |
+| `pages/Index.ets` | 新增 `PAGE_LOGIN` 路由与 `onSettingAction('login')` 分支（原来落到「暂未接入」） |
+| `entryability/EntryAbility.ets` | 启动时 `musicAccount().init(context)`，早于界面与第一次请求 |
+| `MusicList` / `MusicSearch` / `MusicArtist` / `PlaylistSearch` | 网易请求头统一 `musicCookieHeader('wy')`；**必须是函数、不能是模块级常量**（常量导入时求值，登录后不更新） |
+| `views/SettingsView.ets` | 「登录音乐」卡副标题显示真实状态：未登录说明登录能换到什么，已登录显示昵称 + 会员档 |
+| `views/PlayerView.ets` | `extendHint()`：开了拓展音质却一档都没列出来时，面板里说明原因（账号权益档 / 音源未声明），网易歌另提示去「设置 - 登录音乐」 |
+| `views/PlaySettingsView.ets` | 「拓展音质」开关旁**常驻**一句说明（`ExtendQualitySetting.note`）：需要登录并有会员，且音源要声明支持 —— 开关关着也可见，避免「打开就一定有母带」的误解 |
+| `views/RecommendView.ets` + `MusicList.getWyPersonalizedPlaylists` | 登录后推荐页（来源 = 网易云、精选页）新增「私人推荐」一横排：网易 `POST /api/v1/discovery/recommend/resource` 的每日推荐 / 私人雷达类歌单；未登录或非网易来源整块不渲染，失败只在块内提示，不影响其它内容 |
+
+### 验收标准
+
+- [ ] 设置 - 登录音乐：网页登录网易后回到设置页，卡片显示「已登录：昵称 · 黑胶VIP」；
+      退出后回到未登录；重启应用状态仍在。
+- [ ] 登录网易会员账号后，歌单 / 榜单 / 搜索 / 歌手页进来的网易歌，
+      `_types` 里出现 `master / atmos_plus / atmos`（母带歌曲），播放页面板列得出「母带」。
+- [ ] 音源声明了 `master` 时能解析、出声；音源没声明时面板不列母带，并出现 `extendHint` 说明。
+
+> 注：母带能不能真的出声最终取决于音源脚本实现了 `master`；本工程只负责「让平台愿意报」
+> 与「把真实档位如实显示/协商」。
+
+---
+
 ## 其他待办（不是缺陷，按需排期）
 
 - **歌词逐字（`lxlyric`）**：洛雪的富文本歌词（逐字时间轴）目前未使用，

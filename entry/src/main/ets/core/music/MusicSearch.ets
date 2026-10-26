@@ -1,5 +1,6 @@
 import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
 import { aes128EcbPkcs7HexUpper, md5Hex, sha1Hex, toBase64, utf8Bytes } from './LxCrypto';
+import { musicCookieHeader } from './MusicAccount';
 
 /**
  * 内置音乐搜索（宿主侧）
@@ -1718,6 +1719,9 @@ async function searchWy(str: string, page: number, limit: number): Promise<LxSea
     const headers: Record<string, string> = {
       'User-Agent': WY_UA,
       'origin': 'https://music.163.com',
+      // 登录后带上 MUSIC_U：搜索结果的 privilege 才会按账号权益上报
+      // （匿名最高只到 hires，母带 / 沉浸声 / 杜比属于账号权益档）
+      'Cookie': musicCookieHeader('wy'),
     };
     const body: Record<string, Object> = await httpPostForm('http://interface.music.163.com/eapi/batch', form, headers);
     lastCode = asNumber(body['code']);
