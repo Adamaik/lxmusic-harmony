@@ -7,8 +7,9 @@ import { SongItem } from '../player/PlaySession';
 import { LxPlayer } from '../player/LxPlayer';
 import { mediaKeyOf } from '../music/MediaCache';
 import { fallbackQuality, pickQuality } from '../music/Quality';
+import { PlaySettings } from '../settings/PlaySettings';
 import { SourceEngine } from '../source/SourceEngine';
-import { LxQuality } from '../source/LxTypes';
+import { FailoverOutcome, resolveUrlWithSourceFailover } from '../source/SourceFailover';
 import { DownloadSettings } from './DownloadSettings';
 import { DownloadTagData, collectDownloadTags, tagSummary } from './DownloadTags';
 import { AutoDownloadSong, clearDownloadedFiles, downloadedFile, removeDownloadedFile,
@@ -1339,8 +1340,15 @@ export class DownloadManager {
     }
     const quality: string = pickQuality(item.musicInfoJson, item.source, item.quality);
     item.quality = quality;
+    // 与播放链路共用同一套「选源 + 协商 + 降级」（见 core/source/SourceFailover）：
+    // 取流能力同源，能放的源当然也能下，没必要两套逻辑各写一遍、迟早不一致
+    const settings = PlaySettings.getInstance();
+    const wantQuality: string = settings.isExtendQuality() ? settings.getExtendQualityType() : '';
     try {
-      return { url: await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source), headers: {} };
+      const outcome: FailoverOutcome = await resolveUrlWithSourceFailover(
+        item.musicInfoJson, item.source, quality, {}, wantQuality);
+      item.quality = outcome.quality;
+      return { url: outcome.url, headers: {} };
     } catch (err) {
       const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
       if (retry.length === 0) {
@@ -1348,7 +1356,10 @@ export class DownloadManager {
       }
       hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s', quality, retry);
       item.quality = retry;
-      return { url: await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source), headers: {} };
+      const outcome: FailoverOutcome = await resolveUrlWithSourceFailover(
+        item.musicInfoJson, item.source, retry, {}, '');
+      item.quality = outcome.quality;
+      return { url: outcome.url, headers: {} };
     }
   }
 

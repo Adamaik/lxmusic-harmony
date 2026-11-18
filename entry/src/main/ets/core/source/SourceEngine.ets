@@ -268,6 +268,16 @@ export class SourceEngine {
     return this.loadedSourceId;
   }
 
+  /**
+   * 此刻是否有解析请求还在等沙箱回调
+   *
+   * 换源会重新注入脚本并把这次解析名下的请求一起中止（见 loadSource / abortNativesOf），
+   * 所以「要不要换源」之前必须先问这一句：下载链路在播放正好起播时不该把它打断。
+   */
+  hasPendingResolve(): boolean {
+    return this.activeResolves.length > 0;
+  }
+
   /** 沙箱内 lx.env 的取值。部分源脚本只在特定 env 下调用 lx.send('inited')。 */
   setSandboxEnv(env: string): void {
     this.sandboxEnv = env === 'desktop' ? 'desktop' : 'mobile';
@@ -626,16 +636,17 @@ export class SourceEngine {
       this.pushLog('info', '改用 ArrayBuffer 注入后脚本成功注册 request 处理器');
     }
     const sources: Record<string, SupportedSource> = await initPromise;
-    // 记下这个源声明支持哪些平台（能取播放链接的那些）：下次别的源失败时，
-    // 路由表据此知道「还有谁可以顶上」，不必先把脚本盲加载一遍（见 SourceRouter）
-    const platforms: string[] = [];
+    // 记下这个源声明支持哪些平台、每个平台声明了哪些音质档：
+    // 「按音质选源」靠它（用户选了母带，就优先找声明了母带的源），
+    // 也用于「别的源失败时知道还有谁可以顶上」（见 SourceRouter）
+    const qualitysOf: Record<string, string[]> = {};
     const keys: string[] = Object.keys(sources);
     for (const key of keys) {
       if (sources[key].actions.includes('musicUrl')) {
-        platforms.push(key);
+        qualitysOf[key] = sources[key].qualitys;
       }
     }
-    SourceRouter.getInstance().recordCapability(id, info.name, platforms);
+    SourceRouter.getInstance().recordCapability(id, info.name, qualitysOf);
     // 记住「这次用的是哪个源」：下次启动自动加载（见 restoreLastSource）
     this.store.saveActive(id, this.sandboxEnv);
     return sources;
@@ -1154,6 +1165,14 @@ export class SourceEngine {
       this.supported = data.info.sources;
       this.inited = true;
       this.pushLog('info', `音源初始化成功，支持平台：${Object.keys(this.supported).join(', ')}`);
+      // 每个平台声明了哪些音质档：拓展音质「选不中」时，第一个要看的就是这一行
+      // （沙箱会把音源声明与本工程的宿主白名单取交集，交集为空的表现就是「没有更高档」）
+      const platforms: string[] = Object.keys(this.supported);
+      const parts: string[] = [];
+      for (const platform of platforms) {
+        parts.push(`${platform}=${this.supported[platform].qualitys.join('/')}`);
+      }
+      this.pushLog('log', `音源声明的音质档：${parts.join('  ')}`);
       resolve(data.info.sources);
     } else {
       this.inited = false;

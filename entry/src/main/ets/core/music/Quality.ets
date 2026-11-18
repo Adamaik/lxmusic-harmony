@@ -1,7 +1,11 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LxMusicInfo } from './MusicSearch';
 import { SupportedSource } from '../source/LxTypes';
 import { SourceEngine } from '../source/SourceEngine';
 import { EXTEND_QUALITY_LABELS, EXTEND_QUALITYS, MAIN_QUALITY_LABELS, MAIN_QUALITYS, PlaySettings } from '../settings/PlaySettings';
+
+const DOMAIN: number = 0x0001;
+const TAG: string = 'Quality';
 
 /**
  * 播放音质协商
@@ -143,6 +147,8 @@ export function switchableQualitys(musicInfoJson: string, source: string, curren
       out.push(quality);
     }
   }
+  hilog.info(DOMAIN, TAG, 'switchable %{public}s: [%{public}s] available=[%{public}s] supported=[%{public}s]',
+    source, out.join(','), available.join(','), supported.join(','));
   return out;
 }
 
@@ -189,6 +195,8 @@ export function pickQuality(musicInfoJson: string, source: string, fallback: str
   const sourceOnlyExtend: boolean = PlaySettings.getInstance().isExtendQuality() && extendedBySourceOnly(source);
   for (const quality of candidates) {
     if (qualityUsable(quality, available, supported, sourceOnlyExtend)) {
+      hilog.info(DOMAIN, TAG, 'pick %{public}s -> %{public}s (available=[%{public}s] supported=[%{public}s])',
+        source, quality, available.join(','), supported.join(','));
       return quality;
     }
   }

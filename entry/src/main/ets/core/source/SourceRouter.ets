@@ -44,6 +44,8 @@ interface RouterFile {
   routes: Record<string, SourceRoute[]>;
   /** 音源 id -> 它在 inited 时声明了 musicUrl 的平台 */
   caps: Record<string, string[]>;
+  /** 音源 id -> 平台 -> 该平台声明的音质档（"按音质选源"用） */
+  quals: Record<string, Record<string, string[]>>;
   /** 音源 id -> 名字（源被删掉之后，日志里还能说清是哪一个） */
   names: Record<string, string>;
 }
@@ -80,6 +82,8 @@ export class SourceRouter {
   private routes: Map<string, SourceRoute[]> = new Map<string, SourceRoute[]>();
   /** 音源 id -> 支持的平台 */
   private caps: Map<string, string[]> = new Map<string, string[]>();
+  /** 音源 id -> 平台 -> 声明的音质档 */
+  private quals: Map<string, Map<string, string[]>> = new Map<string, Map<string, string[]>>();
   /** 音源 id -> 名字 */
   private names: Map<string, string> = new Map<string, string>();
 
@@ -122,7 +126,8 @@ export class SourceRouter {
    *
    * 只返回 id 数组，不碰引擎：换源加载、超时、冷却由调用方（PlaySession）执行。
    */
-  candidates(platform: string, loadedId: string, loadedSupports: boolean, allIds: string[]): string[] {
+  candidates(platform: string, loadedId: string, loadedSupports: boolean, allIds: string[],
+    requireQuality: string = ''): string[] {
     const present: Set<string> = new Set<string>();
     for (const id of allIds) {
       present.add(id);
@@ -188,7 +193,21 @@ export class SourceRouter {
     for (const id of unknown) {
       push(id);
     }
-    return out;
+    if (requireQuality.length === 0) {
+      return out;
+    }
+    // 「按音质选源」：声明了目标档的源整体提到前面（组内保持原顺序 ——
+    // 组内顺序本来就带着「上次成功过」「刚失败过」这些信息，不该被打乱）
+    const declaring: string[] = [];
+    const others: string[] = [];
+    for (const id of out) {
+      if (this.declaresQuality(id, platform, requireQuality)) {
+        declaring.push(id);
+      } else {
+        others.push(id);
+      }
+    }
+    return declaring.length > 0 ? declaring.concat(others) : out;
   }
 
   /** 这个平台的第一选择（没有记忆返回空串），日志/界面上用 */
@@ -235,16 +254,57 @@ export class SourceRouter {
 
   // ---------------------------------------------------------------- 写
 
-  /** 记住「这个源声明支持哪些平台」（每次成功加载后调用） */
-  recordCapability(id: string, name: string, platforms: string[]): void {
+  /** 记住「这个源声明支持哪些平台、每个平台声明了哪些音质档」（每次成功加载后调用） */
+  recordCapability(id: string, name: string, qualitysOf: Record<string, string[]>): void {
     if (id.length === 0) {
       return;
     }
+    const platforms: string[] = Object.keys(qualitysOf);
     this.caps.set(id, platforms);
+    const byPlatform: Map<string, string[]> = new Map<string, string[]>();
+    for (const platform of platforms) {
+      byPlatform.set(platform, qualitysOf[platform]);
+    }
+    this.quals.set(id, byPlatform);
     if (name.length > 0) {
       this.names.set(id, name);
     }
     this.persist();
+  }
+
+  /**
+   * 这个源在这个平台上声明了某个音质档吗
+   *
+   * 「按音质选源」用：用户选了母带，就该优先找声明了母带的源。
+   * 没加载过的源没有这份信息 —— 返回 false（宁可按老顺序试，也不要瞎猜）。
+   */
+  declaresQuality(id: string, platform: string, quality: string): boolean {
+    const byPlatform: Map<string, string[]> | undefined = this.quals.get(id);
+    if (byPlatform === undefined) {
+      return false;
+    }
+    const list: string[] | undefined = byPlatform.get(platform);
+    return list !== undefined && list.includes(quality);
+  }
+
+  /**
+   * 有没有**任意一个已知源**在这个平台声明了某一档
+   *
+   * 播放链路用它决定「值不值得为这一档先按高档去查缓存/解析」：
+   * 一个都没声明的话，硬按母带去查只会白白错过普通档的缓存。
+   */
+  declaredByAny(platform: string, quality: string): boolean {
+    let found: boolean = false;
+    this.quals.forEach((byPlatform: Map<string, string[]>) => {
+      if (found) {
+        return;
+      }
+      const list: string[] | undefined = byPlatform.get(platform);
+      if (list !== undefined && list.includes(quality)) {
+        found = true;
+      }
+    });
+    return found;
   }
 
   /**
@@ -298,6 +358,9 @@ export class SourceRouter {
       if (this.caps.delete(id)) {
         changed = true;
       }
+      if (this.quals.delete(id)) {
+        changed = true;
+      }
       if (this.names.delete(id)) {
         changed = true;
       }
@@ -319,6 +382,7 @@ export class SourceRouter {
   reset(): void {
     this.routes.clear();
     this.caps.clear();
+    this.quals.clear();
     this.names.clear();
     this.persist();
   }
@@ -372,6 +436,7 @@ export class SourceRouter {
     this.caps.forEach((_platforms: string[], id: string) => {
       if (!present.has(id)) {
         this.caps.delete(id);
+        this.quals.delete(id);
         this.names.delete(id);
         dropped += 1;
       }
@@ -421,6 +486,18 @@ export class SourceRouter {
           this.names.set(id, file.names[id]);
         }
       }
+      if (file.quals !== undefined) {
+        const ids: string[] = Object.keys(file.quals);
+        for (const id of ids) {
+          const byPlatform: Record<string, string[]> = file.quals[id];
+          const map: Map<string, string[]> = new Map<string, string[]>();
+          const platforms: string[] = Object.keys(byPlatform);
+          for (const platform of platforms) {
+            map.set(platform, byPlatform[platform]);
+          }
+          this.quals.set(id, map);
+        }
+      }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to parse router state: %{public}s', JSON.stringify(e));
     }
@@ -442,7 +519,17 @@ export class SourceRouter {
     this.names.forEach((value: string, key: string) => {
       names[key] = value;
     });
-    const file: RouterFile = { version: SCHEMA_VERSION, routes: routes, caps: caps, names: names };
+    const quals: Record<string, Record<string, string[]>> = {};
+    this.quals.forEach((byPlatform: Map<string, string[]>, id: string) => {
+      const one: Record<string, string[]> = {};
+      byPlatform.forEach((value: string[], platform: string) => {
+        one[platform] = value;
+      });
+      quals[id] = one;
+    });
+    const file: RouterFile = {
+      version: SCHEMA_VERSION, routes: routes, caps: caps, quals: quals, names: names,
+    };
     this.store.saveRouter(JSON.stringify(file));
   }
 }
