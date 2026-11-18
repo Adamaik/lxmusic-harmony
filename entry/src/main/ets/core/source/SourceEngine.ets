@@ -17,6 +17,7 @@ import {
   UpdateAlertData,
 } from './LxTypes';
 import { SourceStore, ActiveSource } from './SourceStore';
+import { SourceRouter } from './SourceRouter';
 import { MAX_SCRIPT_SIZE, buildSourceInfo, sourceMetaKey } from './LxMetadata';
 import { LxRequestHandle, LxRequestOptions, LxResponse, lxRequest } from './LxHttp';
 import { utf8Bytes } from '../music/LxCrypto';
@@ -166,6 +167,16 @@ export class SourceEngine {
   private requestSeq: number = 0;
   /** 源脚本发起、正在由宿主代理的 HTTP 请求（requestKey -> 句柄，用于取消） */
   private httpRequests: Map<string, LxRequestHandle> = new Map();
+  /**
+   * 正在等回调的解析请求（按发起顺序，最后一个视为「当前这一次」）
+   *
+   * 源脚本发起的原生请求只带它自己的 key，拿不到「属于哪次解析」。沙箱是单线程、
+   * 解析也是串行的，所以用「最近发起的那一次」做归属足够准；万一归错（比如后台预取
+   * 同时在跑），最坏结果是那次预取被一起中止 —— 不影响正在放的歌。
+   */
+  private activeResolves: string[] = [];
+  /** 源脚本自己发起的原生请求 key -> 归属的解析请求 key（解析超时时要按归属中止） */
+  private nativeOwner: Map<string, string> = new Map();
   /** 最近一次音源请求的响应摘要（状态码/长度/片段），源脚本报错时一并展示，便于定位 */
   private lastResponseExcerpt: string = '';
 
@@ -184,6 +195,13 @@ export class SourceEngine {
     // 老版本导入时不去重，同一个源可能存了好几份，启动时清一次
     if (this.store.isReady()) {
       this.dedupeStored();
+      // 音源路由记忆跟着存储一起初始化：顺带按「当前真实存在的源」校验一遍，
+      // 用户删过的源不会再出现在尝试顺序里（见 SourceRouter.purge）
+      const ids: string[] = [];
+      for (const item of this.store.list()) {
+        ids.push(item.id);
+      }
+      SourceRouter.getInstance().init(this.store, ids);
     }
     const decoder = util.TextDecoder.create('utf-8');
     const rm = context.resourceManager;
@@ -276,6 +294,10 @@ export class SourceEngine {
     if (duplicate !== null) {
       const same: boolean = this.isSameScript(duplicate.id, script);
       const updated: SourceInfo = this.store.replace(duplicate.id, info, script);
+      // 脚本换了内容等于换了一套后端：它上次声明支持哪些平台、在哪些平台成功过都作废
+      if (!same) {
+        SourceRouter.getInstance().forget([duplicate.id]);
+      }
       this.pushLog('info', same
         ? `该音源已存在，跳过重复导入：${updated.name} [${updated.id}]`
         : `该音源已存在，已用新脚本覆盖更新：${updated.name} [${updated.id}]`);
@@ -362,6 +384,8 @@ export class SourceEngine {
     if (active !== null && active.id === id) {
       this.store.clearActive();
     }
+    // 路由记忆里也不该再留着它：否则下次挑歌还会先试一个已经删掉的源
+    SourceRouter.getInstance().forget([id]);
     return remains;
   }
 
@@ -602,6 +626,16 @@ export class SourceEngine {
       this.pushLog('info', '改用 ArrayBuffer 注入后脚本成功注册 request 处理器');
     }
     const sources: Record<string, SupportedSource> = await initPromise;
+    // 记下这个源声明支持哪些平台（能取播放链接的那些）：下次别的源失败时，
+    // 路由表据此知道「还有谁可以顶上」，不必先把脚本盲加载一遍（见 SourceRouter）
+    const platforms: string[] = [];
+    const keys: string[] = Object.keys(sources);
+    for (const key of keys) {
+      if (sources[key].actions.includes('musicUrl')) {
+        platforms.push(key);
+      }
+    }
+    SourceRouter.getInstance().recordCapability(id, info.name, platforms);
     // 记住「这次用的是哪个源」：下次启动自动加载（见 restoreLastSource）
     this.store.saveActive(id, this.sandboxEnv);
     return sources;
@@ -757,8 +791,11 @@ export class SourceEngine {
    * @param musicInfoJson 洛雪旧版 musicInfo 的 JSON 文本（与源脚本 request.info.musicInfo 一致）
    * @param quality       目标音质
    * @param source        平台 id（kw/kg/tx/wy/mg），需与 musicInfoJson.source 一致
+   * @param timeoutMs     本次解析最多等多久（毫秒，缺省 60s）。多音源切换时由调用方给一个短预算：
+   *                      一个源卡住不能把整个换源链路一起拖死，超时后会把这次解析名下的
+   *                      原生请求一并中止（见 abortNativesOf）。
    */
-  async getMusicUrl(musicInfoJson: string, quality: LxQuality, source: string): Promise<string> {
+  async getMusicUrl(musicInfoJson: string, quality: LxQuality, source: string, timeoutMs?: number): Promise<string> {
     if (!this.inited) {
       throw new Error('音源未加载或初始化失败，请先调用 loadSource()');
     }
@@ -775,7 +812,7 @@ export class SourceEngine {
     const started: number = Date.now();
     let resultJson: string;
     try {
-      resultJson = await this.sendToSandbox(requestKey, payload);
+      resultJson = await this.sendToSandbox(requestKey, payload, timeoutMs);
     } catch (e) {
       // 源脚本报的错（如「unknow error」）往往只是它对响应的解读，
       // 把最近一次真实响应的状态码/长度/片段带上，才能判断是接口报错还是响应格式变了。
@@ -850,13 +887,19 @@ export class SourceEngine {
    * 把一次 request action 投递给沙箱里的源脚本，等待它按源规则解析完成。
    * resolve 值为 BridgeResult 的 JSON 文本（即 {source, action, data}）。
    */
-  private sendToSandbox(requestKey: string, payload: string): Promise<string> {
+  private sendToSandbox(requestKey: string, payload: string, timeoutMs?: number): Promise<string> {
+    const budget: number = (timeoutMs !== undefined && timeoutMs > 0) ? timeoutMs : REQUEST_TIMEOUT;
     return new Promise<string>((resolve, reject) => {
       const timer: number = setTimeout(() => {
         this.pending.delete(requestKey);
-        reject(new Error('音源响应超时'));
-      }, REQUEST_TIMEOUT);
+        this.finishResolve(requestKey);
+        // 这次解析已经不等了：把它名下的原生请求一起中止，别让它继续占着网络、
+        // 也别让迟到的回调在换源之后回灌到新沙箱里
+        this.abortNativesOf(requestKey);
+        reject(new Error(`音源响应超时（${Math.round(budget / 1000)} 秒）`));
+      }, budget);
       this.pending.set(requestKey, { resolve: resolve, reject: reject, timer: timer });
+      this.activeResolves.push(requestKey);
       const js: string =
         `window.__lx_native__(${JSON.stringify(this.scriptKey)}, 'request', ${JSON.stringify(payload)});`;
       this.callJs(js).catch((err: Error) => {
@@ -865,10 +908,37 @@ export class SourceEngine {
           return;
         }
         this.pending.delete(requestKey);
+        this.finishResolve(requestKey);
         clearTimeout(target.timer);
         target.reject(new Error(`调用音源失败：${err.message}`));
       });
     });
+  }
+
+  /** 一次解析结束（成功 / 失败 / 超时）时把它从「进行中」列表里摘掉 */
+  private finishResolve(requestKey: string): void {
+    const index: number = this.activeResolves.indexOf(requestKey);
+    if (index >= 0) {
+      this.activeResolves.splice(index, 1);
+    }
+  }
+
+  /** 中止某次解析名下的原生请求（解析超时 / 换源时调用） */
+  private abortNativesOf(resolveKey: string): void {
+    const owned: string[] = [];
+    this.nativeOwner.forEach((owner: string, nativeKey: string) => {
+      if (owner === resolveKey) {
+        owned.push(nativeKey);
+      }
+    });
+    for (const nativeKey of owned) {
+      const handle: LxRequestHandle | undefined = this.httpRequests.get(nativeKey);
+      this.nativeOwner.delete(nativeKey);
+      if (handle !== undefined) {
+        this.httpRequests.delete(nativeKey);
+        handle.abort();
+      }
+    }
   }
 
   /**
@@ -887,6 +957,10 @@ export class SourceEngine {
     const url: string = data.url !== undefined ? data.url : '';
     if (requestKey.length === 0 || url.length === 0) {
       return;
+    }
+    // 这个原生请求是谁的：记下它归属的那次解析，解析超时时要按归属批量中止
+    if (this.activeResolves.length > 0) {
+      this.nativeOwner.set(requestKey, this.activeResolves[this.activeResolves.length - 1]);
     }
     const options: LxRequestOptions = {};
     const raw: NativeRequestOptions | undefined = data.options;
@@ -916,6 +990,7 @@ export class SourceEngine {
     this.pushLog('log', `音源请求：${options.method !== undefined ? options.method : 'get'} ${url}`);
     const handle: LxRequestHandle = lxRequest(url, options, (resp: LxResponse) => {
       this.httpRequests.delete(requestKey);
+      this.nativeOwner.delete(requestKey);
       const digest: ResponseDigest = this.describeResponse(resp);
       this.lastResponseExcerpt = digest.summary;
       // 摘要进面板（观感不变），原文随这条日志一起存下来，点开详情才看全文
@@ -935,6 +1010,7 @@ export class SourceEngine {
       this.postResponseToSandbox(envelope);
     }, (message: string) => {
       this.httpRequests.delete(requestKey);
+      this.nativeOwner.delete(requestKey);
       const friendly: string = describeNetworkError(message, url);
       this.lastResponseExcerpt = `请求失败(${url})：${friendly}`;
       this.pushLog('warn', `音源请求失败（${url}）：${friendly}`);
@@ -1011,6 +1087,10 @@ export class SourceEngine {
       handle.abort();
     }
     this.httpRequests.clear();
+    // 归属表与「进行中的解析」一起清：换源之后旧的 requestKey 再也不会被回灌，
+    // 留着这些键只会让 abortNativesOf 去查一堆早已不存在的句柄
+    this.nativeOwner.clear();
+    this.activeResolves = [];
   }
 
   // ------------------------------------------------------------ 沙箱消息处理
@@ -1095,6 +1175,7 @@ export class SourceEngine {
       return;
     }
     this.pending.delete(data.requestKey);
+    this.finishResolve(data.requestKey);
     clearTimeout(target.timer);
     if (!data.status) {
       target.reject(new Error(data.errorMessage !== undefined ? data.errorMessage : '音源解析失败'));

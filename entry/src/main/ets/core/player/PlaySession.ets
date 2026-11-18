@@ -10,7 +10,8 @@ import { CachedLyricInfo, MediaCache, mediaKeyOf } from '../music/MediaCache';
 import { LyricLine, parseLyric } from '../music/Lyric';
 import { musicIdOf } from '../music/MusicId';
 import { PlatformLyric, fetchPlatformLyric } from '../music/PlatformLyric';
-import { BridgeResult, LxQuality, SupportedSource } from '../source/LxTypes';
+import { BridgeResult, LxQuality, SourceInfo, SupportedSource } from '../source/LxTypes';
+import { SourceRouter } from '../source/SourceRouter';
 import { PlayStateStore } from './PlayStateStore';
 import { ShuffleBag } from './ShuffleBag';
 import { StartupTiming } from './StartupTiming';
@@ -36,6 +37,27 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'PlaySession';
+
+/**
+ * 多音源切换的时间预算
+ *
+ * 用户能忍受的「点了播放却没声音」大概是十秒上下，超过就别再试、老实报错。
+ * 单个源给一个短预算：以前一个源卡住要等满 SourceEngine 的 60 秒上限，
+ * 现在到点就中止它的网络请求、直接换下一个源。
+ */
+const SOURCE_FIRST_TIMEOUT_MS: number = 7000;
+const SOURCE_NEXT_TIMEOUT_MS: number = 5000;
+const SOURCE_FAILOVER_BUDGET_MS: number = 15000;
+/**
+ * 只有一个候选源时的预算
+ *
+ * 这时候没有「换一个人试试」的选项，给太短只会把本来能成功、只是慢的解析误判成失败
+ * （很多音源是代理型的，脚本里还要再串几个请求）。所以单源保持宽松，
+ * 多源才用上面的短预算快速失败换人。
+ */
+const SOURCE_SINGLE_TIMEOUT_MS: number = 25000;
+/** 后台预取的单次预算：比前台宽一点，但同样不许它一直占着沙箱 */
+const SOURCE_PREFETCH_TIMEOUT_MS: number = 8000;
 
 /**
  * 播放会话 / 播放队列
@@ -1268,6 +1290,122 @@ export class PlaySession {
   // fallbackQuality），这里不再重复实现，免得两边挑出的档不一致。
 
   /**
+   * 解析播放地址：配了多个音源时按路由表逐个试（见 core/source/SourceRouter）
+   *
+   * 原来的链路只问当前加载的那**一个**源：它不行，整首就失败；或者先白等它超时
+   * （SourceEngine 的上限是 60 秒）再考虑换平台。而用户配好几个源，本来就是想
+   * 「这个不行换那个」—— 所以这里按下面的顺序试：
+   *   1. 顺序由路由表给：上次在这个平台成功过的源排最前，连败两次的排到队尾；
+   *   2. 正在冷却的源直接跳过（见 PlatformHealth）：省掉一次注定失败的往返；
+   *   3. 每个源单独一个短预算（第一个 7 秒，之后 5 秒），到点就中止它的网络请求、
+   *      换下一个源 —— 不再出现「一个源卡死，整首歌干等 60 秒」；
+   *   4. 成功即记账（路由表回到首位 + 解除平台冷却），失败就累计降级。
+   *
+   * 全部候选都失败才抛最后一个错误，调用方照旧走「换平台」或报错，所以关掉这项功能
+   * （PlaySettings.isAutoSourceSwitch 为 false）时行为与改动前完全一致。
+   */
+  private async resolveWithSourceFailover(item: SongItem, quality: string, token: number): Promise<string> {
+    const engine: SourceEngine = SourceEngine.getInstance();
+    const router: SourceRouter = SourceRouter.getInstance();
+    if (!PlaySettings.getInstance().isAutoSourceSwitch() || !SEARCH_PLATFORMS.includes(item.source)) {
+      return await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+    }
+    const platform: string = item.source;
+    const health: PlatformHealth = PlatformHealth.getInstance();
+    const sources: SourceInfo[] = engine.listSources();
+    const allIds: string[] = [];
+    for (const info of sources) {
+      allIds.push(info.id);
+    }
+    const loadedId: string = engine.getLoadedSourceId();
+    const loadedSupports: boolean = loadedId.length > 0 && engine.supportsAction(platform, 'musicUrl');
+    const candidates: string[] = router.candidates(platform, loadedId, loadedSupports, allIds);
+    if (candidates.length === 0) {
+      // 一个源都没有（或都被判定为不支持这个平台）：照老路子走，让引擎给出准确报错
+      return await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, platform);
+    }
+    const deadline: number = Date.now() + SOURCE_FAILOVER_BUDGET_MS;
+    // 换源失败时引擎会停在「未初始化」状态（loadSource 一进来就清了 inited），
+    // 记下原来那个源，全部试完后若引擎还不可用就把尝试恢复它，
+    // 否则用户接下来连本来能放的平台都放不了了
+    const previousId: string = loadedId;
+    // 只有一个候选就没有「换人」的余地：给它长预算，别把慢但能成功的解析判死
+    const firstBudget: number = candidates.length > 1 ? SOURCE_FIRST_TIMEOUT_MS : SOURCE_SINGLE_TIMEOUT_MS;
+    let lastError: Error = new Error('没有可用的音源');
+    for (let i = 0; i < candidates.length; i++) {
+      if (this.playToken !== token) {
+        // 用户已经切到别的歌了：剩下的源不必再试，交给新的那次播放
+        throw lastError;
+      }
+      if (Date.now() >= deadline) {
+        hilog.info(DOMAIN, TAG, 'source failover budget exhausted, platform=%{public}s', platform);
+        break;
+      }
+      const id: string = candidates[i];
+      if (health.isCooling(id, platform)) {
+        hilog.info(DOMAIN, TAG, 'skip cooling source %{public}s on %{public}s', id, platform);
+        continue;
+      }
+      const budget: number = i === 0 ? firstBudget : SOURCE_NEXT_TIMEOUT_MS;
+      try {
+        if (id !== engine.getLoadedSourceId() || !engine.isInited()) {
+          await this.loadSourceForPlayback(id);
+          if (this.playToken !== token) {
+            throw lastError;
+          }
+        }
+        if (!engine.supportsAction(platform, 'musicUrl')) {
+          throw new Error(`音源「${router.nameOf(id)}」不支持 ${platform} 平台`);
+        }
+        const url: string = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, platform, budget);
+        health.markSuccess(id, platform);
+        router.markSuccess(id, platform);
+        return url;
+      } catch (e) {
+        lastError = e as Error;
+        hilog.warn(DOMAIN, TAG, 'source %{public}s failed on %{public}s: %{public}s',
+          id, platform, lastError.message);
+        StartupTiming.getInstance().note(`源${i + 1}失败`);
+        health.markFailure(id, platform, lastError.message);
+        router.markFailure(id, platform, lastError.message);
+      }
+    }
+    await this.restoreLoadedSource(previousId);
+    throw lastError;
+  }
+
+  /**
+   * 换源链路全部失败后，把原来那个源加载回来（best effort）
+   *
+   * loadSource 一进来就把引擎标成「未初始化」，中途失败（脚本报错 / 沙箱没挂）会让
+   * 引擎停在半个状态：这时候连别的平台的歌都解析不了。恢复失败也只记日志 ——
+   * 用户还能去音源设置里手动加载，不该因为这次恢复再抛一个错。
+   */
+  private async restoreLoadedSource(previousId: string): Promise<void> {
+    const engine: SourceEngine = SourceEngine.getInstance();
+    if (engine.isInited() || previousId.length === 0) {
+      return;
+    }
+    if (engine.getLoadedSourceId() === previousId) {
+      return;
+    }
+    try {
+      await engine.loadSource(previousId);
+      hilog.info(DOMAIN, TAG, 'restored previous source after failed failover: %{public}s', previousId);    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to restore previous source %{public}s: %{public}s',
+        previousId, (e as Error).message);
+    }
+  }
+
+  /** 为播放换到指定音源：状态行与日志集中在这里，避免每条路径各写一句 */
+  private async loadSourceForPlayback(id: string): Promise<void> {
+    const name: string = SourceRouter.getInstance().nameOf(id);
+    this.setStatus('loading', name.length > 0 ? `正在切换到音源「${name}」…` : '正在切换音源…');
+    hilog.info(DOMAIN, TAG, 'switch source for playback: %{public}s', id);
+    await SourceEngine.getInstance().loadSource(id);
+  }
+
+  /**
    * 平台源取不到播放地址时的换源兜底（**只换一次，不递归**）
    *
    * 背景：有一批歌在某个平台就是取不到流（QQ 音乐最典型 —— 取流接口要么要会员票据、
@@ -1335,8 +1473,9 @@ export class PlaySession {
       candidate.quality = nextQuality;
       let nextUrl: string = '';
       try {
-        nextUrl = await engine.getMusicUrl(candidate.musicInfoJson, nextQuality as LxQuality,
-          platform);
+        // 换到另一个平台之后，这一平台上同样有「哪个源能取到流」的问题：
+        // 走同一套多源切换（见 resolveWithSourceFailover），别在换平台时退回单源
+        nextUrl = await this.resolveWithSourceFailover(candidate, nextQuality, token);
       } catch (e) {
         hilog.warn(DOMAIN, TAG, 'switch source %{public}s resolve failed: %{public}s',
           platform, (e as Error).message);
@@ -1882,7 +2021,7 @@ export class PlaySession {
           // 没在冷却，或者冷却期换源没成（备选平台也严格匹配不到这首歌）：退回原来的正常流程，
           // 照旧请求原平台 —— 宁可多试一次，也不能因为一张冷却表把本来能放的歌判死。
           try {
-            url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+            url = await this.resolveWithSourceFailover(item, quality, token);
           } catch (err) {
             // 拓展音质（母带 / 全景声…）多半要会员，拿不到链接是常态：
             // 退回普通音质再试一次，别让「开了拓展音质」变成有些歌直接放不了。
@@ -1900,7 +2039,7 @@ export class PlaySession {
               this.currentCacheQuality = retry;
               AppStorage.setOrCreate(K_CURRENT_QUALITY, retry);
               try {
-                url = await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source);
+                url = await this.resolveWithSourceFailover(item, retry, token);
               } catch (retryErr) {
                 lastError = retryErr as Error;
               }
@@ -1940,11 +2079,14 @@ export class PlaySession {
           // 只认「真的问过平台并拿到了地址」——地址缓存命中时根本走不到这里（见上面的 fromCache），
           // 所以不会出现「一听缓存就把冷却清掉」的误判。
           if (url.length > 0) {
-            if (health.isCooling(loadedId, item.source)) {
+            // 可能是换源之后由另一个源解析成功的：按「现在真正加载着的那个源」记账，
+            // 不能再用循环开头那个 loadedId（它可能是刚失败的那个）
+            const usedId: string = engine.getLoadedSourceId();
+            if (health.isCooling(usedId, item.source)) {
               hilog.info(DOMAIN, TAG, 'platform recovered, clear cooldown: %{public}s (%{public}s)',
-                item.source, loadedId);
+                item.source, usedId);
             }
-            health.markSuccess(loadedId, item.source);
+            health.markSuccess(usedId, item.source);
           }
         }
         if (this.playToken !== token) {
@@ -2082,7 +2224,17 @@ export class PlaySession {
       }
       let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
       if (url.length === 0) {
-        url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+        // 路由表说这个平台该用别的源：预取这一发先不做。
+        // 换源要重新注入脚本、会打断当前这次播放的会话，不值得为一个「还没轮的歌」冒这个险 ——
+        // 等真切到这首时，playAt 的多源切换会一次性把源切好（之后就一直是它，预取照常）。
+        const preferred: string = SourceRouter.getInstance().preferredFor(item.source);
+        if (preferred.length > 0 && preferred !== engine.getLoadedSourceId()) {
+          hilog.info(DOMAIN, TAG, 'prefetch skipped: preferred source is %{public}s', preferred);
+          return;
+        }
+        // 预取也要有预算：源卡住时不能让它一直占着沙箱（最长 60 秒）
+        url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source,
+          SOURCE_PREFETCH_TIMEOUT_MS);
         if (this.playToken !== token) {
           // 解析期间用户又切歌了：这一签作废，地址也别往缓存里写
           return;

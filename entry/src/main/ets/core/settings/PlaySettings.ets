@@ -165,6 +165,13 @@ export const PLAYER_MOTION_DEFAULT: string = PLAYER_MOTION_LIGHT;
  * 筛选各管各的，用户在那里明确选了平台，就不该被这一项盖掉。
  */
 export const K_DEFAULT_SOURCE: string = 'cfg_default_source';
+/**
+ * 多音源自动切换（取不到播放地址时换别的音源再试）
+ *
+ * 默认开：多数人配了好几个源，本来就是为了「这个不行换那个」。
+ * 关掉之后退回老行为：只用当前加载的那一个源，失败就换平台或报错。
+ */
+export const K_AUTO_SOURCE_SWITCH: string = 'cfg_auto_source_switch';
 
 /** 默认渠道的取值（第一项是空串 = 自动 = 不指定），顺序与界面上的胶囊一致 */
 export const DEFAULT_SOURCE_VALUES: string[] = ['', 'kw', 'kg', 'mg', 'tx', 'wy'];
@@ -203,6 +210,8 @@ interface PlaySettingsData {
   playerMotion?: string | boolean;
   /** '' = 自动（不指定默认渠道），见 K_DEFAULT_SOURCE */
   defaultSource?: string;
+  /** 多音源自动切换，见 K_AUTO_SOURCE_SWITCH */
+  autoSourceSwitch?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -294,6 +303,8 @@ export class PlaySettings {
    * 想固定一个平台的用户自己来设置里选（见 K_DEFAULT_SOURCE）。
    */
   private defaultSource: string = '';
+  /** 多音源自动切换默认开，见 K_AUTO_SOURCE_SWITCH 的说明 */
+  private autoSourceSwitch: boolean = true;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -358,6 +369,7 @@ export class PlaySettings {
       autoResumeAfterInterrupt: this.autoResumeAfterInterrupt,
       playerMotion: this.playerMotion,
       defaultSource: this.defaultSource,
+      autoSourceSwitch: this.autoSourceSwitch,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -452,6 +464,9 @@ export class PlaySettings {
     if (defaultSource !== undefined && DEFAULT_SOURCE_VALUES.includes(defaultSource)) {
       this.defaultSource = defaultSource;
     }
+    if (data.autoSourceSwitch !== undefined) {
+      this.autoSourceSwitch = data.autoSourceSwitch;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -476,6 +491,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, this.autoResumeAfterInterrupt);
       AppStorage.setOrCreate(K_PLAYER_MOTION, this.playerMotion);
       AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
+      AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, this.autoSourceSwitch);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -587,6 +603,24 @@ export class PlaySettings {
     }
     this.defaultSource = value;
     AppStorage.setOrCreate(K_DEFAULT_SOURCE, value);
+    this.write();
+  }
+
+  /**
+   * 多音源自动切换（见 K_AUTO_SOURCE_SWITCH）
+   *
+   * 由 PlaySession 解析播放地址时现读，所以改完立刻生效，不必重放当前这首歌。
+   */
+  isAutoSourceSwitch(): boolean {
+    return this.autoSourceSwitch;
+  }
+
+  setAutoSourceSwitch(value: boolean): void {
+    if (value === this.autoSourceSwitch) {
+      return;
+    }
+    this.autoSourceSwitch = value;
+    AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, value);
     this.write();
   }
 

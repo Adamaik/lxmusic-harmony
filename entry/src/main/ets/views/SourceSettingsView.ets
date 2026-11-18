@@ -14,6 +14,7 @@ import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_
 import { LengthMetrics } from '@kit.ArkUI';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { LogDetailView } from './LogDetailView';
+import { K_AUTO_SOURCE_SWITCH, PlaySettings } from '../core/settings/PlaySettings';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SourceSettingsView';
@@ -87,6 +88,8 @@ export struct SourceSettingsView {
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
    */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+  /** 多音源自动切换（见 PlaySettings.K_AUTO_SOURCE_SWITCH） */
+  @StorageLink(K_AUTO_SOURCE_SWITCH) autoSwitch: boolean = true;
 
   /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
   private cardsSideBySide(): boolean {
@@ -518,6 +521,49 @@ export struct SourceSettingsView {
               }, (item: SourceInfo) => item.id)
             }
             .width('100%')
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 多音源
+          /**
+           * 只放一个开关 + 一句解释。
+           *
+           * 为什么值得单开一段：这条链路的行为（会不会换源、换过之后下次走哪个）
+           * 用户看不见，一旦出现「怎么老是先卡一下」就很费解；把开关与规则写在这里，
+           * 出问题时至少知道自己关得掉、也知道我们记得什么。
+           */
+          Column({ space: 10 }) {
+            this.sectionCard('多音源')
+            Column({ space: 6 }) {
+              Row({ space: 12 }) {
+                Column({ space: 4 }) {
+                  Text('自动切换音源')
+                    .fontSize(15)
+                    .fontColor(C_TEXT)
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                  Text('当前音源取不到播放地址时，自动换用其它已导入的音源；'
+                    + '在某个平台成功过的源会被记住，下次同平台的歌直接走它，'
+                    + '连败两次的源先排到后面。')
+                    .fontSize(11.5)
+                    .fontColor(C_TEXT_WEAK)
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+                Toggle({ type: ToggleType.Switch, isOn: this.autoSwitch })
+                  .selectedColor(C_RED)
+                  .onChange((isOn: boolean) => {
+                    PlaySettings.getInstance().setAutoSourceSwitch(isOn);
+                  })
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(14)
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
           }
           .width(cardWidthOf(this.windowWidth))
 

@@ -10,6 +10,8 @@ const STORE_DIR: string = 'lx_sources';
 const INDEX_FILE: string = 'sources.json';
 /** 上次成功加载的音源（重启后自动恢复，省得每次都去音源设置里点一次） */
 const ACTIVE_FILE: string = 'active_source.json';
+/** 音源切换记忆：哪个源在哪个平台成功过（见 SourceRouter） */
+const ROUTER_FILE: string = 'source_router.json';
 
 export interface ActiveSource {
   id: string;
@@ -226,6 +228,51 @@ export class SourceStore {
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to clear active source: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  // ------------------------------------------------------------ 音源路由记忆
+
+  private routerPath(): string {
+    return `${this.dir}/${ROUTER_FILE}`;
+  }
+
+  /**
+   * 读「哪个源在哪个平台成功过」的持久化记忆（见 SourceRouter）
+   *
+   * 读不到 / 解析失败都返回空串：这份记忆只是加速用的缓存，
+   * 损坏了大不了重新观察一遍，绝不能让它把音源功能带坏。
+   */
+  loadRouter(): string {
+    if (!this.ready) {
+      return '';
+    }
+    try {
+      const path: string = this.routerPath();
+      if (!fs.accessSync(path)) {
+        return '';
+      }
+      return fs.readTextSync(path);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to read router state: %{public}s', JSON.stringify(e));
+      return '';
+    }
+  }
+
+  /** 写路由记忆；写失败只记日志（下个平台结论会再写一次） */
+  saveRouter(json: string): void {
+    if (!this.ready) {
+      return;
+    }
+    try {
+      const file = fs.openSync(this.routerPath(), fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, json);
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to save router state: %{public}s', JSON.stringify(e));
     }
   }
 }

@@ -21,6 +21,44 @@ const MAIN_ORDER: string[] = ['flac24bit', 'flac', '320k', '128k'];
 const EXTENDED_ORDER: string[] = ['hires', 'atmos', 'atmos_plus', 'master'];
 
 /**
+ * 曲目元数据里**会**带拓展档的平台（网易云）
+ *
+ * 网易把母带 / 沉浸声 / 杜比全景声报在 `privilege.maxBrLevel` 上（jymaster / sky / dolby），
+ * 所以对网易来说「这首歌的 `_types` 里有没有这一档」是可信的，按曲目判断能少一次必然失败的请求。
+ *
+ * 其余平台（QQ 音乐最典型）**报不出来**：QQ 的搜索 / 歌单接口 `file` 里只有
+ * size_128mp3 / size_320mp3 / size_flac / size_hires（外加 size_dolby / size_ape / size_360ra
+ * 这些和本工程的档位对不上的字段），根本没有母带、全景声的位置 —— 一首歌有没有母带，
+ * 曲目数据看不出来，只有音源（也就是源后端）知道。
+ *
+ * 落雪那边同样是这个口径：音质档位由**音源声明的 qualitys** 决定，不看曲目元数据。
+ * 所以这些平台一律以「音源声明支持」为准，取不到链接时照旧走 fallbackQuality 降档，
+ * 不会把能放的歌变成放不了。
+ */
+const METADATA_EXTENDED_PLATFORMS: string[] = ['wy'];
+
+/** 这个平台的拓展音质档是否只能由音源声明来判断（曲目元数据里没有这些档） */
+function extendedBySourceOnly(source: string): boolean {
+  return !METADATA_EXTENDED_PLATFORMS.includes(source);
+}
+
+/**
+ * 这一档能不能用
+ *
+ * 普通档：曲目数据里有就算能用（元数据对普通档一直是准的）。
+ * 拓展档：曲目数据里有，或者「这个平台报不出拓展档 + 音源声明了支持这一档」。
+ */
+function qualityUsable(quality: string, available: string[], supported: string[], sourceOnlyExtend: boolean): boolean {
+  if (supported.length > 0 && !supported.includes(quality)) {
+    return false;
+  }
+  if (available.includes(quality)) {
+    return true;
+  }
+  return sourceOnlyExtend && supported.length > 0 && EXTENDED_ORDER.includes(quality);
+}
+
+/**
  * 本地音乐 / 云端音乐在 K_CURRENT_QUALITY 里不是音质档，而是这两个标记
  * （见 LocalMusic 造条目、WebDavTypes 的 WEBDAV_QUALITY）：它们的音质由文件本身决定，
  * 没有档可切。
@@ -66,6 +104,8 @@ export function qualityLabel(quality: string): string {
  * 当前这首歌**可以切换过去**的音质档，从高到低
  *
  * = 「这首歌提供了这一档」（musicInfo 的 `_types`）∩「音源声明支持这一档」。
+ * 平台报不出拓展档时（QQ 音乐等，见 extendedBySourceOnly）拓展档只看音源声明 ——
+ * 否则 QQ 的母带永远列不出来，源给得了也只能干瞪眼。
  * 拓展档（母带 / 全景声…）只在「设置 - 播放设置」里开了拓展音质时才列进来 ——
  * 没开的时候选它只会解析失败，与其让用户点了没反应，不如不列。
  *
@@ -85,9 +125,11 @@ export function switchableQualitys(musicInfoJson: string, source: string, curren
     return [];
   }
   const supported: string[] = sourceQualitys(source);
+  const extendOn: boolean = PlaySettings.getInstance().isExtendQuality();
+  const sourceOnlyExtend: boolean = extendOn && extendedBySourceOnly(source);
   // 候选顺序：拓展档（高 -> 低）在前，普通档（高 -> 低）在后，与面板里从上到下的顺序一致
   const order: string[] = [];
-  if (PlaySettings.getInstance().isExtendQuality()) {
+  if (extendOn) {
     for (let i = EXTENDED_ORDER.length - 1; i >= 0; i--) {
       order.push(EXTENDED_ORDER[i]);
     }
@@ -97,7 +139,7 @@ export function switchableQualitys(musicInfoJson: string, source: string, curren
   }
   const out: string[] = [];
   for (const quality of order) {
-    if (available.includes(quality) && (supported.length === 0 || supported.includes(quality))) {
+    if (qualityUsable(quality, available, supported, sourceOnlyExtend)) {
       out.push(quality);
     }
   }
@@ -133,6 +175,8 @@ export function sourceQualitys(source: string): string[] {
  * 候选顺序来自「设置 - 播放设置」：先在拓展音质（开了的话，从用户选的那档往下）里找，
  * 再在普通音质（同样从用户选的那档往下）里找。每一档都要求「这首歌提供该档」且
  * 「音源声明支持该档」——直接用用户选的高档去问不支持它的源，源会解析失败。
+ * 例外是拓展档：平台元数据报不出来时（见 extendedBySourceOnly）只要求音源声明支持，
+ * 拿不到链接再靠 fallbackQuality 降档。
  * 信息不足（没有 musicInfo）时返回 fallback（调用方给的原音质）。
  */
 export function pickQuality(musicInfoJson: string, source: string, fallback: string): string {
@@ -142,8 +186,9 @@ export function pickQuality(musicInfoJson: string, source: string, fallback: str
   }
   const supported: string[] = sourceQualitys(source);
   const candidates: string[] = PlaySettings.getInstance().qualityCandidates();
+  const sourceOnlyExtend: boolean = PlaySettings.getInstance().isExtendQuality() && extendedBySourceOnly(source);
   for (const quality of candidates) {
-    if (available.includes(quality) && (supported.length === 0 || supported.includes(quality))) {
+    if (qualityUsable(quality, available, supported, sourceOnlyExtend)) {
       return quality;
     }
   }
