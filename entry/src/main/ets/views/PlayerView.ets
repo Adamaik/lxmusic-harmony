@@ -4,7 +4,8 @@ import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURR
   K_PLAYER_STATUS, K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
-  K_SHOW_MINI_LYRIC } from '../core/settings/PlaySettings';
+  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LIGHT,
+  PLAYER_MOTION_OFF } from '../core/settings/PlaySettings';
 import { I_CAST, I_CHECK_CIRCLE, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE,
   I_NEXT, I_ORDER_PLAY, I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE,
   IconGlyph } from '../ui/Icons';
@@ -14,12 +15,16 @@ import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
+import { DownloadItem, DownloadManager, downloadKeyOf, K_APP_FOREGROUND } from '../core/download/DownloadManager';
 import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
 import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
 import { C_BG, C_RED } from '../ui/Theme';
 import { HdsEdgeFlowLight } from '../ui/Hds';
+import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS, CoverTint,
+  HALO_GLOW_MAX, HALO_GLOW_REST, MOTION_FPS_30, PlayerAtmosphere, PlayerHalo, PlayerLightBand,
+  PlayerRipple, PlayerSparks, swayOf, TILT_FLOAT_MAX, TILT_SETTLE_MS, TILT_X_CYCLE_MS, TILT_X_MAX,
+  TILT_Y_CYCLE_MS, TILT_Y_MAX } from '../ui/PlayerStage';
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
@@ -125,7 +130,7 @@ export struct PlayerView {
   @StorageLink(K_CURRENT_SINGER) singer: string = '';
   /** 当前这首的来源平台：点歌手名时用它去对应的平台认人（见 ui/ArtistNav.ets） */
   @StorageLink(K_CURRENT_SOURCE) currentSource: string = '';
-  @StorageLink(K_CURRENT_COVER) cover: string = '';
+  @StorageLink(K_CURRENT_COVER) @Watch('onCoverChanged') cover: string = '';
   @StorageLink(K_CURRENT_ART) art: boolean = false;
   @StorageLink(K_CURRENT_QUALITY) quality: string = '128k';
   @StorageLink(K_PLAYER_STATUS) @Watch('onStatusChanged') status: string = 'idle';
@@ -167,6 +172,72 @@ export struct PlayerView {
    * 下面的进度条与播放钮上（见 coverBoxSize）。
    */
   @State coverAreaHeight: number = 0;
+
+  // ------------------------------------------------------------ 播放页动效（三档，方法见下面 motionShouldRun 一段）
+
+  /**
+   * 播放页动效档位（设置 - 播放设置 - 播放页动效，三档，默认轻量）
+   *
+   *   - `off`       封面不呼吸、光晕不明暗、边缘光带整颗卸载 —— 整页完全静态。
+   *   - `light`     呼吸 + 主色光晕 + 边缘光带。
+   *   - `immersive` 再加封面 3D 倾斜漂浮、扩散波纹、上浮光点、氛围底流动。
+   *
+   * 三档共用同一个判定入口（见 motionShouldRun）；沉浸档独有的那几件再由它二次收口。
+   * 封面主色的**氛围底在三档里都留着**：它是静态渐变，画一次就不再变，不产生持续功耗。
+   */
+  @StorageLink(K_PLAYER_MOTION) @Watch('syncPlayerMotion') playerMotion: string = PLAYER_MOTION_LIGHT;
+  /**
+   * 应用是否在前台（EntryAbility 的 onForeground / onBackground 维护，见 DownloadManager）
+   *
+   * 退到后台要立刻停：后台还挂着一条无限循环的动画，就是白烧电。这个 key 本来就有
+   * （自动下载在用），直接订阅，不再自己起一套前后台监听。
+   */
+  @StorageProp(K_APP_FOREGROUND) @Watch('syncPlayerMotion') appForeground: boolean = true;
+  /**
+   * 播放页这一刻是否真的可见
+   *
+   * 用 onVisibleAreaChange 量（挂在 build 的根 Stack 上）：模态被收起、被别的浮层整个
+   * 盖住时它会变成 false。播放页是全屏模态（bindContentCover），收起时组件本来就会被
+   * 销毁（aboutToDisappear 兜底），这一项补的是「还在树上但看不见」的那一段。
+   */
+  @State stageVisible: boolean = true;
+  /** 呼吸推进出来的缩放（静止态恒为 BREATH_SCALE_REST） */
+  @State breathScale: number = BREATH_SCALE_REST;
+  /** 光晕当前明暗（静止态恒为 HALO_GLOW_REST） */
+  @State haloGlow: number = HALO_GLOW_REST;
+  /**
+   * 动效此刻是否在跑
+   *
+   * 与「该不该跑」分开存一份：build 里要靠它决定光带挂不挂、以及 scale 要不要乘呼吸值。
+   * 这样即使某天框架没能打断那条无限动画，画面上依然是静止的（乘的是 1）。
+   */
+  @State motionRunning: boolean = false;
+  /**
+   * 沉浸档的重效果此刻是否在跑
+   *
+   * 与 motionRunning 分两个状态：`light` 档要 motionRunning 为真、沉浸档那几件为假，
+   * build 里各自按自己那个值挂东西，不会出现「轻量档把波纹也挂上」。
+   */
+  @State immersiveRunning: boolean = false;
+  /**
+   * 封面 3D 倾斜的两个相位（0~1，静止恒为 0）
+   *
+   * 为什么不直接存「角度」：角度 = 振幅 × {@link swayOf}(相位)。相位在 0 与 1 上正弦
+   * 都是 0，所以「起」与「停」都不会有一下跳变 —— 这一点在 ±3° 的倾斜上很要紧，
+   * 一个 3° 的生硬跳变整页都看得见。
+   */
+  @State tiltPhaseX: number = 0;
+  @State tiltPhaseY: number = 0;
+  /**
+   * 动效代数：切歌时 +1
+   *
+   * 只用来当波纹的 ForEach key（见 PlayerRipple 的 generation），这样切歌时三圈波纹
+   * 是**重建**、从封面边缘重新开始，而不是接着上一首的进度往下跑。
+   */
+  @State motionGeneration: number = 0;
+  /** 当前封面主色（'#RRGGBB'；空串 = 取不到，退化成「封面模糊 + 深色渐变」） */
+  @State stageTint: string = '';
+
   private controller: SwiperController = new SwiperController();
   private lyricScroller: Scroller = new Scroller();
   /** 弹簧的目标值与速度（速度不参与渲染，不需要 @State） */
@@ -174,6 +245,8 @@ export struct PlayerView {
   private coverSpringVelocity: number = 0;
   private coverSpringTimer: number = 0;
   private coverSpringLastMs: number = 0;
+  /** 封面主色解析器（一首歌一次；页面收起时 cancel，不留定时器） */
+  private tintProbe: CoverTint = new CoverTint();
 
   aboutToAppear(): void {
     // 打开播放器时可能已经唱到一半了，先把当前行对上，别等下一秒 timeUpdate
@@ -184,12 +257,26 @@ export struct PlayerView {
     this.coverSpringScale = this.coverSpringTarget;
     // 歌词列表也对到当前那句（宽屏下歌词栏一开始就摆着，靠的就是这一次）
     this.alignLyricScrollSoon();
+    // 进来时可能已经在放：动效该跑就直接起，别等第一次播放状态变化
+    this.syncPlayerMotion();
+    this.resolveStageTint();
   }
 
   aboutToDisappear(): void {
     // 播放器收起就把常亮还回去，别让这个窗口一直钉在亮屏上
     this.onKeepScreenOn(false);
     this.stopCoverSpring();
+    // 页面没了就停呼吸（并把那条无限动画换掉）、把还在等封面位图的重试也收掉
+    this.stopBreathing();
+    /**
+     * 沉浸档也在这里收一次
+     *
+     * 页面被销毁时波纹 / 光点本来会跟着一起消失，但 `stopFloating` 还会把两个相位
+     * 归零、把 `immersiveRunning` 置 false —— 这样即使某天播放页不是「销毁」而是
+     * 「复用同一棵树」，也不会继承到一个还在摆的角度或一层还在发射的粒子。
+     */
+    this.stopFloating();
+    this.tintProbe.cancel();
   }
 
   // ------------------------------------------------------------ 返回键（覆盖物优先）
@@ -233,6 +320,8 @@ export struct PlayerView {
   onStatusChanged(): void {
     this.coverSpringTarget = this.playing() ? 1.05 : 0.95;
     this.startCoverSpring();
+    // 播放 <-> 暂停（以及 loading / idle）直接决定呼吸该不该跑：暂停、停止一律停掉动画
+    this.syncPlayerMotion();
   }
 
   /**
@@ -268,6 +357,209 @@ export struct PlayerView {
       clearInterval(this.coverSpringTimer);
       this.coverSpringTimer = 0;
     }
+  }
+
+  // ------------------------------------------------------------ 播放页动效（三档，见 ui/PlayerStage.ets）
+
+  /**
+   * 「动效该跑吗」——**唯一**的判定入口（三档共用）
+   *
+   * 四个条件缺一不可：用户在设置里没选「关闭」/ 应用在前台 / 播放页可见 / 正在播。
+   * 为什么把「正在播」也算进来：封面在播放时轻轻呼吸是「这首歌活着」，一旦暂停还继续
+   * 动就成了干扰，而且这时候用户多半就是要放下手机了 —— 那正是该省电的时刻。
+   * 切歌时的 `loading` 也不满足 `playing()`，所以切歌那一段自然就是停的。
+   */
+  private motionShouldRun(): boolean {
+    return this.playerMotion !== PLAYER_MOTION_OFF
+      && this.appForeground && this.stageVisible && this.playing();
+  }
+
+  /** 是否沉浸档（只有这一档才挂波纹 / 光点 / 倾斜 / 流动背景） */
+  private motionImmersive(): boolean {
+    return this.playerMotion === PLAYER_MOTION_IMMERSIVE;
+  }
+
+  /**
+   * 按当前状态开始或停掉动效
+   *
+   * 四个来源（档位 / 前后台 / 可见性 / 播放状态）任何一个变化都只调这一个函数，
+   * 所以不会出现两处各自起一条动画、谁也不知道对方还在跑的情况。
+   * 沉浸档的重效果在同一个入口里二次收口：档位不是 immersive 就一律走停。
+   */
+  syncPlayerMotion(): void {
+    const run: boolean = this.motionShouldRun();
+    if (run) {
+      this.startBreathing();
+    } else {
+      this.stopBreathing();
+    }
+    if (run && this.motionImmersive()) {
+      this.startFloating();
+    } else {
+      this.stopFloating();
+    }
+  }
+
+  /**
+   * 起封面呼吸（缩放 1.0 -> 1.03、光晕 0.15 -> 0.3）
+   *
+   * 用 `animateTo` 的 `iterations: -1` + `PlayMode.Alternate`：一条**声明式**无限动画，
+   * 由框架在渲染侧来回推进。这是本功能功耗的关键 —— JS 侧没有 setInterval、没有每帧
+   * 回调，停下来就是真的没有东西在跑。
+   *
+   * （为什么封面弹簧那套是逐帧自己算的：它需要「过冲」，Curve 里没有带过冲的曲线；
+   * 这里只要一来一回的缓动，声明式正好够用，也就没有定时器要维护。）
+   */
+  private startBreathing(): void {
+    if (this.motionRunning) {
+      return;
+    }
+    this.motionRunning = true;
+    animateTo({
+      duration: BREATH_CYCLE_MS,
+      curve: Curve.EaseInOut,
+      iterations: -1,
+      playMode: PlayMode.Alternate,
+    }, () => {
+      this.breathScale = BREATH_SCALE_MAX;
+      this.haloGlow = HALO_GLOW_MAX;
+    });
+  }
+
+  /**
+   * 停呼吸并回到静止态
+   *
+   * 同一个属性上的新 animateTo 会替换掉上一次动画（包括 iterations:-1 的那条无限循环），
+   * 所以这里用一次 420ms 的短动画把值拉回 1 / 0.15：画面当场定住，那条无限动画也一并
+   * 被换掉。另外 `motionRunning` 置 false 之后，build 里乘的是 1（而不是 breathScale），
+   * 即使某天框架没能打断，画面上也已经是静止的 —— 双保险。
+   */
+  private stopBreathing(): void {
+    if (!this.motionRunning) {
+      return;
+    }
+    this.motionRunning = false;
+    animateTo({ duration: BREATH_SETTLE_MS, curve: Curve.EaseOut }, () => {
+      this.breathScale = BREATH_SCALE_REST;
+      this.haloGlow = HALO_GLOW_REST;
+    });
+  }
+
+  /**
+   * 起沉浸档的重效果（3D 倾斜 + 漂浮）
+   *
+   * 波纹 / 光点不在这里「起」—— 它们由 build 按 `immersiveRunning` 挂载，
+   * 一置真就出现在树上；流动背景由 PlayerAtmosphere 自己按 `flow` 跑。
+   * 这里负责的是**需要相位驱动**的那两件事：绕 X 轴、绕 Y 轴的缓慢摆动。
+   *
+   * 两条 animateTo 各推进一个相位，周期故意不同（8s / 10s）：两条不同周期的正弦
+   * 叠起来，合成的倾倒方向会慢慢游走，看起来是「浮着」而不是「来回机械摆动」。
+   * 帧率上限交给 `MOTION_FPS_30`（expectedFrameRateRange），不按满帧跑。
+   */
+  private startFloating(): void {
+    if (this.immersiveRunning) {
+      return;
+    }
+    this.immersiveRunning = true;
+    animateTo({
+      duration: TILT_X_CYCLE_MS,
+      curve: Curve.EaseInOut,
+      iterations: -1,
+      // PlayMode 没有 Restart：「一直从头重复」= Normal + iterations:-1
+      playMode: PlayMode.Normal,
+      expectedFrameRateRange: MOTION_FPS_30,
+    }, () => {
+      this.tiltPhaseX = 1;
+    });
+    animateTo({
+      duration: TILT_Y_CYCLE_MS,
+      curve: Curve.EaseInOut,
+      iterations: -1,
+      playMode: PlayMode.Normal,
+      expectedFrameRateRange: MOTION_FPS_30,
+    }, () => {
+      this.tiltPhaseY = 1;
+    });
+  }
+
+  /**
+   * 停沉浸档：波纹 / 光点立刻卸载，倾斜在 380ms 内回到 0°
+   *
+   * `immersiveRunning` 先置 false，build 下一帧就把波纹与光点整颗摘掉（连同它们的
+   * 无限动画与粒子发射循环一起）；倾斜不能硬切，所以用一次短 animateTo 把两个相位
+   * 拉回 0 —— 同一个属性上的新动画会替换掉那条无限循环，不会留两份。
+   */
+  private stopFloating(): void {
+    if (!this.immersiveRunning) {
+      return;
+    }
+    this.immersiveRunning = false;
+    animateTo({ duration: TILT_SETTLE_MS, curve: Curve.EaseOut }, () => {
+      this.tiltPhaseX = 0;
+      this.tiltPhaseY = 0;
+    });
+  }
+
+  /**
+   * 切歌：把沉浸档的旧动画先停再起
+   *
+   * 为什么不能只靠 onStatusChanged：切歌并不总是经过 `loading`（同一首重播、
+   * 换码率重连、缓存命中都可能一直停在 playing），那时状态没变、没人通知动效，
+   * 上一首的摆动相位与波纹进度就会直接续到新歌上 —— 观感是「这首的波纹是上一首剩下的」。
+   *
+   * 这里做的是**硬重置**：相位直接归零（不走动画 —— 切歌那一下本来就该断，
+   * 让旧摆动慢慢收回去反而像卡了），代数 +1 让三圈波纹按新 key 重建。
+   * 只在真的在跑的时候重置；没在跑就什么都不做（不动状态就不触发重绘）。
+   */
+  private restartPlayerMotion(): void {
+    if (!this.immersiveRunning) {
+      return;
+    }
+    this.immersiveRunning = false;
+    this.tiltPhaseX = 0;
+    this.tiltPhaseY = 0;
+    this.motionGeneration++;
+    // 同一个更新周期里立刻重新评估：条件仍然成立就起新的一份，从头开始
+    this.syncPlayerMotion();
+  }
+
+  /** 封面绕 X 轴的倾角（度）：相位 0 / 1 上都是 0，所以起停都没有跳变 */
+  private tiltXAngle(): number {
+    return TILT_X_MAX * swayOf(this.tiltPhaseX);
+  }
+
+  /** 封面绕 Y 轴的倾角（度） */
+  private tiltYAngle(): number {
+    return TILT_Y_MAX * swayOf(this.tiltPhaseY);
+  }
+
+  /** 封面的上下漂浮偏移（vp）：跟着 Y 轴那条相位走，不再多维护一个状态 */
+  private floatOffset(): number {
+    return TILT_FLOAT_MAX * swayOf(this.tiltPhaseY);
+  }
+
+  /**
+   * 取当前封面的主色（进页面 / 换封面 / 切歌各一次）
+   *
+   * 主色来自 CoverStore 里已经解好的那张小位图（迷你栏本来就在用它做同步绘制），
+   * 取色交给系统的 ColorPicker（原生实现），**不在 JS 里遍历像素**，一首歌只取一次。
+   * 拿不到就保持空串 —— 页面退化成原来那套「封面模糊 + 深色渐变」，不硬造颜色。
+   */
+  private resolveStageTint(): void {
+    this.tintProbe.request(this.cover, (tint: string) => {
+      this.stageTint = tint;
+    });
+  }
+
+  /**
+   * 换封面（切歌 / 封面晚到）：重新取一次主色，氛围底淡入过去
+   *
+   * 顺手把沉浸档的旧动画重置一遍：这里才是「切歌」最可靠的信号
+   * （封面地址变了就是真的换歌了），见 restartPlayerMotion 的说明。
+   */
+  onCoverChanged(): void {
+    this.resolveStageTint();
+    this.restartPlayerMotion();
   }
 
   /**
@@ -1126,27 +1418,93 @@ export struct PlayerView {
   coverBlock() {
     Column({ space: 26 }) {
       Stack() {
-        CoverArt({
-          url: this.cover,
-          name: this.name,
-          art: this.art,
-          // 没有歌 / 没有封面 / 封面失效：兜底给聆听的应用图标（见 ui/Widgets.ets 的 CoverArt）
-          appIcon: true,
-          boxSize: this.coverBoxSize(),
-          // 圆角来自外观设置（默认 12）
-          radius: this.coverRadius,
-          // 还在解析/缓冲时封面可能没到：先给深色底，别闪一张默认封面
-          pending: this.status === 'loading',
+        /**
+         * 光晕：封面背后一团主色柔光
+         *
+         * 画在封面**之前**（也就是它下面），比封面大一圈（见 PlayerStage 的 HALO_SCALE），
+         * 所以在封面四周露出薄薄一圈。播放时它的 opacity 在 0.15~0.3 之间来回（呼吸），
+         * 暂停时锁在 0.15 —— 光晕不再明暗，但也没有整块消失（那是静态的，不耗电）。
+         */
+        PlayerHalo({
+          tint: this.stageTint,
+          coverSize: this.coverBoxSize(),
+          glow: this.haloGlow,
+          active: this.motionRunning,
         })
+        /**
+         * 扩散波纹（沉浸档）：2~3 圈从封面边缘往外扩、渐隐
+         *
+         * 同样画在封面**之前**（下面）：起始缩放 0.94 让它整圈藏在不透明的封面背后，
+         * 扩出去才从边缘渗出来（见 PlayerStage 的 PlayerRipple）。
+         * `generation` 进 ForEach 的 key，切歌 +1 让三圈重建，不会接着上一首的进度跑。
+         */
+        PlayerRipple({
+          active: this.immersiveRunning,
+          tint: this.stageTint,
+          coverSize: this.coverBoxSize(),
+          generation: this.motionGeneration,
+        })
+        /**
+         * 封面本体（沉浸档叠加 3D 倾斜与漂浮）
+         *
+         * 倾斜只包住**封面本身**：光晕与光带是「光」，不该跟着纸片一起转
+         * （转也看不出来，但光带会被带出一道斜边）。
+         *
+         * 为什么是两层 Stack 各挂一条 rotate：同一个节点上写第二次 `rotate` 会把第一次
+         * 覆盖掉，所以绕 X 轴与绕 Y 轴必须嵌套着写。
+         *
+         * 这里与既有弹簧缩放是**叠加**关系：外面那条
+         * `coverSpringScale × 呼吸` 一个字没改，倾斜只是它下面新的一层变换。
+         * 停在非沉浸档时两个相位都是 0，角度恒为 0 —— 与加倾斜之前完全一样。
+         */
+        Stack() {
+          Stack() {
+            CoverArt({
+              url: this.cover,
+              name: this.name,
+              art: this.art,
+              // 没有歌 / 没有封面 / 封面失效：兜底给聆听的应用图标（见 ui/Widgets.ets 的 CoverArt）
+              appIcon: true,
+              boxSize: this.coverBoxSize(),
+              // 圆角来自外观设置（默认 12）
+              radius: this.coverRadius,
+              // 还在解析/缓冲时封面可能没到：先给深色底，别闪一张默认封面
+              pending: this.status === 'loading',
+            })
+          }
+          .width('100%')
+          .height('100%')
+          // 绕 Y 轴：横向的摆动（振幅比 X 轴小，见 TILT_Y_MAX）
+          .rotate({ x: 0, y: 1, z: 0, angle: this.tiltYAngle(), centerX: '50%', centerY: '50%' })
+        }
+        .width('100%')
+        .height('100%')
+        // 上下漂浮（vp）：与绕 Y 轴同相位，看起来是「一边侧倾一边浮」
+        .translate({ y: this.floatOffset() })
+        // 绕 X 轴：前后的点头式倾斜
+        .rotate({ x: 1, y: 0, z: 0, angle: this.tiltXAngle(), centerX: '50%', centerY: '50%' })
+        /**
+         * 沿封面边缘缓慢流动的光带
+         *
+         * 只在「动效开着且正在跑」时挂：不挂 = HDS 着色器整个不存在，也就没有循环在跑。
+         * 它内部不吃触摸（见 ui/Hds.ets 的 HdsEdgeFlowLight），不影响封面上任何交互。
+         */
+        PlayerLightBand({ active: this.motionRunning, radius: this.coverRadius })
       }
       .width(this.coverBoxSize())
       .height(this.coverBoxSize())
       .borderRadius(this.coverRadius)
       .shadow({ radius: 40, color: '#66000000', offsetX: 0, offsetY: 18 })
-      // 播放/暂停时的弹簧缩放（缩放中心放在封面正中，别从左上角放大）
+      /**
+       * 缩放 = 弹簧（播放 1.05 / 暂停 0.95，见 startCoverSpring） × 呼吸（1.0~1.03）
+       *
+       * 两个动画叠在同一个 transform 上，互不干扰：弹簧负责「按下去弹一下」，
+       * 呼吸负责「放着的时候轻轻起伏」。动效没在跑时乘 1 —— 也就是只剩弹簧，
+       * 与加这个功能之前完全一致。
+       */
       .scale({
-        x: this.coverSpringScale,
-        y: this.coverSpringScale,
+        x: this.coverSpringScale * (this.motionRunning ? this.breathScale : 1),
+        y: this.coverSpringScale * (this.motionRunning ? this.breathScale : 1),
         centerX: '50%',
         centerY: '50%',
       })
@@ -1661,10 +2019,33 @@ export struct PlayerView {
           .opacity(0.5)
           .draggable(false)
       }
+      /**
+       * 氛围底：封面主色铺的一层渐变
+       *
+       * 位置在「封面模糊图」之上、「压暗层」之下：模糊图给形、它给色，压暗层再把整块
+       * 压回去一档，保证顶栏与歌名那些白字的对比度不被主色顶掉。
+       * 取不到主色时它整层不挂（`stageTint` 为空串），背景就是原来那套观感 ——
+       * 这是能力位 / 取色失败时的退化路径，不硬造颜色。
+       */
+      PlayerAtmosphere({
+        tint: this.stageTint,
+        // 三档都留氛围底（它是静态的），「关闭」档只是不再做淡入与流动
+        active: this.playerMotion !== PLAYER_MOTION_OFF,
+        // 只有沉浸档才让主色缓慢流动（两层交叉淡入 + 轻微位移，见 PlayerAtmosphere）
+        flow: this.immersiveRunning,
+      })
       Column()
         .width('100%')
         .height('100%')
         .backgroundColor('#40000000')
+      /**
+       * 上浮光点（沉浸档）
+       *
+       * 位置在压暗层**之上**、页面正文**之下**：它是背景里的浮尘，不该盖在歌名与控件上；
+       * 压在压暗层之下的话会被那 25% 的黑压掉一半，几乎看不见。
+       * 整层不吃触摸，也不参与任何交互。
+       */
+      PlayerSparks({ active: this.immersiveRunning, tint: this.stageTint })
 
       // ---------------------------------------------------- 页面主体
       Column() {
@@ -1795,6 +2176,20 @@ export struct PlayerView {
      * 内容（顶栏 / 底栏）各自按 topInset / bottomInset 让位。
      */
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    /**
+     * 播放页可见性 -> 动效开关
+     *
+     * 挂在根节点上量整页被看见的比例。播放页是全屏模态，收起时组件本身会被销毁
+     * （aboutToDisappear 里也停一次），但「还挂在树上、却已经被别的层整个盖住」这一段
+     * 只有这个回调能告诉我们。不可见就立刻停 —— 看不见还在跑动画是纯浪费。
+     */
+    .onVisibleAreaChange([0.0, 0.1], (isVisible: boolean) => {
+      if (isVisible === this.stageVisible) {
+        return;
+      }
+      this.stageVisible = isVisible;
+      this.syncPlayerMotion();
+    })
     .gesture(
       PanGesture({ direction: PanDirection.Vertical, distance: 12 })
         .onActionEnd((event: GestureEvent) => {

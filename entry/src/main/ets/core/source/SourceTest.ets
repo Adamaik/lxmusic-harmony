@@ -1,8 +1,15 @@
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SourceEngine } from './SourceEngine';
 import { ImportResolveTestResult, LxQuality, ResolveResult, SourceInfo, SourceLog, SupportedSource } from './LxTypes';
+import { parseSourceMeta, sourceMetaKey } from './LxMetadata';
 import { LxMusicInfo, SEARCH_PLATFORMS, isSearchSupported, pickQuality, searchMusic } from '../music/MusicSearch';
+import { AudioCache } from '../music/AudioCache';
+import { MediaCache, mediaKeyOf } from '../music/MediaCache';
+
+const DOMAIN: number = 0x0001;
+const TAG: string = 'SourceTest';
 
 /**
  * 音源引擎测试方法集合
@@ -55,6 +62,20 @@ export const DEFAULT_MUSIC_INFO_JSON: string = JSON.stringify({
   meta: { 'testUrl': 'https://example.com/test-audio.mp3' } as Record<string, string>,
 } as DemoMusicInfo);
 
+/** 示例源里写死的测试地址（见 rawfile/demo_source.js）：自检解析出来的就是它，必然 404 */
+const DEMO_TEST_URL: string = 'https://example.com/test-audio.mp3';
+
+/**
+ * 示例源声明的音质档（见 demo_source.js 的 qualitys）。
+ *
+ * 自检本身只用 128k 解析，但示例源生效期间点播放时，同一个固定地址可能被写到
+ * 别的档上（播放页切档 / 按音乐信息协商出 320k），所以这几档一起清。
+ */
+const SELF_TEST_QUALITIES: string[] = ['128k', '320k', 'flac', 'flac24bit'];
+
+/** 示例歌曲的缓存 key（`kw_demo_songmid_0001`）：只有它名下的音频文件可以放心按 key 删 */
+const DEMO_CACHE_KEY: string = mediaKeyOf(DEFAULT_MUSIC_INFO_JSON);
+
 /** 构造一个测试用 musicInfo JSON */
 export function buildMusicInfoJson(
   name: string,
@@ -98,13 +119,137 @@ function readBundledDemoScript(context: common.Context): string {
 }
 
 /**
+ * 清掉自检留在播放缓存里的痕迹
+ *
+ * 键的算法与播放侧完全一致（见 PlaySession 的 `mediaKeyOf(item.musicInfoJson)`）：
+ *   地址表  MediaCache 里是 `<平台>_<songmid>[_<hash>]_<音质>`（quality 由 MediaCache 自己拼）
+ *   音频文件 AudioCache 里是 `<key>_<音质>.<后缀>`
+ * 这里不自己拼路径，一律走 MediaCache.getMusicUrl / AudioCache.localPath 找、再按官方
+ * 删除接口删（dropMusicUrl / dropPath），否则路径或命名一变就会留下孤儿文件。
+ *
+ * 为什么要清：示例源的地址是写死的 https://example.com/test-audio.mp3，命中它必然 404。
+ * 自检本身只解析、不写缓存，但历史上自检后「当前音源」变成了示例源，用户随手点一首
+ * 播放就会把这个 404 地址写进 MediaCache（音频缓存的 key 也随之出现）。不清掉的话，
+ * 即使音源已修好，第一次播仍会先命中坏缓存报一次错，重试才成功。
+ *
+ * @param musicInfoJson 自检用的 musicInfo
+ * @param resolvedUrl   本次自检解析出来的地址（解析失败传空串）
+ * @returns 清掉的缓存条目数（地址条目 + 音频文件条目）
+ */
+function purgeSelfTestCache(musicInfoJson: string, resolvedUrl: string): number {
+  const key: string = mediaKeyOf(musicInfoJson);
+  if (key.length === 0) {
+    return 0;
+  }
+  const isDemoKey: boolean = key === DEMO_CACHE_KEY;
+  const media: MediaCache = MediaCache.getInstance();
+  const audio: AudioCache = AudioCache.getInstance();
+  let removed: number = 0;
+  for (const quality of SELF_TEST_QUALITIES) {
+    // 地址条目：只删「确实是示例地址」的那条。同一个 key 上如果存的是正常地址
+    // （换源 / 正常播放写下的），不能因为跑了一次自检就把它丢掉
+    const cached: string = media.getMusicUrl(key, quality);
+    if (cached.length > 0 && (cached === resolvedUrl || cached === DEMO_TEST_URL)) {
+      media.dropMusicUrl(key, quality);
+      removed++;
+    }
+    // 音频文件：只有示例歌曲这个 key（songmid 固定 demo_songmid_0001）能按 key 删 ——
+    // 音频缓存条目里看不到地址，换成别的 musicInfo 时按 key 删会误伤真实歌曲的缓存
+    if (isDemoKey) {
+      const local: string = audio.localPath(key, quality);
+      if (local.length > 0) {
+        audio.dropPath(local);
+        removed++;
+      }
+    }
+  }
+  return removed;
+}
+
+/**
  * 离线自检：内置示例源 + 默认 musicInfo，不依赖外部网络。
  * 成功时 resolve 出示例源里写死的测试地址，证明整条链路可用。
+ *
+ * 隔离：示例源的播放地址是写死的 https://example.com/test-audio.mp3，它绝不能变成
+ * 「当前音源」——否则之后所有播放 404，且 loadSource 会把 active_source.json 写成
+ * 示例源，重启后自动恢复的还是它。所以这里先快照自检前正在用的音源（id + 沙箱环境 +
+ * 已有音源列表），结束后原样还原，并顺手把示例地址 / 示例歌曲留在缓存里的条目清掉。
  */
 export async function runOfflineSelfTest(context: common.Context, musicInfoJson?: string): Promise<ImportResolveTestResult> {
-  const script: string = readBundledDemoScript(context);
+  const engine = SourceEngine.getInstance();
+  // 快照：恢复时要按同一个 env 重新初始化；knownIds 用来判断示例源是不是本次新导入的
+  const previousId: string = engine.getLoadedSourceId();
+  const previousEnv: string = engine.getSandboxEnv();
+  const knownIds: string[] = engine.listSources().map((item: SourceInfo) => item.id);
   const json: string = musicInfoJson !== undefined ? musicInfoJson : DEFAULT_MUSIC_INFO_JSON;
-  return doImportAndResolve(script, json, '128k', 'kw');
+  // 读到脚本之后才真的会改沙箱状态：读之前抛错（预览器 mock rawfile）不必还原
+  let touched: boolean = false;
+  // 自检前正在用的源如果本身就是示例源（老版本自检留下的现场），不能把它当成要还原的
+  // 目标：那等于把用户继续钉在一个只会返回 404 地址的音源上，自检等于没修
+  let previousIsDemo: boolean = false;
+  let demoId: string = '';
+  /** 内置示例源的身份键（名字+版本+作者）：finally 里清「历史残留条目」也用它 */
+  let demoKey: string = '';
+  let resolvedUrl: string = '';
+  try {
+    const script: string = readBundledDemoScript(context);
+    touched = true;
+    // 身份用「名字+版本+作者」（与导入去重同一个键）判断，不看 id：id 是随机生成的
+    demoKey = sourceMetaKey(parseSourceMeta(script));
+    for (const item of engine.listSources()) {
+      if (item.id === previousId) {
+        previousIsDemo = sourceMetaKey(item) === demoKey;
+      }
+    }
+    const result: ImportResolveTestResult = await doImportAndResolve(script, json, '128k', 'kw');
+    if (result.source !== null) {
+      demoId = result.source.id;
+    }
+    if (result.resolve !== null) {
+      resolvedUrl = result.resolve.url;
+    }
+    return result;
+  } finally {
+    if (touched) {
+      try {
+        purgeSelfTestCache(json, resolvedUrl);
+      } catch (e) {
+        // 清理失败不能连带把「还原音源」也跳过：坏缓存还有播放侧兜底
+        // （PlaySession 命中缓存地址失败时会丢弃并重试，见其 error 分支），
+        // 而「当前音源被换成示例源 / last-active 被写成示例源」才是致命的
+        hilog.warn(DOMAIN, TAG, 'purge self-test cache failed: %{public}s', JSON.stringify(e));
+      }
+      // 无论自检成功还是失败都要还原：失败路径同样已经导入/加载过示例源。
+      // previousIsDemo 时传空 id，按「自检前没有音源」还原（清现场 + 删 last-active）
+      await engine.restoreSourceSnapshot(previousIsDemo ? '' : previousId, previousEnv);
+      // 删掉示例源这条记录：本次新导入的，或者自检前就残留的（previousIsDemo）。
+      // 自检前就在、但身份不是示例源的（重复导入命中别的同名脚本）保持原样
+      if (demoId.length > 0 && (previousIsDemo || !knownIds.includes(demoId))) {
+        try {
+          engine.removeSource(demoId);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'remove demo source failed: %{public}s', JSON.stringify(e));
+        }
+      }
+      // 顺带清掉**历史残留**的示例源条目：老版本的自检会把内置示例源写进音源列表，
+      // 之后它就一直躺在那里制造噪音（真机实测：列表里留着一条 v1.0.0 的「示例音源」）。
+      // 身份键与内置脚本一致 ⇒ 只可能是内置示例源，不会是用户自己的源；正在用的那个跳过。
+      if (demoKey.length > 0) {
+        const listed: SourceInfo[] = engine.listSources();
+        for (const item of listed) {
+          if (item.id === previousId || sourceMetaKey(item) !== demoKey) {
+            continue;
+          }
+          try {
+            engine.removeSource(item.id);
+            hilog.info(DOMAIN, TAG, '已清理历史残留的示例音源：%{public}s', item.id);
+          } catch (e) {
+            hilog.warn(DOMAIN, TAG, '清理残留示例音源失败：%{public}s', JSON.stringify(e));
+          }
+        }
+      }
+    }
+  }
 }
 
 /**

@@ -12,7 +12,8 @@ views/RecommendView.ets         推荐：三个胶囊三套版面（见下面「
 views/PlaylistSquareView.ets    全部歌单：某个平台 × 某个排序的全量（分区「更多」进来的那一页）
 ui/PlaylistGrid.ets             歌单大卡 + 两列网格的行数据源（推荐页与全部歌单页共用）
 views/MineView.ets              我的（照华为音乐的「我的」重排）：快捷入口卡 + 自建歌单卡 + 设置卡
-views/EchoView.ets              回响（月度收听报告）：固定深色沉浸月报（总时长 / 歌曲榜 / 歌手榜 / 专辑榜 / 时段 / 日历 / 完播率，见下面「回响页」一节）
+views/EchoView.ets              回响（月度收听报告）：派音 2.0 版式（N 分钟 / 三格统计 / 年月切换 / 3D 榜台 / 歌手 / 专辑 / 时段 / 日历 / 循环之王 / 深夜之歌 / 完播率 / 新发现），见 docs/ECHO_MONTHLY.md
+core/history/EchoMonthly.ets    回响月度聚合：月份范围与下拉档位 + `buildMonthlyStats`（新发现 / 深夜之歌 / 连续天数等）
 core/history/ListenLog.ets      收听流水：**回响与播放历史的唯一数据源**（songs 字典 + records，月报聚合都在这里）
 core/history/ListenTracker.ets  收听记账：盯着播放器算每首实际出声时长，切歌 / 退后台收尾写进流水
 views/HistoryView.ets           最近播放（我的 - 快捷入口）：播放历史列表 + 多选（只删记录）；数据与回响共用 ListenLog
@@ -30,7 +31,7 @@ views/PlayQueueSheet.ets        播放列表内容（外面的半模态是系统
 views/MiniBar.ets               HdsTabs 迷你栏内容：折叠=唱片圆钮，展开=迷你播放器
 ui/Theme.ets / ui/Icons.ets / ui/Glass.ets / ui/Widgets.ets   设计基建
 ui/TileCard.ets                 横滑卡：有封面铺封面（底压暗 + 白字），没封面落主题玻璃卡（推荐页分类 / 精选榜、听书分类共用）
-ui/EchoReport.ets               回响月报的深色视觉组件（固定深色调色板 E_* + 领奖台 / 榜单 / 歌手大图 / 专辑横排 / 时段柱图 / 日历 / 完播率圆环）
+ui/EchoMonthlyKit.ets           回响月报的视觉组件库（派音 2.0 版式：3D 四点透视榜台 / 榜单 / 歌手大图 / 专辑横排 / 时段柱图 / 日历热力 / 完播率圆环；颜色走 echo_* 成对资源，跟随系统深浅色）
 ui/Layout.ets                   宽屏适配：断点、底部两条栏的宽度、内容列最大宽度（折叠屏 / 平板）
 ui/Selection.ets                多选：全局会话（顶栏 / 底栏都听它）+ 底栏操作条 + 勾选 / 批量操作助手
 ui/Hds.ets                      HDS 接入：材质档位、光效、栏高常量
@@ -174,9 +175,14 @@ ArtistStore）：这一行滚进可视区才去认一次，认到才有头像 / 
 `Column` + `borderRadius(50%)`，不用 `Circle().fill(资源色)`（取不到资源会退回黑色，同
 `SettingsView` / `AboutView` 那条）。
 
-## 回响页：月度收听报告（固定深色，2026-10-21 重做）
+## 回响页：月度收听报告（2026-11-15 起改为派音 2.0 版式）
 
-照用户给的网易云月报截图重做（`views/EchoView.ets` + `ui/EchoReport.ets`），同时把「回响」与「播放历史」的底层数据合并成一份。
+> **本节以下记录的是旧版（2026-10-21 网易云月报版）实现，已被整页替换，仅作历史留存。**
+> 现行实现以 [`docs/ECHO_MONTHLY.md`](./ECHO_MONTHLY.md) 为准：`views/EchoView.ets`（重写）+
+> `ui/EchoMonthlyKit.ets`（新增）+ `core/history/EchoMonthly.ets`（聚合）；版式与几何照派音
+> `EchoReviewPage.ets`（2095 行），数据口径仍按 `ListenLog`；旧 `ui/EchoReport.ets` 已删除。
+
+旧版：照用户给的网易云月报截图重做（`views/EchoView.ets` + `ui/EchoReport.ets`），同时把「回响」与「播放历史」的底层数据合并成一份。
 
 ### 数据：回响与播放历史共用一套流水
 

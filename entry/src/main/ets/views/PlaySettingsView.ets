@@ -10,7 +10,8 @@ import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
-  K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
+  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
+  PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LABELS, PLAYER_MOTION_LEVELS, PLAYER_MOTION_LIGHT,
   PlaySettings } from '../core/settings/PlaySettings';
 
 /** 拓展音质：开关 +（开着时）档位 + 说明 */
@@ -74,9 +75,13 @@ struct ExtendQualitySetting {
  *       与其他应用同时播放、被其他应用打断结束后自动重新播放
  *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、
  *       桌面歌词、车载蓝牙歌词
+ *   三、播放页：播放页动效（三档：关闭 / 轻量 = 封面呼吸 + 主色光晕 + 边缘光带 /
+ *       沉浸 = 再加 3D 倾斜 + 扩散波纹 + 上浮光点 + 背景流动；默认轻量）
  *
- * 参考图里还有一项「歌词帧率」，这里没做：本移植版没有逐帧渲染的动效（歌词靠
- * AVPlayer 的 timeUpdate 一秒一推、行间是 240ms 的补间），给一个帧率选项只是摆设。
+ * 参考图里还有一项「歌词帧率」，这里没做：歌词本身不是逐帧渲染的（靠 AVPlayer 的
+ * timeUpdate 一秒一推、行间是 240ms 的补间），给一个帧率选项只是摆设。
+ * （「播放页动效」那几处也不是逐帧 JS 渲染：呼吸与光带都是框架 / 着色器侧的声明式动画，
+ * JS 侧没有任何每帧回调，所以同样的理由不适用于它。）
  *
  * 所有项都写进 PlaySettings（沙箱 JSON + AppStorage），改完立即落盘，重启不丢。
  * 真机上生效的路径：
@@ -114,6 +119,13 @@ export struct PlaySettingsView {
   @StorageLink(K_AUTO_MATCH_LYRIC) autoMatchLyric: boolean = true;
   /** 被打断（来电 / 闹铃 / 别的应用出声）结束后自动接着放 */
   @StorageLink(K_AUTO_RESUME_AFTER_INTERRUPT) autoResume: boolean = true;
+  /**
+   * 播放页动效档位（'off' / 'light' / 'immersive'，见 PlaySettings.K_PLAYER_MOTION）
+   *
+   * 早先是布尔开关；三档之后用同一套分段胶囊（OptionSetting）选，
+   * 因为「轻量 / 沉浸」不是「开与关」的关系，开关表达不了。
+   */
+  @StorageLink(K_PLAYER_MOTION) playerMotion: string = PLAYER_MOTION_LIGHT;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
@@ -160,6 +172,33 @@ export struct PlaySettingsView {
   private extendIndex(): number {
     const index: number = EXTEND_QUALITYS.indexOf(this.extendType);
     return index < 0 ? 0 : index;
+  }
+
+  /** 播放页动效胶囊选中的是第几枚（存档里不认识的取值都落在「轻量」上） */
+  private motionIndex(): number {
+    const index: number = PLAYER_MOTION_LEVELS.indexOf(this.playerMotion);
+    return index < 0 ? PLAYER_MOTION_LEVELS.indexOf(PLAYER_MOTION_LIGHT) : index;
+  }
+
+  /**
+   * 播放页动效三档的说明（选中哪档说哪档）
+   *
+   * 为什么逐档给一句话而不是一段通用说明：三档的取舍就是「省电 <-> 好看」，
+   * 用户要能一眼看出多出来的那点观感是用什么换的。沉浸档还必须讲清它比轻量档贵在哪，
+   * 否则「更好看」的默认预期会让人一路开到沉浸、然后觉得费电。
+   */
+  private motionHint(): string {
+    if (this.playerMotion === PLAYER_MOTION_IMMERSIVE) {
+      return '在轻量档之上再加：封面 3D 倾斜并缓慢漂浮、封面后向外扩散的波纹、'
+        + '少量上浮光点、背景主色缓慢流动。代价是播放时多一条 30fps 上限的动画'
+        + '与最多 12 颗粒子；暂停、收起播放页、退到后台、切歌时就全部停掉并卸载。';
+    }
+    if (this.playerMotion === PLAYER_MOTION_LIGHT) {
+      return '封面随播放轻微呼吸、背后一团主色柔光、沿封面边缘一道缓慢流动的光带。'
+        + '零 JS 定时器：全靠框架侧的声明式动画，停下来就真的没有东西在跑。';
+    }
+    return '最省电：播放页一点动画都不跑。封面主色的氛围底是静态渐变（画一次就不变），'
+      + '不产生持续功耗，所以它仍然保留。';
   }
 
   /** 桌面歌词这一项的说明：不支持的设备上明说，免得用户以为开关坏了 */
@@ -393,6 +432,37 @@ export struct PlaySettingsView {
             HintText({
               text: '「歌词页模糊效果」关掉后歌词页用纯深色底（封面页不受影响）；'
                 + '「歌词页不熄屏」只在全屏播放器停在歌词页时生效。',
+            })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 播放页（卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            Column({ space: 8 }) {
+              /**
+               * 三档用分段胶囊而不是开关：见上面 motionHint 的说明。
+               * 选中态只由 `motionIndex()` 决定（读 AppStorage 里的档位），
+               * 组件自己不存「当前选中」—— 点一下设置没落下去时药丸不会骗人。
+               */
+              OptionSetting({
+                label: '播放页动效',
+                options: PLAYER_MOTION_LABELS,
+                activeIndex: this.motionIndex(),
+                hint: this.motionHint(),
+                onPick: (index: number) => {
+                  PlaySettings.getInstance().setPlayerMotionLevel(PLAYER_MOTION_LEVELS[index]);
+                },
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({
+              text: '三档共用同一条开关条件：只有「正在播放 + 应用在前台 + 播放页可见 + 没选关闭」'
+                + '同时成立才有动画。暂停、收起播放页、退到后台、切歌加载时立刻停；'
+                + '切歌是先停旧再起新，不会两份叠着跑。',
             })
           }
           .width(cardWidthOf(this.windowWidth))

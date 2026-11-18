@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SourceEngine } from '../core/source/SourceEngine';
 import { MAX_SCRIPT_SIZE } from '../core/source/LxMetadata';
@@ -10,9 +10,10 @@ import { DEFAULT_MUSIC_INFO_JSON, formatTestResult, runOfflineSelfTest } from '.
 import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '@kit.UIDesignKit';
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
-import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, F_TAB, R_CARD } from '../ui/Theme';
 import { LengthMetrics } from '@kit.ArkUI';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
+import { LogDetailView } from './LogDetailView';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SourceSettingsView';
@@ -25,6 +26,24 @@ const PLATFORM_NAMES: Record<string, string> = {
   'wy': '网易',
   'xm': '喜马拉雅',
 };
+
+/**
+ * 日志面板里的一行
+ *
+ * 面板只显示 `text`（时间 + 级别 + 裁过的消息，保持原来的观感），`full` 是引擎存下来的
+ * 完整原文，只给「日志详情」和「复制全部日志」用 —— 两者分开是这一页的核心：
+ * 用户要的是看得见全文，但面板不能因此变成一面文字墙。
+ */
+interface LogLine {
+  /** 面板那一行：`[时间][级别] 裁剪版消息` */
+  text: string;
+  /** 完整原文：同一前缀 + 不裁剪的消息体 */
+  full: string;
+  /** 级别（详情页顶部显示） */
+  type: string;
+  /** 发生时间（毫秒时间戳；0 = 没有可信时间的纯文本行，如离线自检输出） */
+  time: number;
+}
 
 /**
  * 音源设置
@@ -49,7 +68,17 @@ export struct SourceSettingsView {
   @State loadedId: string = '';
   @State supportedText: string = '-';
   @State sandboxEnv: string = 'mobile';
-  @State logs: string[] = [];
+  @State logs: LogLine[] = [];
+  /**
+   * 「日志详情」半模态的开关与内容
+   *
+   * 内容拆成三个基本类型字段而不是存一个 LogLine：@Prop 传的是值，
+   * 换一条日志时三个字段一起变，详情页必然重建，不会出现"点第二条还显示第一条"的残留。
+   */
+  @State detailOpen: boolean = false;
+  @State detailText: string = '';
+  @State detailType: string = '';
+  @State detailTime: number = 0;
   @State testUrl: string = '';
   private logListener: ((log: SourceLog) => void) | null = null;
   /**
@@ -69,9 +98,20 @@ export struct SourceSettingsView {
     this.sandboxEnv = engine.getSandboxEnv();
     this.refreshSources();
     this.logListener = (log: SourceLog) => {
+      // 面板这行只留时分秒（保持原来那一行的长度），完整日期在详情页里给
       const time: string = new Date(log.time).toLocaleTimeString();
-      const next: string[] = this.logs.slice();
-      next.push(`[${time}][${log.type}] ${log.message}`);
+      const prefix: string = `[${time}][${log.type}] `;
+      // 没有 full 的日志（引擎未裁剪、或老逻辑推送过来的）全文就等于消息本身
+      const fullText: string = log.full !== undefined ? log.full : log.message;
+      const line: LogLine = {
+        text: `${prefix}${log.message}`,
+        full: `${prefix}${fullText}`,
+        type: log.type,
+        time: log.time,
+      };
+      const next: LogLine[] = this.logs.slice();
+      next.push(line);
+      // 面板最多显示最近 60 条（与引擎自己的 maxLogs 无关，那是不落盘的完整环形缓冲）
       this.logs = next.slice(-60);
     };
     engine.setLogListener(this.logListener);
@@ -175,22 +215,105 @@ export struct SourceSettingsView {
     this.status = `已把沙箱环境切换为 ${next}，请重新点「加载」`;
   }
 
+  /** 按 id 找音源名（状态行要说清「还原成了哪个」，只给 id 用户认不出来） */
+  private sourceNameOf(id: string): string {
+    for (const item of this.sources) {
+      if (item.id === id) {
+        return item.name;
+      }
+    }
+    return id;
+  }
+
   private async runSelfTest(): Promise<void> {
     if (this.busy) {
       return;
     }
+    const engine = SourceEngine.getInstance();
+    // 自检会把示例源临时装进沙箱，结束后由 SourceTest 负责还原（见 runOfflineSelfTest）。
+    // 这里记下自检前的音源，回来比对一次：坏音源不能被悄悄留下，状态行要如实说清
+    const beforeId: string = engine.getLoadedSourceId();
     this.busy = true;
     this.status = '离线自检中…';
     try {
       const result: ImportResolveTestResult = await runOfflineSelfTest(this.getContext(), DEFAULT_MUSIC_INFO_JSON);
-      this.status = result.ok ? '离线自检通过' : '离线自检失败';
+      const restored: boolean = engine.getLoadedSourceId() === beforeId;
+      const restoredText: string = restored
+        ? (beforeId.length > 0 ? `当前音源仍是「${this.sourceNameOf(beforeId)}」` : '自检前未加载音源，现仍未加载')
+        : '原音源未保留，请在下方重新点「加载」';
+      this.status = `${result.ok ? '离线自检通过' : '离线自检失败'} · ${restoredText}`;
       this.testUrl = result.resolve !== null ? result.resolve.url : '';
-      this.logs = formatTestResult(result).split('\n');
+      // 自检输出是纯文本行，没有级别与逐行时间：整段共用一个时间戳，
+      // 每行原文就是它自己（自检本来就按行输出，没有"被裁掉的全文"这回事）
+      const report: string = formatTestResult(result);
+      const now: number = Date.now();
+      const selfTestLines: LogLine[] = [];
+      for (const one of report.split('\n')) {
+        selfTestLines.push({ text: one, full: one, type: 'selftest', time: now });
+      }
+      this.logs = selfTestLines;
+      // 自检可能顺手删掉了「本次新导入的示例源」，列表要跟着刷新，
+      // 顺便把 loadedId 同步成引擎里真实的当前音源
+      this.refreshSources();
     } catch (e) {
       this.status = `离线自检异常: ${(e as Error).message}`;
     } finally {
       this.busy = false;
     }
+  }
+
+  // ------------------------------------------------------------ 日志的查看与复制
+
+  /** 打开某条日志的半模态详情（里面是完整原文） */
+  private openLogDetail(line: LogLine): void {
+    this.detailText = line.full;
+    this.detailType = line.type;
+    this.detailTime = line.time;
+    this.detailOpen = true;
+  }
+
+  /**
+   * 复制全部日志（含全文）
+   *
+   * 拼的是每条的 `full` 而不是面板上的 `text`：面板那行都裁过，逐条复制等于把
+   * 「看不到全文」换个地方再来一遍。整段按行拼，贴到聊天/工单里直接可读。
+   */
+  private copyAllLogs(): void {
+    if (this.logs.length === 0) {
+      this.toast('还没有日志可复制');
+      return;
+    }
+    const lines: string[] = [];
+    for (const line of this.logs) {
+      lines.push(line.full);
+    }
+    this.copyText(lines.join('\n'), `已复制 ${this.logs.length} 条日志（含全文）`);
+  }
+
+  /**
+   * 写系统剪贴板
+   *
+   * 用 BasicServicesKit 的 pasteboard（与「关于」页复制群号、听歌识曲复制结果是同一套做法，
+   * 项目里没有更上层的封装）。失败不静默：详情页文本本身可长按选中，提示用户手动复制，
+   * 别让人以为已经复制成功了。
+   */
+  private copyText(text: string, tip: string): void {
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      pasteboard.getSystemPasteboard().setData(data).then(() => {
+        this.toast(tip);
+      }).catch((err: BusinessError) => {
+        hilog.warn(DOMAIN, TAG, 'copy logs failed: %{public}s', err.message);
+        this.toast('写入剪贴板失败，可长按日志手动复制');
+      });
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'copy logs threw: %{public}s', (e as BusinessError).message);
+      this.toast('写入剪贴板失败，可长按日志手动复制');
+    }
+  }
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message });
   }
 
   @Builder
@@ -202,6 +325,54 @@ export struct SourceSettingsView {
       .width('100%')
       .textAlign(TextAlign.Start)
       .padding({ left: 4, bottom: 8 })
+  }
+
+  /**
+   * 日志卡片的小标题行：标题 + 「复制全部」
+   *
+   * 不复用 sectionCard：那一枚是「标题独占一行」，而日志需要在自己的标题行右边挂一个入口。
+   * 字号/字重/颜色/左内边距与 sectionCard 逐项一致，宽屏并排时不会和其它卡片错位。
+   */
+  @Builder
+  logHeader() {
+    Row() {
+      Text('引擎日志')
+        .fontSize(F_SECTION)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(C_TEXT)
+      Blank()
+      // 没有日志时不显示：空态保持原样，不给一个点了也没反应的入口
+      if (this.logs.length > 0) {
+        Text('复制全部')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .padding({ left: 10, right: 4, top: 2, bottom: 2 })
+          .onClick(() => {
+            this.copyAllLogs();
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: 4, right: 4, bottom: 8 })
+  }
+
+  /**
+   * 日志详情半模态的内容
+   *
+   * 只把当前这一条传下去：详情组件不持有日志列表，宿主点哪条它就显示哪条。
+   * 半模态的标题栏/关闭钮/拖动条由系统的 bindSheet 提供（见 build 末尾）。
+   */
+  @Builder
+  logDetailSheet() {
+    LogDetailView({
+      content: this.detailText,
+      type: this.detailType,
+      time: this.detailTime,
+      bottomInset: this.bottomInset,
+      onCopy: (text: string) => {
+        this.copyText(text, '已复制这条日志的全文');
+      },
+    })
   }
 
   build() {
@@ -398,21 +569,34 @@ export struct SourceSettingsView {
 
           // ------------------------------------------------ 日志
           Column({ space: 10 }) {
-            this.sectionCard('引擎日志')
+            this.logHeader()
             Column({ space: 3 }) {
               if (this.logs.length === 0) {
                 Text('暂无日志')
                   .fontSize(11.5)
                   .fontColor(C_TEXT_WEAK)
               }
-              ForEach(this.logs, (line: string, i: number) => {
-                Text(line)
+              ForEach(this.logs, (line: LogLine, i: number) => {
+                // 面板这一行照旧是裁剪版（观感不变）；点一下才进详情看完整原文
+                Text(line.text)
                   .fontSize(11)
                   .fontColor(C_TEXT_SUB)
                   .width('100%')
                   .textAlign(TextAlign.Start)
                   .copyOption(CopyOptions.LocalDevice)
-              }, (line: string, i: number) => `${i}_${line}`)
+                  .onClick(() => {
+                    this.openLogDetail(line);
+                  })
+              }, (line: LogLine, i: number) => `${i}_${line.text}`)
+              // 入口要能被发现：不写这一句，用户只会以为日志还是原来那样只能看一半
+              if (this.logs.length > 0) {
+                Text('点任一条查看完整内容，长按可选中复制')
+                  .fontSize(F_TAB)
+                  .fontColor(C_TEXT_WEAK)
+                  .width('100%')
+                  .textAlign(TextAlign.Start)
+                  .margin({ top: 6 })
+              }
             }
             .width('100%')
             .padding(14)
@@ -431,6 +615,21 @@ export struct SourceSettingsView {
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)
+    /**
+     * 日志详情：系统的半模态（与本项目其它面板一致，见 views/AddToPlaylistSheet.ets）。
+     *
+     * 挂在页面根节点上而不是日志卡片上：卡片在 Scroll 里，跟着内容滚走，
+     * 半模态会跟着一起被裁。detents 给两档、默认拉到 LARGE —— 全文常常比一半屏幕高，
+     * 先展开省得用户自己再拖一次；仍然保留 MEDIUM，方便回到半屏对照上面的面板。
+     */
+    .bindSheet($$this.detailOpen, this.logDetailSheet(), {
+      preferType: SheetType.BOTTOM,
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+      detentSelection: SheetSize.LARGE,
+      dragBar: true,
+      showClose: true,
+      title: { title: '日志详情' },
+    })
   }
 
   @Builder

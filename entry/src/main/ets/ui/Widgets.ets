@@ -88,6 +88,8 @@ function initialsOf(name: string): string {
 struct HeartCover {
   @Prop boxSize: number = 48;
   @Prop radius: number = R_COVER;
+  /** 铺满父容器（CoverArt 的 fill 场景：整卡封面不能只画一个 boxSize 的方块） */
+  @Prop fill: boolean = false;
 
   build() {
     Stack({ alignContent: Alignment.Center }) {
@@ -111,8 +113,8 @@ struct HeartCover {
       })
         .offset({ x: 0, y: this.boxSize * 0.05 })
     }
-    .width(this.boxSize)
-    .height(this.boxSize)
+    .width(this.fill ? '100%' : this.boxSize)
+    .height(this.fill ? '100%' : this.boxSize)
     .borderRadius(this.radius)
     .clip(true)
     .backgroundColor('#0A0A0B')
@@ -196,7 +198,7 @@ export struct CoverArt {
           .objectFit(ImageFit.Cover)
           .draggable(false)
       } else if (this.art) {
-        HeartCover({ boxSize: this.boxSize, radius: this.radius })
+        HeartCover({ boxSize: this.boxSize, radius: this.radius, fill: this.fill })
       } else {
         Column()
           .width('100%')
@@ -583,9 +585,9 @@ export struct SingerLink {
 /**
  * 页面大标题
  *
- * `onDark`：回响页是**固定深色**的沉浸式月报（见 views/EchoView.ets，配色不跟
- * 系统深浅模式走，像播放页封面上的白字），压在它上面的页头标题必须是白字，
- * 否则深色底上是一行看不见的深色字。其它页签照旧用主题的文字色。
+ * `onDark`：给**固定深色**页用（例如播放页那种深底沉浸版式）—— 深色底上必须压白字，
+ * 否则是一行看不见的深色字。回响页 2.0 起改成跟随系统深浅色的 `echo_*` 资源，
+ * 不再用这个开关（见 views/EchoView.ets）。
  */
 @Component
 export struct PageTitle {

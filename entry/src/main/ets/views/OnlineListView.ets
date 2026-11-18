@@ -1,8 +1,11 @@
+import { common } from '@kit.AbilityKit';
 import { LengthMetrics } from '@kit.ArkUI';
 import { K_CURRENT_ID, PlaySession, PlaylistSummary, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { LxListDetail, LxListInfo, getBoardSongs, getPlaylistDetail, platformName } from '../core/music/MusicList';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
+// 加歌的返回值是 { added, skipped }：重复的会被跳过，提示要按真实结果说话
+import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { CollectedPlaylists, K_COLLECTED_VERSION } from '../core/sync/CollectedPlaylists';
 import { C_BG, C_DIVIDER, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_DOWNLOAD, I_HEART, I_HEART_FILLED,
@@ -10,9 +13,10 @@ import { I_CHECK_CIRCLE, I_CIRCLE, I_DOWNLOAD, I_HEART, I_HEART_FILLED,
 import { CoverArt, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
-  SelectionActions, SelectSession, toggleSelected } from '../ui/Selection';
+  SelectionActions, K_SELECT_END_SEQ, SelectSession, toggleSelected } from '../ui/Selection';
 import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL, K_NAV_FOLLOW_HAND } from '../core/settings/AppearanceSettings';
+import { UiHintStore } from '../core/settings/UiHintStore';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { K_BAR_MINI_WIDTH, barSideMarginFor, contentColumnsFor } from '../ui/Layout';
 import { MiniBarView } from './MiniBar';
@@ -21,6 +25,31 @@ import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/D
 
 /** 一次最多往队列里放多少首（在线榜单动辄几百首，全塞进队列既慢也没意义） */
 const MAX_SONGS: number = 500;
+
+/**
+ * 「长按可多选」的提示文案
+ *
+ * 多选在界面上是**零入口**的：没有任何按钮写着它，顶栏那套「取消 + 已选中 N 项 + 全选」
+ * 要先进了多选才出现。用户群里问「热歌榜能一键导入歌单吗」问的就是这件事 ——
+ * 功能早就有了，但是没人发现，所以在首次进入时用一句话点一次。
+ */
+const MULTI_HINT_TEXT: string = '长按任意歌曲可多选，全选后能批量收藏或加进歌单';
+
+/**
+ * 提示延迟（毫秒）：等页面转场结束、首屏数据落地
+ *
+ * 立刻弹有两个问题：进页面这一下正做转场动画，toast 容易被盖住；而且那一刻列表还是空的，
+ * 「长按任意歌曲」没有对象。1.2 秒大致是转场走完、第一页榜单回来的时间。
+ */
+const MULTI_HINT_DELAY_MS: number = 1200;
+
+/**
+ * 提示的停留时长（毫秒）
+ *
+ * 比 toast 默认的 1.5 秒长：默认值是按「已添加」这种三五个字定的，这句话二十多字，
+ * 1.5 秒根本读不完，看不清就等于没提示。
+ */
+const MULTI_HINT_DURATION_MS: number = 4000;
 
 /**
  * 多选能做的事（与 `onBatchAction` 的下标同序）
@@ -128,14 +157,35 @@ export struct OnlineListView {
    */
   @State selecting: boolean = false;
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  /**
+   * 多选被全局收尾的序号（见 ui/Selection.ets 的 K_SELECT_END_SEQ）
+   *
+   * 不依赖 onCancel 回调：壳层点叉 / 会话被别处 end 时，序号 +1，这里无条件把自己
+   * 的多选状态清掉。真机上「顶栏退了、行尾还是勾选圈」就是回调链断掉的现场。
+   */
+  @StorageLink(K_SELECT_END_SEQ) @Watch('onSelectEnded') selectEndSeq: number = 0;
   /** 懒加载数据源：在线榜单可能上千首，一次性建完所有行会卡 */
   private listSource: SongListSource = new SongListSource();
   /** 收藏歌单在别处被改了（「我的」页里取消收藏）时把顶部那颗钮的状态同步过来 */
   @StorageLink(K_COLLECTED_VERSION) @Watch('onCollectedChanged') collectedVersion: number = 0;
+  /** 「长按可多选」是一次性提示，看过的记录落在 core/settings/UiHintStore（本页第一次进来时 init） */
+  private hintStore: UiHintStore = UiHintStore.getInstance();
+  /** 延迟弹提示的定时器（-1 = 没有排）：页面在 1.2 秒内被弹掉时要取消，不然 toast 会冒到下面那一页 */
+  private hintTimer: number = -1;
 
   aboutToAppear(): void {
+    // 这一页刚出现，不可能已经在多选，所以本页与全局会话两边一起归零：
+    //   - 新实例本来是默认值，这两行只是把「复用实例再次出现」这种情形也拉回一致 ——
+    //     否则可能出现 selecting=true（页内画着勾选圈）而顶栏已是普通标题的反向错位；
+    //   - 全局会话是单例，上一份页面实例留下的「已选中 N 项」与指向旧实例的取消回调
+    //     会跟着进这一页（目的地内容被重建 / 页面被回收后再进来时就是这样）。
+    // 先归零再拉数据（end() 幂等：没在多选时只是把结束态再写一遍，顺带让壳层标题栏重算）。
+    this.selecting = false;
+    this.selectedIds = [];
+    SelectSession.getInstance().end();
     this.loadCollected();
     void this.load(1, false);
+    this.scheduleMultiHint();
   }
 
   private onCollectedChanged(): void {
@@ -303,14 +353,39 @@ export struct OnlineListView {
     if (songs.length === 0) {
       return;
     }
-    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, songs);
+    const result: AddMusicResult = SyncManager.getInstance().getLibrary()
+      .addMusicToPlaylist(playlist.id, songs);
     this.closePicker();
     this.exitSelecting();
-    if (songs.length === 1) {
-      this.toast(added > 0 ? `已添加到「${playlist.name}」` : `「${playlist.name}」里已经有这首歌了`);
+    this.reportAdded(playlist.name, result, songs.length);
+  }
+
+  /**
+   * 加歌之后那句提示，按**真实结果**说话
+   *
+   * 库里会把「已经在歌单里的」那些跳过并返回 { added, skipped }，
+   * 所以不能只看 `added > 0`：部分重复时不说清楚，用户会以为全进去了。
+   *   - 全进去：原口径「已把 N 首加入」
+   *   - 进去一部分：「已加入 N 首，M 首已在歌单里」
+   *   - 全被跳过：「这 N 首都已经在「X」里了」（原文案不提数量，容易被当成失败）
+   *   - 单选：一句「里已经有这首歌了」最自然，不必报数
+   */
+  private reportAdded(playlistName: string, result: AddMusicResult, total: number): void {
+    if (total === 1) {
+      this.toast(result.added > 0
+        ? `已添加到「${playlistName}」`
+        : `「${playlistName}」里已经有这首歌了`);
       return;
     }
-    this.toast(added > 0 ? `已把 ${added} 首加入「${playlist.name}」` : `「${playlist.name}」里已经有这些歌了`);
+    if (result.added <= 0) {
+      this.toast(`这 ${total} 首都已经在「${playlistName}」里了`);
+      return;
+    }
+    if (result.skipped > 0) {
+      this.toast(`已加入 ${result.added} 首，${result.skipped} 首已在歌单里`);
+      return;
+    }
+    this.toast(`已把 ${result.added} 首加入「${playlistName}」`);
   }
 
   private createPlaylistAndAdd(name: string): void {
@@ -320,10 +395,17 @@ export struct OnlineListView {
     }
     const library = SyncManager.getInstance().getLibrary();
     const id: string = library.createPlaylist(name);
-    library.addMusicToPlaylist(id, songs);
+    // 新歌单里不可能有重复，但仍读返回值取数：万一有歌曲信息不全被挡下，报的数才对得上
+    const result: AddMusicResult = library.addMusicToPlaylist(id, songs);
     this.closePicker();
     this.exitSelecting();
-    this.toast(songs.length === 1 ? `已新建歌单「${name}」并添加` : `已新建歌单「${name}」并加入 ${songs.length} 首`);
+    if (result.added <= 0) {
+      this.toast(`已新建歌单「${name}」，但这些歌没能加进去`);
+      return;
+    }
+    this.toast(result.added === 1
+      ? `已新建歌单「${name}」并添加`
+      : `已新建歌单「${name}」并加入 ${result.added} 首`);
   }
 
   private closePicker(): void {
@@ -434,6 +516,49 @@ export struct OnlineListView {
 
   // ------------------------------------------------------------ 多选
 
+  /**
+   * 排一次「长按可多选」的提示（全应用只弹一次）
+   *
+   * 用 toast 而不是自绘浮层：这条提示**不需要任何交互**（没有按钮、没有跳转），
+   * toast 由系统画在最上层、不参与本页布局、也不吃触摸，用完自己消失；
+   * 自绘浮层要自己算位置、自己保证不拦截滑动，还得防它把列表高度挤一下 —— 为一句提示不值当。
+   *
+   * 看过的记录先读出来再决定排不排：已经看过就连定时器都不建，不占生命周期。
+   */
+  private scheduleMultiHint(): void {
+    // 页面自己 init 一次（其它设置项在 EntryAbility.onCreate 里 init；这一条只有本页用得上，
+    // 没必要给冷启动加一次同步读文件，见 UiHintStore 的说明）
+    this.hintStore.init(this.getUIContext().getHostContext() as common.Context);
+    if (this.hintStore.hasSeenOnlineMultiHint()) {
+      return;
+    }
+    this.hintTimer = setTimeout(() => {
+      this.hintTimer = -1;
+      this.showMultiHintOnce();
+    }, MULTI_HINT_DELAY_MS);
+  }
+
+  /** 真正弹那一下：延迟到点后才判断「现在该不该弹」，因为 1.2 秒里页面可能已经变了 */
+  private showMultiHintOnce(): void {
+    if (this.hintStore.hasSeenOnlineMultiHint()) {
+      return;
+    }
+    if (this.songs.length === 0) {
+      // 没拉到歌（还在加载 / 报错 / 空榜单）：这时说「长按任意歌曲」是句空话。
+      // **不落盘**，下次进页面再试 —— 网络失败过一次不该把这条提示永久用掉
+      return;
+    }
+    // 不走 this.toast()：那个封装用 toast 的默认 1.5 秒，这句话读不完（见 MULTI_HINT_DURATION_MS）
+    this.getUIContext().getPromptAction().showToast({
+      message: MULTI_HINT_TEXT,
+      duration: MULTI_HINT_DURATION_MS,
+    });
+    // 弹完**立刻**落盘，不挂在 toast 的消失回调/关闭按钮上：这条提示没有交互，
+    // 想等「用户确实看到了」永远等不到；而一旦等用户操作，用户在提示显示期间杀掉应用，
+    // 下次进来还会弹 —— 那就不是「只打扰一次」了。代价最多是刚弹就被杀时少看一次。
+    this.hintStore.markOnlineMultiHintSeen();
+  }
+
   private isSelected(id: string): boolean {
     return this.selectedIds.indexOf(id) >= 0;
   }
@@ -444,6 +569,14 @@ export struct OnlineListView {
     this.selectedIds = [item.id];
     // @Watch 只在**值真的变了**时才回调，进多选这一下不能只靠它（同一条二次长按就不变）
     this.publishSelectBar();
+  }
+
+  /** 全局多选已收尾：无条件复位本地状态（回调可能根本没被调到） */
+  private onSelectEnded(): void {
+    if (this.selecting) {
+      this.selecting = false;
+      this.selectedIds = [];
+    }
   }
 
   private exitSelecting(): void {
@@ -480,6 +613,12 @@ export struct OnlineListView {
   /** 页面被弹掉时把工具条一起收走（不然它会留在下一层页面上） */
   aboutToDisappear(): void {
     SelectSession.getInstance().end();
+    // 还没到点的提示一并取消：定时器不认页面，留着它 1.2 秒后会把 toast 弹到下面那一页上
+    // （用户可能已经退回去了 —— 提示挂在错误的页面上比不弹更糟）
+    if (this.hintTimer >= 0) {
+      clearTimeout(this.hintTimer);
+      this.hintTimer = -1;
+    }
   }
 
   private toggleSelect(item: SongItem): void {
@@ -765,6 +904,26 @@ export struct OnlineListView {
     .padding({ left: 32, right: 32, top: 50, bottom: 20 })
   }
 
+  /**
+   * 行上的读屏文案：歌名 + 歌手 + 这一行的主操作
+   *
+   * 「长按可多选」必须说出来：这一页进多选**只有长按**一条路，界面上没有任何按钮写着它，
+   * 读屏用户既找不到入口、也想不到要去长按。多选态下换成勾选状态 —— 那时用户要的是
+   * 「这首选了没」，再读一遍「长按可多选」只是噪音。
+   */
+  private rowAccessibilityText(item: SongItem): string {
+    const parts: string[] = [item.name];
+    if (item.singer.length > 0) {
+      parts.push(item.singer);
+    }
+    if (this.selecting) {
+      parts.push(this.isSelected(item.id) ? '已选中' : '未选中');
+    } else {
+      parts.push('长按可多选');
+    }
+    return parts.join('，');
+  }
+
   @Builder
   songRow(item: SongItem, index: number) {
     Row({ space: 12 }) {
@@ -833,6 +992,10 @@ export struct OnlineListView {
         this.enterSelecting(item);
       }
     }))
+    // 读屏用户摸不到长按（屏幕上也没有任何按钮写着「长按可多选」），
+    // 所以把这句提示挂在行本身上 —— 行就是长按的落点。爱心 / 更多仍是各自可聚焦的子控件。
+    .accessibilityText(this.rowAccessibilityText(item))
+    .accessibilityLevel('yes')
   }
 
   /**

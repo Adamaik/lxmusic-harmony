@@ -1,18 +1,37 @@
+/*
+ * 回响（月度收听报告）
+ *
+ * 版式与几何移植自派音 2.0.0 的回响页（features/recommendation/view/EchoReviewPage.ets，
+ * 2095 行，2026-11-15 版），但**数据口径按聆听自己的 ListenLog**（30 秒门槛、真实 playedMs）。
+ * 颜色是**固定深色**（`ui/EchoMonthlyKit.ets` 顶部的 ECHO_* 调色板 + 纯黑页底），
+ * 不跟系统浅色模式 —— 沉浸式月报，用户 2026-11-15 明确要求；标题仍由壳层 PageTitle 承载（白字）。
+ * 背景氛围层按旧版聆听回响的口径：当前段落/领奖台中心卡封面 → 模糊 70 + 0.62 不透明度，
+ * 两层交叉淡入 420ms；滚到底 / 进入听众段渐隐回纯黑。
+ *
+ * 与派音的有意差异（详见 _echo_port/PORT_CONTRACT.md §10）：
+ *   · 完播率用聆听真实的「播完 / 切走」判定（≥85% 算完整），不是派音「播≥2 次占比」；
+ *   · 裁掉派音的「新收藏」段：聆听的收藏项（PlaySession.favorites）没有时间戳，无法按月统计；
+ *   · 不移植 HDS 标题栏：标题写 AppStorage 由壳层画，滚动切段名的逻辑保留；
+ *   · 聆听没有专辑详情页：点专辑 = 播这张专辑里这个月最常听的那首。
+ *
+ * 数据只有 ListenLog 一个来源（一次播放一条流水），聚合全部在 core/history/EchoMonthly.ets，
+ * 本页只做「整体赋值 + 布局 + 交互」。
+ */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BottomBar } from '../ui/BottomBar';
 import { ArtistNav } from '../ui/ArtistNav';
-import { CONTENT_MAX_WIDTH } from '../ui/Layout';
-import { C_RED, F_SECTION, F_SUB } from '../ui/Theme';
-import { COUNTED_MS, EchoAlbum, EchoArtist, EchoCompletion, EchoSong, EchoStats, K_ECHO_VERSION,
-  ListenLog } from '../core/history/ListenLog';
-import { ArtistCandidate } from '../core/music/MusicArtist';
+import { isWideWindow, K_WINDOW_WIDTH } from '../ui/Layout';
+import { ArtistCandidate, cachedArtistOf, LxArtist, resolveArtistByName } from '../core/music/MusicArtist';
 import { isSearchSupported, LxMusicInfo, LxSearchOutcome, SEARCH_PLATFORMS, searchMusic,
   searchMusicAll } from '../core/music/MusicSearch';
-import { PlaySession, songFromSearch } from '../core/player/PlaySession';
-import { E_CARD, E_TEXT, E_TEXT_SUB, E_TEXT_WEAK, EchoAlbumCard,
-  EchoAlbumStrip, EchoArtistHero, EchoCalendar, EchoCompletionCard, EchoHourChart, EchoPickerPill,
-  EchoPodiumSong, EchoRankList, EchoRankRow, EchoSongPodium, EchoSectionTitle, EchoStatsRow,
-  EchoSubTitle, echoDurationText, echoShareText } from '../ui/EchoReport';
+import { PlaySession, SongItem, songFromSearch } from '../core/player/PlaySession';
+import { K_ECHO_VERSION, ListenLog, MonthKey } from '../core/history/ListenLog';
+import { buildMonthlyStats, buildMonthOptions, echoMinutes, monthRangeOf, MonthlyAlbum,
+  MonthlyArtist, MonthlySong, MonthlyStats, MonthOption, MonthRange } from '../core/history/EchoMonthly';
+import { ECHO_PAGE_BACKGROUND, ECHO_TOP_FADE, ECHO_TOP_FADE_END, EchoAudience, EchoCompletionCard,
+  EchoDiscoveryCard, EchoEmptyHint, EchoMonthHeader,
+  EchoMonthPicker, EchoOverviewCard, EchoSectionTitle, EchoSongHighlight, EchoTopAlbums,
+  EchoTopArtists, EchoTopSongs } from '../ui/EchoMonthlyKit';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'EchoView';
@@ -21,8 +40,7 @@ const TAG: string = 'EchoView';
  * 页头大标题（壳层订阅的那个键）
  *
  * 「10 月 · 回响」这行字画在**壳层的标题栏**里，与「推荐」「我的」同一个位置、同一档字号
- * （见 pages/Index.ets 的 homeHeader）—— 所以这一页把标题**发布**给壳层，自己不再画一遍：
- * 两处都画，屏幕上就是「回响」与「10 月 · 回响」上下叠着两个字（上一版就是这样）。
+ * （见 pages/Index.ets 的 homeHeader）—— 所以这一页把标题**发布**给壳层，自己不再画一遍。
  */
 export const K_ECHO_TITLE: string = 'ps_echo_title';
 
@@ -31,156 +49,128 @@ export function echoTitleOf(month: number): string {
   return month > 0 ? `${month} 月 · 回响` : '回响';
 }
 
-/**
- * 总时长那一行的字号
- *
- * 这一版把它当成整页的「主数字」：网易云年度报告那种版式，一进来先砸一个 34 号的大数
- * （截图里就是「4 分钟」），下面才是三格小统计。字号写在页面里而不是组件库里 ——
- * 它是**这一页的版面**（页首主数字），不是某个可复用组件的内部样式。
- */
-const DURATION_SIZE: number = 34;
-/** 领奖台摆前 3 名（截图里就是三张立体封面），第 4 名往后进榜单 */
-const PODIUM_SIZE: number = 3;
-/** 专辑横排最多摆 6 张：再多就横着翻不完了，6 张正好铺满一屏并露出「还有更多」的暗示 */
-const ALBUM_STRIP_SIZE: number = 6;
+/** 段落下标 → 页头标题里「N 月 · ×××」那半句（相邻多段共用，所以全程只变 3 次） */
+const SECTION_NAMES: string[] = ['回响', '你听了什么', '你听了什么', '你听了什么',
+  '你是怎样的听众', '你是怎样的听众', '有趣的发现'];
 /** 点一行去播放时，按「歌名 + 歌手」搜几条候选、取第一条（与识别页同一套） */
 const PLAY_SEARCH_LIMIT: number = 10;
-/** 歌曲榜 / 歌手榜最多展示的条数：超出的不显示 */
-const ECHO_LIST_LIMIT: number = 50;
-/**
- * 页面底色 / 中下部（「你是怎样的听众」往后）的纯黑
- *
- * 这一版的配色口径：背景是**固定的主题色氛围层**（当前段落 / 轮播中心卡的封面模糊而成），
- * 换段落时两层交叉淡入；「你是怎样的听众」那一段目标色为空，整屏渐隐成纯黑。
- */
-const ECHO_BLACK: string = '#000000';
-/**
- * 背景主题色的交叉淡入时长（毫秒）
- *
- * 太长会显得「颜色在慢吞吞地挪」，太短又像直接闪一下；400ms 左右正好是一眼能看出
- * 「颜色化过去」但不拖沓的量。
- */
+/** 背景氛围层：两层模糊封面交叉淡入的时长（照旧版回响，400ms 左右是「颜色化过去」的量） */
 const THEME_FADE_MS: number = 420;
-/**
- * 封面模糊半径
- *
- * 要大到只剩色块（像播放页背景那样），否则背景里能看出封面的轮廓，文字压上去很脏。
- */
+/** 背景封面模糊半径：要大到只剩色块，否则背景里能看出封面轮廓，文字压上去很脏 */
 const BACKDROP_BLUR: number = 70;
+/** 背景封面的最终不透明度（叠在页面底色上，再压一层日间遮罩） */
+const BACKDROP_OPACITY: number = 0.62;
 
-/**
- * 回响（月度收听报告，深色沉浸版）
- *
- * 版式照网易云年度报告那种「固定深色沉浸式」重做：整页近黑渐变、亮粉强调，
- * 一进来先是总时长大字 + 三格统计（次播放 / 首歌 / 位歌手）+ 年 / 月选择，
- * 然后是三段故事线：
- *   1. 「你听了什么」——Top3 立体封面领奖台 + 第 4 名往后的榜单；
- *   2. 「最常听的歌手」——第 1 名大图卡 + 2 名往后的榜单，后面接「最常听的专辑」横排；
- *   3. 「你是怎样的听众」——听歌时段柱图、听歌日历、完播率圆环。
- *
- * 页面自己是**深色**的（浅色 token 一个都不用），但壳层标题栏是浅色主题的 —— 标题只
- * 发布不改色（见 K_ECHO_TITLE），大标题的颜色与状态栏图标由壳层统一处理。
- *
- * 数据全来自 {@link ListenLog}（一次播放一条流水）与它的聚合，页面自己不算数；
- * 流水一变（切歌、退到后台落盘、播放中每 60 秒一次的落盘、清空）就由 @StorageLink 把
- * 这一页刷一遍。与上一版比，数据层升级成了「回响与播放历史共用一套流水」，所以这里
- * 多了专辑 / 时段 / 日历 / 完播率四块聚合，页面只负责摆。
- *
- * 只算「听满 30 秒」的那几次播放（门槛在 ListenLog，不在这一页）：点开一下就切走的不算听过。
- */
 @Component
 export struct EchoView {
   /** 内容起始偏移：让出透明标题栏那一段（状态栏 + 标题栏，由壳层算好） */
   @Prop topInset: number = 0;
   /** 内容底部要留出的空间：悬浮页签栏 + 迷你条（由壳层算好） */
   @Prop bottomInset: number = 0;
+  /** 当前窗口宽度：判宽屏双列（宽度变了标题档位要跟着归位，见 onWindowWidthChanged） */
+  @StorageLink(K_WINDOW_WIDTH) @Watch('onWindowWidthChanged') windowWidth: number = 0;
   /** 流水版本号：变了就重算这一页 */
   @StorageLink(K_ECHO_VERSION) @Watch('onLogChanged') logVersion: number = 0;
-  /** 选中的年月：进来默认当月 */
-  @State year: number = 0;
-  @State month: number = 0;
-  @State stats: EchoStats = new EchoStats();
-  /** 这个月听过的歌（ListenLog 已按「次数降序、次数同则总时长降序」排好） */
-  @State songs: EchoSong[] = [];
-  /** 这个月听过的歌手（已按播放次数降序） */
-  @State artists: EchoArtist[] = [];
-  /** 这个月听过的专辑（已按播放次数降序） */
-  @State albums: EchoAlbum[] = [];
-  /** 24 个小时各听了几次（柱图） */
-  @State hours: number[] = [];
-  /** 当月每天听了几次，下标 0 = 1 号（日历） */
-  @State days: number[] = [];
+  /** 月份偏移：0 = 本月，-1 = 上月 …（最多回溯 12 个自然月）。不要叫 offset：与 CustomComponent 基类属性冲突 */
+  @State monthOffset: number = 0;
+  /** 整页统计（一次性构建、整体替换） */
+  @State stats: MonthlyStats = new MonthlyStats();
+  /** 年下拉的档位文案 / 当前档 / 每档对应的「代表月份偏移」 */
+  @State yearLabels: string[] = [];
+  @State yearIndex: number = 0;
+  @State yearOffsets: number[] = [];
+  /** 月下拉的档位文案 / 当前档 / 每档对应的月份偏移 */
+  @State monthLabels: string[] = [];
+  @State monthIndex: number = 0;
+  @State monthOffsets: number[] = [];
+  /** 标题里的「当前状态」名（回响 / 你听了什么 / 你是怎样的听众 / 有趣的发现） */
+  @State sectionTitle: string = '回响';
+  /** 正在按名字去搜的那一首（防连点） */
+  @State playingKey: string = '';
   /**
-   * 下面四组是**派生数据**：组件库要的数据形状 / 整句文案，都在 refresh 里一次算好
+   * 背景氛围层（旧版回响的「跟着内容走」的那层，用户要求拉回来）
    *
-   * 为什么不放在 build 里现算：@Builder 里不能声明局部变量，一段段三元与 for 循环塞进
-   * UI 描述里既没法读也没法测；而且派生数组换了新对象才会触发子组件重刷（原地改不算），
-   * 统一在 refresh 里「重建 + 整体赋值」正好对上这个刷新口径。
-   */
-  @State podium: EchoPodiumSong[] = [];
-  @State songRows: EchoRankRow[] = [];
-  @State artistRows: EchoRankRow[] = [];
-  @State albumCards: EchoAlbumCard[] = [];
-  /** 完播率卡片：数字与四行文案 */
-  @State completionRate: number = 0;
-  @State completionPercent: string = '—';
-  @State completionMain: string = '';
-  @State completionComplete: string = '';
-  @State completionSkip: string = '';
-  @State completionFoot: string = '';
-  /** 听歌日历下面那两行说明 */
-  @State calendarHint: string = '';
-  @State calendarBest: string = '';
-  /**
-   * 背景主题色氛围（**两层交叉淡入**）
-   *
-   * 月报的背景跟着内容走：最上面的歌曲榜用「轮播当前中间那张封面」，滚到歌手段换成
-   * 冠军歌手的封面、专辑段换成专辑封面，最后「你是怎样的听众」是纯黑（两层都收掉）。
-   * 所以背景是**固定**在页面上的（不随内容滚），换段落 / 轮播切封面时用两层模糊图
-   * 交叉淡入淡出 —— 直接换 URL 会闪一下，两层各自调 opacity 才像「颜色化过去」。
+   * 当前段落 / 领奖台中心卡是哪张封面，背景就用那张图的**高斯大模糊 + 低透明度**；
+   * 换段落时两层交叉淡入（直接换 URL 会闪一下）。段落进入「听众 / 完播率 / 新发现」时
+   * 目标为空串 ⇒ 两层都淡到 0，回到纯页面底色。宽屏两列同屏，段落判定没有意义，
+   * 只跟领奖台中心那张走。
    */
   @State bgUrlA: string = '';
   @State bgUrlB: string = '';
   @State bgOpA: number = 0;
   @State bgOpB: number = 0;
-  /**
-   * 当前段落：songs（歌曲榜）/ artist（歌手）/ album（专辑）/ analysis（听众分析）
-   *
-   * 由**滚动位置**驱动（见 syncSectionByScroll）：取「视口 45% 高度处」落在哪一段，
-   * 背景就换成那一段的主题封面。不要用 onVisibleAreaChange 的「露出过半」——
-   * 歌曲榜能有 50 行、高度远超一屏，比例永远到不了 0.5，整页背景就切不过去。
-   */
-  @State sectionKey: string = 'songs';
-  /** 轮播当前中心那张的下标（0 = 第 1 名）：切封面时背景要跟着换 */
+  /** 当前滚动到第几段（0 页头 / 1 歌曲 / 2 歌手 / 3 专辑 / 4 听众 / 5 完播率 / 6 新发现） */
+  @State sectionIdx: number = 0;
+  /** 领奖台当前中心卡下标（背景跟着中心那张封面走） */
   @State podiumActive: number = 0;
-  /** 滚动容器（要拿 currentOffset 判断段落） */
-  private scroller: Scroller = new Scroller();
-  /** Scroll 视口高度（vp）：判定锚点 = 视口 45% */
-  private scrollViewportH: number = 0;
-  /** reportSections 根节点在滚动内容里的起始 y（vp），由它自己的 onAreaChange 写入 */
-  private sectionBase: number = 0;
-  /** 每段相对 reportSections 根节点的起始 y（vp） */
-  private sectionOffsets: Map<string, number> = new Map<string, number>();
-  /** 段落从上到下的顺序（判定时取「最后一个起点在锚点之上的段」） */
-  private sectionOrder: string[] = ['songs', 'artist', 'album', 'analysis'];
-  /** 下一次主题封面写哪一层（两层轮换；只在方法里用，不参与界面刷新） */
+  /** 「最常听的歌手」本人写真（背景用）；空串 = 还没解析到，退回他的歌封面 */
+  @State artistPicUrl: string = '';
+  /** 上面这张写真对应的歌手键（来源+名字），换歌手才重新解析 */
+  private artistPicKey: string = '';
+  /** 下一次主题图写哪一层（两层轮换） */
   private nextIsB: boolean = true;
   /** 上一次应用的主题地址（同一个值不重复做动画） */
   private themeApplied: string = '';
-  /** 第一次应用主题直接给结果、不做动画（页面刚进来时不要闪一下黑） */
+  /** 第一次应用主题直接给结果、不做动画（页面刚进来时不要闪一下） */
   private themeInited: boolean = false;
-  /** 年选择器的档：有记录的年份 + 今年（新的在前） */
-  @State years: number[] = [];
-  /** 月选择器的档：选中年份里能选的月份（新的在前，今年只到当月） */
-  @State monthOptions: number[] = [];
-  /** 正在按名字去搜的那一首（防连点） */
-  @State playingKey: string = '';
+  private scroller: Scroller = new Scroller();
+  /** 首次进入是否已经做过「自动落到最近有数据的月份」（只做一次，不抢用户手动选择） */
+  private initialMonthPicked: boolean = false;
+  /**
+   * 各段起点（相对窄屏那一列 Column 的 y，vp）与滚动视口高度
+   *
+   * 段落判定**必须按滚动偏移算**，不能用 `onVisibleAreaChange` 的比例：那个回调只在
+   * 可见比例跨过给定阈值时触发，而长区块（比如榜单卡）永远到不了 1.0，背景就永远停在
+   * 第一段 —— 旧版回响踩过同一个坑，注释里写着「不要用露出过半」。这里照旧版：
+   * 视口 45% 处落在哪一段，背景/标题就用哪一段。
+   */
+  private sectionTops: number[] = [-1, -1, -1, -1, -1, -1, -1];
+  /** Scroll 视口高度（vp）：锚点 = 视口 45% */
+  private scrollViewportH: number = 0;
+  /** 内容总高（vp）：滚到底判定用 */
+  private contentHeight: number = 0;
 
   aboutToAppear(): void {
-    const now = new Date();
-    this.year = now.getFullYear();
-    this.month = now.getMonth() + 1;
+    this.pickInitialMonth();
     this.refresh();
+  }
+
+  /**
+   * 首屏月份：本月没有「听满 30 秒」的记录时，自动落到最近一个有数据的月份
+   *
+   * 回响的统计门槛是 `playedMs ≥ 30 秒`（ListenLog），而且流水里还混着旧版本迁移进来的
+   * 历史（`playedMs=0`、`startedAt=0`，只进「最近播放」，不进回响）—— 所以「播放历史里
+   * 有上百首、本月回响却是空的」是常态，不是数据丢了。旧版与派音都默认停在「本月」，
+   * 用户第一眼就是空页，会以为坏了。这里只在**首次进入**自动跳一次；用户自己手动选到
+   * 空月份时不再抢方向盘。
+   */
+  private pickInitialMonth(): void {
+    if (this.initialMonthPicked) {
+      return;
+    }
+    this.initialMonthPicked = true;
+    const log: ListenLog = ListenLog.getInstance();
+    const now = new Date();
+    const currentYear: number = now.getFullYear();
+    const currentMonth: number = now.getMonth() + 1;
+    if (log.hasData(currentYear, currentMonth)) {
+      return;
+    }
+    const months: MonthKey[] = log.months();
+    if (months.length === 0) {
+      return;
+    }
+    const latest: MonthKey = months[0];
+    let offset: number = (latest.year - currentYear) * 12 + (latest.month - currentMonth);
+    if (offset > 0) {
+      offset = 0;
+    }
+    if (offset < -11) {
+      offset = -11;
+    }
+    hilog.info(DOMAIN, TAG, '本月无回响数据，自动落到 %{public}d-%{public}d（offset=%{public}d）',
+      latest.year, latest.month, offset);
+    this.monthOffset = offset;
   }
 
   /** 流水在别处变了（播放器落盘 / 清空）：重算这一页 */
@@ -192,123 +182,128 @@ export struct EchoView {
 
   private refresh(): void {
     const log: ListenLog = ListenLog.getInstance();
-    this.stats = log.statsOf(this.year, this.month);
-    // 歌曲榜 / 歌手榜最多 50 条：超出的不显示（数据仍然全量聚合，只是展示截断）
-    this.songs = log.songsOf(this.year, this.month).slice(0, ECHO_LIST_LIMIT);
-    this.artists = log.artistsOf(this.year, this.month).slice(0, ECHO_LIST_LIMIT);
-    this.albums = log.albumsOf(this.year, this.month);
-    this.hours = log.hoursOf(this.year, this.month);
-    this.days = log.daysOf(this.year, this.month);
-    this.years = this.yearOptions();
-    this.monthOptions = this.monthOptionsOf(this.year);
-    this.rebuildLists();
-    this.rebuildCompletion(log.completionOf(this.year, this.month));
-    this.rebuildCalendar();
-    // 背景主题：换月 / 数据变了就按「当前段落 + 轮播当前那张」重新取一次封面
+    const range: MonthRange = monthRangeOf(this.monthOffset);
+    const prev: MonthRange = monthRangeOf(this.monthOffset - 1);
+    this.stats = buildMonthlyStats(log, range, prev);
+    const options: MonthOption[] = buildMonthOptions(log.months(), range, this.monthOffset);
+    this.rebuildPickers(range, options);
+    this.publishTitle(range);
+    // 换月后领奖台回到第 1 名，背景也跟着换成新月份的第 1 名封面
+    this.podiumActive = 0;
+    this.artistPicUrl = '';
+    this.artistPicKey = '';
+    this.resolveArtistBackground();
     this.applyTheme(this.themeCoverOfSection());
-    // 标题画在壳层的标题栏里，跟着选中的月份走（见 K_ECHO_TITLE）；
-    // 值没变就别写 AppStorage，免得白刷一遍壳层
-    const title: string = echoTitleOf(this.month);
-    if (AppStorage.get<string>(K_ECHO_TITLE) !== title) {
-      AppStorage.setOrCreate(K_ECHO_TITLE, title);
-    }
   }
 
-  /** 年选择器：今年永远在里面（当月还没听歌时也得能选到当月），其余按有记录的年份补 */
-  private yearOptions(): number[] {
-    const currentYear: number = new Date().getFullYear();
-    const years: number[] = [currentYear];
-    for (const key of ListenLog.getInstance().months()) {
-      if (!years.includes(key.year)) {
-        years.push(key.year);
-      }
-    }
-    // 新的在前：排序函数写成闭包，别依赖外部状态
-    years.sort((left: number, right: number): number => right - left);
-    return years;
-  }
-
-  /** 某年能选的月份：往下的 12 个月；今年只到当月（将来的月份没有账可看） */
-  private monthOptionsOf(year: number): number[] {
-    const now = new Date();
-    const top: number = year === now.getFullYear() ? now.getMonth() + 1 : 12;
-    const months: number[] = [];
-    for (let month = top; month >= 1; month--) {
-      months.push(month);
-    }
-    return months;
-  }
+  // ------------------------------------------------------------ 歌手写真（背景用）
 
   /**
-   * 当前段落该用哪张封面当背景主题色
+   * 解析「最常听的歌手」本人的写真，给背景用
    *
-   *   - songs：跟着**轮播当前中间那张**走（用户左右滑动切封面时，背景也要跟着换）；
-   *     中间那张没封面就退到这个月第一张有封面的歌，再退到冠军歌手的封面；
-   *   - artist：冠军歌手的封面（歌手没有写真，用他最常听那首歌的封面，见 ListenLog.artistsOf）；
-   *   - album：最常听专辑的封面；
-   *   - analysis：空串 —— 背景渐隐到纯黑（截图里「你是怎样的听众」就是纯黑底）。
+   * 回响的聚合数据里 `EchoArtist.coverUrl` 是**借用的**「该歌手最常听那首歌的封面」——
+   * 看起来就是一张专辑封面，用户 2026-11-15 反馈「有时候背景显示的是专辑封面，应该显示
+   * 最常听歌手的封面」。本工程已有歌手写真缓存（`artist_cache.json`，`cachedArtistOf`
+   * 同步读；没缓存再 `resolveArtistByName` 在线取一次），这里按「歌手名 + 来源」去解析：
+   *   · 命中缓存 → 立刻用；
+   *   · 没命中 → 先用歌封面兜底，在线取到后再淡入换成真写真。
    */
+  private resolveArtistBackground(): void {
+    if (this.stats.topArtists.length === 0) {
+      return;
+    }
+    const artist: MonthlyArtist = this.stats.topArtists[0];
+    const key: string = `${artist.source}\u0001${artist.name}`;
+    if (key === this.artistPicKey) {
+      return;
+    }
+    this.artistPicKey = key;
+    const cached: LxArtist | null = cachedArtistOf(artist.name);
+    if (cached !== null && cached.picUrl.length > 0) {
+      this.artistPicUrl = cached.picUrl;
+      this.applyTheme(this.themeCoverOfSection());
+      return;
+    }
+    resolveArtistByName(artist.name, artist.source).then((resolved: LxArtist | null) => {
+      // 异步回来时可能已经换月 / 换歌手了：只认「现在仍是同一个歌手」
+      if (resolved === null || resolved.picUrl.length === 0 || this.artistPicKey !== key) {
+        return;
+      }
+      hilog.info(DOMAIN, TAG, '歌手写真解析成功 name=%{public}s', artist.name);
+      this.artistPicUrl = resolved.picUrl;
+      this.applyTheme(this.themeCoverOfSection());
+    }).catch(() => {
+      // 取不到就继续用歌封面兜底，不影响页面
+    });
+  }
+
+  // ------------------------------------------------------------ 背景氛围层
+
+  /** 当前段落该拿哪张封面当背景（空串 = 没有氛围层，渐隐回纯黑） */
   private themeCoverOfSection(): string {
-    if (this.sectionKey === 'artist') {
-      return this.artists.length > 0 ? this.artists[0].coverUrl : '';
+    if (this.isWide()) {
+      // 宽屏两列同屏，段落判定没有意义：只跟领奖台中心那张走
+      return this.podiumCover();
     }
-    if (this.sectionKey === 'album') {
-      return this.albums.length > 0 ? this.albums[0].coverUrl : '';
+    // 页头与歌曲榜都用领奖台中心那张封面（旧版进页面第一眼就是封面背景，不是黑屏）
+    if (this.sectionIdx <= 1) {
+      return this.podiumCover();
     }
-    if (this.sectionKey === 'analysis') {
-      return '';
-    }
-    if (this.podiumActive >= 0 && this.podiumActive < this.songs.length) {
-      const current: EchoSong = this.songs[this.podiumActive];
-      if (current.coverUrl.length > 0) {
-        return current.coverUrl;
+    // 歌手段用**歌手本人的写真**（解析中 / 取不到时退回「他最常听那首歌的封面」）；
+    // **专辑段沿用歌手背景**（用户 2026-11-15：取消专辑的背景过渡）
+    if (this.sectionIdx === 2 || this.sectionIdx === 3) {
+      if (this.artistPicUrl.length > 0) {
+        return this.artistPicUrl;
       }
+      return this.stats.topArtists.length > 0 ? this.stats.topArtists[0].coverUrl : '';
     }
-    for (const song of this.songs) {
-      if (song.coverUrl.length > 0) {
-        return song.coverUrl;
-      }
+    // 听众 / 完播率 / 新发现 / 滚到底：渐隐回纯黑
+    return '';
+  }
+
+  /** 领奖台中心卡那张封面（没有就退第 1 名） */
+  private podiumCover(): string {
+    if (this.podiumActive >= 0 && this.podiumActive < this.stats.topSongs.length) {
+      return this.stats.topSongs[this.podiumActive].coverUrl;
     }
-    return this.artists.length > 0 ? this.artists[0].coverUrl : '';
+    return this.stats.topSongs.length > 0 ? this.stats.topSongs[0].coverUrl : '';
   }
 
   /**
-   * 把背景主题切到某张封面
+   * 应用背景主题（两层交叉淡入）
    *
-   * 两层轮换 + 交叉淡入：新封面写进「当前不在显示的那一层」，然后把两层透明度对调，
-   * 这样换色是渐变的、不会闪；目标为空串时只把现有那层渐隐到 0，露出的就是纯黑底。
-   * 第一次（页面刚进来）直接给结果不做动画。
+   * 口径照旧版回响：同一个地址不重复做动画；第一次直接给结果（进页面不要闪）；
+   * 目标为空串时两层都淡到 0（渐隐回页面底色）。
    */
   private applyTheme(cover: string): void {
+    if (!this.themeInited) {
+      this.themeInited = true;
+      this.themeApplied = cover;
+      this.bgUrlA = cover;
+      this.bgOpA = cover.length > 0 ? 1 : 0;
+      this.bgUrlB = '';
+      this.bgOpB = 0;
+      this.nextIsB = true;
+      return;
+    }
     if (cover === this.themeApplied) {
       return;
     }
     this.themeApplied = cover;
-    if (!this.themeInited) {
-      this.themeInited = true;
-      this.bgUrlA = cover;
-      this.bgOpA = cover.length > 0 ? 1 : 0;
-      this.bgOpB = 0;
-      return;
-    }
     if (cover.length === 0) {
-      // 渐隐到纯黑：两层都收到 0，下一张封面来了再淡入
       animateTo({ duration: THEME_FADE_MS, curve: Curve.EaseInOut }, () => {
         this.bgOpA = 0;
         this.bgOpB = 0;
       });
       return;
     }
-    // 写进「看不见的那一层」，再对调透明度
     if (this.nextIsB) {
       this.bgUrlB = cover;
     } else {
       this.bgUrlA = cover;
     }
-    const writingB: boolean = this.nextIsB;
-    this.nextIsB = !writingB;
     animateTo({ duration: THEME_FADE_MS, curve: Curve.EaseInOut }, () => {
-      if (writingB) {
+      if (this.nextIsB) {
         this.bgOpB = 1;
         this.bgOpA = 0;
       } else {
@@ -316,241 +311,204 @@ export struct EchoView {
         this.bgOpB = 0;
       }
     });
+    this.nextIsB = !this.nextIsB;
+  }
+
+  /** 领奖台中心卡换了（滑到另一张）→ 背景跟着换 */
+  private onPodiumActive(index: number): void {
+    this.podiumActive = index;
+    if (this.sectionIdx === 1 || this.isWide()) {
+      this.applyTheme(this.themeCoverOfSection());
+    }
+  }
+
+  /** 重建年 / 月两枚下拉的档位（有记录的月份在前，今年只到当月） */
+  private rebuildPickers(range: MonthRange, options: MonthOption[]): void {
+    // 年份：当前年 + 历史里出现过的年，新的在前
+    const currentYear: number = new Date().getFullYear();
+    const years: number[] = [currentYear];
+    for (const option of options) {
+      if (!years.includes(option.year)) {
+        years.push(option.year);
+      }
+    }
+    years.sort((left: number, right: number): number => right - left);
+    const yearLabels: string[] = [];
+    const yearOffsets: number[] = [];
+    for (const year of years) {
+      yearLabels.push(`${year} 年`);
+      // 这一年的「代表偏移」：同月优先，否则该年最接近的一个（有记录才进来）
+      yearOffsets.push(this.yearRepresentativeOffset(year, range, options));
+    }
+    this.yearLabels = yearLabels;
+    this.yearOffsets = yearOffsets;
+    this.yearIndex = Math.max(0, years.indexOf(range.year));
+
+    // 月份：只列该年的有记录月份（当月永远补上）
+    const monthLabels: string[] = [];
+    const monthOffsets: number[] = [];
+    for (const option of options) {
+      if (option.year !== range.year) {
+        continue;
+      }
+      monthLabels.push(`${option.month} 月`);
+      monthOffsets.push(option.offset);
+    }
+    if (monthLabels.length === 0) {
+      monthLabels.push(`${range.month} 月`);
+      monthOffsets.push(this.monthOffset);
+    }
+    this.monthLabels = monthLabels;
+    this.monthOffsets = monthOffsets;
+    let index: number = monthOffsets.indexOf(this.monthOffset);
+    if (index < 0) {
+      index = 0;
+    }
+    this.monthIndex = index;
+  }
+
+  /** 某年份下拉档位应跳到哪个月份偏移：同月优先，否则该年最接近的一个 */
+  private yearRepresentativeOffset(year: number, range: MonthRange, options: MonthOption[]): number {
+    let best: number = this.monthOffset;
+    let bestDistance: number = Number.MAX_SAFE_INTEGER;
+    const now = new Date();
+    for (const option of options) {
+      if (option.year !== year) {
+        continue;
+      }
+      const distance: number = Math.abs(option.month - range.month);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = option.offset;
+      }
+    }
+    if (year === now.getFullYear()) {
+      const distance: number = Math.abs((now.getMonth() + 1) - range.month);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = 0;
+      }
+    }
+    return best;
+  }
+
+  /** 切月份：统一走这里（负数偏移夹到 [-11, 0]），切完重算并回顶 */
+  private pickOffset(offset: number): void {
+    const clamped: number = Math.min(0, Math.max(-11, offset));
+    if (clamped === this.monthOffset) {
+      return;
+    }
+    this.monthOffset = clamped;
+    this.refresh();
+    this.scroller.scrollEdge(Edge.Top);
+    this.sectionTitle = '回响';
+    this.publishTitle(monthRangeOf(this.monthOffset));
   }
 
   /**
-   * 记下某一段相对（reportSections 根节点）的起始位置
+   * 窗口宽度变了（分屏 / 横竖屏 / 折叠展开）：标题档位要跟着归位
    *
-   * 只存相对值、不存绝对值：绝对值要在滚动时现算（内容坐标 = 顶部占位 + 根节点偏移 +
-   * 段偏移），这样不依赖 onAreaChange 的触发顺序 —— 用 globalPosition 反推会依赖
-   * 「Scroll 的全局坐标先测到」，两者顺序不保证。
+   * 宽屏两列同屏不切段名，所以切到宽屏时标题必须回到「N 月 · 回响」；切回窄屏时
+   * 再按当前滚动段名给（sectionIdx 一直保留着最后判定出来的段）。
    */
-  private recordSectionTop(section: string, area: Area): void {
-    this.sectionOffsets.set(section, Number(area.position.y));
+  onWindowWidthChanged(): void {
+    this.publishTitle(monthRangeOf(this.monthOffset));
+    this.applyTheme(this.themeCoverOfSection());
+  }
+
+  /** 发布页头标题（值没变就不写 AppStorage，免得白刷一遍壳层） */
+  private publishTitle(range: MonthRange): void {
+    const name: string = this.isWide() ? '回响' : SECTION_NAMES[this.sectionIdx];
+    const title: string = `${range.label} · ${name}`;
+    if (AppStorage.get<string>(K_ECHO_TITLE) !== title) {
+      AppStorage.setOrCreate(K_ECHO_TITLE, title);
+    }
+  }
+
+  /**
+   * 记下某一段的起点（相对窄屏 Column 的 y）
+   *
+   * 只存相对值：绝对位置 = 内容顶部内边距（this.topInset + 8）+ 相对值。这样不依赖
+   * onAreaChange 的触发顺序（用 globalPosition 反推会要求 Scroll 的全局坐标先量到）。
+   */
+  private recordSectionTop(index: number, relativeY: number): void {
+    if (index < 0 || index >= this.sectionTops.length) {
+      return;
+    }
+    this.sectionTops[index] = relativeY;
     this.syncSectionByScroll();
   }
 
   /**
-   * 按滚动位置决定背景主题属于哪一段
+   * 按滚动位置决定「当前是哪一段」（背景主题与标题都跟着它）
    *
-   * 判定锚点取视口 45% 处：锚点落到哪一段，就用哪一段的主题封面。段落顺序固定
-   * songs → artist → album → analysis，取「最后一个起点在锚点之上的段」。
-   * 这样即使某一段有几十行、高度远超一屏，也能在它滚进视口中部时正确切过去；
-   * 滚到底部时自然进入 analysis（主题为空 → 渐变成纯黑）。
+   * 锚点取视口 45% 处：锚点落到哪一段，就用哪一段的主题封面；段落顺序固定
+   * 页头 → 歌曲 → 歌手 → 专辑 → 听众 → 完播率 → 新发现。滚到底部时自然进入
+   * 「新发现」（主题为空 → 氛围层渐隐，露出纯黑/页面底色）。
+   * 宽屏两列同屏，段落判定没有意义（背景只跟领奖台中心卡）。
    */
   private syncSectionByScroll(): void {
-    if (this.scrollViewportH <= 0) {
+    if (this.isWide() || this.scrollViewportH <= 0) {
       return;
     }
     const offsetY: number = this.scroller.currentOffset().yOffset;
     const anchor: number = offsetY + this.scrollViewportH * 0.45;
-    let target: string = 'songs';
-    for (const key of this.sectionOrder) {
-      const rel: number | undefined = this.sectionOffsets.get(key);
-      if (rel !== undefined && anchor >= this.topInset + 14 + this.sectionBase + rel) {
-        target = key;
+    const paddingTop: number = this.topInset + 8;
+    let target: number = 0;
+    // 滚到底：直接算「最后一段」，让背景渐隐到纯黑
+    // （内容不够长、锚点到不了最后一段时，用户仍能看到「底部变黑」的效果）
+    if (this.contentHeight > 0 && offsetY + this.scrollViewportH >= this.contentHeight - 4) {
+      target = 6;
+    } else {
+      for (let i: number = 0; i < this.sectionTops.length; i++) {
+        const rel: number = this.sectionTops[i];
+        if (rel >= 0 && anchor >= paddingTop + rel) {
+          target = i;
+        }
       }
     }
-    if (target !== this.sectionKey) {
-      this.sectionKey = target;
-      this.applyTheme(this.themeCoverOfSection());
-    }
-  }
-
-  /**
-   * 轮播换了中心卡（用户左右滑动 / 点侧卡）：背景跟着换成那张封面的主题色
-   *
-   * 只在这一段（歌曲榜）是当前段时才换 —— 用户已经滚到下面的段落时，滑轮播
-   * 不应该把背景抢回歌曲主题。
-   */
-  private onPodiumActive(index: number): void {
-    this.podiumActive = index;
-    if (this.sectionKey === 'songs') {
-      this.applyTheme(this.themeCoverOfSection());
-    }
-  }
-
-  private pickYear(year: number): void {
-    this.year = year;
-    const months: number[] = this.monthOptionsOf(year);
-    this.monthOptions = months;
-    // 换到「今年」时，原来选的月份可能还没到（比如原来在 12 月、现在只是 10 月），往前收一档
-    if (!months.includes(this.month)) {
-      this.month = months.length > 0 ? months[0] : 1;
-    }
-    // 换年月回到页面顶部，背景主题也回到歌曲榜
-    this.sectionKey = 'songs';
-    this.podiumActive = 0;
-    this.refresh();
-  }
-
-  private pickMonth(month: number): void {
-    if (this.month === month) {
+    if (target === this.sectionIdx) {
       return;
     }
-    this.month = month;
-    // 换年月回到页面顶部，背景主题也回到歌曲榜
-    this.sectionKey = 'songs';
-    this.podiumActive = 0;
-    this.refresh();
+    this.sectionIdx = target;
+    this.applyTheme(this.themeCoverOfSection());
+    if (!this.isWide()) {
+      this.sectionTitle = SECTION_NAMES[target];
+      this.publishTitle(monthRangeOf(this.monthOffset));
+    }
   }
 
+  private isWide(): boolean {
+    return isWideWindow(this.windowWidth > 0 ? this.windowWidth : 360);
+  }
+
+  // ------------------------------------------------------------ 交互
+
   /**
-   * 把原始聚合数据翻成组件库要的三种行 / 卡
+   * 毫秒 → `m:ss`（给 `SongItem.interval` 用）
    *
-   * 名次直接用数组下标 + 偏移算（数据层已经排好序，页面不再排一遍）：
-   *   - 歌：领奖台是 1~3 名，榜单从第 4 名起；
-   *   - 歌手：第 1 名是大图卡，榜单从第 2 名起。
+   * 回响记录里没有原始 interval 字符串（只有 `ListenRecord.durationMs` 真实时长），
+   * 直接传空串会让播放页 / 媒体中心**首帧**总时长是 0:00（随后被播放器回调修正）。
+   * 用记录里的真实时长还原一下，首帧就是对的。
    */
-  private rebuildLists(): void {
-    // —— 歌：Top3 领奖台
-    const podium: EchoPodiumSong[] = [];
-    const podiumTop: number = this.songs.length < PODIUM_SIZE ? this.songs.length : PODIUM_SIZE;
-    for (let i = 0; i < podiumTop; i++) {
-      const song: EchoSong = this.songs[i];
-      const item: EchoPodiumSong = {
-        rank: i + 1,
-        name: song.name,
-        singer: song.singer,
-        coverUrl: song.coverUrl,
-        art: song.art,
-        plays: song.plays,
-        // 占比用「这首歌的次数 / 这个月总次数」：榜单之间可以横向比
-        share: echoShareText(song.plays, this.stats.playCount),
-      };
-      podium.push(item);
+  private intervalTextOf(ms: number): string {
+    if (ms <= 0) {
+      return '';
     }
-    this.podium = podium;
-
-    // —— 歌：第 4 名往后
-    const songRows: EchoRankRow[] = [];
-    for (let i = PODIUM_SIZE; i < this.songs.length; i++) {
-      const song: EchoSong = this.songs[i];
-      const row: EchoRankRow = {
-        rank: i + 1,
-        name: song.name,
-        sub: song.singer,
-        count: `${song.plays} 次`,
-      };
-      songRows.push(row);
-    }
-    this.songRows = songRows;
-
-    // —— 歌手：第 2 名往后（第 1 名单独是大图卡）
-    const artistRows: EchoRankRow[] = [];
-    for (let i = 1; i < this.artists.length; i++) {
-      const artist: EchoArtist = this.artists[i];
-      const row: EchoRankRow = {
-        rank: i + 1,
-        name: artist.name,
-        // 歌手行不给副标题：名字本身就是全部信息，再塞「N 首」会和右边的次数重叠
-        sub: '',
-        count: `${artist.plays} 次`,
-      };
-      artistRows.push(row);
-    }
-    this.artistRows = artistRows;
-
-    // —— 专辑：前 6 张横排
-    const albumCards: EchoAlbumCard[] = [];
-    const albumTop: number = this.albums.length < ALBUM_STRIP_SIZE ? this.albums.length : ALBUM_STRIP_SIZE;
-    for (let i = 0; i < albumTop; i++) {
-      const album: EchoAlbum = this.albums[i];
-      const card: EchoAlbumCard = {
-        name: album.name,
-        coverUrl: album.coverUrl,
-        art: album.art,
-        meta: `${album.plays} 次`,
-      };
-      albumCards.push(card);
-    }
-    this.albumCards = albumCards;
+    const total: number = Math.round(ms / 1000);
+    const minutes: number = Math.floor(total / 60);
+    const seconds: number = total % 60;
+    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
   }
 
   /**
-   * 完播率卡片
+   * 点一首歌 → 播放
    *
-   * 口径在数据层（EchoCompletion）：judged = 当月「听满 30 秒」的播放次数，complete =
-   * 完整听完的次数（playedMs / 歌曲时长 ≥ 0.85），skipped = judged - complete。
-   * 时长是**系统自己记的**（AVPlayer 上报的真实时长，见 ListenRecord.durationMs）；
-   * 老记录没有时长时数据层会用全库平均时长兜底，所以这里永远算得出一个百分比，
-   * 不会再出现「音源没给时长，暂时算不出完播率」。
-   */
-  private rebuildCompletion(completion: EchoCompletion): void {
-    const judged: number = completion.judged;
-    const complete: number = completion.complete;
-    const skipped: number = completion.skipped;
-    const days: number = completion.days;
-    const rate: number = judged > 0 ? Math.round(complete / judged * 100) : 0;
-    this.completionRate = rate;
-    this.completionPercent = `${rate}%`;
-    this.completionMain = '的歌被听到了最后';
-    this.completionComplete = `完整听完 ${complete} 次`;
-    this.completionSkip = `中途切走 ${skipped} 次`;
-    // 平均每个听歌日：总时长 / 有听歌的天数（days 是「有听歌的天数」，不是当月天数）
-    this.completionFoot = days > 0 ? `平均每个听歌日 ${echoDurationText(completion.totalMs / days)}` : '';
-  }
-
-  /**
-   * 听歌日历下面那两行说明
-   *
-   * hint 说「这个月一共几天、其中几天在听歌」；best 找次数最多的那一天。
-   * 一天都没听时 best 给空串（别画「0 月 0 日听得最多」这种假话），hint 照常
-   * —— 空月份也想知道「30 天里 0 天在听歌」这件事。
-   */
-  private rebuildCalendar(): void {
-    const total: number = this.days.length;
-    let listening: number = 0;
-    let bestIndex: number = -1;
-    let bestCount: number = 0;
-    for (let i = 0; i < this.days.length; i++) {
-      const count: number = this.days[i];
-      if (count > 0) {
-        listening++;
-      }
-      // 并列最多时取最早的一天：日历是从左往右读的，先出现的更自然
-      if (count > bestCount) {
-        bestCount = count;
-        bestIndex = i;
-      }
-    }
-    this.calendarHint = `${total} 天里有 ${listening} 天在听歌`;
-    this.calendarBest = bestIndex >= 0
-      ? `${this.month} 月 ${bestIndex + 1} 日听得最多 —— ${bestCount} 次`
-      : '';
-  }
-
-  private confirmClear(): void {
-    this.getUIContext().showAlertDialog({
-      title: '清空收听记录',
-      message: '清空之后「回响」里的月度统计与记录就都没了，这个动作没法撤销。',
-      autoCancel: true,
-      buttons: [
-        { value: '取消', action: () => {
-        } },
-        {
-          value: '清空',
-          fontColor: C_RED,
-          action: () => {
-            ListenLog.getInstance().clear();
-            this.refresh();
-            this.toast('收听记录已清空');
-          },
-        },
-      ],
-    });
-  }
-
-  // ------------------------------------------------------------ 播放 / 跳转
-
-  /**
-   * 点一行 → 播放这一首
-   *
-   * 与识别页同一个路子：回响里存的是「歌名 + 歌手 + 来源」，没有可以直接取流的 id
+   * 与识别页同一个路子：回响里存的是「歌名 + 歌手 + 来源」，没有可以直接取流的地址
    * （那是**播放记录**，不是搜索结果），所以按名字在它原来的平台上搜一遍、取第一条；
    * 那个平台没版权或者搜不到，再跨平台聚合找一遍。
    */
-  private async playSong(song: EchoSong): Promise<void> {
+  private async playSong(song: MonthlySong): Promise<void> {
     const key: string = `${song.name}\u0001${song.singer}`;
     if (this.playingKey.length > 0) {
       return;
@@ -562,6 +520,26 @@ export struct EchoView {
     this.playingKey = key;
     const quality: string = PlaySession.getInstance().quality;
     try {
+      // ① 有平台 id + musicInfoJson 时**直接建队列播放**（与播放历史 / 收藏同一套装配，
+      //    见 HistoryView.songItemOf + setQueueAndPlay）。旧回响只能按名字搜，是因为当时的
+      //    EchoSong 不带 id；2.0 的 MonthlySong 专门补了 songId / musicInfoJson 两个字段。
+      if (song.songId.length > 0 && song.musicInfoJson.length > 0) {
+        const item: SongItem = {
+          id: song.songId,
+          name: song.name,
+          singer: song.singer,
+          coverUrl: song.coverUrl,
+          art: song.art,
+          source: song.source,
+          quality: quality,
+          interval: this.intervalTextOf(song.durationMs),
+          musicInfoJson: song.musicInfoJson,
+        };
+        hilog.info(DOMAIN, TAG, '按记录 id 直接播放 id=%{public}s', song.songId);
+        await PlaySession.getInstance().setQueueAndPlay([item], 0);
+        return;
+      }
+      // ② 没有 id（v1 老记录 / 本地歌）：退回按「歌名 + 歌手」搜索
       if (song.source.length > 0 && isSearchSupported(song.source)) {
         hilog.info(DOMAIN, TAG, '按记录来源搜索播放 source=%{public}s keyword=%{public}s',
           song.source, keyword);
@@ -588,37 +566,31 @@ export struct EchoView {
 
   /** 领奖台上的第 index 首（0 = 第 1 名） */
   private playSongAt(index: number): void {
-    if (index < 0 || index >= this.songs.length) {
+    if (index < 0 || index >= this.stats.topSongs.length) {
       return;
     }
-    void this.playSong(this.songs[index]);
+    void this.playSong(this.stats.topSongs[index]);
   }
 
-  /**
-   * 点一张专辑 → 播这张专辑里这个月听过的第一首歌
-   *
-   * 回响里没有专辑 id（流水只记了专辑名），所以拿专辑名去**这个月听过的歌**里对第一首
-   * 同专辑的 —— 对不上就不响应（宁可不响，也别随便播一首不在这张专辑里的歌）。
-   */
+  /** 点一张专辑 → 播这张专辑里这个月最常听的那首（聆听没有专辑详情页） */
   private playAlbumAt(index: number): void {
-    if (index < 0 || index >= this.albums.length) {
+    if (index < 0 || index >= this.stats.topAlbums.length) {
       return;
     }
-    const album: EchoAlbum = this.albums[index];
-    for (const song of this.songs) {
-      if (song.albumName === album.name) {
-        void this.playSong(song);
-        return;
-      }
+    const album: MonthlyAlbum = this.stats.topAlbums[index];
+    if (album.topSong === null) {
+      this.toast('这张专辑里没有能直接播放的版本');
+      return;
     }
+    void this.playSong(album.topSong);
   }
 
   /** 点第 index 位歌手（0 = 第 1 名）→ 他的聚合页 */
   private openArtistAt(index: number): void {
-    if (index < 0 || index >= this.artists.length) {
+    if (index < 0 || index >= this.stats.topArtists.length) {
       return;
     }
-    const artist: EchoArtist = this.artists[index];
+    const artist: MonthlyArtist = this.stats.topArtists[index];
     const candidate: ArtistCandidate = {
       source: artist.source,
       name: artist.name,
@@ -628,21 +600,12 @@ export struct EchoView {
     ArtistNav.getInstance().openArtist(candidate);
   }
 
-  /**
-   * 点「位歌手」那一格：把这个月听过的歌手整份名单交给壳层的歌手列表页
-   * （见 ui/ArtistNav.ets）
-   */
-  private openArtists(): void {
-    const candidates: ArtistCandidate[] = [];
-    for (const artist of this.artists) {
-      candidates.push({
-        source: artist.source,
-        name: artist.name,
-        note: `${artist.songCount} 首`,
-      });
+  /** 点「单曲循环之王」/「深夜之歌」那一张卡 */
+  private playHighlight(song: MonthlySong | null): void {
+    if (song === null) {
+      return;
     }
-    ArtistNav.getInstance().openList('这个月听过的歌手',
-      `${this.year} 年 ${this.month} 月 · 共 ${this.artists.length} 位`, candidates);
+    void this.playSong(song);
   }
 
   private toast(message: string): void {
@@ -651,361 +614,327 @@ export struct EchoView {
 
   // ------------------------------------------------------------ 构建
 
+  /** 你听了什么：3D 三卡榜台（数据不够三张时空位不画） */
   @Builder
-  yearMenu() {
-    Menu() {
-      ForEach(this.years, (item: number) => {
-        MenuItem({ content: `${item} 年` })
-          .onClick(() => {
-            this.pickYear(item);
-          })
-      }, (item: number) => `y${item}`)
-    }
-  }
-
-  @Builder
-  monthMenu() {
-    Menu() {
-      ForEach(this.monthOptions, (item: number) => {
-        MenuItem({ content: `${item} 月` })
-          .onClick(() => {
-            this.pickMonth(item);
-          })
-      }, (item: number) => `m${item}`)
-    }
-  }
-
-  /**
-   * 有记录时的正文：三段故事线
-   *
-   * 名次、次数、占比都是数据层排好 / 页面算好的，这里只负责摆 —— 点歌走 playSongAt，
-   * 点歌手上聚合页，点专辑播这张专辑里这个月的第一首。空月份不进来（见 build 里的空态）。
-   */
-  @Builder
-  reportSections() {
-    /**
-     * 外面这层 Column 只做两件事：给构建函数一个**唯一根节点**（@Builder 的函数体按
-     * build() 的语法规则写，并列多个根节点在不同 SDK 版本上支持不一致，包一层最稳），
-     * 以及让所有小节共享同一个 100% 宽的容器。子项全是 width 100%，版面不变。
-     *
-     * 里面每一段都包一层 Column 挂 onVisibleAreaChange：哪一段有一半露出来，背景主题
-     * 就换成那一段的封面（见 onSectionVisible）—— 这是「翻到歌手段背景跟着换」的入口。
-     */
-    Column() {
-      // ---------------------------------------------------- 你听了什么
-      Column() {
-        EchoSectionTitle({ text: '你听了什么', topMargin: 34 })
-        EchoSubTitle({ text: '最常听的歌', topMargin: 20 })
-        EchoSongPodium({
-          items: this.podium,
-          onPick: (index: number) => {
+  private topSongsSection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '你听了什么', subtitle: '最常听的歌' })
+      if (this.stats.topSongs.length === 0) {
+        EchoEmptyHint({ text: '这个月还没有听歌记录', hint: '听满 30 秒的歌会出现在回响里' })
+      } else {
+        EchoTopSongs({
+          songs: this.stats.topSongs,
+          totalPlays: this.stats.playCount,
+          onPlay: (index: number) => {
             this.playSongAt(index);
           },
-          // 轮播中心卡换了（左右滑 / 点侧卡）→ 背景跟着换成那张封面（见 onPodiumActive）
           onActive: (index: number) => {
             this.onPodiumActive(index);
           },
         })
-          .margin({ top: 16 })
-        if (this.songRows.length > 0) {
-          EchoRankList({
-            rows: this.songRows,
-            // 歌曲榜是一整块：4 名往后的行数常常十几条，散在渐变上会显得碎
-            card: true,
-            onPick: (index: number) => {
-              // rows 从第 4 名起（下标 0 对应 songs[3]），所以这里要补上领奖台那 3 首
-              this.playSongAt(index + PODIUM_SIZE);
-            },
-          })
-            .margin({ top: 10 })
-        }
       }
-      .width('100%')
-      .onAreaChange((oldValue: Area, newValue: Area) => {
-        this.recordSectionTop('songs', newValue);
-        this.syncSectionByScroll();
-      })
-
-      // ---------------------------------------------------- 最常听的歌手
-      if (this.artists.length > 0) {
-        Column() {
-          EchoSectionTitle({ text: '最常听的歌手', topMargin: 34 })
-          /**
-           * 冠军大图与 2 名以后的榜单拼成**一个连续图形**（截图里它们是一张卡：
-           * 上半是大图、下半接着排名行，中间没有缝、也没有两张卡的圆角互相怼着）。
-           * 做法：外层只给一次卡底与圆角并裁切，大图传 radius 0（顶角由外层裁出来），
-           * 榜单走 card:false（透明、不带自己的圆角），于是两块天然接在一起。
-           */
-          Column() {
-            EchoArtistHero({
-              name: this.artists[0].name,
-              coverUrl: this.artists[0].coverUrl,
-              art: this.artists[0].art,
-              meta: `${this.artists[0].plays} 次播放 · ${echoShareText(this.artists[0].plays, this.stats.playCount)}`,
-              radius: 0,
-              onPick: () => {
-                this.openArtistAt(0);
-              },
-            })
-            if (this.artistRows.length > 0) {
-              EchoRankList({
-                rows: this.artistRows,
-                // 透明榜单：卡底与外层圆角都由外面这一层给，接在大图下面就是同一张卡
-                card: false,
-                onPick: (index: number) => {
-                  // rows 从第 2 名起（下标 0 对应 artists[1]）
-                  this.openArtistAt(index + 1);
-                },
-              })
-            }
-          }
-          .width('100%')
-          .backgroundColor(E_CARD)
-          .borderRadius(20)
-          .clip(true)
-          .margin({ top: 16 })
-        }
-        .width('100%')
-        .onAreaChange((oldValue: Area, newValue: Area) => {
-          this.recordSectionTop('artist', newValue);
-          this.syncSectionByScroll();
-        })
-      }
-
-      // ---------------------------------------------------- 最常听的专辑
-      // 这里是**子标题**级别（与「最常听的歌」同一档）：专辑是前面歌 / 歌手那条线的补充，
-      // 不给它再开一个大节标题，否则「你是怎样的听众」之前会冒出第三层结构
-      if (this.albumCards.length > 0) {
-        Column() {
-          EchoSubTitle({ text: '最常听的专辑', topMargin: 26 })
-          EchoAlbumStrip({
-            items: this.albumCards,
-            onPick: (index: number) => {
-              this.playAlbumAt(index);
-            },
-          })
-            .margin({ top: 12 })
-        }
-        .width('100%')
-        .onAreaChange((oldValue: Area, newValue: Area) => {
-          this.recordSectionTop('album', newValue);
-          this.syncSectionByScroll();
-        })
-      }
-
-      // ---------------------------------------------------- 你是怎样的听众
-      // 这一段背景是纯黑（themeCoverOfSection 对 analysis 返回空串，氛围层渐隐到 0）
-      Column() {
-        EchoSectionTitle({ text: '你是怎样的听众', topMargin: 36 })
-        EchoSubTitle({ text: '听歌时段', topMargin: 20 })
-        EchoHourChart({ counts: this.hours })
-          .margin({ top: 12 })
-        EchoSubTitle({ text: '听歌日历', topMargin: 26 })
-        EchoCalendar({
-          counts: this.days,
-          hint: this.calendarHint,
-          bestText: this.calendarBest,
-        })
-          .margin({ top: 12 })
-        EchoSubTitle({ text: '完播率', topMargin: 26 })
-        EchoCompletionCard({
-          rate: this.completionRate,
-          percentText: this.completionPercent,
-          mainText: this.completionMain,
-          completeText: this.completionComplete,
-          skipText: this.completionSkip,
-          footText: this.completionFoot,
-        })
-          .margin({ top: 12 })
-      }
-      .width('100%')
-      .onAreaChange((oldValue: Area, newValue: Area) => {
-        this.recordSectionTop('analysis', newValue);
-        this.syncSectionByScroll();
-      })
     }
     .width('100%')
-    .alignItems(HorizontalAlign.Start)
-    // 根节点相对滚动内容的偏移：段落的绝对位置 = 顶部占位 + 这个偏移 + 段自身的相对位置
     .onAreaChange((oldValue: Area, newValue: Area) => {
-      this.sectionBase = Number(newValue.position.y);
-      this.syncSectionByScroll();
+      this.recordSectionTop(1, Number(newValue.position.y));
     })
   }
 
-  /**
-   * 背景主题氛围层（固定在页面上，不随内容滚）
-   *
-   * 两层模糊封面交叉淡入（切换逻辑见 applyTheme）：当前段落 / 轮播中心卡换了封面，
-   * 就淡到新的那一张。上面再压一层「上保留色相、往下渐到纯黑」—— 文字都压在深色区，
-   * 读得清；目标为空（「你是怎样的听众」段）时两层都收到 0，露出的就是纯黑底。
-   */
+  /** 最常听的歌手 */
   @Builder
-  backdropLayer() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      if (this.bgUrlA.length > 0) {
-        Image(this.bgUrlA)
-          .width('100%')
-          .height('100%')
-          .objectFit(ImageFit.Cover)
-          .blur(BACKDROP_BLUR)
-          .opacity(this.bgOpA * 0.62)
-          .draggable(false)
-      }
-      if (this.bgUrlB.length > 0) {
-        Image(this.bgUrlB)
-          .width('100%')
-          .height('100%')
-          .objectFit(ImageFit.Cover)
-          .blur(BACKDROP_BLUR)
-          .opacity(this.bgOpB * 0.62)
-          .draggable(false)
-      }
-      // 压暗 + 向下渐到纯黑：顶部留一点封面的色相，30% 后开始收，78% 之后彻底黑
-      Column()
-        .width('100%')
-        .height('100%')
-        .linearGradient({
-          angle: 180,
-          colors: [['#4D000000', 0.0], ['#73000000', 0.3], ['#B8000000', 0.55],
-            ['#000000', 0.78], ['#000000', 1.0]],
+  private topArtistsSection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '最常听的歌手' })
+      if (this.stats.topArtists.length === 0) {
+        EchoEmptyHint({ text: '这个月还没有听歌记录', hint: '听满 30 秒的歌会出现在回响里' })
+      } else {
+        EchoTopArtists({
+          artists: this.stats.topArtists,
+          totalPlays: this.stats.playCount,
+          onOpen: (index: number) => {
+            this.openArtistAt(index);
+          },
         })
+      }
     }
     .width('100%')
-    .height('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(2, Number(newValue.position.y));
+    })
+  }
+
+  /** 最常听的专辑 */
+  @Builder
+  private topAlbumsSection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '最常听的专辑' })
+      if (this.stats.topAlbums.length === 0) {
+        EchoEmptyHint({ text: '这个月还没有听歌记录', hint: '听满 30 秒的歌会出现在回响里' })
+      } else {
+        EchoTopAlbums({
+          albums: this.stats.topAlbums,
+          onOpen: (index: number) => {
+            this.playAlbumAt(index);
+          },
+        })
+      }
+    }
+    .width('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(3, Number(newValue.position.y));
+    })
+  }
+
+  /** 你是怎样的听众：时段柱图 + 日历 */
+  @Builder
+  private audienceSection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '你是怎样的听众' })
+      EchoAudience({
+        hours: this.stats.hourBuckets,
+        days: this.stats.dayBuckets,
+        monthLabel: monthRangeOf(this.monthOffset).label,
+        listenDays: this.stats.listenDays,
+        longestStreak: this.stats.longestStreak,
+        bestDay: this.stats.bestDay,
+        bestDayCount: this.stats.bestDayCount,
+      })
+    }
+    .width('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(4, Number(newValue.position.y));
+    })
+  }
+
+  /** 单曲循环之王（本月最高的那首放了 ≥2 次才显示） */
+  @Builder
+  private loopKingSection() {
+    if (this.stats.loopKing !== null && this.stats.loopKingCount >= 2) {
+      Column({ space: 10 }) {
+        EchoSectionTitle({ text: '单曲循环之王' })
+        EchoSongHighlight({
+          title: '单曲循环之王',
+          song: this.stats.loopKing,
+          countText: `连着放了 ${this.stats.loopKingCount} 遍`,
+          onPlay: () => {
+            this.playHighlight(this.stats.loopKing);
+          },
+        })
+      }
+      .width('100%')
+    }
+  }
+
+  /** 深夜之歌（0-5 点听过才显示） */
+  @Builder
+  private nightSongSection() {
+    if (this.stats.nightSong !== null && this.stats.nightCount > 0) {
+      Column({ space: 10 }) {
+        EchoSectionTitle({ text: '深夜之歌' })
+        EchoSongHighlight({
+          title: '深夜之歌',
+          song: this.stats.nightSong,
+          countText: `深夜听了 ${this.stats.nightCount} 次`,
+          onPlay: () => {
+            this.playHighlight(this.stats.nightSong);
+          },
+        })
+      }
+      .width('100%')
+    }
+  }
+
+  /** 完播率 */
+  @Builder
+  private completionSection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '完播率' })
+      EchoCompletionCard({
+        rate: this.stats.completionRate,
+        completeCount: this.stats.completeCount,
+        skippedCount: this.stats.skippedCount,
+        avgMinutes: this.stats.avgMinutesPerDay,
+      })
+    }
+    .width('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(5, Number(newValue.position.y));
+    })
+  }
+
+  /** 新发现 */
+  @Builder
+  private discoverySection() {
+    Column({ space: 10 }) {
+      EchoSectionTitle({ text: '新发现' })
+      EchoDiscoveryCard({ count: this.stats.newSongCount, total: this.stats.newSongTotal })
+    }
+    .width('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(6, Number(newValue.position.y));
+    })
+  }
+
+  /** 页头 + 三格统计 + 年月选择（空月份只留页头 + 年月切换器，不摆 0 值卡片） */
+  @Builder
+  private headerBlock() {
+    Column({ space: 18 }) {
+      EchoMonthHeader({ minutes: echoMinutes(this.stats.totalMs), ratioText: this.stats.ratioText })
+      if (this.stats.hasData) {
+        EchoOverviewCard({
+          playCount: this.stats.playCount,
+          songCount: this.stats.songCount,
+          artistCount: this.stats.artistCount,
+        })
+      }
+      EchoMonthPicker({
+        yearLabels: this.yearLabels,
+        yearIndex: this.yearIndex,
+        monthLabels: this.monthLabels,
+        monthIndex: this.monthIndex,
+        onPickYear: (index: number) => {
+          if (index >= 0 && index < this.yearOffsets.length) {
+            this.pickOffset(this.yearOffsets[index]);
+          }
+        },
+        onPickMonth: (index: number) => {
+          if (index >= 0 && index < this.monthOffsets.length) {
+            this.pickOffset(this.monthOffsets[index]);
+          }
+        },
+      })
+    }
+    .width('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.recordSectionTop(0, Number(newValue.position.y));
+    })
+  }
+
+  /** 窄屏：11 段单列（派音 12 段里裁掉了「新收藏」） */
+  @Builder
+  private narrowColumn() {
+    Column({ space: 18 }) {
+      this.headerBlock()
+      if (this.stats.hasData) {
+        this.topSongsSection()
+        this.topArtistsSection()
+        this.topAlbumsSection()
+        this.audienceSection()
+        this.loopKingSection()
+        this.nightSongSection()
+        this.completionSection()
+        this.discoverySection()
+      } else {
+        EchoEmptyHint({
+          text: '这个月还没有听歌记录',
+          hint: '听满 30 秒的歌会出现在回响里',
+        })
+      }
+    }
+    .width('100%')
+  }
+
+  /** 宽屏：两列 1:1（左 7 段 / 右 4 段，与派音同一分组） */
+  @Builder
+  private wideColumns() {
+    Row({ space: 18 }) {
+      Column({ space: 18 }) {
+        this.headerBlock()
+        if (this.stats.hasData) {
+          this.topSongsSection()
+          this.audienceSection()
+          this.loopKingSection()
+          this.nightSongSection()
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Column({ space: 18 }) {
+        if (this.stats.hasData) {
+          this.topArtistsSection()
+          this.topAlbumsSection()
+          this.completionSection()
+          this.discoverySection()
+        } else {
+          EchoEmptyHint({
+            text: '这个月还没有听歌记录',
+            hint: '听满 30 秒的歌会出现在回响里',
+          })
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Top)
   }
 
   build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      // ---------------------------------------------------- 页面底色
-      // 纯黑垫底：氛围层没图 / 渐隐到 0 时露出的就是它（「你是怎样的听众」段整屏纯黑）
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(ECHO_BLACK)
+    Stack({ alignContent: Alignment.Top }) {
+      // 背景氛围层（在内容下面）：两层模糊封面交叉淡入 + 旧版那层「压暗 / 向下渐到纯黑」
+      // 参数与旧版聆听回响**逐字一致**：模糊 70、每层 0.62 不透明度，上面压
+      // #4D000000(0%) → #73000000(30%) → #B8000000(55%) → 纯黑(78%) → 纯黑(100%)。
+      // 这层是「透明度不对 / 底部渐变到纯黑」的关键：顶部保留一点封面色相，78% 以下彻底黑。
+      Column() {
+        if (this.bgUrlA.length > 0) {
+          Image(this.bgUrlA)
+            .width('100%')
+            .height('100%')
+            .objectFit(ImageFit.Cover)
+            .blur(BACKDROP_BLUR)
+            .opacity(this.bgOpA * BACKDROP_OPACITY)
+            .draggable(false)
+        }
+        if (this.bgUrlB.length > 0) {
+          Image(this.bgUrlB)
+            .width('100%')
+            .height('100%')
+            .objectFit(ImageFit.Cover)
+            .blur(BACKDROP_BLUR)
+            .opacity(this.bgOpB * BACKDROP_OPACITY)
+            .draggable(false)
+        }
+        Column()
+          .width('100%')
+          .height('100%')
+          .linearGradient({
+            angle: 180,
+            colors: [['#4D000000', 0.0], ['#73000000', 0.3], ['#B8000000', 0.55],
+              ['#000000', 0.78], ['#000000', 1.0]],
+          })
+      }
+      .width('100%')
+      .height('100%')
 
-      // 主题色氛围层：固定铺满页面（不随内容滚），随段落 / 轮播中心卡交叉淡入（见 applyTheme）
-      this.backdropLayer()
-
-      /**
-       * 内容铺满整页、从透明标题栏下面穿过去（与「推荐」「我的」等页面一致）
-       *
-       * 标题栏是透明的，滚动内容会从「10 月 · 回响」底下滑过；靠近顶部时由下面那条
-       * 「深色半透明 → 透明」的渐隐吃掉 —— 这就是其它页 TopFade 的观感。这一页顶部
-       * 底色是封面的模糊色、没有固定色可渐，所以渐隐用半透明黑压暗而不是铺底色
-       * （铺系统材质模糊会变成一条灰白色的带子，之前就是这么翻车的）。
-       */
       Column() {
         Scroll(this.scroller) {
           Column() {
-              // 顶部占位：让出透明标题栏那一段（大标题在标题栏里，内容从它下面开始）
-              Column().height(this.topInset + 14).width('100%')
-
-              Column() {
-                // 「10 月 · 回响」这个标题不在这里画：它由壳层的标题栏承载（见 K_ECHO_TITLE），
-                // 与「推荐」「我的」同一个位置。这一页从总时长大字开始
-                Text(echoDurationText(this.stats.totalMs))
-                  .fontSize(DURATION_SIZE)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor(E_TEXT)
-                  .width('100%')
-                  .textAlign(TextAlign.Start)
-
-                // 三格统计：次播放 / 首歌 / 位歌手（「位歌手」那一格点进这个月的歌手名单）
-                EchoStatsRow({
-                  playCount: this.stats.playCount,
-                  songCount: this.stats.songCount,
-                  artistCount: this.stats.artistCount,
-                  onArtists: () => {
-                    this.openArtists();
-                  },
-                })
-                  .margin({ top: 18 })
-
-                // 年 / 月两颗胶囊 +（有数据时）右上角「清空」
-                Row({ space: 10 }) {
-                  Row() {
-                    EchoPickerPill({ text: `${this.year} 年` })
-                  }
-                  .bindMenu(this.yearMenu())
-                  .accessibilityText(`年份：${this.year} 年，点按切换`)
-                  .accessibilityLevel('yes')
-
-                  Row() {
-                    EchoPickerPill({ text: `${this.month} 月` })
-                  }
-                  .bindMenu(this.monthMenu())
-                  .accessibilityText(`月份：${this.month} 月，点按切换`)
-                  .accessibilityLevel('yes')
-
-                  Blank()
-
-                  if (this.songs.length > 0) {
-                    Text('清空')
-                      .fontSize(F_SUB)
-                      .fontColor(E_TEXT_SUB)
-                      .padding({ left: 8, right: 4, top: 8, bottom: 8 })
-                      .onClick(() => {
-                        this.confirmClear();
-                      })
-                      .accessibilityText('清空收听记录')
-                      .accessibilityLevel('yes')
-                  }
-                }
-                .width('100%')
-                .margin({ top: 22 })
-
-                if (this.songs.length === 0) {
-                  /**
-                   * 空月份：整页深色引导，不摆空卡片
-                   *
-                   * 一段留白 + 两行字（照截图的分量）：这个月没听歌时，三格数字 / 年月选择
-                   * 都还在（还能翻到别的月），但下面没有任何榜单可摆 —— 摆一排 0 和空卡
-                   * 只会让人以为页面坏了。
-                   */
-                  Column({ space: 8 }) {
-                    Text('这个月还没有收听记录')
-                      .fontSize(F_SECTION)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor(E_TEXT)
-                    // 「听满 30 秒」这个门槛不在页面里写死：跟着数据层的 COUNTED_MS 走，
-                    // 以后门槛改了这句引导自动是对的
-                    Text(`听满 ${Math.round(COUNTED_MS / 1000)} 秒的歌会出现在回响里`)
-                      .fontSize(F_SUB)
-                      .fontColor(E_TEXT_WEAK)
-                  }
-                  .width('100%')
-                  .alignItems(HorizontalAlign.Center)
-                  .margin({ top: 56 })
-                } else {
-                  this.reportSections()
-                }
-
-                Column().height(this.bottomInset + 16).width('100%')
-              }
-              .width('100%')
-              /**
-               * 宽屏下这一页收成居中的一列，窄屏铺满 —— 两种情况下都留 16 的左右内边距
-               *
-               * 口径与设置类表单一致（见 ui/Layout.ets 的 CONTENT_MAX_WIDTH）：月报是一张
-               * 报告，一共几屏内容，平板上拉满 1400vp 的话大数字孤零零挂在最左边。
-               * 外层的 Column 用 HorizontalAlign.Center 让限宽后的这一列居中。
-               */
-              .padding({ left: 16, right: 16 })
-              .constraintSize({ maxWidth: CONTENT_MAX_WIDTH })
+            if (this.isWide()) {
+              this.wideColumns()
+            } else {
+              this.narrowColumn()
             }
-            .width('100%')
-            .alignItems(HorizontalAlign.Center)
+            // 底部占位：悬浮页签栏 + 迷你播放条
+            Column().height(this.bottomInset + 120).width('100%')
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: this.topInset + 8 })
+          .onAreaChange((oldValue: Area, newValue: Area) => {
+            // 内容总高：判断「已经滚到底」用（滚到底 = 背景渐隐到纯黑）
+            this.contentHeight = Number(newValue.height);
+          })
         }
+        .width('100%')
+        .height('100%')
         .scrollBar(BarState.Off)
-        .layoutWeight(1)
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
         .align(Alignment.Top)
-        // 视口高度：判定锚点用它（段落位置取相对坐标，见 recordSectionTop）
         .onAreaChange((oldValue: Area, newValue: Area) => {
+          // 视口高度：段落判定的锚点 = 视口 45%（见 syncSectionByScroll）
           this.scrollViewportH = Number(newValue.height);
           this.syncSectionByScroll();
         })
-        // 背景主题跟着滚动实时判定（滚到歌手段 → 歌手封面；滚到底 → 纯黑）
         .onDidScroll((xOffset: number, yOffset: number, scrollState: ScrollState) => {
           this.syncSectionByScroll();
         })
@@ -1014,33 +943,25 @@ export struct EchoView {
           BottomBar.notifyScrollDelta(this.getUIContext(), offset);
           return { offsetRemain: offset };
         })
-        .width('100%')
       }
       .width('100%')
       .height('100%')
 
-      /**
-       * 顶栏渐隐（与其它页一致的观感：内容滑到标题下面会逐渐淡掉直到看不见）
-       *
-       * 其它页用「页面底色 → 透明」的 TopFade；这一页顶部是封面的模糊色、没有固定色
-       * 可渐，于是用「深色半透明黑 → 全透明」：只压暗、不铺底色 —— 标题区仍是主题色
-       * 氛围，内容越靠近顶部越淡。**不要换成系统材质模糊**：浅色模式下材质是白灰的，
-       * 压在深色背景上就是一条灰白色带子（之前那版就是这么错的）。
-       * 压在滚动内容之上、标题栏之下；hitTestBehavior 透明，不拦滚动与点击。
-       */
+      // 顶栏渐隐：内容滚到透明标题栏下面时逐渐淡掉，避免与标题叠字。
+      // 页签页壳层不画 TopFade，所以自己带一层；但**不用通用 TopFade**：它取主题的
+      // `c_top_fade`（夜间 #121214），压在回响纯黑底上会留一条灰带 —— 这里用回响自己的
+      // echo_top_fade / echo_top_fade_end（夜间 #000000 → 全透明），与页面底色严格同源。
       Column()
         .width('100%')
-        .height(this.topInset + 18)
+        .height(this.topInset + 10)
         .linearGradient({
           angle: 180,
-          colors: [['#B3000000', 0.0], ['#73000000', 0.55], ['#00000000', 1.0]],
+          colors: [[ECHO_TOP_FADE, 0.0], [ECHO_TOP_FADE_END, 1.0]],
         })
         .hitTestBehavior(HitTestMode.Transparent)
     }
     .width('100%')
     .height('100%')
-    // 兜底底色：氛围层还没画出来的那一帧、或封面取不到时，露出来的也是纯黑，
-    // 而不是壳层 WidePane 的浅色底
-    .backgroundColor(ECHO_BLACK)
+    .backgroundColor(ECHO_PAGE_BACKGROUND)
   }
 }

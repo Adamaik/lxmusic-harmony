@@ -2,11 +2,16 @@ import { LengthMetrics } from '@kit.ArkUI';
 import { K_CURRENT_ID, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
-import { C_BG, C_DIVIDER, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
-import { I_CHECK_CIRCLE, I_CIRCLE, I_DOWNLOAD, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
+// AddMusicResult：加歌的返回值从「加进去几首」改成了 { added, skipped }，要显式标类型
+// DuplicateGroup：「检查重复歌曲」扫出来的分组（保留哪一首由库里的 keepId 定）
+import { AddMusicResult, DuplicateGroup } from '../core/sync/LocalLibrary';
+import { C_BG, C_DIVIDER, C_FILL_SOFT, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
+  F_SUB } from '../ui/Theme';
+import { I_CHECK_CIRCLE, I_CIRCLE, I_CLOSE, I_DOWNLOAD, I_MORE, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_SEARCH,
+  I_VOLUME, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { allSelectedOf, favoriteSongs, pruneSelected, queueSongs, selectActionsOf, SelectAction, selectedSongs,
-  SelectionActions, SelectSession, toggleSelected } from '../ui/Selection';
+  SelectionActions, K_SELECT_END_SEQ, SelectSession, toggleSelected } from '../ui/Selection';
 import { SongListSource } from '../ui/SongListSource';
 import { glassLight, harmony7ApiReady, immersiveMaterialForBar, thinGlass } from '../ui/Glass';
 import { K_MATERIAL_LEVEL, K_NAV_FOLLOW_HAND } from '../core/settings/AppearanceSettings';
@@ -15,6 +20,7 @@ import { K_BAR_MINI_WIDTH, barSideMarginFor, contentColumnsFor } from '../ui/Lay
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { MiniBarView } from './MiniBar';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
+import { DuplicateSongsSheet } from './DuplicateSongsSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
 import { isWebDavSong } from '../core/webdav/WebDavLibrary';
@@ -29,6 +35,20 @@ const PAGE_BAR_BOTTOM_GAP: number = 10;
  */
 const PAGE_BAR_MASK_COLOR: string = '#66F1F1F2';
 const PAGE_BAR_MASK_HEIGHT: number = 104;
+
+/**
+ * 一条歌是否命中关键词（歌名 + 歌手，大小写不敏感）
+ *
+ * 关键词调用方已经 trim + toLowerCase，这里只把两个字段也降到小写再比：
+ * 中文没有大小写，需要这一步的是英文歌名 / 歌手（「Taylor Swift」敲 taylor 也得中）。
+ * 抽成模块级纯函数放在循环外，1000 首逐字过滤时省掉方法查表与闭包分配。
+ */
+function matchKeyword(item: SongItem, key: string): boolean {
+  if (item.name.toLowerCase().includes(key)) {
+    return true;
+  }
+  return item.singer.toLowerCase().includes(key);
+}
 
 /**
  * 多选能做的事
@@ -80,6 +100,19 @@ export struct PlaylistDetailView {
   onOpenQueue: () => void = () => {
   };
   @State songs: SongItem[] = [];
+  /**
+   * 整张歌单的歌（**全量**，顺序就是同步模块给的那一份）
+   *
+   * `songs` 改成「当前该显示的那些」：没搜索时与它同一份，搜索时是过滤结果。
+   * 列表、播放全部、多选、下载全部一律以 `songs` 为准 —— 所见即所操作，
+   * 不会出现「列表只剩 3 首、点播放全部却把 800 首塞进队列」这种错位。
+   * 它不是 @State：每次变化都跟着重写 `songs`，重绘由 `songs` 通知。
+   */
+  private allSongs: SongItem[] = [];
+  /** 搜索框是否展开：头部那颗放大镜点开 / 再点收起 */
+  @State searching: boolean = false;
+  /** 搜索关键词：只跟输入框走，过滤结果在 applyFilter 里算 */
+  @State keyword: string = '';
   @State title: string = '';
   /**
    * 多选（长按任意一行进）
@@ -93,12 +126,28 @@ export struct PlaylistDetailView {
    */
   @State selecting: boolean = false;
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  /**
+   * 多选被全局收尾的序号（见 ui/Selection.ets 的 K_SELECT_END_SEQ）
+   *
+   * 不依赖 onCancel 回调：壳层点叉 / 会话被别处 end 时，序号 +1，这里无条件把自己
+   * 的多选状态清掉。真机上「顶栏退了、行尾还是勾选圈」就是回调链断掉的现场。
+   */
+  @StorageLink(K_SELECT_END_SEQ) @Watch('onSelectEnded') selectEndSeq: number = 0;
   /** 懒加载数据源：只建屏幕上可见的那几行 */
   private source: SongListSource = new SongListSource();
   /** 「添加到歌单」选歌单面板：要加入的歌（单选时一首，多选时是勾选的那些） */
   @State pickerOpen: boolean = false;
   @State pending: SongItem[] = [];
   @State candidates: PlaylistSummary[] = [];
+  /**
+   * 「检查重复歌曲」面板
+   *
+   * 只有查出重复时才打开（一组都没有就只 toast 一句，不弹空面板）。
+   * 分组存在这里、面板只管确认：确认后由本页调 `removeDuplicateSongs` 再 `refresh()`，
+   * 面板那一刻已经被系统收掉了（见 views/DuplicateSongsSheet.ets 的说明）。
+   */
+  @State dupOpen: boolean = false;
+  @State dupGroups: DuplicateGroup[] = [];
   @StorageLink(K_CURRENT_ID) currentId: string = '';
   @StorageLink(K_LIBRARY_VERSION) @Watch('refresh') libraryVersion: number = 0;
   @StorageLink(K_SYNC_DATA_VERSION) @Watch('refresh') syncVersion: number = 0;
@@ -110,18 +159,29 @@ export struct PlaylistDetailView {
   private dustY: number = 0;
 
   aboutToAppear(): void {
+    // 这一页刚出现，不可能已经在多选，所以本页与全局会话两边一起归零：
+    //   - 新实例本来是默认值，这两行只是把「复用实例再次出现」这种情形也拉回一致 ——
+    //     否则可能出现 selecting=true（页内画着勾选圈）而顶栏已是普通标题的反向错位；
+    //   - 全局会话是单例，上一份页面实例留下的「已选中 N 项」与指向旧实例的取消回调
+    //     会跟着进这一页（目的地内容被重建 / 页面被回收后再进来时就是这样）。
+    // 先归零再读数据（end() 幂等：没在多选时只是把结束态再写一遍，顺带让壳层标题栏重算）。
+    this.selecting = false;
+    this.selectedIds = [];
+    SelectSession.getInstance().end();
     this.refresh();
   }
 
   private refresh(): void {
     const library = SyncManager.getInstance().getLibrary();
-    this.songs = library.playlistSongs(this.playlistId);
-    this.source.setItems(this.songs);
+    this.allSongs = library.playlistSongs(this.playlistId);
+    // 数据变了也按**当前关键词**重算一次再灌回列表：搜索态下别处删掉一首，
+    // 它能立刻从结果里消失，不用等用户再敲一遍关键词
+    this.applyFilter();
     // 歌曲列表变了（别处删了歌 / 同步覆盖）就把已经不存在的勾选摘掉，
-    // 否则批量删除会带着幽灵条目算数
+    // 否则批量删除会带着幽灵条目算数。按**全量**摘：搜索态下按过滤结果摘会误删勾选
     if (this.selectedIds.length > 0) {
       const alive: string[] = [];
-      for (const item of this.songs) {
+      for (const item of this.allSongs) {
         alive.push(item.id);
       }
       const pruned: string[] = pruneSelected(this.selectedIds, alive);
@@ -142,6 +202,73 @@ export struct PlaylistDetailView {
         break;
       }
     }
+  }
+
+  // ------------------------------------------------------------ 歌单内搜索
+
+  /**
+   * 按「歌名 + 歌手」重算可见歌曲，并灌回懒加载数据源
+   *
+   * 只替换数组引用：不重建 SongItem、不碰封面解析（重解析封面等于每敲一个字发一批请求）。
+   * 1000 首也就是一次纯数组遍历 + 两次 toLowerCase，毫秒级，输入框不会掉字。
+   * `this.songs` 换掉后 @State 负责通知页面，而 LazyForEach 必须靠 source.setItems
+   * 才会 onDataReloaded（见 ui/SongListSource.ets），两件事都要做。
+   */
+  private applyFilter(): void {
+    const key: string = this.keyword.trim().toLowerCase();
+    if (key.length === 0) {
+      this.songs = this.allSongs;
+    } else {
+      // 顺着 allSongs 走：过滤结果天然保持原排序（同步模块给的顺序 = 原列表顺序）
+      const matched: SongItem[] = [];
+      for (const item of this.allSongs) {
+        if (matchKeyword(item, key)) {
+          matched.push(item);
+        }
+      }
+      this.songs = matched;
+    }
+    this.source.setItems(this.songs);
+  }
+
+  /** 输入框每一次变化：立刻重算（见 applyFilter 的性能说明） */
+  private onKeywordChanged(value: string): void {
+    if (this.keyword === value) {
+      return;
+    }
+    this.keyword = value;
+    this.applyFilter();
+  }
+
+  /** 当前是否真的在筛选（空关键词等同没筛，列表就是原来那份全量） */
+  private filtering(): boolean {
+    return this.keyword.trim().length > 0;
+  }
+
+  /**
+   * 收起搜索并清掉过滤
+   *
+   * 收起时**必须**把过滤一起清掉：否则输入框没了、列表却还只剩搜出来的几首，
+   * 用户会以为歌被删了。滚的是原来那个 List / scroller，收起后回到同一份列表。
+   */
+  private closeSearch(): void {
+    this.searching = false;
+    this.keyword = '';
+    this.applyFilter();
+  }
+
+  /** 头部那颗放大镜：点开 / 再点收起 */
+  private toggleSearch(): void {
+    if (this.selecting) {
+      // 多选时顶栏、底栏都在报「已选中 N 项」，这时候再筛一遍就会出现
+      // 「勾着的歌被过滤出列表」的错位，所以多选态下这颗钮不接（头部也不画它）
+      return;
+    }
+    if (this.searching) {
+      this.closeSearch();
+      return;
+    }
+    this.searching = true;
   }
 
   /**
@@ -363,14 +490,40 @@ export struct PlaylistDetailView {
     if (songs.length === 0) {
       return;
     }
-    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, songs);
+    const result: AddMusicResult = SyncManager.getInstance().getLibrary()
+      .addMusicToPlaylist(playlist.id, songs);
     this.closePicker();
     this.exitSelecting();
-    if (songs.length === 1) {
-      this.toast(added > 0 ? `已添加到「${playlist.name}」` : `「${playlist.name}」里已经有这首歌了`);
+    this.reportAdded(playlist.name, result, songs.length);
+  }
+
+  /**
+   * 加歌之后那句提示，按**真实结果**说话
+   *
+   * 库里现在会把「已经在歌单里的」那些跳过，返回 { added, skipped }，
+   * 所以不能再只看 `added > 0` 就一句「已把 N 首加入」—— 那样部分重复时用户会以为全进去了。
+   * 四种情形分开说（单选另算：一句「里已经有这首歌了」就够自然，不必报数）：
+   *   - 全进去：保持原口径「已把 N 首加入「X」」；
+   *   - 进去一部分：把跳过的首数也说出来；
+   *   - 全被跳过：改说「这 N 首都已经在「X」里了」，点明数量（原文案不提数量，容易被当成失败）；
+   *   - 单选：进去说「已添加到」，没进去说「里已经有这首歌了」。
+   */
+  private reportAdded(playlistName: string, result: AddMusicResult, total: number): void {
+    if (total === 1) {
+      this.toast(result.added > 0
+        ? `已添加到「${playlistName}」`
+        : `「${playlistName}」里已经有这首歌了`);
       return;
     }
-    this.toast(added > 0 ? `已把 ${added} 首加入「${playlist.name}」` : `「${playlist.name}」里已经有这些歌了`);
+    if (result.added <= 0) {
+      this.toast(`这 ${total} 首都已经在「${playlistName}」里了`);
+      return;
+    }
+    if (result.skipped > 0) {
+      this.toast(`已加入 ${result.added} 首，${result.skipped} 首已在歌单里`);
+      return;
+    }
+    this.toast(`已把 ${result.added} 首加入「${playlistName}」`);
   }
 
   private createPlaylistAndAdd(name: string): void {
@@ -380,10 +533,59 @@ export struct PlaylistDetailView {
     }
     const library = SyncManager.getInstance().getLibrary();
     const id: string = library.createPlaylist(name);
-    library.addMusicToPlaylist(id, songs);
+    // 刚建的空歌单里不可能有重复，这里照样读返回值（而不是假设「一定全加进去了」）：
+    // 万一某条歌曲信息不全被库里挡下，提示里的数字才对得上
+    const result: AddMusicResult = library.addMusicToPlaylist(id, songs);
     this.closePicker();
     this.exitSelecting();
-    this.toast(songs.length === 1 ? `已新建歌单「${name}」并添加` : `已新建歌单「${name}」并加入 ${songs.length} 首`);
+    if (result.added <= 0) {
+      this.toast(`已新建歌单「${name}」，但这些歌没能加进去`);
+      return;
+    }
+    this.toast(result.added === 1
+      ? `已新建歌单「${name}」并添加`
+      : `已新建歌单「${name}」并加入 ${result.added} 首`);
+  }
+
+  // ------------------------------------------------------------ 检查重复歌曲
+
+  /**
+   * ⋮ →「检查重复歌曲」
+   *
+   * 先扫一遍再决定弹什么：没有重复就只 toast（弹一个空面板等于让用户白点一次关闭）。
+   * 有重复就报「几组 / 几首可清理」再开面板 —— 这个数面板顶部还会再写一次，
+   * 但用户点菜单那一下就得知道「值不值得点进去」。
+   */
+  private checkDuplicates(): void {
+    const groups: DuplicateGroup[] = SyncManager.getInstance().getLibrary()
+      .findDuplicateGroups(this.playlistId);
+    if (groups.length === 0) {
+      this.toast('没有发现重复歌曲');
+      return;
+    }
+    let removable: number = 0;
+    for (const group of groups) {
+      removable += group.duplicateIds.length;
+    }
+    this.dupGroups = groups;
+    this.dupOpen = true;
+    this.toast(`发现 ${groups.length} 组重复，共 ${removable} 首可清理`);
+  }
+
+  /**
+   * 面板确认：删掉这些 id，然后刷新列表并如实报数
+   *
+   * 先收面板再删：删除会让 `libraryVersion` 变化、@Watch 触发 refresh，
+   * 面板这会儿还开着的话，列表在面板底下换一遍观感很怪。
+   */
+  private cleanDuplicates(ids: string[]): void {
+    const removed: number = SyncManager.getInstance().getLibrary()
+      .removeDuplicateSongs(this.playlistId, ids);
+    this.dupOpen = false;
+    // **不**在这里清 dupGroups：面板还要播一段收起动画，清早了它在动画里会先闪成
+    // 「没有发现重复歌曲」的空态。等 onDisappear（收完）再清，见 build 末尾那个挂载点。
+    this.refresh();
+    this.toast(removed > 0 ? `已清理 ${removed} 首重复歌曲` : '没有可清理的重复歌曲');
   }
 
   private closePicker(): void {
@@ -399,10 +601,23 @@ export struct PlaylistDetailView {
 
   /** 长按某一行进多选：顺手把长按的那条勾上 */
   private enterSelecting(item: SongItem): void {
+    // 搜索态进多选：**先把过滤清掉**。不然后面「已选中 N 项 / 全选 / 批量操作」
+    // 算的都是过滤后那几首，而屏幕上勾着的歌随时可能被关键词挡在列表外，数就对不上
+    if (this.searching || this.filtering()) {
+      this.closeSearch();
+    }
     this.selecting = true;
     this.selectedIds = [item.id];
     // @Watch 只在**值真的变了**时才回调，进多选这一下不能只靠它（同一条二次长按就不变）
     this.publishSelectBar();
+  }
+
+  /** 全局多选已收尾：无条件复位本地状态（回调可能根本没被调到） */
+  private onSelectEnded(): void {
+    if (this.selecting) {
+      this.selecting = false;
+      this.selectedIds = [];
+    }
   }
 
   private exitSelecting(): void {
@@ -592,6 +807,30 @@ export struct PlaylistDetailView {
     })
   }
 
+  /**
+   * 歌单级 ⋮ 菜单（头部那一颗）
+   *
+   * 与 {@link rowMenu} 分开：那个挂在每一行上、每一项只作用于「这一首歌」；
+   * 这里的项作用于整张歌单。内置收藏歌单（isBuiltinPlaylist）也用这一项 ——
+   * 收藏歌单同样会积重复（同一个源重复收藏、多端同步合并），库里的去重口径两种都兼容。
+   */
+  @Builder
+  playlistMenu() {
+    Menu() {
+      MenuItem({ content: '检查重复歌曲' })
+        .onClick(() => {
+          this.checkDuplicates();
+        })
+    }
+    .font({ size: 16 })
+    .menuItemDivider({
+      strokeWidth: LengthMetrics.vp(0.5),
+      color: C_DIVIDER,
+      startMargin: LengthMetrics.vp(14),
+      endMargin: LengthMetrics.vp(14),
+    })
+  }
+
   /** 「添加到歌单」面板（面板本体是三处共用的那个组件） */
   @Builder
   playlistPickerSheet() {
@@ -622,7 +861,9 @@ export struct PlaylistDetailView {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
           .textAlign(TextAlign.Start)
-        Text(`${this.songs.length} 首`)
+        // 曲目数按**全量**给：这一行说的是「这张歌单有多少首」，
+        // 筛出来几首由搜索条下面那行「筛选出 N 首」负责，两个数各说各的
+        Text(`${this.allSongs.length} 首`)
           .fontSize(F_SUB)
           .fontColor(C_TEXT_SUB)
           .width('100%')
@@ -630,9 +871,107 @@ export struct PlaylistDetailView {
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
+
+      // 歌单内搜索入口：画在页面自己的头部里，**不依赖壳层那条标题栏**
+      // （pageTitleBar 在 pages/Index.ets，那是壳层的东西，这一页改不了它）
+      if (!this.selecting) {
+        Row() {
+          IconGlyph({
+            symbol: I_SEARCH,
+            iconSize: 19,
+            color: this.searching ? C_RED : C_TEXT_SUB,
+          })
+        }
+        .width(36)
+        .height(36)
+        .justifyContent(FlexAlign.Center)
+        .borderRadius(18)
+        .backgroundColor(this.searching ? C_RED_TINT : C_FILL_SOFT)
+        .onClick(() => {
+          this.toggleSearch();
+        })
+        .accessibilityText(this.searching ? '收起搜索' : '搜索歌单内的歌曲')
+        .accessibilityLevel('yes')
+      }
+
+      // 歌单级 ⋮：这一颗管的是**整张歌单**（目前是「检查重复歌曲」），
+      // 与每行那颗行尾 ⋮（管那一首歌）分开挂 —— 塞进行菜单的话，
+      // 点某首歌的「更多」却弹出「检查重复歌曲」，会让人以为只检查这一首
+      if (!this.selecting) {
+        Row() {
+          IconGlyph({ symbol: I_MORE, iconSize: 20, color: C_TEXT_SUB })
+        }
+        .width(36)
+        .height(36)
+        .justifyContent(FlexAlign.Center)
+        .borderRadius(18)
+        .backgroundColor(C_FILL_SOFT)
+        .bindMenu(this.playlistMenu())
+        .accessibilityText('歌单更多操作')
+        .accessibilityLevel('yes')
+      }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 12, bottom: 16 })
+  }
+
+  /**
+   * 搜索条：点开头部那颗放大镜后就地展开，输入时列表在眼皮底下实时变
+   *
+   * 用的是搜索页那颗输入框的同一套写法（Row + 放大镜 + 透明 TextInput + 右侧清除），
+   * 只是底色用页面自己的柔和填充、**不叠玻璃**：它在滚动内容里，沉浸光感的材质
+   * 只在 Navigation 标题栏 / 底部 TabBar 内才渲染（见下面 build 那段长注释），
+   * 这里挂 systemMaterial 也是死的，白叠一层毛玻璃只会盖住内容。
+   *
+   * 输入即过滤：每敲一个字只重算一次数组（见 applyFilter），不弹面板、不阻塞输入。
+   */
+  @Builder
+  searchPanel() {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        IconGlyph({ symbol: I_SEARCH, iconSize: 17, color: C_TEXT_SUB })
+          .accessibilityLevel('no')
+        TextInput({ text: this.keyword, placeholder: '搜歌名 / 歌手' })
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 15 })
+          .fontSize(15)
+          .fontColor(C_TEXT)
+          .backgroundColor(Color.Transparent)
+          .padding(0)
+          .height(28)
+          .layoutWeight(1)
+          .enterKeyType(EnterKeyType.Search)
+          .onChange((value: string) => {
+            this.onKeywordChanged(value);
+          })
+        if (this.keyword.length > 0) {
+          // 清除 = 清关键词并收起搜索条（与「再点放大镜」同一个出口）
+          IconGlyph({ symbol: I_CLOSE, iconSize: 16, color: C_TEXT_WEAK })
+            .onClick(() => {
+              this.closeSearch();
+            })
+            .accessibilityText('清除搜索')
+            .accessibilityLevel('yes')
+        }
+      }
+      .width('100%')
+      .height(40)
+      .padding({ left: 14, right: 12 })
+      .borderRadius(20)
+      .backgroundColor(C_FILL_SOFT)
+
+      if (this.filtering()) {
+        // 计数：告诉用户「现在看到的是筛出来的几首」，免得以为歌单被削减了
+        Text(`筛选出 ${this.songs.length} 首`)
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, bottom: 4 })
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder
@@ -640,7 +979,9 @@ export struct PlaylistDetailView {
     Row({ space: 12 }) {
       IconGlyph({ symbol: I_PLAY_CIRCLE, iconSize: 46, color: C_RED })
 
-      Text('播放全部')
+      // 文案跟着筛选态走：队列就是 `this.songs`（搜索时是筛出来的那几首），
+      // 不写清楚的话用户会以为「播放全部」把整张歌单都塞进队列了
+      Text(this.filtering() ? '播放筛选结果' : '播放全部')
         .fontSize(F_ITEM)
         .fontWeight(FontWeight.Medium)
         .fontColor(C_TEXT)
@@ -665,6 +1006,11 @@ export struct PlaylistDetailView {
     .height(70)
     .padding({ left: 16, right: 16 })
     .onClick(() => {
+      // 搜索无结果时这一行还画在列表头上，点它要有个回音，不能静默什么都不发生
+      if (this.songs.length === 0) {
+        this.toast('没有可播放的歌曲');
+        return;
+      }
       this.playFrom(0);
     })
   }
@@ -682,14 +1028,19 @@ export struct PlaylistDetailView {
    * （多选里的「下载」共用它 —— 那是用户一首首勾出来的，不必再确认一遍）。
    */
   private downloadAll(): void {
-    if (this.songs.length === 0) {
+    // 判「歌单是不是空的」要看**全量**：搜索无结果时 songs 也是 0，
+    // 这时候说「歌单里还没有歌曲」就撒谎了（歌单有歌，只是没筛出来）
+    if (this.allSongs.length === 0) {
       this.toast('歌单里还没有歌曲');
       return;
     }
     const count: number = this.songs.length;
+    // 搜索态下「下载全部」下的是筛出来的那些（与列表所见一致），文案得跟着说清楚
     this.getUIContext().showAlertDialog({
       title: '下载全部',
-      message: `确定要把「${this.title}」里的 ${count} 首歌全部加入下载吗？可以在「我的 - 下载管理」里看进度。`,
+      message: this.filtering()
+        ? `确定把筛选出的 ${count} 首加入下载吗？可以在「我的 - 下载管理」里看进度。`
+        : `确定要把「${this.title}」里的 ${count} 首歌全部加入下载吗？可以在「我的 - 下载管理」里看进度。`,
       autoCancel: true,
       buttons: [
         { value: '取消', action: () => { } },
@@ -818,26 +1169,58 @@ export struct PlaylistDetailView {
     }
   }
 
-  /** 组头：歌单封面那一块 + 「播放全部」（宽屏通栏，见 pageBody 的说明） */
+  /** 组头：歌单封面那一块 + 搜索条（展开时）+ 「播放全部」（宽屏通栏，见 pageBody 的说明） */
   @Builder
   listHeader() {
     Column() {
       this.header()
+      // 搜索条夹在头部与「播放全部」之间：展开/收起只动这一块，列表其余部分不搬家
+      if (this.searching) {
+        this.searchPanel()
+      }
       this.playAllRow()
     }
     .width('100%')
   }
 
-  /** 组尾：空歌单的空态 + 给悬浮迷你播放条让位的那一段 */
+  /** 组尾：空歌单 / 搜索无结果的空态 + 给悬浮迷你播放条让位的那一段 */
   @Builder
   listFooter() {
     Column() {
-      if (this.songs.length === 0) {
+      if (this.allSongs.length === 0) {
         EmptyState({
           text: '这个歌单还没有歌曲',
           hint: '可以在洛雪桌面端 / 移动端把歌加进来，同步后就会出现',
           topPadding: 56,
         })
+      } else if (this.songs.length === 0) {
+        // 有歌、但一首都没筛出来。这里必须给一个「清除搜索」的出口：
+        // 搜索条在组头，用户滚到这里时早就看不见它了，让人自己滚回去找太别扭
+        Column({ space: 12 }) {
+          EmptyState({
+            icon: I_SEARCH,
+            text: `没有找到「${this.keyword.trim()}」`,
+            hint: '换个歌名或歌手试试，也可以清除搜索看全部',
+            topPadding: 48,
+          })
+          Row() {
+            Text('清除搜索')
+              .fontSize(F_SUB)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(C_RED)
+          }
+          .padding({ left: 16, right: 16, top: 7, bottom: 7 })
+          .borderRadius(16)
+          .backgroundColor(C_RED_TINT)
+          .onClick(() => {
+            this.closeSearch();
+          })
+          .accessibilityText('清除搜索，显示全部歌曲')
+          .accessibilityLevel('yes')
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Center)
+        .padding({ bottom: 24 })
       }
 
       // 给悬浮的迷你播放条让位：最后一行能滚到栏的上方，而不是被它压住
@@ -894,6 +1277,28 @@ export struct PlaylistDetailView {
     }
     .width('100%')
     .height('100%')
+  }
+
+  /**
+   * 「检查重复歌曲」面板
+   *
+   * 只传查好的分组，删不删由用户在这里拍板；确认后回调宿主（见 cleanDuplicates）。
+   * bottomInset 照传：面板底部那条安全区留白与「添加到歌单」面板同一口径。
+   */
+  @Builder
+  duplicateSheet() {
+    DuplicateSongsSheet({
+      groups: this.dupGroups,
+      playlistName: this.title,
+      bottomInset: this.bottomInset,
+      onConfirm: (ids: string[]) => {
+        this.cleanDuplicates(ids);
+      },
+      onClose: () => {
+        // 只收面板，不动 dupGroups：理由同 cleanDuplicates（收起动画里别闪空态）
+        this.dupOpen = false;
+      },
+    })
   }
 
   /** 迷你栏的宽度：宽屏给壳层算好的最大宽度（与鸿蒙7 那条 `barWidth` 同口径），窄屏铺满 */
@@ -983,6 +1388,27 @@ export struct PlaylistDetailView {
 
         this.fallbackMiniBar()
       }
+
+      // 「检查重复歌曲」面板：**单独挂一个节点**。
+      // 最外层那个节点已经被「添加到歌单」的 bindSheet 占了，同一个节点叠两个半模态
+      // 会互相干扰（工程里同一处结论见 pages/Index.ets 的 syncMode 那段）。
+      // 1×1 + 贴左上角：只是个挂载点，不参与布局、也点不到。
+      Column()
+        .width(1)
+        .height(1)
+        .position({ x: 0, y: 0 })
+        .bindSheet($$this.dupOpen, this.duplicateSheet(), {
+          preferType: SheetType.BOTTOM,
+          detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+          detentSelection: SheetSize.MEDIUM,
+          dragBar: true,
+          showClose: true,
+          title: { title: '检查重复歌曲' },
+          onDisappear: () => {
+            // 下滑关掉也要把分组清掉：下次打开前一定重新扫一遍库，别拿旧结果删歌
+            this.dupGroups = [];
+          },
+        })
     }
     .width('100%')
     .height('100%')

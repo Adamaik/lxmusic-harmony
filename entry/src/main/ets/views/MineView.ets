@@ -260,6 +260,19 @@ export struct MineView {
     return entry.meta.length > 0 ? `${platform} · ${entry.meta}` : platform;
   }
 
+  /**
+   * 自建歌单那一行的第二行说明：`平台 · N 首`（导入的）/ `N 首`（自己手建的）
+   *
+   * 为什么带平台：导入的歌单与手建的歌单可能**同名**（把线上歌单导进来之后，又照名字
+   * 手建了一个），两条都是用户的数据，不能替他合并。标出来源，用户就能分清哪条是
+   * 导入的（点进去是线上那份的本地副本）、哪条是自己建的。本地手建没有平台，照旧只显示「N 首」。
+   */
+  private playlistMeta(item: PlaylistSummary): string {
+    const source: string = SyncManager.getInstance().getLibrary().playlistSourceOf(item.id);
+    const platform: string = source.length > 0 ? platformName(source) : '';
+    return platform.length > 0 ? `${platform} · ${item.count} 首` : `${item.count} 首`;
+  }
+
   /** 取消收藏一张（只去掉收藏这一位，什么都不动） */
   private uncollect(entry: CollectedPlaylist): void {
     CollectedPlaylists.getInstance().remove(entry.source, entry.id);
@@ -395,9 +408,11 @@ export struct MineView {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .textAlign(TextAlign.Start)
-          Text(`${item.count} 首`)
+          Text(this.playlistMeta(item))
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .textAlign(TextAlign.Start)
         }
@@ -596,9 +611,15 @@ export struct MineView {
             .padding({ left: 14, right: 14, top: 4, bottom: 18 })
             .textAlign(TextAlign.Start)
         } else {
+          /**
+           * key 里带条数与名字：ForEach 对 key 没变的条目不会重跑生成器，改名 / 加歌后
+           * 行上的文字会停在旧值（与推荐页那条注释同一个坑）。
+           * 前面再带下标：历史数据里同 id 同名的两条记录 key 会重复，重复 key 的渲染结果
+           * 是未定义的（可能丢行、可能重复画）。
+           */
           ForEach(this.playlists, (item: PlaylistSummary, index: number) => {
             this.playlistRow(item, index > 0)
-          }, (item: PlaylistSummary) => `${item.id}_${item.count}_${item.name}`)
+          }, (item: PlaylistSummary, index: number) => `${index}_${item.id}_${item.count}_${item.name}`)
         }
       }
     }

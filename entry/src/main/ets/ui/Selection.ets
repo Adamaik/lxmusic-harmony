@@ -30,6 +30,15 @@ import { I_ADD_SONGLIST, I_DOWNLOAD_TO_LINE, I_HEART, I_HEART_SLASH, I_LIST_PLAY
 
 /** 当前有多选在进行（顶栏据此换成「取消 + 已选中 N 项 + 全选」，底栏据此换成操作条） */
 export const K_SELECT_ACTIVE: string = 'select_bar_active';
+/**
+ * 「多选被收尾」的序号
+ *
+ * 页面靠回调（onCancel）退出多选，但回调链一旦断掉（会话被重复 end、页面实例换过），
+ * 顶栏收尾了、页面自己的 selecting 却没复位 —— 真机上表现就是「点了叉没反应 / 顶栏退了
+ * 但行尾还是勾选圈」。所以每次 {@link SelectSession.end} 都让这个序号 +1，各页面
+ * @StorageLink 它，在 watch 里把自己的多选状态**无条件**清掉：不依赖任何回调。
+ */
+export const K_SELECT_END_SEQ: string = 'select_end_seq';
 /** 已勾选条数（顶栏的标题、底栏主操作的可用态都看它） */
 export const K_SELECT_COUNT: string = 'select_bar_count';
 /** 是不是已经全选（顶栏那颗钮的读屏文案在「全选 / 取消全选」之间切） */
@@ -96,11 +105,18 @@ export class SelectSession {
    * 退出多选：顶栏与底栏一起恢复原样
    *
    * 页面被弹掉（aboutToDisappear）时也要调 —— 不然工具条会留在下一层页面上。
+   *
+   * **必须无条件写到「已结束」这一档，不能先看 isActive() 再决定写不写**：
+   * 这里原来有一句 `if (!this.isActive()) return;`，本意是「没在多选就别白写一次」，
+   * 实际效果是把「收尾」这件事做成了有条件 —— 只要 K_SELECT_ACTIVE 已经被谁先置成
+   * false（重复 end：exitSelecting 一次、aboutToDisappear 一次；或上一份页面实例先收尾），
+   * 后面所有 end() 都会被这句挡掉，`K_SELECT_COUNT` 再也没人清零。于是顶栏那行
+   * 「已选中 N 项」永远停在最后一次发布的那一帧，而它的「取消」钮调的是本方法最后
+   * 换成空函数的 onCancel —— 点了没反应，用户只能按系统返回键离开（真机 bug 的现场）。
+   * 写一遍是幂等的、代价只有一次状态赋值，所以这里不看前置状态：
+   * 每次调用都让「三个订阅值」落到确定的结束态，订阅方（壳层标题栏 / 底栏）才会稳定重算。
    */
   end(): void {
-    if (!this.isActive()) {
-      return;
-    }
     this.actions = [];
     this.onCancel = () => {
     };
@@ -111,6 +127,9 @@ export class SelectSession {
     AppStorage.setOrCreate(K_SELECT_ACTIVE, false);
     AppStorage.setOrCreate(K_SELECT_COUNT, 0);
     AppStorage.setOrCreate(K_SELECT_ALL, false);
+    // 通知所有页面自己复位（见 K_SELECT_END_SEQ 的注释）：不依赖 onCancel 回调有没有被调用
+    const seq: number | undefined = AppStorage.get<number>(K_SELECT_END_SEQ);
+    AppStorage.setOrCreate(K_SELECT_END_SEQ, (seq === undefined ? 0 : seq) + 1);
   }
 }
 

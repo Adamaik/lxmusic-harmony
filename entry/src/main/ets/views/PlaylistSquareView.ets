@@ -171,6 +171,15 @@ export struct PlaylistSquareView {
     Column() {
       Refresh({ refreshing: $$this.refreshing }) {
         List({ space: ROW_GAP }) {
+          // 顶部占位：`contentStartOffset` 只在**首次布局**取一次值，而 topInset 来自壳层
+          // 窗口避让的异步测量（首帧 0、随后才到），属性不会跟着重排 —— 内容就永久顶在
+          // 标题栏下面（与 RecommendView 同一处坑）。用真实 ListItem 占位，高度一变必然重排。
+          // 减去 ROW_GAP 是把 List 的项间距抵掉，第一行可见内容的位置与原 contentStartOffset 等值。
+          ListItem() {
+            Column()
+              .height(Math.max(0, this.topInset + 6 - ROW_GAP))
+              .width('100%')
+          }
           if (this.items.length === 0) {
             ListItem() {
               if (this.error.length > 0) {
@@ -224,7 +233,6 @@ export struct PlaylistSquareView {
         .scrollBar(BarState.Off)
         .width('100%')
         .height('100%')
-        .contentStartOffset(this.topInset + 6)
         .onReachEnd(() => {
           if (!this.noMore && !this.loading) {
             void this.load(this.page + 1, true);

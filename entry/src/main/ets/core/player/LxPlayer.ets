@@ -5,6 +5,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { PlaybackService } from './PlaybackService';
 import { PlaySettings } from '../settings/PlaySettings';
+import { StartupTiming } from './StartupTiming';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'LxPlayer';
@@ -411,6 +412,10 @@ export class LxPlayer {
   /** 播放一个网络音频地址（先释放上一个实例） */
   async playUrl(url: string): Promise<void> {
     const player: media.AVPlayer = await this.preparePlayer();
+    // 起播计时的后半段从这里开始（前半段是 PlaySession 取地址，见 StartupTiming）。
+    // 看门狗一起挂上：地址是死链或播放器卡在 prepare 时 stateChange 一声不吭，
+    // 不挂它的话这次起播连一条日志都不会留下。
+    StartupTiming.getInstance().armWatchdog();
     // state 为 idle 时设置 url 会进入 initialized，随后由 stateChange 驱动 prepare/play
     player.url = url;
   }
@@ -509,6 +514,12 @@ export class LxPlayer {
           break;
         }
         case 'playing':
+          // AVPlayer 真正开始出声音了：这里就是「点击到出声」的终点，把起播耗时打出去。
+          // 只在「从没在播」的时候打：暂停后接着播、seek 之后续播都不算一次新的起播，
+          // 每次进 playing 都打一条的话日志里全是假的起播耗时。
+          if (this.status !== 'playing') {
+            StartupTiming.getInstance().markPlaying();
+          }
           this.update('playing', '正在播放');
           break;
         case 'paused':
@@ -522,6 +533,8 @@ export class LxPlayer {
           this.update('stopped', '已停止');
           break;
         case 'error':
+          // 失败也要把耗时打出来：排障时最需要看的恰恰是失败那几次等了多久
+          StartupTiming.getInstance().markFailed('播放器错误态');
           this.update('error', '播放器进入错误状态');
           break;
         default:
@@ -569,6 +582,8 @@ export class LxPlayer {
         return;
       }
       hilog.error(DOMAIN, TAG, 'playback error: %{public}s', `${err.code} ${err.message}`);
+      // 与 stateChange 的 error 分支同一件事，两条都可能来；StartupTiming 自己保证只记一次
+      StartupTiming.getInstance().markFailed(`播放错误 ${err.code}`);
       this.update('error', `播放错误：${err.message}`);
     });
     // 音频焦点被打断 / 打断结束：这是「与其他应用同时播放」之外的另一半 ——

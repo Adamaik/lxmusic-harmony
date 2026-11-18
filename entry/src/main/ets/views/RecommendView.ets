@@ -1128,6 +1128,24 @@ export struct RecommendView {
   // -------------------------------------------------- 顶部推荐歌曲
 
   /**
+   * 首块之前那段留白的高度：让出透明标题栏 + 状态栏
+   *
+   * 为什么要一个**真实的占位行**，而不是 List 的 `contentStartOffset`：那个属性只在
+   * 首次布局时取一次值，而 `topInset` 是壳层异步量出来的（pages/Index.ets 的
+   * readAvoidArea 排在一个 500ms 的 setTimeout 里，首帧还是 0）。冷启动时 List 就按
+   * `0 + 6` 排好了，等 topInset 到齐也不会重排 —— 整页内容钉在标题栏下面，看起来就是
+   * 「推荐」大标题与「推荐歌曲」叠在一起（实测 s0 / s9 / s23 三张跨 9 分钟都是错位，
+   * 重启偶尔正常）。换成真实节点后，高度一变就重排，首帧与后续帧必然一致。
+   *
+   * 减掉 ROW_GAP：List 的 `space` 会在占位行与第一块之间再加一段，不减就比原设计
+   * 多出 18vp 的空白（视觉会整体下移）。
+   */
+  private heroTopSpacer(): number {
+    const height: number = this.topInset + 6 - ROW_GAP;
+    return height > 0 ? height : 0;
+  }
+
+  /**
    * 推荐歌曲那一行
    *
    * 可右滑（横向 List，一屏露两张半），每张：封面铺满 + 底部压暗 + 左下歌名 / 歌手
@@ -2389,10 +2407,22 @@ export struct RecommendView {
       Column() {
         Refresh({ refreshing: $$this.refreshing }) {
           /**
-           * 整页用 List（不是 Scroll）：只有 List 有 `contentStartOffset`，内容才能从
-           * 透明标题栏底下穿过、而不是被顶栏整块裁掉（见下面那处用法）。
+           * 整页用 List（不是 Scroll）：只有 List 能让内容从透明标题栏底下穿过、
+           * 而不是被顶栏整块裁掉（起始那一段留白用下面那个占位行让出来）。
            */
           List({ space: ROW_GAP }) {
+            /**
+             * 顶部留白：让出透明标题栏 + 状态栏
+             *
+             * 必须是**占位行**，不能用 `contentStartOffset` —— 那个属性只在首次布局
+             * 取值，topInset 后到时不会重排（详见 heroTopSpacer 的说明）。
+             */
+            ListItem() {
+              Column()
+                .height(this.heroTopSpacer())
+                .width('100%')
+            }
+
             // ------------------------------------------------ 顶部推荐歌曲
             ListItem() {
               this.heroRow()
@@ -2434,11 +2464,6 @@ export struct RecommendView {
           .scrollBar(BarState.Off)
           .width('100%')
           .height('100%')
-          /**
-           * 起始偏移：第一行落在透明标题栏下方，但内容可以滚进这段区域
-           * （与改版前同一口径，理由见上面 List 那行注释）。
-           */
-          .contentStartOffset(this.topInset + 6)
           .onReachEnd(() => {
             this.loadMorePlaza();
           })

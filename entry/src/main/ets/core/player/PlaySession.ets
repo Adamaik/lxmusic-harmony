@@ -2,7 +2,8 @@ import { LxPlayer, LxPlayerBufferListener, LxPlayerStateListener, LxPlayerTimeLi
   LxPlayerCompletionListener, LxPlayerStatus } from './LxPlayer';
 import { PlaybackCommand, PlaybackMediaInfo, PlaybackService } from './PlaybackService';
 import { SourceEngine } from '../source/SourceEngine';
-import { LxMusicInfo, fetchMusicPic, isSearchSupported, searchMusic } from '../music/MusicSearch';
+import { LxMusicInfo, SEARCH_PLATFORMS, SINGER_SEPARATORS, fetchMusicPic, isSearchSupported,
+  searchMusic } from '../music/MusicSearch';
 import { CoverStore } from '../music/CoverStore';
 import { AudioCache } from '../music/AudioCache';
 import { CachedLyricInfo, MediaCache, mediaKeyOf } from '../music/MediaCache';
@@ -12,6 +13,8 @@ import { PlatformLyric, fetchPlatformLyric } from '../music/PlatformLyric';
 import { BridgeResult, LxQuality, SupportedSource } from '../source/LxTypes';
 import { PlayStateStore } from './PlayStateStore';
 import { ShuffleBag } from './ShuffleBag';
+import { StartupTiming } from './StartupTiming';
+import { PlatformHealth } from './PlatformHealth';
 import { PlaySettings } from '../settings/PlaySettings';
 import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
 import { AutoDownloadSong, downloadedFile, removeDownloadedFile,
@@ -280,6 +283,158 @@ export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
     interval: info.interval,
     musicInfoJson: json,
   };
+}
+
+// ------------------------------------------------------------ 跨平台换源（降级）
+
+/**
+ * 换源时依次尝试的平台：网易 → 酷我 → 酷狗
+ *
+ * 顺序照「哪家最容易直接给出可播地址」排：网易的取流接口最稳，酷我次之。
+ * 只在这里出现的平台才可能被换过去，QQ（tx）不放进候选 —— 它正是最常失败的那家，
+ * 换回它等于原地打转。
+ */
+const FALLBACK_PLATFORM_ORDER: string[] = ['wy', 'kw', 'kg'];
+
+/** 平台展示名（提示语里用，`QQ 音乐源不可用，已自动换源播放`） */
+const SOURCE_LABELS: Record<string, string> = {
+  'kw': '酷我音乐',
+  'kg': '酷狗音乐',
+  'mg': '咪咕音乐',
+  'tx': 'QQ 音乐',
+  'wy': '网易云音乐',
+  'qs': '汽水音乐',
+};
+
+/** 换源解析成功的结果（ArkTS 不允许拿匿名对象字面量当类型，显式声明一个） */
+interface AltPlayback {
+  /** 换源后解析出的播放地址 */
+  url: string;
+  /** 换源后协商出来的音质档（新平台未必支持原来那一档） */
+  quality: string;
+  /** 换源后的缓存键：媒体键里带平台，换源就必须跟着换（见 MediaCache.mediaKeyOf） */
+  cacheKey: string;
+}
+
+function labelOf(source: string): string {
+  const label: string | undefined = SOURCE_LABELS[source];
+  return label !== undefined ? label : source;
+}
+
+/**
+ * 源报错 → 提示语里的短原因
+ *
+ * 用户看到的那句 toast 以前只有「X源不可用，已自动换源播放」，看不出到底为什么。
+ * 音源后端拒绝时常见三类：要人机验证、要卡密/认证、别的原因。这里只取一个短语接在
+ * 源名后面，保持提示条一句话能读完（详细原文仍在引擎日志里）。
+ */
+function switchReasonText(message: string): string {
+  // 平台还在冷却（见 PlatformHealth）：这句是我们自己传进 switchSourceAndResolve 的，
+  // 用「冷却」这个词认，不跟源后端文案耦合
+  if (message.includes('冷却')) {
+    return '（该平台暂时不可用）';
+  }
+  const lower: string = message.toLowerCase();
+  if (message.includes('人机验证') || lower.includes('captcha') || lower.includes('verify')) {
+    return '（需要人机验证或卡密）';
+  }
+  if (message.includes('卡密') || message.includes('认证') || lower.includes('license') ||
+    lower.includes('unauthorized') || message.includes('403')) {
+    return '（需要卡密或授权）';
+  }
+  return '';
+}
+
+/**
+ * 「同一个版本」的规范化（严格匹配用）
+ *
+ * 小写 + 去空白 + 去**末尾**的括号后缀：`晴天 (Live)`、`晴天【伴奏】` -> `晴天`。
+ * 括号里的内容一并丢掉是**故意**的：各平台给同一个录音挂的修饰语差得离谱
+ * （(Live) / （录音室版） / [Remastered]），留着它就永远匹配不上。
+ * 代价是「原版」与「Live 版」会被当成同一首 —— 这是这条降级链路上唯一放宽的地方，
+ * 换来的确定性是：歌名与歌手对不上的候选**一律不换**，宁可报错也不放错歌。
+ */
+function strictKey(text: string): string {
+  let out: string = text.toLowerCase();
+  out = out.replace(/[\s\u3000]/g, '');
+  let open: number = trailingBracketStart(out);
+  while (open >= 0) {
+    out = out.substring(0, open);
+    open = trailingBracketStart(out);
+  }
+  return out;
+}
+
+/** 结尾是不是一个括号组：是就返回它的左括号下标，否则 -1 */
+function trailingBracketStart(text: string): number {
+  const pairs: string[][] = [['(', ')'], ['（', '）'], ['[', ']'], ['【', '】']];
+  for (const pair of pairs) {
+    if (text.endsWith(pair[1])) {
+      const open: number = text.lastIndexOf(pair[0]);
+      if (open >= 0) {
+        return open;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * 歌手集合的规范化：拆开、各自规范化、排序后再拼
+ *
+ * 拆歌手的口径直接用 MusicSearch 导出的 `SINGER_SEPARATORS`，与全应用的去重 / 打分
+ * 保持一致：`周杰伦、方文山` 与 `方文山/周杰伦` 是同一组人，不该因为书写顺序被拒。
+ * 成员变了一个（合唱换人）仍然会被拒 —— 这仍然是「严格匹配」。
+ */
+function strictSingerKey(singer: string): string {
+  if (singer.length === 0) {
+    return '';
+  }
+  if (!SINGER_SEPARATORS.test(singer)) {
+    return strictKey(singer);
+  }
+  const parts: string[] = singer.split(SINGER_SEPARATORS);
+  const cleaned: string[] = [];
+  for (const part of parts) {
+    const one: string = strictKey(part);
+    if (one.length > 0) {
+      cleaned.push(one);
+    }
+  }
+  cleaned.sort((a: string, b: string) => a.localeCompare(b));
+  return cleaned.join('、');
+}
+
+/**
+ * 候选是不是**同一首歌**：规范化后歌名与歌手都必须相等
+ *
+ * 任何一边为空都算「没法核对」，直接判否 —— 空歌手匹配等于按歌名乱撞，
+ * 同名不同人的情况（《后来》就有好几个版本）太多，宁可放弃。
+ */
+function strictlySameSong(candidate: LxMusicInfo, item: SongItem): boolean {
+  const name: string = strictKey(candidate.name);
+  const singer: string = strictSingerKey(candidate.singer);
+  const targetName: string = strictKey(item.name);
+  const targetSinger: string = strictSingerKey(item.singer);
+  if (name.length === 0 || singer.length === 0 || targetName.length === 0 || targetSinger.length === 0) {
+    return false;
+  }
+  return name === targetName && singer === targetSinger;
+}
+
+/**
+ * 在搜索结果里挑出**严格匹配**的那一条（挑不到就返回 null）
+ *
+ * 这里刻意不做「相似度最高」「取第一条」那种模糊匹配：换源是为了让用户听到原来那首歌，
+ * 不是随便给点什么声音。搜不到同名同歌手，就宁可让它按原来的错误文案报错。
+ */
+function strictMatch(results: LxMusicInfo[], item: SongItem): LxMusicInfo | null {
+  for (const info of results) {
+    if (strictlySameSong(info, item)) {
+      return info;
+    }
+  }
+  return null;
 }
 
 export class PlaySession {
@@ -1112,6 +1267,113 @@ export class PlaySession {
   // 音质协商见 core/music/Quality.ets：播放与下载共用同一套规则（pickQuality /
   // fallbackQuality），这里不再重复实现，免得两边挑出的档不一致。
 
+  /**
+   * 平台源取不到播放地址时的换源兜底（**只换一次，不递归**）
+   *
+   * 背景：有一批歌在某个平台就是取不到流（QQ 音乐最典型 —— 取流接口要么要会员票据、
+   * 要么直接回空），用户看到的就是一句「播放失败」。而这些歌在别的平台上往往能正常播，
+   * 于是这里在「取地址最终失败」之后，去备选平台找**同一首歌**顶上。
+   *
+   * 三道保险，任何一道不满足就放弃（宁可报错，也不能放错歌）：
+   *   1. 只对**平台源**生效：`item.source` 必须是 SEARCH_PLATFORMS 里的平台 id。
+   *      本地音乐（LOCAL_SOURCE）、WebDAV、听书（BOOK_SOURCE）各自有自己的解析链路，
+   *      而且 BOOK_SOURCE 的 musicInfoJson 装的是书籍载荷，拿去搜歌只会搜出别的歌；
+   *   2. 备选平台必须「当前音源声明了 musicUrl」且「有内置搜索」（见 isSearchSupported）——
+   *      否则搜到了也解析不出来；
+   *   3. 严格匹配：规范化后歌名与歌手都要与原条目**完全相等**（见 strictlySameSong）。
+   *
+   * 换源成功才改条目（source / musicInfoJson / quality + 时长封面），失败不动它 ——
+   * 半途改掉身份再抛错，队列里就会留着一首「来源已经变了但没播成」的歌。
+   *
+   * @param quality 当前已经降过档的音质（新平台未必支持，这里会重新协商）
+   * @param token   本次播放的号：中途用户切了歌就直接放弃，别把新歌顶掉
+   * @returns 换源后的地址 / 音质 / 缓存键；换不成返回 null
+   */
+  private async switchSourceAndResolve(item: SongItem, quality: string,
+    token: number, failReason: string): Promise<AltPlayback | null> {
+    if (!SEARCH_PLATFORMS.includes(item.source)) {
+      return null;
+    }
+    const engine = SourceEngine.getInstance();
+    const map: Record<string, SupportedSource> = engine.getSupportedSources();
+    const failedLabel: string = labelOf(item.source);
+    for (const platform of FALLBACK_PLATFORM_ORDER) {
+      if (platform === item.source) {
+        continue;
+      }
+      // 没声明 musicUrl（或根本没声明这个平台）就跳过去：搜到了也取不到流
+      const supported: SupportedSource | undefined = map[platform];
+      if (supported === undefined || !supported.actions.includes('musicUrl')) {
+        continue;
+      }
+      if (!isSearchSupported(platform)) {
+        continue;
+      }
+      const keyword: string = item.singer.length > 0 ? `${item.name} ${item.singer}` : item.name;
+      let results: LxMusicInfo[] = [];
+      try {
+        results = await searchMusic(keyword, platform, 1, 15);
+      } catch (e) {
+        // 这个平台搜不通（接口报错 / 网络）：换下一个，别让换源本身变成新的失败点
+        hilog.warn(DOMAIN, TAG, 'switch source search %{public}s failed: %{public}s',
+          platform, (e as Error).message);
+        continue;
+      }
+      if (this.playToken !== token) {
+        return null;
+      }
+      const matched: LxMusicInfo | null = strictMatch(results, item);
+      if (matched === null) {
+        hilog.info(DOMAIN, TAG, 'switch source %{public}s: no strict match for %{public}s',
+          platform, item.name);
+        continue;
+      }
+      // 换源后的那条「候选条目」：先不写回 item，等地址真取到了再写，
+      // 免得新平台也解析不了时把原条目的身份改坏
+      const candidate: SongItem = songFromSearch(matched, quality);
+      const nextQuality: string = pickQuality(candidate.musicInfoJson, platform, quality);
+      candidate.quality = nextQuality;
+      let nextUrl: string = '';
+      try {
+        nextUrl = await engine.getMusicUrl(candidate.musicInfoJson, nextQuality as LxQuality,
+          platform);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'switch source %{public}s resolve failed: %{public}s',
+          platform, (e as Error).message);
+        continue;
+      }
+      if (this.playToken !== token) {
+        return null;
+      }
+      if (nextUrl.length === 0) {
+        continue;
+      }
+      const from: string = item.source;
+      // 身份字段原地写回：队列 / 推荐 / 收藏里是同一个对象（与 applyResolved 同一做法）
+      this.applyResolved(item, candidate);
+      item.quality = nextQuality;
+      hilog.info(DOMAIN, TAG, 'switch source %{public}s -> %{public}s: %{public}s / %{public}s',
+        from, platform, item.name, item.singer);
+      StartupTiming.getInstance().note(`换源${from}->${platform}`);
+      // 只换一次：这条提示同时告诉用户「为什么歌名下面那个平台变了」
+      // 「冷却」那一档的短语本身就带「不可用」，套下面那句会念成「（该平台暂时不可用）不可用」，
+      // 所以这一档换一种语序：「QQ 音乐源不可用（该平台暂时不可用），已自动换源播放」；
+      // 其余两档（要人机验证 / 要卡密）的文案与改动前逐字一致。
+      const reasonText: string = switchReasonText(failReason);
+      const tip: string = reasonText.includes('不可用')
+        ? `${failedLabel}源不可用${reasonText}，已自动换源播放`
+        : `${failedLabel}源${reasonText}不可用，已自动换源播放`;
+      this.notify(tip);
+      const result: AltPlayback = {
+        url: nextUrl,
+        quality: nextQuality,
+        cacheKey: mediaKeyOf(item.musicInfoJson),
+      };
+      return result;
+    }
+    return null;
+  }
+
   // ------------------------------------------------------------ 播放控制
 
   get current(): SongItem | null {
@@ -1480,6 +1742,9 @@ export class PlaySession {
       return;
     }
 
+    // 起播耗时第一段从这里开始：补 musicInfo、协商音质、取播放地址都算「取地址」。
+    // 音质这里先记条目自带的，真正的档位协商完再由 beginBuffer 覆盖（见 StartupTiming）。
+    StartupTiming.getInstance().begin(item.source, item.quality, item.name);
     this.setStatus('loading', `正在解析「${item.name}」…`);
     try {
       const resolved: SongItem = await this.ensurePlayable(item);
@@ -1504,7 +1769,8 @@ export class PlaySession {
       AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
 
       // ---------------------------------------------------------- 缓存 / 本地文件
-      const cacheKey: string = mediaKeyOf(item.musicInfoJson);
+      // 不是 const：换源成功之后这首歌的平台变了，媒体键（含平台）得跟着换
+      let cacheKey: string = mediaKeyOf(item.musicInfoJson);
       const audioCache = AudioCache.getInstance();
       // 这一轮的缓存状态：出错时据此决定要不要丢掉缓存重来
       this.currentCacheKey = cacheKey;
@@ -1536,6 +1802,9 @@ export class PlaySession {
           audioCache.setPlayingPath('');
           this.currentLocalPath = downloaded;
           this.setStatus('loading', '正在读取已下载文件…');
+          // 已下载文件也是「零解析、零缓冲」的一种起播：不结算这一段的话，
+          // 复播永远不出耗时日志，排障时会把「缓存救回来了」误读成「没触发」。
+          StartupTiming.getInstance().beginBuffer(item.source, quality, true);
           await LxPlayer.getInstance().playLocal(downloaded);
           void this.prefetchNext(token, index);
           return;
@@ -1556,6 +1825,9 @@ export class PlaySession {
         audioCache.setPlayingPath(local);
         this.currentLocalPath = local;
         this.setStatus('loading', '正在读取缓存…');
+        // 同上：缓存命中同样要出一条 resolve=0ms / 命中缓存=true 的日志，
+        // 否则「第二次播放快了多少」在数据上是空白
+        StartupTiming.getInstance().beginBuffer(item.source, quality, true);
         await LxPlayer.getInstance().playLocal(local);
         void this.prefetchNext(token, index);
         return;
@@ -1576,23 +1848,104 @@ export class PlaySession {
             return;
           }
         }
-        try {
-          url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
-        } catch (err) {
-          // 拓展音质（母带 / 全景声…）多半要会员，拿不到链接是常态：
-          // 退回普通音质再试一次，别让「开了拓展音质」变成有些歌直接放不了。
-          const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
-          if (retry.length === 0) {
-            throw err as Error;
+        // ---------------------------------------------------------- 平台失败冷却
+        // 星海那类音源对 tx 是「整个平台直接 403」，而原链路的每一首歌都要先请求一次原平台、
+        // 失败、再换源 —— 一张全 tx 的旧歌单就是几百次注定失败的请求，每次切歌都被它拖一段。
+        // 这里先问一句冷却表：命中就**不发那个必败的请求**，直接走换源（见 PlatformHealth）。
+        const loadedId: string = engine.getLoadedSourceId();
+        const health: PlatformHealth = PlatformHealth.getInstance();
+        let altFromCooling: AltPlayback | null = null;
+        if (SEARCH_PLATFORMS.includes(item.source) && health.isCooling(loadedId, item.source)) {
+          hilog.info(DOMAIN, TAG,
+            'platform cooling, skip resolve: %{public}s (%{public}s) 剩余=%{public}ds',
+            item.source, loadedId, health.coolingSecondsLeft(loadedId, item.source));
+          // 起播耗时日志里也记一笔：真机上直接对比「跳过冷却平台」前后的 resolve 差多少
+          StartupTiming.getInstance().note(`跳过冷却平台${item.source}`);
+          // 失败原因传我们自己的那句话（switchReasonText 会翻成「（该平台暂时不可用）」），
+          // 不去假装是源后端刚报的错
+          altFromCooling = await this.switchSourceAndResolve(item, quality, token,
+            '该平台暂时不可用（冷却中）');
+          if (this.playToken !== token) {
+            return;
           }
-          hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s',
-            quality, retry);
-          quality = retry;
-          item.quality = retry;
-          // 缓存现场也要跟着改：这条链接真放不出来时要按「实际用的那一档」丢缓存
-          this.currentCacheQuality = retry;
-          AppStorage.setOrCreate(K_CURRENT_QUALITY, retry);
-          url = await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source);
+        }
+        if (altFromCooling !== null) {
+          // 换源成功：身份字段已由 switchSourceAndResolve 写回条目，这里接上这一轮的现场
+          url = altFromCooling.url;
+          quality = altFromCooling.quality;
+          cacheKey = altFromCooling.cacheKey;
+          this.currentCacheKey = cacheKey;
+          this.currentCacheQuality = quality;
+          AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
+          this.pushQueueState();
+        } else {
+          // 没在冷却，或者冷却期换源没成（备选平台也严格匹配不到这首歌）：退回原来的正常流程，
+          // 照旧请求原平台 —— 宁可多试一次，也不能因为一张冷却表把本来能放的歌判死。
+          try {
+            url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+          } catch (err) {
+            // 拓展音质（母带 / 全景声…）多半要会员，拿不到链接是常态：
+            // 退回普通音质再试一次，别让「开了拓展音质」变成有些歌直接放不了。
+            const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
+            // 先把「已经确定失败」的这个错留着：换源也没成时要原样抛出去，
+            // 用户看到的错误文案必须与改动前一致（换源只是多试一条路，不改报错口径）
+            let lastError: Error = err as Error;
+            if (retry.length > 0) {
+              hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s',
+                quality, retry);
+              StartupTiming.getInstance().note(`降档${quality}->${retry}`);
+              quality = retry;
+              item.quality = retry;
+              // 缓存现场也要跟着改：这条链接真放不出来时要按「实际用的那一档」丢缓存
+              this.currentCacheQuality = retry;
+              AppStorage.setOrCreate(K_CURRENT_QUALITY, retry);
+              try {
+                url = await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source);
+              } catch (retryErr) {
+                lastError = retryErr as Error;
+              }
+            }
+            // 走到这里 = 降档也失败了（或本来就没有档可降）：这是「取地址的最终失败」。
+            // 平台源换成别的平台再解析一次（见 switchSourceAndResolve 的严格匹配），
+            // 换不成照旧抛原来那个错。
+            if (url.length === 0) {
+              // 失败即记账：下一次（以及这张旧歌单里的后面几百首）不再白撞这个平台。
+              // 只在这一处记「最终失败」——首档失败但降档成功了不算平台坏掉。
+              hilog.info(DOMAIN, TAG, 'platform failure recorded: %{public}s (%{public}s): %{public}s',
+                item.source, loadedId, lastError.message);
+              health.markFailure(loadedId, item.source, lastError.message);
+              const alt: AltPlayback | null =
+                await this.switchSourceAndResolve(item, quality, token, lastError.message);
+              if (alt === null) {
+                throw lastError;
+              }
+              if (this.playToken !== token) {
+                return;
+              }
+              url = alt.url;
+              quality = alt.quality;
+              cacheKey = alt.cacheKey;
+              // 换源之后这一轮的缓存现场全都作废了：媒体键、音质档、以及「地址来自缓存」
+              this.currentCacheKey = cacheKey;
+              this.currentCacheQuality = quality;
+              AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
+              // 界面上「这首歌来自哪个平台」也跟着变（歌名下面那行小字、播放页的平台名）
+              // 注意：这一轮早些时候排给下载器的自动下载用的是**换源前**的身份（见上面
+              // queueAutoDownload），下载器按 id 去重、不会在这里重复排；它若失败，
+              // 下一次播这首时会按换源后的新身份重新排队。
+              this.pushQueueState();
+            }
+          }
+          // 解析成功（含降档成功）= 这个平台这一档现在真的能用：立刻解除它的冷却。
+          // 只认「真的问过平台并拿到了地址」——地址缓存命中时根本走不到这里（见上面的 fromCache），
+          // 所以不会出现「一听缓存就把冷却清掉」的误判。
+          if (url.length > 0) {
+            if (health.isCooling(loadedId, item.source)) {
+              hilog.info(DOMAIN, TAG, 'platform recovered, clear cooldown: %{public}s (%{public}s)',
+                item.source, loadedId);
+            }
+            health.markSuccess(loadedId, item.source);
+          }
         }
         if (this.playToken !== token) {
           return;
@@ -1602,6 +1955,9 @@ export class PlaySession {
         }
       }
       this.currentUrlFromCache = fromCache;
+      // 地址到手，交给播放器：起播计时从这一行进第二段（buffer），
+      // 终点在 LxPlayer 的 stateChange 里（进 playing 才算出声）
+      StartupTiming.getInstance().beginBuffer(item.source, quality, fromCache);
       this.setStatus('loading', '正在缓冲…');
       // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
       // 这里不提前改状态，避免没出声界面就先显示播放中
@@ -1616,6 +1972,9 @@ export class PlaySession {
       if (this.playToken !== token) {
         return;
       }
+      // 起播耗时照打：buffer=未开始 说明地址都没取到（解析失败），
+      // buffer 有值说明是送进播放器之后才失败的 —— 这两种在排障时完全是两件事
+      StartupTiming.getInstance().markFailed('播放失败');
       const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
       this.setStatus('error', message);
       this.notify(message);
@@ -1713,6 +2072,14 @@ export class PlaySession {
         // 已经是本地文件了，切过去本来就不用联网
         return;
       }
+      // 这个平台正在冷却：预取这一发注定失败，省掉它。
+      // 真切到这一首时 playAt 会直接走「换源」那条路（不经过本函数），所以这里不需要
+      // 提前改成别的平台 —— 那会让还没播到的歌在列表里突然换了来源，反而更乱。
+      if (PlatformHealth.getInstance().isCooling(engine.getLoadedSourceId(), item.source)) {
+        hilog.info(DOMAIN, TAG, 'prefetch skipped: platform cooling %{public}s',
+          item.source);
+        return;
+      }
       let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
       if (url.length === 0) {
         url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
@@ -1721,11 +2088,19 @@ export class PlaySession {
           return;
         }
         MediaCache.getInstance().saveMusicUrl(key, quality, url);
+        // 这一首在这个平台上真解析出来了：说明平台没坏，顺手解除它的冷却。
+        // 只在这一支里做（缓存命中不算证据）——否则「地址缓存命中」会把冷却白清，
+        // 下一个切歌又回去撞墙。幂等，平时是空操作。
+        PlatformHealth.getInstance().markSuccess(engine.getLoadedSourceId(), item.source);
       }
       cache.prefetchSong(key, quality, url);
     } catch (e) {
       // 预取失败不打扰用户：真切到这一首时照常现场解析，只是会慢一点
-      hilog.info(DOMAIN, TAG, 'prefetch next failed: %{public}s', (e as Error).message);
+      const message: string = (e as Error).message;
+      // 预取正好是「悄悄试一下这个平台还活着吗」：失败就记账，真正切歌时 playAt
+      // 会按冷却表直接换源，不用再等一次同样的失败（aries 那张全 tx 旧歌单就是被它拖住的）
+      PlatformHealth.getInstance().markFailure(engine.getLoadedSourceId(), item.source, message);
+      hilog.info(DOMAIN, TAG, 'prefetch next failed: %{public}s', message);
     }
   }
 

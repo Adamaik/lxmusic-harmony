@@ -2,6 +2,8 @@ import { LengthMetrics } from '@kit.ArkUI';
 import { PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { SyncManager } from '../core/sync/SyncManager';
+// 加歌的返回值是 { added, skipped }：重复的会被跳过，提示要按真实结果说话
+import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { platformName } from '../core/music/MusicList';
 import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, platformColor, platformTint } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_MORE_CIRCLE, IconGlyph } from '../ui/Icons';
@@ -175,9 +177,14 @@ export struct SongListPane {
     if (song === null) {
       return;
     }
-    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, [song]);
+    const result: AddMusicResult = SyncManager.getInstance().getLibrary()
+      .addMusicToPlaylist(playlist.id, [song]);
     this.closePicker();
-    this.toast(added > 0 ? `已添加到「${playlist.name}」` : `「${playlist.name}」里已经有这首歌了`);
+    // 这里永远是「一首」：歌单里已经有它的那一种情形说「里已经有这首歌了」最自然，
+    // 不必像多选那样报「加了几首 / 跳过几首」
+    this.toast(result.added > 0
+      ? `已添加到「${playlist.name}」`
+      : `「${playlist.name}」里已经有这首歌了`);
   }
 
   private createPlaylistAndAdd(name: string): void {
@@ -187,9 +194,11 @@ export struct SongListPane {
     }
     const library = SyncManager.getInstance().getLibrary();
     const id: string = library.createPlaylist(name);
-    library.addMusicToPlaylist(id, [song]);
+    const result: AddMusicResult = library.addMusicToPlaylist(id, [song]);
     this.closePicker();
-    this.toast(`已新建歌单「${name}」并添加`);
+    this.toast(result.added > 0
+      ? `已新建歌单「${name}」并添加`
+      : `已新建歌单「${name}」，但这首歌没能加进去`);
   }
 
   private closePicker(): void {

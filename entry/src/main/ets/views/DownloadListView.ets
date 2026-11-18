@@ -5,7 +5,7 @@ import { CoverArt } from '../ui/Widgets';
 import { CoverStore } from '../core/music/CoverStore';
 import { PlaySession } from '../core/player/PlaySession';
 import { DownloadItem, DownloadManager, K_DOWNLOAD_VERSION } from '../core/download/DownloadManager';
-import { allSelectedOf, pruneSelected, selectActionsOf, SelectAction, SelectSession, toggleSelected } from '../ui/Selection';
+import { allSelectedOf, pruneSelected, selectActionsOf, SelectAction, K_SELECT_END_SEQ, SelectSession, toggleSelected } from '../ui/Selection';
 import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /** 下载管理的多选能做什么 */
@@ -52,6 +52,13 @@ export struct DownloadListPane {
   /** 勾选一变就往全局会话里发布一次（顶栏与底栏都听它，见 ui/Selection.ets） */
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
   /**
+   * 多选被全局收尾的序号（见 ui/Selection.ets 的 K_SELECT_END_SEQ）
+   *
+   * 不依赖 onCancel 回调：壳层点叉 / 会话被别处 end 时，序号 +1，这里无条件把自己
+   * 的多选状态清掉。真机上「顶栏退了、行尾还是勾选圈」就是回调链断掉的现场。
+   */
+  @StorageLink(K_SELECT_END_SEQ) @Watch('onSelectEnded') selectEndSeq: number = 0;
+  /**
    * 窗口宽度（vp）：宽屏下这个列表一屏多列（0 = 还没量到，按手机一列）
    *
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
@@ -64,6 +71,12 @@ export struct DownloadListPane {
   }
 
   aboutToAppear(): void {
+    // 页面刚出现 ⇒ 两边都不在多选：上一份页面实例可能把「已选中 N 项」留在全局会话里
+    // （壳层标题栏照那份状态画，就会出现退不掉的残影，见 ui/Selection.ets 的 end() 注释）。
+    // 先收掉再读数据，代价是一次幂等的状态赋值。
+    this.selecting = false;
+    this.selectedIds = [];
+    SelectSession.getInstance().end();
     this.refresh();
   }
 
@@ -93,6 +106,14 @@ export struct DownloadListPane {
     this.selectedIds = [item.key];
     // @Watch 只在**值真的变了**时才回调，进多选这一下不能只靠它（同一条二次长按就不变）
     this.publishSelectBar();
+  }
+
+  /** 全局多选已收尾：无条件复位本地状态（回调可能根本没被调到） */
+  private onSelectEnded(): void {
+    if (this.selecting) {
+      this.selecting = false;
+      this.selectedIds = [];
+    }
   }
 
   private exitSelecting(): void {

@@ -183,6 +183,110 @@
     {
       "name": "p_wy_tint",
       "value": "#1FC62F2F"
+    },
+    {
+      "name": "echo_text_primary",
+      "value": "#E6000000"
+    },
+    {
+      "name": "echo_text_chip",
+      "value": "#E6000000"
+    },
+    {
+      "name": "echo_text_secondary",
+      "value": "#CC000000"
+    },
+    {
+      "name": "echo_text_ratio",
+      "value": "#B3000000"
+    },
+    {
+      "name": "echo_text_tertiary",
+      "value": "#99000000"
+    },
+    {
+      "name": "echo_text_unit",
+      "value": "#8F000000"
+    },
+    {
+      "name": "echo_text_faint",
+      "value": "#99000000"
+    },
+    {
+      "name": "echo_rank_gold",
+      "value": "#8A6100"
+    },
+    {
+      "name": "echo_rank_silver",
+      "value": "#5A6472"
+    },
+    {
+      "name": "echo_rank_bronze",
+      "value": "#8A5522"
+    },
+    {
+      "name": "echo_on_photo_primary",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "echo_on_photo_secondary",
+      "value": "#CCFFFFFF"
+    },
+    {
+      "name": "echo_chip_background",
+      "value": "#1F000000"
+    },
+    {
+      "name": "echo_card_background",
+      "value": "#14000000"
+    },
+    {
+      "name": "echo_placeholder_background",
+      "value": "#22000000"
+    },
+    {
+      "name": "echo_track_background",
+      "value": "#33000000"
+    },
+    {
+      "name": "echo_bar_rest",
+      "value": "#80000000"
+    },
+    {
+      "name": "echo_photo_scrim",
+      "value": "#CC000000"
+    },
+    {
+      "name": "echo_accent",
+      "value": "#BA0F55"
+    },
+    {
+      "name": "echo_heat_low",
+      "value": "#4DBA0F55"
+    },
+    {
+      "name": "echo_heat_mid",
+      "value": "#99BA0F55"
+    },
+    {
+      "name": "echo_heat_high",
+      "value": "#FFBA0F55"
+    },
+    {
+      "name": "echo_page_background",
+      "value": "#F1F3F5"
+    },
+    {
+      "name": "echo_top_fade",
+      "value": "#F1F3F5"
+    },
+    {
+      "name": "echo_top_fade_end",
+      "value": "#00F1F3F5"
+    },
+    {
+      "name": "echo_backdrop_scrim",
+      "value": "#CCF1F3F5"
     }
   ]
 }

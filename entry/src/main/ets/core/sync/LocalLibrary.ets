@@ -1,6 +1,10 @@
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { K_LIBRARY_VERSION, PlaySession, LibrarySink, PlaylistSummary, SongItem } from '../player/PlaySession';
+import { PlaylistLink, parseShareText } from '../music/PlaylistLink';
+// 歌手拆分口径与搜索页的判重必须完全一致：两处各写一份正则，迟早有一边补了「；」
+// 另一边没补，同一个歌单里「A、B」与「B/A」就会被当成两组人（见 duplicateKeyOf）
+import { SINGER_SEPARATORS } from '../music/MusicSearch';
 import { fromLxMusicInfo, isSyncable, toLxMusicInfo } from './SyncConvert';
 import { defaultListData, SyncStore } from './SyncStore';
 import { LocalMusic } from '../local/LocalMusic';
@@ -23,6 +27,39 @@ export type SyncActionSink = (action: LxSyncAction, kind: string) => void;
 export interface LibrarySummary {
   playlists: number;
   songs: number;
+}
+
+/**
+ * 加歌结果：added = 真正加入的条数（含本地/云端侧表歌），skipped = 因重复被跳过的条数
+ *
+ * 为什么要分两个数：以前只返回「加了几首」，调用方没法把「这首歌已经在歌单里了」
+ * 讲给用户听 —— 群反馈里 QQ 的做法是「发现重复就不让加并提示」，我们至少要能提示
+ * 「N 首已在歌单里，已跳过」，否则静默丢弃看起来就像点了没反应。
+ */
+export interface AddMusicResult {
+  added: number;
+  skipped: number;
+}
+
+/**
+ * 一组重复歌曲（按歌名·歌手聚合，组内 >1）
+ *
+ * 只用于「检测并清理重复」，不改动任何数据：界面拿 keepId / duplicateIds 自己决定
+ * 删不删，删除仍然走 removeMusicFromPlaylist 的上行分支。
+ */
+export interface DuplicateGroup {
+  /** duplicateKeyOf 的结果（空串表示只能按 id 判重的条目，不参与分组） */
+  key: string;
+  /** 展示用歌名（组内第一条） */
+  name: string;
+  /** 展示用歌手（组内第一条） */
+  singer: string;
+  /** 组内总条数 */
+  count: number;
+  /** 建议保留的那条 id（列表中位置最靠前的一条） */
+  keepId: string;
+  /** 建议删除的那几条 id（组内除 keepId 外全部） */
+  duplicateIds: string[];
 }
 
 /**
@@ -221,6 +258,40 @@ export class LocalLibrary implements LibrarySink {
     return added;
   }
 
+  /**
+   * 这批条目里会被侧表挡掉的条数（加歌时算「重复跳过」用）
+   *
+   * 侧表的 addToList 只返回「真正加了几条」，被它挡下的那部分（key 已经在歌单里、
+   * 或同一批里出现了两次）不会有人告诉界面，用户看到的就是「点了没反应」。
+   * **必须在写入之前调用**：写完再数，刚加进去的 key 全成了「本来就有」。
+   */
+  private sideSkippedCount(listId: string, items: SongItem[]): number {
+    let skipped: number = 0;
+    for (const table of this.sideTables()) {
+      // 已属于这张歌单的 key 先占位，后面同 key 的条目就算「本批内重复」
+      const claimed: Set<string> = new Set<string>();
+      for (const key of table.listKeys(listId)) {
+        claimed.add(key);
+      }
+      for (const item of items) {
+        if (item.source !== table.source) {
+          continue;
+        }
+        const key: string = table.keyOfId(item.id);
+        // 认不出 key 或条目已不在库里：addToList 收不到它，这里也不该算「跳过」
+        if (key.length === 0 || !table.hasKey(key)) {
+          continue;
+        }
+        if (claimed.has(key)) {
+          skipped++;
+          continue;
+        }
+        claimed.add(key);
+      }
+    }
+    return skipped;
+  }
+
   /** 从各张侧表里摘；@returns 真正被摘掉的总数 */
   private removeFromSideTables(listId: string, ids: string[]): number {
     let removed: number = 0;
@@ -350,17 +421,50 @@ export class LocalLibrary implements LibrarySink {
 
   // ------------------------------------------------------------ 歌单操作（界面入口）
 
+  /**
+   * 歌单列表（「我的 → 自建歌单」直接渲染这一份）
+   *
+   * **按 id 去重**：老用户的数据里可能存在两条完全同 id 的记录 —— 历史同步把同一条
+   * list_create 落了两遍（实测 list.json 里就是两条同 id 的「茗秋瞳喜欢的音乐」，
+   * 见 docs/UPDATE_1.0.7_TEST_RESULT.md 那条低严重问题）。同 id 就是同一张歌单，
+   * 列两遍只会让用户以为自己建重了。
+   *
+   * 这里只做**只读的展示层去重**：不动 `this.data.userList`，所以既不删数据、也不会
+   * 让同步 md5 因为去重而漂移（一漂移就会在下次连接时多弹一次「选择同步方式」）。
+   * 同 id 且曲目数不同时按多的那条显示，免得去重把「N 首」显示小了。
+   */
   playlistSummaries(): PlaylistSummary[] {
     const out: PlaylistSummary[] = [];
+    const keptAt: Map<string, number> = new Map<string, number>();
     for (const item of this.data.userList) {
-      out.push({
-        id: item.id,
-        name: item.name,
-        // 曲目数要把侧表里的本地歌 / 云端歌算上，否则「歌单里有 3 首本地歌」外面显示 0 首
-        count: item.list.length + this.sideCountOf(item.id),
-      });
+      // 曲目数要把侧表里的本地歌 / 云端歌算上，否则「歌单里有 3 首本地歌」外面显示 0 首
+      const count: number = item.list.length + this.sideCountOf(item.id);
+      const at: number | undefined = keptAt.get(item.id);
+      if (at === undefined) {
+        keptAt.set(item.id, out.length);
+        out.push({ id: item.id, name: item.name, count: count });
+        continue;
+      }
+      const kept: PlaylistSummary = out[at];
+      if (count > kept.count) {
+        kept.count = count;
+      }
     }
     return out;
+  }
+
+  /**
+   * 歌单的来源平台（本地手建的返回空串）
+   *
+   * 列表副标题用它标出来源：导入的歌单与手建的歌单可能同名，两条都合法，界面必须
+   * 让用户分得清哪条是导入的（见 views/MineView 的 playlistMeta）。
+   */
+  playlistSourceOf(id: string): string {
+    const item = this.findPlaylist(id);
+    if (item === null || item.source === undefined) {
+      return '';
+    }
+    return item.source;
   }
 
   playlistSongs(id: string): SongItem[] {
@@ -412,9 +516,24 @@ export class LocalLibrary implements LibrarySink {
     return false;
   }
 
-  /** 新建歌单；返回新歌单 id */
+  /**
+   * 新建歌单；返回新歌单 id
+   *
+   * **同名不合并**：用户有权建两张同名歌单（一张放这个歌手、一张放那张合集），
+   * 静默合并会把其中一张的歌「吃掉」。同名要区分就让界面去标来源（见 playlistSourceOf）。
+   *
+   * 但 **id 必须唯一**：`Date.now()` 只有毫秒精度，连点两下「新建歌单」或脚本批量建
+   * 会撞出同一个 id，落库后就是两条同 id 的记录 —— 界面上是两条同名，而
+   * `findPlaylist` 只认第一条，第二条从此改不动也删不干净（同一类重复的根因之一）。
+   */
   createPlaylist(name: string): string {
-    const id: string = `user_list_${Date.now()}`;
+    const stamp: number = Date.now();
+    let id: string = `user_list_${stamp}`;
+    let seq: number = 0;
+    while (this.hasPlaylist(id)) {
+      seq++;
+      id = `user_list_${stamp}_${seq}`;
+    }
     const item: LxUserListInfoFull = {
       id: id,
       name: name,
@@ -434,15 +553,30 @@ export class LocalLibrary implements LibrarySink {
    * 按线上歌单标识找已经导入过的本地歌单
    *
    * 导入面板拿它判断这次是「新建」还是「更新已有歌单」。sourceListId 存的是洛雪的
-   * 列表标识 `${source}__${歌单id}`（与 core/music/PlaylistLink 解析出来的一致）。
+   * 列表标识 `${source}__${歌单id}`（与 core/music/PlaylistLink 解析出来的一致），
+   * 但老数据里可能是 `wy__<整条分享链接>`（见 normalizeSourceListId 的说明），
+   * 所以比较走归一化口径 —— 否则升级后的用户会对同一张歌单再建一条同名列表。
    */
   playlistBySourceListId(sourceListId: string): PlaylistSummary | null {
-    if (sourceListId.length === 0) {
+    const item = this.findBySourceListId(sourceListId);
+    if (item === null) {
+      return null;
+    }
+    return { id: item.id, name: item.name, count: item.list.length + this.sideCountOf(item.id) };
+  }
+
+  /** 按归一化后的线上歌单标识找记录（`wy__2102211118` 与 `wy__https://…?id=2102211118` 视为同一条） */
+  private findBySourceListId(sourceListId: string): LxUserListInfoFull | null {
+    const key: string = normalizeSourceListId(sourceListId);
+    if (key.length === 0) {
       return null;
     }
     for (const item of this.data.userList) {
-      if (item.sourceListId === sourceListId) {
-        return { id: item.id, name: item.name, count: item.list.length + this.sideCountOf(item.id) };
+      if (item.sourceListId === undefined) {
+        continue;
+      }
+      if (normalizeSourceListId(item.sourceListId) === key) {
+        return item;
       }
     }
     return null;
@@ -456,6 +590,12 @@ export class LocalLibrary implements LibrarySink {
    *      本地歌单，不会冒出一堆同名列表（洛雪也是这么算 id 的）；
    *   2. 一起落 source / sourceListId，服务端与官方客户端认这两个字段，以后还能
    *      按它判断「这个歌单来自哪个平台」。
+   *
+   * **认领老记录**：只比 id 还不够 —— 老版本有一条入口把整条分享链接当 listId 传进来，
+   * 那批记录的 id 是按 `md5('wy__https://…')` 算的，与新口径算出来的不同。所以 id 找不到
+   * 时再按归一化 sourceListId 找一次，命中就原地更新那条（沿用它的 id），顺手把
+   * sourceListId 迁到规范形态。这样老用户再导一次同一张歌单不会多出一条同名列表，
+   * 也不会删掉任何原有数据。
    * @returns 导入后的歌单；没有任何可导入的歌时返回 null
    */
   importPlaylist(name: string, source: string, sourceListId: string,
@@ -464,26 +604,33 @@ export class LocalLibrary implements LibrarySink {
     if (musics.length === 0) {
       return null;
     }
-    const id: string = `${source}_${toMD5(sourceListId)}`;
-    const existing = this.findPlaylist(id);
+    // id 按**归一化**后的标识算：同一张线上歌单，无论调用方给的是 `wy__2102211118`
+    // 还是老的 `wy__https://…?id=2102211118`，都落到同一个本地歌单上
+    const key: string = normalizeSourceListId(sourceListId);
+    const id: string = `${source}_${toMD5(key)}`;
+    let existing: LxUserListInfoFull | null = this.findPlaylist(id);
+    if (existing === null) {
+      existing = this.findBySourceListId(key);
+    }
     if (existing !== null) {
       // 同一个线上歌单再导一次：原地更新（名字与歌曲都换成线上最新的）
+      const targetId: string = existing.id;
       existing.name = name;
       existing.source = source;
-      existing.sourceListId = sourceListId;
+      existing.sourceListId = key;
       existing.locationUpdateTime = Date.now();
       existing.list = musics;
       this.persist();
       this.mirrorToSession();
-      this.emitOverwrite(id, musics);
+      this.emitOverwrite(targetId, musics);
       this.emit({ action: 'list_update', data: [buildUserListInfo(existing)] }, 'list');
-      return { id: id, name: name, count: musics.length + this.sideCountOf(id) };
+      return { id: targetId, name: name, count: musics.length + this.sideCountOf(targetId) };
     }
     const item: LxUserListInfoFull = {
       id: id,
       name: name,
       source: source,
-      sourceListId: sourceListId,
+      sourceListId: key,
       locationUpdateTime: Date.now(),
       list: musics,
     };
@@ -548,12 +695,19 @@ export class LocalLibrary implements LibrarySink {
    * 新加的歌放在**最前面**（保持传入顺序），与洛雪的默认设置一致
    * （list.addMusicLocationType 默认就是 'top'）：刚加完就能在歌单顶部看到，
    * 不用翻到最底下确认加没加上。上行也照这个位置报，别让别的设备加到底部去。
+   *
+   * **判重为什么不能只看 id**：同一首歌在酷我 / QQ / 网易各有一条 id，从不同音源、
+   * 不同搜索结果回来的条目 id 全不一样，只按 id 判重必然往同一个歌单里塞进两首一样的歌
+   * （群反馈「歌单要加个删除重复歌曲……加歌的时候和 QQ 不一样」就是这个）。
+   * 所以 id 之外再按歌名·歌手（duplicateKeyOf）兜一层，被挡下的如实计进 skipped。
    */
-  addMusicToPlaylist(id: string, items: SongItem[]): number {
+  addMusicToPlaylist(id: string, items: SongItem[]): AddMusicResult {
     const target = this.findPlaylist(id);
     if (target === null) {
-      return 0;
+      return { added: 0, skipped: 0 };
     }
+    // 侧表歌已经在歌单里的，也算「重复跳过」；先数再写，顺序不能反（见 sideSkippedCount）
+    const sideSkipped: number = this.sideSkippedCount(id, items);
     // 本地歌 / 云端歌走侧表（它们不属于同步结构，musicsOf 会把它们丢掉）
     const localAdded: number = this.addToSideTables(id, items);
     const musics: LxMusicInfoNew[] = musicsOf(items);
@@ -562,25 +716,41 @@ export class LocalLibrary implements LibrarySink {
       if (localAdded > 0) {
         this.bumpLocalChange();
       }
-      return localAdded;
+      return { added: localAdded, skipped: sideSkipped };
     }
     const existed: Set<string> = new Set<string>();
+    // 同曲不同 id 的兜底键：歌名·歌手（空键不可判重，只按 id 走）
+    const existedKeys: Set<string> = new Set<string>();
     for (const info of target.list) {
       existed.add(info.id);
+      const key: string = duplicateKeyOf(info.name, info.singer);
+      if (key.length > 0) {
+        existedKeys.add(key);
+      }
     }
     const added: LxMusicInfoNew[] = [];
+    let skipped: number = sideSkipped;
     for (const info of musics) {
       if (existed.has(info.id)) {
+        skipped++;
+        continue;
+      }
+      const key: string = duplicateKeyOf(info.name, info.singer);
+      if (key.length > 0 && existedKeys.has(key)) {
+        skipped++;
         continue;
       }
       existed.add(info.id);
+      if (key.length > 0) {
+        existedKeys.add(key);
+      }
       added.push(info);
     }
     if (added.length === 0) {
       if (localAdded > 0) {
         this.bumpLocalChange();
       }
-      return localAdded;
+      return { added: localAdded, skipped: skipped };
     }
     target.list = added.concat(target.list);
     this.persist();
@@ -591,7 +761,7 @@ export class LocalLibrary implements LibrarySink {
       addMusicLocationType: ADD_MUSIC_TOP,
     };
     this.emit({ action: 'list_music_add', data: data }, 'list');
-    return added.length + localAdded;
+    return { added: added.length + localAdded, skipped: skipped };
   }
 
   /**
@@ -657,6 +827,91 @@ export class LocalLibrary implements LibrarySink {
     this.persist();
     this.mirrorToSession();
     this.emitOverwrite(LIST_ID_LOVE, this.data.loveList);
+  }
+
+  /**
+   * 找出某个歌单里的重复组（按列表顺序，keep 取最靠前的一条；没有重复返回空数组）
+   *
+   * 口径与加歌时的判重完全一致（duplicateKeyOf）：只有「歌名·歌手」非空的条目才参与，
+   * key 为空的条目（连歌名都没有的侧表歌）宁可漏报也不并组 —— 并错了就是误删用户的歌。
+   *
+   * 内建收藏歌单也覆盖：它的数据在 loveList 里，playlistSongs → targetMusics 认 'love'，
+   * 侧表里属于收藏的那部分也一起被 playlistSongs 合进来，不另造一份数据源。
+   */
+  findDuplicateGroups(id: string): DuplicateGroup[] {
+    const songs: SongItem[] = this.playlistSongs(id);
+    const order: string[] = [];
+    const byKey: Map<string, DuplicateGroup> = new Map<string, DuplicateGroup>();
+    const seenIds: Set<string> = new Set<string>();
+    for (const song of songs) {
+      // 老数据（同一条侧表 key 被记了两遍）会把同一首歌列两次：那是「同一行重复」，
+      // 删一次就干净了，不能当成「两首重复的歌」让用户点两次删除
+      if (seenIds.has(song.id)) {
+        continue;
+      }
+      seenIds.add(song.id);
+      const key: string = duplicateKeyOf(song.name, song.singer);
+      if (key.length === 0) {
+        continue;
+      }
+      const group: DuplicateGroup | undefined = byKey.get(key);
+      if (group === undefined) {
+        const fresh: DuplicateGroup = {
+          key: key,
+          name: song.name,
+          singer: song.singer,
+          count: 1,
+          keepId: song.id,
+          duplicateIds: [],
+        };
+        byKey.set(key, fresh);
+        order.push(key);
+        continue;
+      }
+      // 组内顺序就是列表顺序：第一条（最靠前）留着，后面的一律进 duplicateIds
+      group.count++;
+      group.duplicateIds.push(song.id);
+    }
+    const out: DuplicateGroup[] = [];
+    for (const key of order) {
+      const group: DuplicateGroup | undefined = byKey.get(key);
+      if (group !== undefined && group.count > 1) {
+        out.push(group);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 删除指定的重复条目；@returns 实际删除条数
+   *
+   * 内部走 removeMusicFromPlaylist 同一套分支（内建收藏歌单 = 收藏侧移除 + love 整份覆盖，
+   * 用户歌单 = list_music_remove），所以上行、落盘、界面镜像都不必在这里重写一遍。
+   * 调用方可能拿着旧快照来删，不在当前歌单里的 id 直接跳过，不报错。
+   */
+  removeDuplicateSongs(id: string, ids: string[]): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    // 只认内建收藏歌单与用户歌单：removeMusicFromPlaylist 对 'default' 之类本来就不动，
+    // 这里若照单全收，返回的「删了 N 首」就是假数
+    if (!this.isBuiltinPlaylist(id) && this.findPlaylist(id) === null) {
+      return 0;
+    }
+    const present: string[] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const song of this.playlistSongs(id)) {
+      if (seen.has(song.id) || !ids.includes(song.id)) {
+        continue;
+      }
+      seen.add(song.id);
+      present.push(song.id);
+    }
+    if (present.length === 0) {
+      return 0;
+    }
+    this.removeMusicFromPlaylist(id, present);
+    return present.length;
   }
 
   /** 用整份列表覆盖歌单歌曲（界面里的「用当前播放列表替换」） */
@@ -1170,12 +1425,135 @@ function idsOf(musics: LxMusicInfoNew[]): string[] {
   return out;
 }
 
+/** 判重键里隔开歌名与歌手的字符（与对外说明的「歌名·歌手」写法一致，只是个分隔符） */
+const DUPLICATE_KEY_SEP: string = '·';
+
+/** 一个收尾括号组：全角/半角圆括号、方括号、方头括号、尖括号都算「附注」（Live / 伴奏 / 重制版） */
+const TRAILING_BRACKET_GROUP: RegExp = /[（(\[【〔<][^）)\]】〕>]*[）)\]】〕>]$/;
+
+/** 标准化歌手拼回去用的分隔符，与 MusicSearch 的 normalizeSingers 一致 */
+const SINGER_JOIN: string = '、';
+
+/**
+ * 判重用的标准化键：歌名·歌手（小写、去空白、去尾部括号组，如「晴天 (Live)」→「晴天」）
+ *
+ * 为什么判重落在「歌名 + 歌手」而不是条目 id：同一首歌在酷我 / QQ / 网易各有一条 id，
+ * 从不同音源、不同搜索结果加进同一个歌单时 id 全不一样，只按 id 判重必然重复
+ * （群反馈「歌单要加个删除重复歌曲」的根因之一）。
+ *
+ * 标准化规则：
+ *   - 歌名、歌手都去空白并转小写 ——「晴天」「 晴天 」以及带全角空格的写法必须同键
+ *     （JS 的 \s 本来就含全角空格 U+3000，不用再单列）；
+ *   - 歌名去掉**尾部**括号组且允许连续多组：「晴天 (Live)」「晴天（伴奏）」「晴天(Live)(Remastered)」
+ *     都归到「晴天」；括号在歌名中间的保留 —— 那是歌名本身的一部分，砍掉会把
+ *     「A (B) C」和「A C」并成一回事，那是误删；
+ *   - 歌手按 SINGER_SEPARATORS 拆开、各自标准化、排序后用「、」重拼，于是
+ *     「周杰伦、方文山」与「方文山/周杰伦」是同一个键（口径与搜索页去重一致）；
+ *   - 任一边为空就退化为只用非空的那一边；两边都空返回空串，调用方必须把空串视为
+ *     **不可判重**、只用 id 判，否则所有缺歌名的条目会被并成一坨。
+ *
+ * 导出它是为了界面层「这首歌是不是已经在歌单里」的预检与将来的单测能复用同一口径，
+ * 免得界面上写一份、库里写一份。
+ */
+export function duplicateKeyOf(name: string, singer: string): string {
+  const song: string = normalizeDuplicateName(name);
+  const artist: string = normalizeDuplicateSinger(singer);
+  if (song.length === 0) {
+    return artist;
+  }
+  if (artist.length === 0) {
+    return song;
+  }
+  return `${song}${DUPLICATE_KEY_SEP}${artist}`;
+}
+
+/** 歌名标准化：去空白 → 小写 → 反复剥掉尾部括号组（剥完可能为空，交给调用方退化） */
+function normalizeDuplicateName(name: string): string {
+  if (name === undefined || name === null) {
+    return '';
+  }
+  return stripTrailingBracketGroups(name.replace(/\s/g, '').toLowerCase());
+}
+
+/**
+ * 剥掉尾部的括号组，直到尾部不再是括号组
+ *
+ * 循环而不是一次 replace：`/(…)$/` 去掉的最外层那组，后面可能还挂着一组
+ * （「晴天 (Live) (Remastered)」）；一次只去一组会留下「晴天 (Live)」这种半成品键。
+ */
+function stripTrailingBracketGroups(text: string): string {
+  let out: string = text;
+  while (out.length > 0) {
+    const next: string = out.replace(TRAILING_BRACKET_GROUP, '');
+    if (next === out) {
+      break;
+    }
+    out = next;
+  }
+  return out;
+}
+
+/** 歌手标准化：去空白 → 小写 → 按分隔符拆开 → 各自去重排序 → 用「、」重拼 */
+function normalizeDuplicateSinger(singer: string): string {
+  if (singer === undefined || singer === null) {
+    return '';
+  }
+  const text: string = singer.replace(/\s/g, '').toLowerCase();
+  if (text.length === 0) {
+    return '';
+  }
+  if (!SINGER_SEPARATORS.test(text)) {
+    return text;
+  }
+  const parts: string[] = text.split(SINGER_SEPARATORS);
+  const cleaned: string[] = [];
+  for (const part of parts) {
+    if (part.length > 0 && !cleaned.includes(part)) {
+      cleaned.push(part);
+    }
+  }
+  cleaned.sort((a: string, b: string) => a.localeCompare(b));
+  return cleaned.join(SINGER_JOIN);
+}
+
 function replaceInList(list: LxMusicInfoNew[], id: string, musicInfo: LxMusicInfoNew): LxMusicInfoNew[] {
   const out: LxMusicInfoNew[] = [];
   for (const info of list) {
     out.push(info.id === id ? musicInfo : info);
   }
   return out;
+}
+
+/**
+ * 把 sourceListId 归一成规范的 `${平台}__${歌单id}`
+ *
+ * 为什么需要：老版本有一条导入入口把**整条分享链接**当 listId 传了进来，落库成了
+ * `wy__https://music.163.com/playlist?id=2102211118&uct2=…`（本机 list.json 里实测就是
+ * 这种，id 后缀 md5('wy__https://…') 与它完全对得上），而现在的解析器给的是
+ * `wy__2102211118`。两者字面不等 —— 不归一的话，用户升级后对同一张歌单再导一次会被
+ * 判成「没导入过」，又冒出一条同名歌单（就是「我的」页两条同名那条路）。
+ *
+ * 只做字符串层面的归一，不改任何已有数据；"链接 → 平台+id" 的规则直接复用
+ * core/music/PlaylistLink 的解析器，免得平台正则出现第二份实现（酷狗 gcid、
+ * 洛雪深链都由它兜住）。认不出的形态原样返回：宁可匹配不上，也不要匹配错。
+ */
+export function normalizeSourceListId(raw: string): string {
+  const text: string = raw.trim();
+  if (text.length === 0) {
+    return '';
+  }
+  // 已经是规范形态（`wy__2102211118` / `kg__gcid_xxx`），直接用
+  if (/^(kw|kg|mg|tx|wy)__[0-9A-Za-z_-]+$/.test(text)) {
+    return text;
+  }
+  // `wy__https://…`：剥掉平台前缀，剩下的是链接
+  const prefixed: RegExpMatchArray | null = text.match(/^(kw|kg|mg|tx|wy)__(.+)$/);
+  const body: string = (prefixed !== null && prefixed[2] !== undefined) ? prefixed[2].trim() : text;
+  if (!/^https?:\/\//i.test(body)) {
+    return text;
+  }
+  const link: PlaylistLink | null = parseShareText(body);
+  return link === null ? text : link.listId;
 }
 
 /** 按洛雪 buildUserListInfoFull 的字段顺序重建歌单信息 */

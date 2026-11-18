@@ -368,7 +368,10 @@ export class HeartEngine {
     pick.interest = bestQueryIndex(queries.queries, item.vec);
     pick.taste = tasteVec === null ? 0 : cosine(tasteVec, item.vec);
     pick.affinity = this.profile.affinityBonus(item.doc);
-    pick.fresh = this.isFresh(item.doc) ? 1 : 0;
+    // 新歌曝光：真实入库时间命中窗口就记满 1，否则用候选来源/榜内位次推断的
+    // freshBoost 兜底。平台歌 addedAt 恒为 0，没有这层兜底时整项恒为 0，
+    // weights.fresh 对全网候选等于白给。
+    pick.fresh = Math.max(this.isFresh(item.doc) ? 1 : 0, item.doc.freshBoost);
     pick.ucb = this.profile.ucbBonus(item.doc.id);
     pick.noise = (this.nextRandom() * 2 - 1) * this.weights.noise;
     pick.score = this.weights.dot * pick.dot

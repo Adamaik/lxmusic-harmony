@@ -12,8 +12,13 @@ const FILE_NAME: string = 'play_settings.json';
  * 因此 v1 存档里的 desktopLyric 不再可信、按新默认处理（见 apply）。
  * v3：新增「默认渠道」字段；老存档里没有这一项，按「自动（不指定）」处理 ——
  * 也就是行为与加这一项之前完全一致，不替用户改既有习惯。
+ * v4：新增「播放页动效」字段；默认开，老存档里没有这一项时按开处理，
+ * 因此升级后观感与加这一项之前一致（多出来的只是播放页那点视觉，且用户随时可关）。
+ * v5：「播放页动效」由布尔改成三档字符串（off / light / immersive，见 K_PLAYER_MOTION）。
+ * v4 及更早的存档里它是 `true` / `false`，apply 里按 `true -> light`、`false -> off` 迁移，
+ * 迁移完立刻按 v5 结构回写一次（用户不必等到下次改设置才落成新格式）。
  */
-const SETTINGS_VERSION: number = 3;
+const SETTINGS_VERSION: number = 5;
 
 /**
  * 播放设置（设置 - 播放设置）
@@ -23,7 +28,8 @@ const SETTINGS_VERSION: number = 3;
  *   播放音质 / 拓展音质（含 Hi-Res、全景声、全景声+、母带）/ 与其他应用同时播放 /
  *   被打断结束后自动重新播放
  *   播放页显示小歌词 / 歌词页模糊效果 / 歌词居中显示 / 歌词字号 / 歌词页不熄屏 /
- *   桌面歌词 / 车载蓝牙歌词 / 本地与云端自动匹配歌词
+ *   桌面歌词 / 车载蓝牙歌词 / 本地与云端自动匹配歌词 /
+ *   播放页动效（三档：关闭 / 轻量 = 封面呼吸 + 主色氛围底 + 边缘光带 / 沉浸 = 再加 3D 倾斜 + 波纹 + 浮光 + 流动背景）
  *
  * 存法：一份 JSON 落在应用沙箱（filesDir/play_settings.json），同时把每个值写进
  * AppStorage——界面用 @StorageLink 订阅即可实时响应，播放器侧直接读本单例。
@@ -99,6 +105,50 @@ export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
 export const K_AUTO_RESUME_AFTER_INTERRUPT: string = 'cfg_auto_resume_after_interrupt';
 
 /**
+ * 播放页动效（设置 - 播放设置 - 播放页动效）
+ *
+ * 管的是播放页那几处「活的」视觉，分三档（`PLAYER_MOTION_LEVELS`）：
+ *
+ *   - `off`       全静态。不跑任何动画，连 HDS 那圈流光都不挂，
+ *                 封面主色的氛围底留着（静态渐变，不产生持续功耗）。
+ *   - `light`     轻量档（默认）：封面轻微呼吸缩放、背后主色光晕明暗、边缘光带。
+ *                 这一档**零 JS 定时器**，全靠声明式动画（animateTo 无限循环 /
+ *                 着色器自己的循环），停下来就是真的没东西在跑。
+ *   - `immersive` 沉浸档：在轻量档之上再加封面 3D 倾斜漂浮、封面后的扩散波纹、
+ *                 低密度上浮光点、氛围底缓慢流动。这一档多出来的代价是
+ *                 5 条 30fps 上限的声明式动画（2 条倾斜相位 + 3 圈波纹）+ 1 条
+ *                 氛围底流动 + 一层 ≤12 个粒子的 Particle，**仍然零 JS 帧回调**。
+ *
+ * 为什么要有这个开关：这几处动效本身就是**耗电**的（哪怕量很小），而且用户群明确
+ * 提过「如果会增加功耗，不弄也算了」。所以默认停在轻量档，但必须留出口 ——
+ * 续航优先的人关掉它，播放页就与加这个功能之前一模一样。
+ *
+ * 早先这里是布尔值（`true` / `false`）。改成三档后旧存档照样读得懂：
+ * `true -> light`、`false -> off`（见 apply 里的迁移与 SETTINGS_VERSION 的说明）。
+ */
+export const K_PLAYER_MOTION: string = 'cfg_player_motion';
+
+/** 关：最省电，播放页完全静态 */
+export const PLAYER_MOTION_OFF: string = 'off';
+/** 轻量：呼吸 + 柔光（零 JS 定时器的声明式动画） */
+export const PLAYER_MOTION_LIGHT: string = 'light';
+/** 沉浸：轻量档 + 3D 倾斜 / 扩散波纹 / 上浮光点 / 氛围底流动 */
+export const PLAYER_MOTION_IMMERSIVE: string = 'immersive';
+
+/** 三档取值，顺序与界面上的胶囊一致（也是校验存档用的白名单） */
+export const PLAYER_MOTION_LEVELS: string[] = [
+  PLAYER_MOTION_OFF, PLAYER_MOTION_LIGHT, PLAYER_MOTION_IMMERSIVE
+];
+/** 三档的界面文案，与 PLAYER_MOTION_LEVELS 一一对应 */
+export const PLAYER_MOTION_LABELS: string[] = ['关闭', '轻量', '沉浸'];
+
+/**
+ * 播放页动效默认**轻量**：新功能默认让人看到，又不必一上来就付沉浸档的代价；
+ * 觉得费电的往下拨到「关闭」，喜欢观感的往上拨到「沉浸」。
+ */
+export const PLAYER_MOTION_DEFAULT: string = PLAYER_MOTION_LIGHT;
+
+/**
  * 默认渠道（默认平台）
  *
  * 有些页面没有「选渠道」的入口，只能替用户猜一个平台：
@@ -144,6 +194,13 @@ interface PlaySettingsData {
   autoMatchLyric?: boolean;
   bluetoothLyric?: boolean;
   autoResumeAfterInterrupt?: boolean;
+  /**
+   * 播放页动效（见 K_PLAYER_MOTION）
+   *
+   * 类型写成 `string | boolean` 是为了兼容：v4 及更早的存档里它是布尔值，
+   * v5 起是三档字符串。读的时候按 typeof 分流，不猜。
+   */
+  playerMotion?: string | boolean;
   /** '' = 自动（不指定默认渠道），见 K_DEFAULT_SOURCE */
   defaultSource?: string;
 }
@@ -217,6 +274,19 @@ export class PlaySettings {
    */
   private autoResumeAfterInterrupt: boolean = true;
   /**
+   * 播放页动效档位，默认「轻量」（见 K_PLAYER_MOTION）
+   *
+   * 读取方是播放页：它订阅 AppStorage 里的同一个 key，改一下立刻生效，
+   * 不用重启播放页、也不用重进设置。
+   */
+  private playerMotion: string = PLAYER_MOTION_DEFAULT;
+  /**
+   * 刚才那份存档是不是旧的布尔值（需要按 v5 结构回写一次）
+   *
+   * 只在 init 里用一次：迁移完立刻落盘，之后这个标记就没意义了。
+   */
+  private playerMotionMigrated: boolean = false;
+  /**
    * 默认渠道，默认「自动」（空串 = 不指定）。
    *
    * 为什么默认不指定：这一项会改「点歌手名进哪个平台的歌手页」这种既有行为，
@@ -242,6 +312,15 @@ export class PlaySettings {
       } catch (e) {
         hilog.warn(DOMAIN, TAG, 'failed to parse play settings: %{public}s', JSON.stringify(e));
       }
+    }
+    /**
+     * 旧布尔存档（v4 及更早）迁移成三档之后立刻按新结构回写一次
+     *
+     * 为什么不等用户下次改设置：那样存档里会长期留着 `true/false`，下一次读还是走迁移
+     * 分支 —— 迁移只该发生一次，落成定局比「每次启动都猜一遍」可靠。
+     */
+    if (this.playerMotionMigrated) {
+      this.write();
     }
     this.publish();
   }
@@ -277,6 +356,7 @@ export class PlaySettings {
       autoMatchLyric: this.autoMatchLyric,
       bluetoothLyric: this.bluetoothLyric,
       autoResumeAfterInterrupt: this.autoResumeAfterInterrupt,
+      playerMotion: this.playerMotion,
       defaultSource: this.defaultSource,
     };
     try {
@@ -344,6 +424,29 @@ export class PlaySettings {
     if (data.autoResumeAfterInterrupt !== undefined) {
       this.autoResumeAfterInterrupt = data.autoResumeAfterInterrupt;
     }
+    /**
+     * 播放页动效：v4 及更早的存档里是布尔值，v5 起是三档字符串
+     *
+     * 迁移规则（用户不必重设）：
+     *   - `true`  -> `light`：旧版「开」对应的就是轻量档那三件事（呼吸 / 柔光 / 光带）；
+     *     不迁到 `immersive`：沉浸档是**新增**的更重的效果，不该替用户决定多付这份功耗。
+     *   - `false` -> `off`：旧版「关」就是「完全静态」，语义一一对应。
+     *   - 已经是合法档位字符串：直接用。
+     *   - 其它（手改坏的存档、以后删掉的档位）：保持默认（轻量），不抛错也不猜。
+     *
+     * 老存档里完全没有这一项时**什么都不做**：保持默认（轻量），
+     * 观感与加这一项之前一致（多出来的只是播放页那点视觉，且用户随时可改）。
+     */
+    const motion: string | boolean | undefined = data.playerMotion;
+    if (typeof motion === 'boolean') {
+      this.playerMotion = motion ? PLAYER_MOTION_LIGHT : PLAYER_MOTION_OFF;
+      this.playerMotionMigrated = true;
+    } else if (typeof motion === 'string') {
+      if (PLAYER_MOTION_LEVELS.includes(motion)) {
+        this.playerMotion = motion;
+      }
+      // 是字符串但不是已知档位：多半是被手改过，按默认处理
+    }
     // 默认渠道：只认已知平台或空串；不认识的（以后删掉的平台 / 手改坏的存档）按自动处理
     const defaultSource: string | undefined = data.defaultSource;
     if (defaultSource !== undefined && DEFAULT_SOURCE_VALUES.includes(defaultSource)) {
@@ -371,6 +474,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
       AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, this.bluetoothLyric);
       AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, this.autoResumeAfterInterrupt);
+      AppStorage.setOrCreate(K_PLAYER_MOTION, this.playerMotion);
       AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
@@ -614,6 +718,31 @@ export class PlaySettings {
     }
     this.autoResumeAfterInterrupt = value;
     AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, value);
+    this.write();
+  }
+
+  /** 播放页动效档位（见 K_PLAYER_MOTION）：'off' / 'light' / 'immersive' */
+  getPlayerMotionLevel(): string {
+    return this.playerMotion;
+  }
+
+  /** 播放页动效没有关掉：轻量与沉浸都要跑基础那三件事（呼吸 / 柔光 / 光带） */
+  isPlayerMotionOn(): boolean {
+    return this.playerMotion !== PLAYER_MOTION_OFF;
+  }
+
+  /** 是否沉浸档（只有这一档才挂 3D 倾斜 / 扩散波纹 / 上浮光点 / 流动背景） */
+  isPlayerMotionImmersive(): boolean {
+    return this.playerMotion === PLAYER_MOTION_IMMERSIVE;
+  }
+
+  /** 选播放页动效档位（播放设置页的胶囊点选）；不认识的取值直接忽略 */
+  setPlayerMotionLevel(value: string): void {
+    if (!PLAYER_MOTION_LEVELS.includes(value) || value === this.playerMotion) {
+      return;
+    }
+    this.playerMotion = value;
+    AppStorage.setOrCreate(K_PLAYER_MOTION, value);
     this.write();
   }
 }

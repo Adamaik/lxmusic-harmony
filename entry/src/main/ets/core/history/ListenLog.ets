@@ -980,6 +980,40 @@ export class ListenLog {
   hasData(year: number, month: number): boolean {
     return this.countedOf(year, month).length > 0;
   }
+
+  // ------------------------------------------------ 回响 2.0 移植新增（只读）
+
+  /**
+   * 某月的 counted 流水快照（playedMs ≥ COUNTED_MS 且 startedAt 属于该年月），新在前
+   *
+   * 回响 2.0 的「深夜之歌」要按每首歌逐条计时、「新发现」要看跨月的原始流水，
+   * 只拿 songsOf 的月度合计不够；而 records 是 private，页面与 EchoMonthly 都读不到。
+   * 返回的是**副本**：调用方随便排序 / 筛选都改不到流水本身。
+   */
+  countedRecordsOf(year: number, month: number): ListenRecord[] {
+    return this.countedOf(year, month).slice();
+  }
+
+  /**
+   * 全量流水只读快照（新在前）
+   *
+   * 「新发现」要回答「这首歌在本月之前出现过没有」，必须跨月看全部流水；
+   * 同样是副本，不会让外部有机会改到内部状态。
+   */
+  allRecords(): ListenRecord[] {
+    return this.records.slice();
+  }
+
+  /**
+   * 按 songKey 取歌曲元数据
+   *
+   * 键的约定见上面的 songKeyOf（歌名 + 分隔符 + 歌手）。回响点歌要用到
+   * `id` 与 `musicInfoJson`（能直接续播，不用再搜一遍），而榜单行 EchoSong
+   * 只带歌名 / 歌手，所以要按这个键换回完整元数据。取不到返回 undefined。
+   */
+  songByKey(key: string): ListenSong | undefined {
+    return this.songs.get(key);
+  }
 }
 
 /**

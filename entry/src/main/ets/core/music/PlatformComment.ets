@@ -32,6 +32,15 @@ export interface LxComment {
   avatar: string;
   /** 已经格式化好的时间文案（「3 分钟前」/「2024-05-06」）；空串 = 平台没给时间 */
   timeStr: string;
+  /**
+   * 评论时间的毫秒时间戳；0 / 缺省 = 平台没给时间
+   *
+   * `timeStr` 是给「数据层口径」用的（酷我 / 洛雪那套「N 秒前」）。
+   * 评论页要按播放页风格自己排版（刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期），
+   * 那是**视图口径**，只有拿到原始时间戳才算得出来 —— 所以这里把原始值一并留下，
+   * 避免为了换个文案再回数据层改一遍档位。可选（`timeMs?`）：老调用处不写这个字段也能编过。
+   */
+  timeMs?: number;
   /** IP 归属地；空串 = 没有 */
   location: string;
   /** 点赞数；-1 = 平台没给（界面就不画这一块，而不是显示 0） */
@@ -62,6 +71,27 @@ const COMMENT_SOURCES: string[] = ['kw', 'kg', 'mg', 'tx', 'wy'];
 
 export function commentsSupported(source: string): boolean {
   return COMMENT_SOURCES.includes(source);
+}
+
+/**
+ * 评论页要显示的平台名（「来自酷我音乐」那一句）
+ *
+ * 不直接复用 `MusicList.PLATFORM_NAMES`：那张表是歌单广场的短名（QQ / 网易），
+ * 塞进「来自 QQ 的评论」里读着像缩写；而且评论这条链路跟歌单没有关系，
+ * 为一个名字把两个模块连起来不划算。
+ */
+const COMMENT_PLATFORM_NAMES: Record<string, string> = {
+  'kw': '酷我音乐',
+  'kg': '酷狗音乐',
+  'mg': '咪咕音乐',
+  'tx': 'QQ 音乐',
+  'wy': '网易云音乐',
+};
+
+/** 平台 code -> 展示名；认不出来的返回「音乐平台」，不把 code 直接漏给用户看 */
+export function commentPlatformName(source: string): string {
+  const name: string = COMMENT_PLATFORM_NAMES[source];
+  return name !== undefined ? name : '音乐平台';
 }
 
 // ------------------------------------------------------------------ 小工具
@@ -186,7 +216,9 @@ export function parseKwComments(rawList: Object[]): LxComment[] {
     const comment: LxComment = makeComment(
       asString(item['id']), asString(item['msg']), asString(item['u_name']));
     comment.avatar = asString(item['u_pic']);
-    comment.timeStr = relativeTime(asNumber(item['time'], 0) * 1000);
+    const timeMs: number = asNumber(item['time'], 0) * 1000;
+    comment.timeMs = timeMs;
+    comment.timeStr = relativeTime(timeMs);
     comment.likedCount = likedCountOf(item['like_num']);
     const pic: string = asString(item['mpic']);
     if (pic.length > 0) {
@@ -197,7 +229,9 @@ export function parseKwComments(rawList: Object[]): LxComment[] {
       const reply: LxComment = makeComment(
         asString(child['id']), asString(child['msg']), asString(child['u_name']));
       reply.avatar = asString(child['u_pic']);
-      reply.timeStr = relativeTime(asNumber(child['time'], 0) * 1000);
+      const childTimeMs: number = asNumber(child['time'], 0) * 1000;
+      reply.timeMs = childTimeMs;
+      reply.timeStr = relativeTime(childTimeMs);
       reply.likedCount = likedCountOf(child['like_num']);
       const childPic: string = asString(child['mpic']);
       if (childPic.length > 0) {
@@ -272,7 +306,9 @@ export function parseKgComments(rawList: Object[]): LxComment[] {
     comment.avatar = asString(item['user_pic']);
     comment.userId = asString(item['user_id']);
     comment.location = asString(item['location']);
-    comment.timeStr = relativeTime(parseDateTime(asString(item['addtime'])));
+    const timeMs: number = parseDateTime(asString(item['addtime']));
+    comment.timeMs = timeMs;
+    comment.timeStr = relativeTime(timeMs);
     comment.likedCount = likedCountOf(asRecord(item['like'])['likenum']);
     comment.replyNum = likedCountOf(item['reply_num']);
     for (const imageRaw of asObjectArray(item['images'])) {
@@ -376,7 +412,9 @@ export function parseMgComments(rawList: Object[]): LxComment[] {
       asString(item['commentInfo']), asString(user['nickName']));
     comment.avatar = mgAvatar(user);
     comment.userId = asString(user['userId']);
-    comment.timeStr = relativeTime(parseDateTime(asString(item['commentTime'])));
+    const timeMs: number = parseDateTime(asString(item['commentTime']));
+    comment.timeMs = timeMs;
+    comment.timeStr = relativeTime(timeMs);
     comment.likedCount = likedCountOf(asRecord(item['opNumItem'])['thumbNum']);
     comment.replyNum = likedCountOf(item['replyTotalCount']);
     for (const replyRaw of asObjectArray(item['replyComments'])) {
@@ -386,7 +424,9 @@ export function parseMgComments(rawList: Object[]): LxComment[] {
         asString(replyData['replyInfo']), asString(replyUser['nickName']));
       reply.avatar = mgAvatar(replyUser);
       reply.userId = asString(replyUser['userId']);
-      reply.timeStr = relativeTime(parseDateTime(asString(replyData['replyTime'])));
+      const replyTimeMs: number = parseDateTime(asString(replyData['replyTime']));
+      reply.timeMs = replyTimeMs;
+      reply.timeStr = relativeTime(replyTimeMs);
       comment.reply.push(reply);
     }
     out.push(comment);
@@ -509,7 +549,9 @@ export function parseTxComments(rawList: Object[]): LxComment[] {
     comment.likedCount = likedCountOf(item['praisenum']);
     // 时间只跟着「本条」走：被引用进来的原文不报时间（洛雪同款判断）
     if (isRoot) {
-      comment.timeStr = relativeTime(secondsToMs(item['time']));
+      const timeMs: number = secondsToMs(item['time']);
+      comment.timeMs = timeMs;
+      comment.timeStr = relativeTime(timeMs);
     }
     for (const replyRaw of asObjectArray(item['middlecommentcontent'])) {
       const replyData: Record<string, Object> = asRecord(replyRaw);
@@ -542,7 +584,9 @@ export function parseTxHotComments(rawList: Object[]): LxComment[] {
     comment.userId = asString(item['EncryptUin']);
     comment.location = asString(item['Location']);
     comment.likedCount = likedCountOf(item['PraiseNum']);
-    comment.timeStr = relativeTime(secondsToMs(item['PubTime']));
+    const hotTimeMs: number = secondsToMs(item['PubTime']);
+    comment.timeMs = hotTimeMs;
+    comment.timeStr = relativeTime(hotTimeMs);
     const pic: string = asString(item['Pic']);
     if (pic.length > 0) {
       comment.images = [pic];
@@ -555,7 +599,9 @@ export function parseTxHotComments(rawList: Object[]): LxComment[] {
       reply.avatar = asString(replyData['Avatar']);
       reply.userId = asString(replyData['EncryptUin']);
       reply.likedCount = likedCountOf(replyData['PraiseNum']);
-      reply.timeStr = relativeTime(secondsToMs(replyData['PubTime']));
+      const replyTimeMs: number = secondsToMs(replyData['PubTime']);
+      reply.timeMs = replyTimeMs;
+      reply.timeStr = relativeTime(replyTimeMs);
       const replyPic: string = asString(replyData['Pic']);
       if (replyPic.length > 0) {
         reply.images = [replyPic];
@@ -755,7 +801,9 @@ function wyOne(raw: Object, withTime: boolean): LxComment {
   comment.userId = asString(user['userId']);
   comment.likedCount = likedCountOf(item['likedCount']);
   if (withTime) {
-    comment.timeStr = relativeTime(asNumber(item['time'], 0));
+    const timeMs: number = asNumber(item['time'], 0);
+    comment.timeMs = timeMs;
+    comment.timeStr = relativeTime(timeMs);
     comment.location = asString(asRecord(item['ipLocation'])['location']);
   }
   return comment;

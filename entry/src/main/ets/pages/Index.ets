@@ -551,6 +551,8 @@ struct Index {
       return;
     }
     try {
+      // 回响是**固定深色沉浸月报**（页面底色恒为纯黑，不跟系统浅色模式），
+      // 所以停在回响页签时状态栏图标必须是白字
       const onDarkPage: boolean = this.isDarkMode() || this.activeTabKey === TAB_KEY_ECHO;
       win.setWindowSystemBarProperties({
         statusBarContentColor: (playerOpen || onDarkPage) ? '#FFFFFF' : '#000000',
@@ -933,8 +935,8 @@ struct Index {
   @Builder
   homeHeader() {
     Row({ space: 10 }) {
-      // 标题按页签取：回响是「10 月 · 回响」（月份跟着它的选择器变，见 echoTitle），
-      // 其余直接用页签自己的名字。回响是固定深色的月报页，标题要转白字（onDark）。
+      // 标题按页签取：回响是「10 月 · 回响」（月份与滚动段名跟着页面变，见 echoTitle），
+      // 其余直接用页签自己的名字。回响是固定深色的沉浸月报，标题必须转白字（onDark）。
       PageTitle({
         text: this.activeTabKey === TAB_KEY_ECHO
           ? this.echoTitle
@@ -1415,7 +1417,13 @@ struct Index {
    * 标题里的数字与右钮的文案跟着变。
    */
   private pageTitleBar(title: string = '', scroller?: Scroller): HdsNavigationTitleBarOptions {
-    if (!this.selectBarActive) {
+    // 是不是还在多选：除了这条 @StorageLink，还要**现读一次会话**（isActive 走 AppStorage）。
+    //
+    // 为什么要两重判断：`@StorageLink` 是「值变了才通知」，它跟 AppStorage 之间有一拍延迟，
+    // 而 HDS 的标题栏是照这份 options 画的 —— 一旦按「已选中 N 项」画下去，只要再没有
+    // 第二次状态变化，这一帧就永远是那一帧：页面早就退出了多选，顶栏还留着多选条。
+    // 这里两个都为真才画多选；会话已经收尾（现读为假）就直接画普通标题，宁可早一拍也不画残影。
+    if (!this.selectBarActive || !SelectSession.getInstance().isActive()) {
       return this.titleBarOptions(title, scroller);
     }
     const session: SelectSession = SelectSession.getInstance();
@@ -1428,7 +1436,15 @@ struct Index {
           icon: new SymbolGlyphModifier(I_CLOSE),
           label: '取消',
           action: () => {
-            session.onCancel();
+            // 先让页面自己收尾（回调还在时，它会清掉本地 selecting/selectedIds）
+            if (session.isActive()) {
+              session.onCancel();
+            }
+            // 再无条件收尾一次：即使 onCancel 已经是空函数（会话被重复 end 过），顶栏也立刻
+            // 恢复；同时 end() 会让 K_SELECT_END_SEQ +1，六个列表页在自己的 watch 里
+            // **无条件**清本地多选状态。真机上「点叉没反应 / 顶栏退了但行尾还是勾选圈」
+            // 就是回调链断掉造成的，所以这里不再依赖回调是否真的执行。
+            session.end();
           },
         },
         menu: {
@@ -1993,10 +2009,9 @@ struct Index {
          * 左右滑动切页签：**回响页签下要关掉**
          *
          * HdsTabs 的 `scrollable` 是「能不能左右滑动切换页签」（见 HDS 声明里的
-         * "page switching can be performed by sliding left and right"）。回响页的
-         * Top3 是一个要横向拖动的 3D 轮播：页签级滑动会把这个横向拖动抢走，
-         * 表现就是「滑了没反应 / 直接换了页面」。所以停在回响页时关掉页签滑动，
-         * 让横向手势归轮播（专辑横条那种横向 Scroll 本来就有嵌套滚动协商，不受影响）。
+         * "page switching can be performed by sliding left and right"）。回响页 2.0
+         * （派音版）已经没有横向手势（3D 榜台是静态四点透视，不跟手），但**先保留禁用**，
+         * 避免和页内纵向滚动/月选择器抢手势，也免得多一处真机回归面。
          * 其它页签照旧开着 —— 底栏还在，切页签不受影响。
          */
         .scrollable(this.activeTabKey !== TAB_KEY_ECHO)

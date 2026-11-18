@@ -112,7 +112,26 @@ export struct ExploreView {
     this.radio.played(card.item.id);
   }
 
+  /**
+   * 点播放钮
+   *
+   * 关键：**只有在放的正是这一张时才去 toggle**。以前这里无条件 `PlaySession.toggle()`，
+   * 于是「别处正在放别的歌」时点探索页的播放钮，暂停/继续的其实是别人的歌 ——
+   * 用户看到的是「点了探索的歌，响的是另一首，或者干脆把另一首暂停了」。
+   *
+   * 现在：不是这一张 → 直接切到这一张播；就是这一张 → 才做播放/暂停切换。
+   * 图标仍然按全局播放状态画（别处有歌在放时显示暂停），这与用户预期一致。
+   */
   private togglePlay(): void {
+    const card: ExploreCard | null = this.card();
+    if (card === null) {
+      return;
+    }
+    if (this.currentId !== card.item.id) {
+      // 正在放的不是这张：切歌（不碰别人的播放状态，setQueueAndPlay 本身就是打断并重排）
+      this.playCurrent();
+      return;
+    }
     PlaySession.getInstance().toggle();
   }
 

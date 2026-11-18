@@ -26,7 +26,7 @@ import {
   HeartPick
 } from './HeartTypes';
 import { HeartEngine } from './HeartEngine';
-import { HeartPool } from './HeartPool';
+import { HeartPool, HeartPoolResult } from './HeartPool';
 import { HeartCache } from './HeartCache';
 import { songKeyOf, songKeyOfItem } from './HeartIdentity';
 
@@ -36,6 +36,31 @@ const INTEREST_HISTORY: number = 200;
 const EXCLUDE_RECENT: number = 6;
 /** 种子（锚点）最多几个 */
 const SEED_MAX: number = 8;
+/**
+ * 缓存命中时的近似新鲜度：缓存不落盘 freshBoost（HeartCache 的格式不在这次改动范围内），
+ * 但缓存里存的是上次**按新鲜度排好序**的池子，所以用位次还原相对新旧：池子前 25%
+ * 从 CACHE_FRESH_TOP 线性衰减到 0，之后的都当不新。
+ */
+const CACHE_FRESH_TOP: number = 0.9;
+const CACHE_FRESH_SPAN: number = 0.25;
+
+/** 缓存池里第 index 首的近似新鲜度（见 CACHE_FRESH_TOP 的注释） */
+function cacheFreshOfRank(index: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  const span: number = Math.max(1, Math.floor(total * CACHE_FRESH_SPAN));
+  if (index >= span) {
+    return 0;
+  }
+  return CACHE_FRESH_TOP * (1 - index / span);
+}
+
+/** Map 取值带缺省（ArkTS 里 Map.get 是 T | undefined，这里收口一次） */
+function boostOf(map: Map<string, number>, key: string): number {
+  const value: number | undefined = map.get(key);
+  return value === undefined ? 0 : value;
+}
 
 /** 探索页一张卡：歌 + 推荐理由（分项来自引擎真实打分） */
 export class ExploreCard {
@@ -100,7 +125,13 @@ function albumOf(item: SongItem): string {
   }
 }
 
-function docOfItem(item: SongItem, liked: boolean): HeartDoc {
+/**
+ * SongItem → 算法侧的 HeartDoc
+ *
+ * freshBoost 必须由调用方给：平台歌没有 addedAt，新鲜度只能来自候选来源与榜内位置
+ * （见 HeartPool）。画像侧的本地歌不属于候选，传 0 即可。
+ */
+function docOfItem(item: SongItem, liked: boolean, freshBoost: number): HeartDoc {
   const doc: HeartDoc = new HeartDoc();
   doc.id = item.id;
   doc.name = item.name;
@@ -108,6 +139,7 @@ function docOfItem(item: SongItem, liked: boolean): HeartDoc {
   doc.album = albumOf(item);
   doc.durationMs = intervalToMs(item.interval);
   doc.addedAt = 0;
+  doc.freshBoost = freshBoost;
   doc.liked = liked;
   return doc;
 }
@@ -189,14 +221,15 @@ export class HeartRadio {
       this.collectInterest();
     }
     const source: string = RecommendSettings.getInstance().getSource();
-    const pool: SongItem[] = await HeartPool.build(source, this.interestDocs,
+    const result: HeartPoolResult = await HeartPool.build(source, this.interestDocs,
       this.recentKeys(), this.recentIds());
-    if (pool.length === 0) {
+    if (result.songs.length === 0) {
       return 0;
     }
-    HeartCache.getInstance().save(source, pool);
-    this.applyLibrary(pool);
-    return pool.length;
+    // 落盘只存 SongItem（缓存格式不动），新鲜度只在内存里带到 HeartDoc 上
+    HeartCache.getInstance().save(source, result.songs);
+    this.applyLibrary(result.songs, result.fresh);
+    return result.songs.length;
   }
 
   /** 读本地画像：播放历史 + 收藏 + 本地曲库（去重） */
@@ -218,11 +251,12 @@ export class HeartRadio {
     }
     const favs: SongItem[] = PlaySession.getInstance().favorites;
     for (let i = 0; i < favs.length; i++) {
-      push(docOfItem(favs[i], true));
+      // 画像不是候选池，新鲜度无意义，传 0
+      push(docOfItem(favs[i], true, 0));
     }
     const locals: SongItem[] = LocalMusic.getInstance().songsForUi();
     for (let i = 0; i < locals.length; i++) {
-      push(docOfItem(locals[i], favKeys.has(songKeyOfItem(locals[i]))));
+      push(docOfItem(locals[i], favKeys.has(songKeyOfItem(locals[i])), 0));
     }
     this.interestDocs = docs;
     this.seeds = this.pickSeeds(favKeys);
@@ -283,8 +317,13 @@ export class HeartRadio {
     return out;
   }
 
-  /** 候选池 → 引擎全库（候选只用来打分，不参与画像） */
-  private applyLibrary(items: SongItem[]): void {
+  /**
+   * 候选池 → 引擎全库（候选只用来打分，不参与画像）
+   *
+   * @param fresh 身份键 → 新鲜度（来自 HeartPool）；不传表示这是缓存池，
+   *              按池内位次近似还原（缓存存的是上次按新鲜度排好的顺序）
+   */
+  private applyLibrary(items: SongItem[], fresh?: Map<string, number>): void {
     this.docsById = new Map<string, HeartDoc>();
     this.docsByKey = new Map<string, HeartDoc>();
     this.songs = new Map<string, SongItem>();
@@ -296,7 +335,10 @@ export class HeartRadio {
     for (let i = 0; i < items.length; i++) {
       const item: SongItem = items[i];
       const key: string = songKeyOfItem(item);
-      const doc: HeartDoc = docOfItem(item, favKeys.has(key));
+      const boost: number = fresh === undefined
+        ? cacheFreshOfRank(i, items.length)
+        : boostOf(fresh, key);
+      const doc: HeartDoc = docOfItem(item, favKeys.has(key), boost);
       docs.push(doc);
       this.docsById.set(doc.id, doc);
       this.docsByKey.set(key, doc);

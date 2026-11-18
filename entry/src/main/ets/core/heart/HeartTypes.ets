@@ -10,8 +10,10 @@
  * 序列模型（GRU4Rec）与 DIN 排序器在该仓库的真实行为上都**负收益**（线上权重置 0），
  * 所以这里不移植，也就不需要任何推理框架。
  *
- * 约束：本目录所有文件**不 import 任何 @kit.\***，因此可以被 `entry/src/test` 下的
- * 主机单测直接跑（项目约定见 docs/UI_REPLICA.md）。
+ * 约束：**纯算法文件**（本文件 / HeartEncoder / HeartInterest / HeartProfile /
+ * HeartEngine / HeartFeedback / HeartIdentity）不 import 任何 @kit.\*，因此可以被
+ * `entry/src/test` 下的主机单测直接跑（项目约定见 docs/UI_REPLICA.md）。
+ * 带网络与文件 IO 的 HeartPool / HeartRadio / HeartCache 不在此列。
  */
 
 /** 曲目向量维度。128 是仓库实测的饱和点：64→128 只涨 0.6 点，128→256 只涨 0.3 点却翻倍存储 */
@@ -34,7 +36,12 @@ export const HEART_EXCLUDE_ARTISTS: number = 3;
 export const HEART_EXCLUDE_RECENT: number = 6;
 /** 同一首歌被跳过的次数达到该值就拉黑 */
 export const HEART_BLACKLIST_SKIPS: number = 2;
-/** 新歌窗口（天）：入库时间在这之内算 fresh，给曝光加成 */
+/**
+ * 新歌窗口（天）：**入库时间**在这之内算 fresh，给曝光加成
+ *
+ * 只对拿得到 addedAt 的条目（本地歌 / 播放历史）有效；平台候选没有入库时间，
+ * 走 HeartDoc.freshBoost 那套按来源与位次推断的新鲜度。
+ */
 export const HEART_FRESH_DAYS: number = 30;
 /** 历史向量的记忆上限：超过就丢最旧的，避免内存无界增长 */
 export const HEART_HISTORY_MAX: number = 500;
@@ -90,6 +97,15 @@ export class HeartDoc {
   durationMs: number = 0;
   /** 入库时刻（毫秒）；平台歌可为 0（拿不到发行/入库时间时不算新歌） */
   addedAt: number = 0;
+  /**
+   * 候选新鲜度，0~1（1 = 最新）
+   *
+   * **不是真实发行时间**：平台歌（洛雪榜单/歌单/艺人作品）拿不到发行或入库时间，
+   * addedAt 恒为 0，真实新歌窗口对它们永远不命中。所以这个值由**候选来源 + 榜内
+   * 位置**推断：新歌榜/飙升榜靠前的歌接近 1，经典榜靠后的歌接近 0，老歌单与艺人
+   * 作品只给低值。生成逻辑见 HeartPool.boardFreshness / freshOfRank。
+   */
+  freshBoost: number = 0;
   /** 本地累计播放次数（热度兜底与 UCB 初值用） */
   plays: number = 0;
   /** 是否已收藏 */
@@ -115,8 +131,15 @@ export class HeartWeights {
   taste: number = 0.6;
   /** 艺人 / 专辑亲和计数 */
   affinity: number = 0.3;
-  /** 新歌曝光 */
-  fresh: number = 0.3;
+  /**
+   * 新歌曝光
+   *
+   * 从仓库默认的 0.3 提到 0.45：平台候选的 addedAt 恒为 0，真实新歌窗口几乎命中
+   * 不了，旧值等于「新歌信号对全网候选恒为 0」，此时只剩 相似度 1.0 + 口味 0.6 +
+   * 亲和 0.3 在把越像历史（老歌）的候选往前顶。0.45 让「明确来自新歌榜/飙升榜」
+   * 的候选能与一条满值亲和打平，但仍低于相似度主信号，不至于把推荐变成随机新歌。
+   */
+  fresh: number = 0.45;
   /** 非参数探索（曝光少的给一点补偿） */
   ucb: number = 0.05;
   /** ε-greedy 比例 */

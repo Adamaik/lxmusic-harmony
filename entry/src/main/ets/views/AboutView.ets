@@ -393,6 +393,20 @@ export struct AboutView {
             HintText({ text: '有改进建议或者功能需求，欢迎向作者反馈：在 GitHub 仓库里提 Issue，或加入用户群聊一聊。' })
           }
           .width(cardWidthOf(this.windowWidth))
+
+          /**
+           * 常见问题：这三条是用户群里反复问的，且答案都不在界面里
+           *
+           * 用 HintText 而不是再做一张卡片：卡片的行式布局是「图标 + 标题 + 箭头」，
+           * 而这三条是**纯说明**、没有可点进去的下一页，做成卡片反而给出错误的可点暗示。
+           * 内容只写结论不写原理 —— 问这个问题的人要的是「我该怎么办」，不是为什么。
+           */
+          Column({ space: 14 }) {
+            HintText({ text: '安装测试包：群置顶链接会跳到 AppTest，如果停在白页，先点右上角「…」选「在浏览器打开」，再在浏览器里下载安装。' })
+            HintText({ text: '车机 / HiCar：受审核限制，应用无法安装到车机系统；现在支持在车机上显示蓝牙歌词，用蓝牙连手机播放即可。' })
+            HintText({ text: '自己编译：装好 DevEco Studio 打开工程即可一键编译；自己签名安装最简单，给别人分发要联网走 AppTest 的测试签名。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 20 })

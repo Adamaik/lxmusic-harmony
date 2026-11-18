@@ -7,9 +7,11 @@ import { PlaylistSummary, SongItem, PlaySession } from '../core/player/PlaySessi
 import { ImportResult, K_LOCAL_PROGRESS, K_LOCAL_VERSION, LocalMusic } from '../core/local/LocalMusic';
 import { C_CARD, C_DIVIDER, C_RED, C_TEXT_SUB, C_TEXT_WEAK, F_SUB, R_CARD } from '../ui/Theme';
 import { I_IMPORT, IconGlyph } from '../ui/Icons';
-import { allSelectedOf, favoriteSongs, queueSongs, selectActionsOf, SelectAction, selectedSongs, SelectSession,
+import { allSelectedOf, favoriteSongs, queueSongs, selectActionsOf, SelectAction, selectedSongs, K_SELECT_END_SEQ, SelectSession,
   toggleSelected } from '../ui/Selection';
 import { SyncManager } from '../core/sync/SyncManager';
+// 加歌的返回值是 { added, skipped }：重复的会被跳过，提示要按真实结果说话
+import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { SongListPane } from './SongListPane';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 
@@ -58,6 +60,13 @@ export struct LocalMusicPane {
   @State selecting: boolean = false;
   /** 勾选一变就往全局会话里发布一次（顶栏与底栏都听它，见 ui/Selection.ets） */
   @State @Watch('syncSelectBar') selectedIds: string[] = [];
+  /**
+   * 多选被全局收尾的序号（见 ui/Selection.ets 的 K_SELECT_END_SEQ）
+   *
+   * 不依赖 onCancel 回调：壳层点叉 / 会话被别处 end 时，序号 +1，这里无条件把自己
+   * 的多选状态清掉。真机上「顶栏退了、行尾还是勾选圈」就是回调链断掉的现场。
+   */
+  @StorageLink(K_SELECT_END_SEQ) @Watch('onSelectEnded') selectEndSeq: number = 0;
   /** 「加入歌单」面板 */
   @State pickerOpen: boolean = false;
   @State candidates: PlaylistSummary[] = [];
@@ -65,6 +74,12 @@ export struct LocalMusicPane {
   @StorageLink(K_LOCAL_PROGRESS) progressText: string = '';
 
   aboutToAppear(): void {
+    // 页面刚出现 ⇒ 两边都不在多选：上一份页面实例可能把「已选中 N 项」留在全局会话里
+    // （壳层标题栏照那份状态画，就会出现退不掉的残影，见 ui/Selection.ets 的 end() 注释）。
+    // 先收掉再读数据，代价是一次幂等的状态赋值。
+    this.selecting = false;
+    this.selectedIds = [];
+    SelectSession.getInstance().end();
     this.refresh();
   }
 
@@ -106,6 +121,14 @@ export struct LocalMusicPane {
   private enterSelectingFrom(item: SongItem): void {
     this.enterSelecting();
     this.selectedIds = [item.id];
+  }
+
+  /** 全局多选已收尾：无条件复位本地状态（回调可能根本没被调到） */
+  private onSelectEnded(): void {
+    if (this.selecting) {
+      this.selecting = false;
+      this.selectedIds = [];
+    }
   }
 
   private exitSelecting(): void {
@@ -194,10 +217,39 @@ export struct LocalMusicPane {
 
   private addSelectedToPlaylist(playlist: PlaylistSummary): void {
     const targets: SongItem[] = this.selectedItems();
-    const added: number = SyncManager.getInstance().getLibrary().addMusicToPlaylist(playlist.id, targets);
+    const result: AddMusicResult = SyncManager.getInstance().getLibrary()
+      .addMusicToPlaylist(playlist.id, targets);
     this.pickerOpen = false;
     this.exitSelecting();
-    this.toast(added > 0 ? `已把 ${added} 首加入「${playlist.name}」` : `「${playlist.name}」里已经有这些歌了`);
+    this.reportAdded(playlist.name, result, targets.length);
+  }
+
+  /**
+   * 加歌之后那句提示，按**真实结果**说话
+   *
+   * 库里会把「已经在歌单里的」那些跳过并返回 { added, skipped }，所以不能只看 `added > 0`：
+   * 部分重复时不说清楚，用户会以为全进去了。
+   *   - 全进去：原口径「已把 N 首加入」
+   *   - 进去一部分：「已加入 N 首，M 首已在歌单里」
+   *   - 全被跳过：「这 N 首都已经在「X」里了」（原文案不提数量，容易被当成失败）
+   *   - 只勾了一首：一句「里已经有这首歌了」最自然，不必报数
+   */
+  private reportAdded(playlistName: string, result: AddMusicResult, total: number): void {
+    if (total === 1) {
+      this.toast(result.added > 0
+        ? `已添加到「${playlistName}」`
+        : `「${playlistName}」里已经有这首歌了`);
+      return;
+    }
+    if (result.added <= 0) {
+      this.toast(`这 ${total} 首都已经在「${playlistName}」里了`);
+      return;
+    }
+    if (result.skipped > 0) {
+      this.toast(`已加入 ${result.added} 首，${result.skipped} 首已在歌单里`);
+      return;
+    }
+    this.toast(`已把 ${result.added} 首加入「${playlistName}」`);
   }
 
   private createPlaylistAndAdd(name: string): void {
@@ -207,10 +259,17 @@ export struct LocalMusicPane {
     const targets: SongItem[] = this.selectedItems();
     const library = SyncManager.getInstance().getLibrary();
     const id: string = library.createPlaylist(name);
-    library.addMusicToPlaylist(id, targets);
+    // 新歌单里不可能有重复，但仍读返回值取数：万一有歌曲信息不全被挡下，报的数才对得上
+    const result: AddMusicResult = library.addMusicToPlaylist(id, targets);
     this.pickerOpen = false;
     this.exitSelecting();
-    this.toast(`已新建歌单「${name}」并加入 ${targets.length} 首`);
+    if (result.added <= 0) {
+      this.toast(`已新建歌单「${name}」，但这些歌没能加进去`);
+      return;
+    }
+    this.toast(result.added === 1
+      ? `已新建歌单「${name}」并添加`
+      : `已新建歌单「${name}」并加入 ${result.added} 首`);
   }
 
   /**

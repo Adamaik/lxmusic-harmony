@@ -82,6 +82,20 @@ interface NativeResponseMessage {
 }
 
 /**
+ * 一次音源请求响应的两种形态
+ *
+ * 面板只有一行宽，只能放摘要；用户要定位问题（服务端回了 HTML 错误页、字段改名、
+ * body 比 200 字符更长的 JSON）时得看原文。所以同一个响应同时产出两份：
+ * 摘要进日志面板保持原观感，原文存进 SourceLog.full 供「日志详情」展示。
+ */
+interface ResponseDigest {
+  /** 面板那一行：状态码 + 正文长度 + 前 200 字符（换行已压成空格） */
+  summary: string;
+  /** 完整原文：状态码 + 完整正文（不裁剪，换行/缩进原样保留） */
+  full: string;
+}
+
+/**
  * 洛雪音乐自定义音源核心引擎（HarmonyOS 版）
  *
  * 对应 lx-music-mobile 的组合：
@@ -389,6 +403,70 @@ export class SourceEngine {
     return this.restoring;
   }
 
+  // ------------------------------------------------------------ 自检隔离（离线自检专用）
+
+  /**
+   * 把「当前音源」还原成离线自检之前的样子
+   *
+   * 为什么需要它：离线自检必须把示例源导入这个全局单例沙箱并初始化一遍，才能验证
+   * 「导入 -> 初始化 -> 解析」整条链路。但示例源的 musicUrl 固定返回
+   * https://example.com/test-audio.mp3，如果自检结束后就这么放着，示例源就成了
+   * 「当前音源」——之后每次播放都 404；更麻烦的是 loadSource 成功时已经把
+   * active_source.json 写成了示例源，重启后 restoreLastSource 恢复的还是它。
+   * 所以自检结束必须把现场（已加载的源 + 沙箱环境 + 上次用的源记录）原样还原。
+   *
+   * @param snapshotId  自检前已加载的音源 id（空串 = 自检前没有加载任何音源）
+   * @param snapshotEnv 自检前的沙箱环境（mobile / desktop）
+   * @returns 是否还原成功；失败时也会把 active_source.json 改回去，避免重启又恢复示例源
+   */
+  async restoreSourceSnapshot(snapshotId: string, snapshotEnv: string): Promise<boolean> {
+    const env: string = snapshotEnv === 'desktop' ? 'desktop' : 'mobile';
+    this.setSandboxEnv(env);
+    if (snapshotId.length === 0) {
+      // 自检前本来就没有音源：内存现场清空，并把「上次用的源」记录删掉。
+      // 不删的话，下次启动会把示例源当成「上次用的源」自动加载回来，继续 404。
+      if (this.engineInjected) {
+        try {
+          await this.callJs('if (typeof __lx_destroy__ === "function") { __lx_destroy__(); }');
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'destroy sandbox script for self-test failed: %{public}s', JSON.stringify(e));
+        }
+        this.engineInjected = false;
+      }
+      this.resetLoadedState();
+      this.store.clearActive();
+      this.pushLog('info', '自检结束：已清空音源现场（自检前未加载任何音源）');
+      return true;
+    }
+    try {
+      // 走原来的 loadSource：它会重新初始化沙箱，并在成功时把 active_source.json
+      // 写回这个 id（见 loadSource 末尾），所以「当前音源」与「上次用的源」一起还原
+      await this.loadSource(snapshotId);
+      this.pushLog('info', `自检结束：已还原自检前的音源 ${snapshotId}`);
+      return true;
+    } catch (e) {
+      // 还原失败也不能让示例源留在 active_source.json 里：显式改回原 id，
+      // 同时清掉内存状态，让播放侧按「音源未加载」报错，而不是拿一个初始化失败的
+      // 源去解析（那会继续产出 404 地址）。
+      this.store.saveActive(snapshotId, env);
+      this.resetLoadedState();
+      this.pushLog('warn',
+        `自检结束：还原自检前的音源失败：${(e as Error).message}（已把上次用的源改回 ${snapshotId}，可手动重新加载）`);
+      return false;
+    }
+  }
+
+  /** 清掉内存里的「已加载」标记（不碰音源列表与 active_source.json） */
+  private resetLoadedState(): void {
+    this.cancelInitWait();
+    this.abortHttpRequests();
+    this.inited = false;
+    this.supported = {};
+    this.loadedSourceId = '';
+    this.scriptKey = '';
+    this.lastScriptError = '';
+  }
+
   /**
    * 等音源初始化完成（正在自动恢复时用）。
    * 刚启动的那几秒源脚本还在沙箱里跑，这时候点播放不该直接报「音源未加载」。
@@ -500,7 +578,8 @@ export class SourceEngine {
     if (scriptResult.length > 0 && scriptResult !== 'null' && scriptResult !== 'undefined') {
       // 脚本「返回了个值」本身说明不了什么：IIFE 的完成值、最后一句表达式的值都会落到这里，
       // 大多数正常音源都会带一个。脚本到底跑没跑起来，紧接着的 readDebugState 才说了算。
-      this.pushLog('log', `源脚本执行返回：${scriptResult.substring(0, 300)}`);
+      this.pushLog('log', `源脚本执行返回：${scriptResult.substring(0, 300)}`, false,
+        `源脚本执行返回：${scriptResult}`);
     }
     // ArkWeb 的 runJavaScript 在脚本执行失败时返回 null（不是 reject），
     // 所以不能只看返回值，必须问沙箱「脚本跑到哪一步了」。
@@ -703,7 +782,8 @@ export class SourceEngine {
       const message: string = (e as Error).message;
       const extra: string = this.lastResponseExcerpt.length > 0
         ? `；最近一次音源请求响应：${this.lastResponseExcerpt}` : '';
-      throw new Error(message + extra);
+      // 先归类（人机验证 / 卡密 / 403 → 指到「换音源或填卡密」），认不出的原样带出
+      throw new Error(describeSourceFailure(message) + extra);
     }
     let url: string = '';
     try {
@@ -836,9 +916,11 @@ export class SourceEngine {
     this.pushLog('log', `音源请求：${options.method !== undefined ? options.method : 'get'} ${url}`);
     const handle: LxRequestHandle = lxRequest(url, options, (resp: LxResponse) => {
       this.httpRequests.delete(requestKey);
-      const excerpt: string = this.describeResponse(resp);
-      this.lastResponseExcerpt = excerpt;
-      this.pushLog(resp.ok ? 'info' : 'warn', `音源请求响应：${excerpt}`);
+      const digest: ResponseDigest = this.describeResponse(resp);
+      this.lastResponseExcerpt = digest.summary;
+      // 摘要进面板（观感不变），原文随这条日志一起存下来，点开详情才看全文
+      this.pushLog(resp.ok ? 'info' : 'warn', `音源请求响应：${digest.summary}`, false,
+        `音源请求响应：${digest.full}`);
       const body: NativeResponseBody = {
         statusCode: resp.statusCode,
         statusMessage: resp.statusMessage,
@@ -867,11 +949,16 @@ export class SourceEngine {
   }
 
   /**
-   * 把响应压成一行摘要：状态码 + 正文长度 + 前 300 字符。
-   * 源脚本的 handler 只看 body 里的字段，一旦它报「unknow error」这类自己的错，
-   * 只有这行摘要能说明服务端到底回了什么（HTML 错误页 / 空 body / 字段改名）。
+   * 把响应拆成「面板摘要」和「完整原文」两段
+   *
+   * 摘要是给日志面板那一行用的：状态码 + 正文长度 + 前 200 字符。源脚本的 handler
+   * 只看 body 里的字段，一旦它报「unknow error」这类自己的错，只有这行摘要能说明
+   * 服务端到底回了什么（HTML 错误页 / 空 body / 字段改名）。
+   *
+   * 但 200 字符常常正好差在出错字段上（用户报的就是这个），所以原文另存一份 ——
+   * 面板照旧显示裁剪版，点开「日志详情」才看全文（见 LxTypes 的 SourceLog.full）。
    */
-  private describeResponse(resp: LxResponse): string {
+  private describeResponse(resp: LxResponse): ResponseDigest {
     const raw: string | Object | number[] = resp.body;
     let text: string;
     if (typeof raw === 'string') {
@@ -881,10 +968,13 @@ export class SourceEngine {
     } else {
       text = JSON.stringify(raw);
     }
+    // 原文不压单行：JSON 错误体的缩进/换行本身就是线索，详情页能滚动，不必迁就一行
+    const full: string = `HTTP ${resp.statusCode}, body(${text.length})：\n${text}`;
     const clipped: string = text.length > 200 ? `${text.substring(0, 200)}…` : text;
     // 压成单行：状态栏只有一行，HTML 错误页里的换行会让提示被截断得毫无信息
     const oneLine: string = clipped.split('\r').join(' ').split('\n').join(' ').split('\t').join(' ').trim();
-    return `HTTP ${resp.statusCode}, body(${text.length})=${oneLine}`;
+    const summary: string = `HTTP ${resp.statusCode}, body(${text.length})=${oneLine}`;
+    return { summary: summary, full: full };
   }
 
   /** 源脚本取消请求（lx.request 返回的 cancel / 请求超时） */
@@ -1128,9 +1218,20 @@ export class SourceEngine {
    * 默认只落日志（面板里能看），不弹提示条 —— 这里的绝大多数条目都是「过程留痕」：
    * 自动恢复失败可以手动选音源、脚本没注册 handler 会换注入方式重试、某个接口 404
    * 了脚本自己会兜底。链路既然还能走通，就不该拿提示条打断用户（见 SourceLog.alert）。
+   *
+   * `message` 是面板那一行（调用方按需先裁剪，保持面板观感）；`full` 传同一段话的
+   * 完整原文，只有被裁剪过的日志才需要传，缺省就等于 `message`。
+   * 参数都带默认值，所以既有调用点不用动、行为也不变。
    */
-  private pushLog(type: string, message: string, alert: boolean = false): void {
-    const log: SourceLog = { time: Date.now(), type: type, message: message, alert: alert };
+  private pushLog(type: string, message: string, alert: boolean = false, full: string = ''): void {
+    // 空串按「没传原文」处理：避免详情页对没裁剪的日志显示一片空白
+    const log: SourceLog = {
+      time: Date.now(),
+      type: type,
+      message: message,
+      alert: alert,
+      full: full.length > 0 ? full : message,
+    };
     hilog.info(DOMAIN, TAG, '[%{public}s] %{public}s', type, message);
     this.logs.push(log);
     if (this.logs.length > this.maxLogs) {
@@ -1214,6 +1315,32 @@ function describeNetworkError(message: string, url: string): string {
     return `与音源服务端 ${host} 的连接被中断；可稍后重试`;
   }
   return `${message}（${host}）`;
+}
+
+/**
+ * 源脚本自己抛的错，翻成「用户能照做」的话
+ *
+ * 音源脚本的取址多半是打它自己的后端（星海那类源就是 `https://yy1.zddyr.top/lx/api/`），
+ * 后端会在几种情况下直接拒：没带它签发的令牌、没填卡密、同一 IP 请求过频被风控。
+ * 脚本往往把这些原样抛给我们，于是用户看到的是「触发人机验证」「后端聚合接口返回403」
+ * 这类只有作者看得懂的句子 —— 它既不是手机的问题，也不是本软件的问题。
+ *
+ * 这里只做「归类 + 给出下一步」，不掩盖原文：认不出来的照旧原样返回。
+ */
+export function describeSourceFailure(message: string): string {
+  const lower: string = message.toLowerCase();
+  const hitVerify: boolean = message.includes('人机验证') || lower.includes('captcha') ||
+    lower.includes('verify') || message.includes('验证');
+  if (hitVerify) {
+    return '音源服务端要求人机验证：多半是该音源需要填卡密 / 授权，或请求过于频繁被风控。' +
+      '请到「设置 → 音源设置」确认该音源是否要卡密，或换用其它音源';
+  }
+  const hitAuth: boolean = message.includes('卡密') || lower.includes('license') ||
+    lower.includes('unauthorized') || message.includes('认证') || message.includes('403');
+  if (hitAuth) {
+    return '该音源仅对认证用户开放（需要在音源脚本里填卡密）：未认证时请换用其它音源';
+  }
+  return message;
 }
 
 /** 沙箱自检状态（由 lx_preload.js 的 __lx_debug_state__() 返回） */
