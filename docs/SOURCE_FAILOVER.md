@@ -161,6 +161,29 @@ requestError: true, errorType: server error, errorCode: 404, …
 
 日志关键字：`lyric borrowed from another platform: %s / %s`、`lyric fallback %s failed`。
 
+### 3.10 显示档位 vs 实际拿到的档位（2026-11-19 记录，未改代码）
+
+真机测试时注意到一个「看起来像 bug」的现象：酷狗某首曲目播放页音质钮显示「母带」，
+日志里 `available=[128k,320k,flac,flac24bit]`（曲目自带的 `_types` 没有 master），
+实际解析出的链接带 `_quviper_`。
+
+排查结论：**这不是本项目的显示错误，是音源侧的档位口径**。把设备上的音源脚本拉下来看，
+ikun v27 的声明是：
+
+```
+kg: ["128k","320k","flac","flac24bit","hires","atmos","master"]
+```
+
+即它对 kg 平台**声称**支持母带；而播放页/音质面板列的就是「源声明的档位 ∩ 曲目提供的档位」
+（拓展档按 `extendedBySourceOnly` 只看源声明，否则 QQ 母带永远列不出来）。
+至于请求 master 之后源的后端实际返回哪一档（`viper_clear` 还是真正的母带文件），
+由那个源自己决定 —— 洛雪原版同样是「显示设置/声明的档位」，不校验 URL 的真实码率。
+
+所以这里**刻意不做「按 URL 猜码率、把显示改小」**：URL 里的 `_quviper_` 这类标识
+各平台含义不一，猜错就会把真母带显示成 flac24bit，反而误导用户。
+真要解决，得让源作者把 kg 的 master 映射到真正的母带接口。
+
+
 ## 四、开关与观测
 
 - 设置 → 音源设置 → **多音源 / 自动切换音源**（默认开）。
