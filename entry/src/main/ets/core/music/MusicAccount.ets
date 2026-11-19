@@ -36,6 +36,11 @@ export const K_MUSIC_NICK_WY: string = 'music_login_nick_wy';
 /** 会员标签：黑胶VIP / 非会员 / 未知（决定母带等权益档能不能用） */
 export const K_MUSIC_VIP_WY: string = 'music_login_vip_wy';
 
+/** QQ 音乐登录态（同一套形状，界面同样订阅这三个 key） */
+export const K_MUSIC_LOGGED_TX: string = 'music_login_logged_tx';
+export const K_MUSIC_NICK_TX: string = 'music_login_nick_tx';
+export const K_MUSIC_VIP_TX: string = 'music_login_vip_tx';
+
 /** 登录成功的账号信息（昵称 + 会员档，界面上给用户一个「登录对了」的确认） */
 export interface MusicProfile {
   nickname: string;
@@ -52,6 +57,8 @@ interface LoginEntry {
 interface LoginFile {
   version?: number;
   wy?: LoginEntry;
+  /** QQ 音乐（y.qq.com）的登录态 */
+  tx?: LoginEntry;
 }
 
 const WY_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -86,6 +93,90 @@ function hasWySession(cookie: string): boolean {
   return /(^|;\s*)MUSIC_U=[^;]/.test(cookie);
 }
 
+// ------------------------------------------------------------------ QQ 音乐
+
+const TX_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/**
+ * QQ 音乐网页登录态要保留的 Cookie 项
+ *
+ * y.qq.com 的会话票据是 `qm_keyst`（新版）或 `qqmusic_key`（兼容旧名），账号身份在 `uin`
+ * （微信登录时是 `wxuin`）；其余是写操作/风控会用到的辅助项，先留着，免得以后接「收藏 /
+ * 歌单同步」再让用户重登一次。
+ */
+const TX_COOKIE_KEYS: string[] = [
+  'uin', 'p_uin', 'qm_keyst', 'qqmusic_key', 'qqmusic_key_2',
+  'p_skey', 'skey', 'wxuin', 'wxskey', 'euin',
+  'psrf_musickey_createtime', 'psrf_access_token_expiresAt',
+  'psrf_qqunionid', 'psrf_qqopenid',
+];
+
+/** 取某一项 Cookie 的值（没有返回空串） */
+function cookieValue(cookie: string, name: string): string {
+  for (const pair of cookie.split(';')) {
+    const text: string = pair.trim();
+    const eq: number = text.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    if (text.substring(0, eq).trim() === name) {
+      return text.substring(eq + 1).trim();
+    }
+  }
+  return '';
+}
+
+/** 从网页抓回来的整串 Cookie 里只留 QQ 音乐相关项（空值的项丢掉） */
+function pickTxCookie(raw: string): string {
+  const parts: string[] = [];
+  for (const pair of raw.split(';')) {
+    const text: string = pair.trim();
+    const eq: number = text.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const name: string = text.substring(0, eq).trim();
+    const value: string = text.substring(eq + 1).trim();
+    if (TX_COOKIE_KEYS.includes(name) && value.length > 0) {
+      parts.push(`${name}=${value}`);
+    }
+  }
+  return parts.join('; ');
+}
+
+/** 这一串 Cookie 里有没有 QQ 音乐真正的登录票据 */
+function hasTxSession(cookie: string): boolean {
+  return cookieValue(cookie, 'qm_keyst').length > 0
+    || cookieValue(cookie, 'qqmusic_key').length > 0;
+}
+
+/** QQ 号（数字）：`uin` 常带 `o` 前缀，微信登录时在 `wxuin` 上 */
+export function txUinOf(cookie: string): string {
+  let uin: string = cookieValue(cookie, 'uin');
+  if (uin.length === 0) {
+    uin = cookieValue(cookie, 'wxuin');
+  }
+  while (uin.startsWith('o')) {
+    uin = uin.substring(1);
+  }
+  return /^\d+$/.test(uin) ? uin : '';
+}
+
+/** QQ 音乐票据：`qm_keyst` 优先，退旧名 `qqmusic_key` */
+export function txMusicKeyOf(cookie: string): string {
+  const key: string = cookieValue(cookie, 'qm_keyst');
+  return key.length > 0 ? key : cookieValue(cookie, 'qqmusic_key');
+}
+
+/** QQ 音乐会员标签：vipType 拿不到就标「未知」，不把「没查到」说成「不是会员」 */
+function txVipLabelOf(vipType: number, present: boolean): string {
+  if (!present) {
+    return '';
+  }
+  return vipType > 0 ? 'VIP' : '非会员';
+}
+
 /**
  * 会员标签
  *
@@ -109,6 +200,10 @@ class MusicAccountStore {
   private wyCookie: string = '';
   private wyNick: string = '';
   private wyVip: string = '';
+
+  private txCookie: string = '';
+  private txNick: string = '';
+  private txVip: string = '';
 
   init(context: common.Context): void {
     if (this.inited) {
@@ -137,6 +232,12 @@ class MusicAccountStore {
       this.wyNick = wy.nickname !== undefined ? wy.nickname : '';
       this.wyVip = wy.vip !== undefined ? wy.vip : '';
     }
+    const tx: LoginEntry | undefined = data.tx;
+    if (tx !== undefined && tx.cookie !== undefined) {
+      this.txCookie = tx.cookie;
+      this.txNick = tx.nickname !== undefined ? tx.nickname : '';
+      this.txVip = tx.vip !== undefined ? tx.vip : '';
+    }
   }
 
   private read(): string {
@@ -156,7 +257,8 @@ class MusicAccountStore {
       return;
     }
     const entry: LoginEntry = { cookie: this.wyCookie, nickname: this.wyNick, vip: this.wyVip };
-    const data: LoginFile = { version: ACCOUNT_VERSION, wy: entry };
+    const txEntry: LoginEntry = { cookie: this.txCookie, nickname: this.txNick, vip: this.txVip };
+    const data: LoginFile = { version: ACCOUNT_VERSION, wy: entry, tx: txEntry };
     try {
       const file = fs.openSync(this.file,
         fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -175,6 +277,9 @@ class MusicAccountStore {
       AppStorage.setOrCreate(K_MUSIC_LOGGED_WY, this.wyCookie.length > 0);
       AppStorage.setOrCreate(K_MUSIC_NICK_WY, this.wyNick);
       AppStorage.setOrCreate(K_MUSIC_VIP_WY, this.wyVip);
+      AppStorage.setOrCreate(K_MUSIC_LOGGED_TX, this.txCookie.length > 0);
+      AppStorage.setOrCreate(K_MUSIC_NICK_TX, this.txNick);
+      AppStorage.setOrCreate(K_MUSIC_VIP_TX, this.txVip);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to publish music login: %{public}s', JSON.stringify(e));
     }
@@ -187,27 +292,51 @@ class MusicAccountStore {
   }
 
   cookieOf(source: string): string {
-    return source === 'wy' ? this.wyCookie : '';
+    if (source === 'wy') {
+      return this.wyCookie;
+    }
+    if (source === 'tx') {
+      return this.txCookie;
+    }
+    return '';
   }
 
   nicknameOf(source: string): string {
-    return source === 'wy' ? this.wyNick : '';
+    if (source === 'wy') {
+      return this.wyNick;
+    }
+    if (source === 'tx') {
+      return this.txNick;
+    }
+    return '';
   }
 
   vipOf(source: string): string {
-    return source === 'wy' ? this.wyVip : '';
+    if (source === 'wy') {
+      return this.wyVip;
+    }
+    if (source === 'tx') {
+      return this.txVip;
+    }
+    return '';
   }
 
   /**
    * 给 HTTP 头用的 Cookie 串
    *
-   * 没登录时只有 `os=pc`（明文接口要求声明客户端形态，见 MusicList 的 WY_HEADERS）；
+   * 网易：没登录时只有 `os=pc`（明文接口要求声明客户端形态，见 MusicList 的 WY_HEADERS）；
    * 登录后在后面接会话票据。**没登录不能塞空的 `MUSIC_U=`** —— 那会让接口认成
    * 「登录了一个空账号」，反而可能把公开数据也挡掉。
+   *
+   * QQ 音乐：没登录返回空串（它的公开接口不需要声明客户端形态，空串表示「不带头」），
+   * 登录后原样带整串票据。
    */
   cookieHeader(source: string): string {
     const cookie: string = this.cookieOf(source);
-    return cookie.length > 0 ? `os=pc; ${cookie}` : 'os=pc';
+    if (source === 'wy') {
+      return cookie.length > 0 ? `os=pc; ${cookie}` : 'os=pc';
+    }
+    return cookie;
   }
 
   // ---------------------------------------------------------------- 写入
@@ -222,6 +351,9 @@ class MusicAccountStore {
    * @throws 没抓到登录票据时抛错，界面据此提示「没抓到登录态」
    */
   async login(source: string, rawCookie: string): Promise<MusicProfile> {
+    if (source === 'tx') {
+      return await this.loginTx(rawCookie);
+    }
     if (source !== 'wy') {
       throw new Error('这个平台还不支持账号登录');
     }
@@ -236,6 +368,59 @@ class MusicAccountStore {
     this.write();
     this.publish();
     return profile;
+  }
+
+  /** QQ 音乐登录：票据在 `qm_keyst` / `qqmusic_key`，账号身份在 `uin` */
+  private async loginTx(rawCookie: string): Promise<MusicProfile> {
+    const cookie: string = pickTxCookie(rawCookie);
+    if (!hasTxSession(cookie)) {
+      throw new Error('没抓到 QQ 音乐的登录态（qm_keyst）——请确认网页里已经登录成功再点完成');
+    }
+    if (txUinOf(cookie).length === 0) {
+      throw new Error('没抓到你登录的 QQ 号（uin）——请确认是在 y.qq.com 上登录的');
+    }
+    this.txCookie = cookie;
+    this.txNick = '';
+    this.txVip = '';
+    const profile: MusicProfile = await this.refreshTxProfile();
+    this.write();
+    this.publish();
+    return profile;
+  }
+
+  /** 用当前 QQ 音乐 Cookie 拉一次账号信息（失败不改登录态，昵称留空） */
+  async refreshTxProfile(): Promise<MusicProfile> {
+    if (this.txCookie.length === 0) {
+      return { nickname: '', vip: '' };
+    }
+    const uin: string = txUinOf(this.txCookie);
+    const url: string = 'https://c.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg'
+      + `?ct=24&cv=4747474&format=json&inCharset=utf-8&outCharset=utf-8&notice=0`
+      + `&platform=yqq.json&needNewCode=0&uin=${encodeURIComponent(uin)}&hostUin=0&g_tk=5381`;
+    const headers: Record<string, string> = {
+      'User-Agent': TX_UA,
+      'Referer': 'https://y.qq.com/',
+      'Cookie': this.txCookie,
+    };
+    try {
+      const body: Record<string, Object> = await httpGetJson(url, headers, 'QQ音乐账号');
+      const creator: Record<string, Object> = asRecord(asRecord(body['data'])['creator']);
+      const nickname: string = asString(creator['nick']).length > 0
+        ? asString(creator['nick']) : asString(creator['hostname']);
+      const hasVip: boolean = creator['vipType'] !== undefined || creator['vipFlag'] !== undefined;
+      const vipType: number = creator['vipType'] !== undefined
+        ? asNumber(creator['vipType']) : asNumber(creator['vipFlag']);
+      if (nickname.length > 0) {
+        this.txNick = nickname;
+        this.txVip = txVipLabelOf(vipType, hasVip);
+        this.write();
+        this.publish();
+        return { nickname: this.txNick, vip: this.txVip };
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to fetch tx profile: %{public}s', JSON.stringify(e));
+    }
+    return { nickname: this.txNick, vip: this.txVip };
   }
 
   /** 用当前 Cookie 拉一次账号信息（登录后调用；失败返回空信息，不改变登录态） */
@@ -269,14 +454,21 @@ class MusicAccountStore {
 
   /** 退出登录：清 Cookie 与账号信息（母带这类权益档会随之退回普通档） */
   logout(source: string): void {
-    if (source !== 'wy') {
+    if (source === 'wy') {
+      this.wyCookie = '';
+      this.wyNick = '';
+      this.wyVip = '';
+      this.write();
+      this.publish();
       return;
     }
-    this.wyCookie = '';
-    this.wyNick = '';
-    this.wyVip = '';
-    this.write();
-    this.publish();
+    if (source === 'tx') {
+      this.txCookie = '';
+      this.txNick = '';
+      this.txVip = '';
+      this.write();
+      this.publish();
+    }
   }
 }
 

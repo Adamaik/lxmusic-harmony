@@ -6,13 +6,16 @@ import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_ON_ACCENT, C_RED, C_TEXT
 import { cardWidthOf, cardColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 import { IconGlyph, I_PERSON } from '../ui/Icons';
 import { BookLoginWeb } from '../components/BookLoginWeb';
-import { K_MUSIC_LOGGED_WY, K_MUSIC_NICK_WY, K_MUSIC_VIP_WY, MusicProfile,
-  musicAccount } from '../core/music/MusicAccount';
+import { K_MUSIC_LOGGED_TX, K_MUSIC_LOGGED_WY, K_MUSIC_NICK_TX, K_MUSIC_NICK_WY,
+  K_MUSIC_VIP_TX, K_MUSIC_VIP_WY, MusicProfile, musicAccount } from '../core/music/MusicAccount';
 
 /** 网易云的登录页（网页端；扫码 / 短信 / 账号密码都在这一页里，应用内浏览器照着走一遍即可） */
 const WY_LOGIN_URL: string = 'https://music.163.com/#/login';
 /** 网易云站址：登录后常跳到主站，抓 Cookie 时也扫一遍这里 */
 const WY_SITE_URL: string = 'https://music.163.com';
+/** QQ 音乐：主站右上角「登录」弹的官方登录页（QQ / 微信扫码都在里面） */
+const TX_LOGIN_URL: string = 'https://y.qq.com/';
+const TX_SITE_URL: string = 'https://y.qq.com';
 
 /**
  * 设置 - 登录音乐
@@ -40,8 +43,14 @@ export struct MusicLoginView {
   @StorageLink(K_MUSIC_LOGGED_WY) loggedIn: boolean = false;
   @StorageLink(K_MUSIC_NICK_WY) nickname: string = '';
   @StorageLink(K_MUSIC_VIP_WY) vip: string = '';
+  /** QQ 音乐登录态（同一套形状） */
+  @StorageLink(K_MUSIC_LOGGED_TX) loggedInTx: boolean = false;
+  @StorageLink(K_MUSIC_NICK_TX) nicknameTx: string = '';
+  @StorageLink(K_MUSIC_VIP_TX) vipTx: string = '';
   /** 应用内浏览器是否打开（bindContentCover 的开关） */
   @State webOpen: boolean = false;
+  /** 这次网页登录是给哪个平台（'wy' / 'tx'）：决定浏览器打开哪个登录页 */
+  @State loginSource: string = 'wy';
   /** 登录 / 退出进行中：按钮禁用并显示「处理中…」，避免连点重复请求 */
   @State busy: boolean = false;
   /** 窗口宽度（vp）：宽屏下两张卡并排，与其它设置页同一套排布（0 = 还没量到，按手机一列） */
@@ -76,11 +85,22 @@ export struct MusicLoginView {
     return `已登录：${name} · ${vip}`;
   }
 
+  /** QQ 音乐这一行的状态文案：登录后能用平台的私人推荐（每日 30 首 / 私人雷达 / 猜你喜欢） */
+  private txStatus(): string {
+    if (!this.loggedInTx) {
+      return '未登录：登录后可用 QQ 音乐的私人推荐（每日推荐 / 私人雷达 / 猜你喜欢）';
+    }
+    const name: string = this.nicknameTx.length > 0 ? this.nicknameTx : '没取到昵称';
+    const vip: string = this.vipTx.length > 0 ? this.vipTx : '会员档未知';
+    return `已登录：${name} · ${vip}`;
+  }
+
   /** 打开应用内浏览器：把站点自己的登录页装进来，扫码 / 短信 / 跳转都能走 */
-  private openWebLogin(): void {
+  private openWebLogin(source: string): void {
     if (this.busy) {
       return;
     }
+    this.loginSource = source;
     this.webOpen = true;
   }
 
@@ -103,14 +123,16 @@ export struct MusicLoginView {
   /** 校验并落盘登录态；成功 / 失败都给出明确 toast，不让按钮点完没反应 */
   private async finishLogin(rawCookie: string): Promise<void> {
     this.busy = true;
+    const source: string = this.loginSource;
+    const label: string = source === 'tx' ? 'QQ 音乐' : '网易云音乐';
     try {
-      const profile: MusicProfile = await musicAccount().login('wy', rawCookie);
+      const profile: MusicProfile = await musicAccount().login(source, rawCookie);
       if (profile.nickname.length > 0) {
         const vip: string = profile.vip.length > 0 ? profile.vip : '会员档未知';
-        this.toast(`已登录网易云音乐：${profile.nickname}（${vip}）`);
+        this.toast(`已登录${label}：${profile.nickname}（${vip}）`);
       } else {
-        // 账号信息没拉到不影响「已登录」：音质协商照样会带 Cookie 去问
-        this.toast('已登录网易云音乐（账号信息没拉到，不影响播放）');
+        // 账号信息没拉到不影响「已登录」：音质协商 / 私人推荐照样带 Cookie 去问
+        this.toast(`已登录${label}（账号信息没拉到，不影响使用）`);
       }
     } catch (e) {
       this.toast(`登录失败：${(e as Error).message}`);
@@ -120,14 +142,20 @@ export struct MusicLoginView {
   }
 
   /** 退出先问一声：退出会让母带这类权益档退回普通档，属于用户能感知的变化 */
-  private confirmLogout(): void {
+  private confirmLogout(source: string): void {
     if (this.busy) {
       return;
     }
+    const isTx: boolean = source === 'tx';
+    const label: string = isTx ? 'QQ 音乐' : '网易云音乐';
+    const message: string = isTx
+      ? '退出后请求不再带你的 QQ 音乐登录态：私人推荐（每日推荐 / 私人雷达 / 猜你喜欢）会不可用；'
+        + '搜索、歌单、榜单、播放这些公开接口照旧能用。随时可以再登回来。'
+      : '退出后请求不再带你的登录态，母带 / 沉浸声 / 杜比这类账号权益档会跟着消失；'
+        + '搜索、歌单、榜单这些公开接口照旧能用。随时可以再登回来。';
     this.getUIContext().showAlertDialog({
-      title: '退出网易云音乐登录？',
-      message: '退出后请求不再带你的登录态，母带 / 沉浸声 / 杜比这类账号权益档会跟着消失；'
-        + '搜索、歌单、榜单这些公开接口照旧能用。随时可以再登回来。',
+      title: `退出${label}登录？`,
+      message: message,
       autoCancel: true,
       buttons: [
         { value: '取消', action: () => { } },
@@ -136,9 +164,9 @@ export struct MusicLoginView {
           fontColor: C_RED,
           action: () => {
             this.busy = true;
-            musicAccount().logout('wy');
+            musicAccount().logout(source);
             this.busy = false;
-            this.toast('已退出网易云音乐登录，权益音质会退回普通档');
+            this.toast(isTx ? '已退出 QQ 音乐登录，私人推荐会不可用' : '已退出网易云音乐登录，权益音质会退回普通档');
           },
         },
       ],
@@ -147,27 +175,27 @@ export struct MusicLoginView {
 
   // ------------------------------------------------------------ 界面片段
 
-  /** 网易云这一行：状态两行 + 右侧登录 / 退出按钮 */
+  /** 一个平台账号行：状态两行 + 右侧登录 / 退出按钮（网易云与 QQ 音乐共用） */
   @Builder
-  wyRow() {
+  accountRow(source: string, name: string, status: string, logged: boolean) {
     Row({ space: 12 }) {
       Stack({ alignContent: Alignment.Center }) {
         Column()
           .width(40)
           .height(40)
           .borderRadius(20)
-          .backgroundColor(platformTint('wy'))
-        IconGlyph({ symbol: I_PERSON, iconSize: 22, color: platformColor('wy') })
+          .backgroundColor(platformTint(source))
+        IconGlyph({ symbol: I_PERSON, iconSize: 22, color: platformColor(source) })
       }
       .width(40)
       .height(40)
 
       Column({ space: 4 }) {
-        Text('网易云音乐')
+        Text(name)
           .fontSize(F_ITEM)
           .fontColor(C_TEXT)
           .maxLines(1)
-        Text(this.wyStatus())
+        Text(status)
           .fontSize(F_SUB)
           .fontColor(C_TEXT_SUB)
           .maxLines(2)
@@ -178,23 +206,23 @@ export struct MusicLoginView {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      Button(this.busy ? '处理中…' : (this.loggedIn ? '退出登录' : '登录'))
+      Button(this.busy ? '处理中…' : (logged ? '退出登录' : '登录'))
         .fontSize(13)
         .height(30)
         .padding({ left: 14, right: 14 })
         // 已登录是「撤销一个已生效的状态」，弱化成次要文字色；未登录才是要用户动手的主按钮
-        .fontColor(this.loggedIn ? C_TEXT_SUB : C_ON_ACCENT)
-        .backgroundColor(this.loggedIn ? C_FILL_SOFT_STRONG : C_RED)
+        .fontColor(logged ? C_TEXT_SUB : C_ON_ACCENT)
+        .backgroundColor(logged ? C_FILL_SOFT_STRONG : C_RED)
         .enabled(!this.busy)
         .opacity(this.busy ? 0.6 : 1)
         .onClick(() => {
-          if (this.loggedIn) {
-            this.confirmLogout();
+          if (logged) {
+            this.confirmLogout(source);
           } else {
-            this.openWebLogin();
+            this.openWebLogin(source);
           }
         })
-        .accessibilityText(this.loggedIn ? '退出网易云音乐登录' : '登录网易云音乐')
+        .accessibilityText(logged ? `退出${name}登录` : `登录${name}`)
         .accessibilityLevel('yes')
     }
     .width('100%')
@@ -250,9 +278,9 @@ export struct MusicLoginView {
   @Builder
   loginWebCover() {
     BookLoginWeb({
-      title: '网易云音乐',
-      loginUrl: WY_LOGIN_URL,
-      siteUrl: WY_SITE_URL,
+      title: this.loginSource === 'tx' ? 'QQ 音乐' : '网易云音乐',
+      loginUrl: this.loginSource === 'tx' ? TX_LOGIN_URL : WY_LOGIN_URL,
+      siteUrl: this.loginSource === 'tx' ? TX_SITE_URL : WY_SITE_URL,
       safeTop: this.safeTop,
       safeBottom: this.safeBottom,
       onClose: (cookie: string) => {
@@ -324,11 +352,11 @@ export struct MusicLoginView {
           // ------------------------------------------------ 平台列表
           Column({ space: 14 }) {
             Column() {
-              this.wyRow()
+              this.accountRow('wy', '网易云音乐', this.wyStatus(), this.loggedIn)
 
               Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
 
-              this.pendingRow('QQ 音乐', 'tx')
+              this.accountRow('tx', 'QQ 音乐', this.txStatus(), this.loggedInTx)
 
               Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
 
@@ -339,8 +367,9 @@ export struct MusicLoginView {
             .backgroundColor(C_CARD)
             .clip(true)
 
-            Text('目前只有网易云能账号登录；QQ 音乐、酷狗后续按同一套接进来。'
-              + '登录后返回的权益档只在播放网易云音源时生效，别的平台各按各的规矩来。')
+            Text('网易云登录主要是为了母带 / 沉浸声 / 杜比这类账号权益档；'
+              + 'QQ 音乐登录是为了平台的私人推荐（每日推荐 / 私人雷达 / 猜你喜欢）与账号歌单。'
+              + '两者互不影响，可以只登其中一个。')
               .fontSize(11.5)
               .fontColor(C_TEXT_WEAK)
               .width('100%')
