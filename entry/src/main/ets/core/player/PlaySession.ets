@@ -162,11 +162,15 @@ interface PersistedPlayState {
   position?: number;
   playMode?: string;
   /**
-   * 旧版本存档里的播放历史
+   * 退出时它是队列里的第几个（0 起）
    *
-   * **只用于读旧版本存档做一次性迁移**（见 applyPersistedState），新存档不再写它：
-   * 播放历史已经搬进 core/history/ListenLog，与回响共用同一份流水。
+   * 为什么需要：重启时队列是从同步数据恢复的，如果那首歌**恰好没被同步回来**
+   * （缺 musicInfo 的条目会被过滤掉，见 LocalLibrary.onLocalListsChanged），
+   * 只按 id 找不到它。以前这时会把它塞到队首，于是「当前歌播完 → 下一首 = 列表第一首」
+   * （群反馈 2026-11-17 11:06，StarFlame）。有这个下标就能把它插回原来的位置。
    */
+  index?: number;
+  /** 旧版本存档里的播放历史（只读，见 applyPersistedState 的一次性迁移） */
   history?: SongItem[];
 }
 
@@ -715,6 +719,7 @@ export class PlaySession {
       current: this.current,
       position: AppStorage.get<number>(K_PROGRESS) ?? 0,
       playMode: this.playMode,
+      index: this.currentIndex,
     };
     try {
       this.stateStore.write(JSON.stringify(state));
@@ -769,12 +774,34 @@ export class PlaySession {
       }
     }
     if (index < 0) {
-      // 队列里没有这首（没配同步 / 队列被清过）：放回队首，保证「继续播放」有歌可放
-      this.queue = [current].concat(this.queue);
-      index = 0;
+      /**
+       * 队列里没有这首 —— 两种常见原因：没配同步（队列没恢复），或者这首**没被同步回来**
+       * （缺 musicInfo 的条目会被 LocalLibrary.onLocalListsChanged 过滤掉）。
+       *
+       * 以前一律塞到队首，于是「当前这首播完后，下一首 = 列表第一首」，用户看到的就是
+       * 「播放列表被刷新了、播完从第一首开始」（群反馈 2026-11-17 11:06）。
+       * 现在优先按存档里的下标插回原位置，只有下标也没有时才退回队首。
+       */
+      const savedIndex: number = state.index !== undefined ? state.index : -1;
+      if (this.queue.length === 0) {
+        this.queue = [current];
+        index = 0;
+      } else {
+        const at: number = savedIndex >= 0 && savedIndex <= this.queue.length
+          ? savedIndex : 0;
+        const nextQueue: SongItem[] = this.queue.slice();
+        nextQueue.splice(at, 0, current);
+        this.queue = nextQueue;
+        index = at;
+      }
+      hilog.info(DOMAIN, TAG,
+        'restore: current not in queue, inserted at %{public}d (saved=%{public}d, queue=%{public}d)',
+        index, savedIndex, this.queue.length);
       this.bumpQueueVersion();
     }
     this.currentIndex = index;
+    hilog.info(DOMAIN, TAG, 'restore play state: queue=%{public}d index=%{public}d',
+      this.queue.length, index);
     const position: number = state.position !== undefined ? state.position : 0;
     if (position > 0) {
       this.resumePosition = position;
@@ -3034,6 +3061,7 @@ export class PlaySession {
     if (this.queue.length === 0) {
       return;
     }
+    this.resyncCurrentIndex();
     if (this.playMode === 'shuffle') {
       // 预取时如果已经抽过签，就用那一签：保证「预取的那首」就是「真正播的那首」
       const reserved: number = this.takeReservedShuffle();
@@ -3061,6 +3089,7 @@ export class PlaySession {
     if (this.queue.length === 0) {
       return;
     }
+    this.resyncCurrentIndex();
     if (this.playMode === 'shuffle') {
       await this.playAt(this.prevShuffleIndex());
       return;
@@ -3081,6 +3110,30 @@ export class PlaySession {
   private bumpQueueVersion(): void {
     this.queueVersion++;
     this.shuffleHistory = [];
+  }
+
+  /**
+   * 当前下标丢了（-1）时，按界面上正在显示的歌曲 id 在队列里重新定位一次
+   *
+   * 为什么会丢：队列被同步数据整体换掉（adoptLibraryState）时，如果那首歌不在新队列里，
+   * currentIndex 会被清成 -1；此时「下一首」若直接按 currentIndex+1 算，就是从第 0 首开始播 ——
+   * 用户看到的是「播完回到列表第一首」。这里在切歌前兜一次，能对上就接上原来那首。
+   */
+  private resyncCurrentIndex(): void {
+    if (this.currentIndex >= 0 && this.currentIndex < this.queue.length) {
+      return;
+    }
+    const id: string = AppStorage.get<string>(K_CURRENT_ID) ?? '';
+    if (id.length === 0) {
+      return;
+    }
+    for (let i = 0; i < this.queue.length; i++) {
+      if (this.queue[i].id === id) {
+        this.currentIndex = i;
+        hilog.info(DOMAIN, TAG, 'resync current index to %{public}d by id', i);
+        return;
+      }
+    }
   }
 
   /**
