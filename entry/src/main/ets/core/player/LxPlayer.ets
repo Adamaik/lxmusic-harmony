@@ -70,14 +70,83 @@ const LOADED_PROBE_MS: number = 1000;
  * 状态与进度的唯一来源是 AVPlayer 自己：调用方（PlaySession）不再自己造
  * 「正在播放」和假进度，否则界面会在没有声音的时候也一路走进度条。
  */
+/**
+ * 这批设备里有没有「耳机类」的（有线耳机 / 蓝牙 / USB）
+ *
+ * 拔耳机时系统上报的是断开的那几个设备，所以只要其中有一个是耳机类就认为「耳机没了」。
+ * 内置扬声器/听筒不算 —— 切到外放不暂停会吵到别人，也正是这个功能要解决的问题。
+ */
+function isHeadsetOf(devices: audio.AudioDeviceDescriptors): boolean {
+  const headsets: number[] = [
+    audio.DeviceType.WIRED_HEADSET,
+    audio.DeviceType.WIRED_HEADPHONES,
+    audio.DeviceType.BLUETOOTH_SCO,
+    audio.DeviceType.BLUETOOTH_A2DP,
+    audio.DeviceType.USB_HEADSET,
+  ];
+  for (let i = 0; i < devices.length; i++) {
+    if (headsets.includes(devices[i].deviceType)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class LxPlayer {
   private static instance: LxPlayer | null = null;
 
   static getInstance(): LxPlayer {
     if (LxPlayer.instance === null) {
       LxPlayer.instance = new LxPlayer();
+      LxPlayer.instance.wireHeadsetOffPause();
     }
     return LxPlayer.instance;
+  }
+
+  /** 耳机断连监听是否已经挂过（只能挂一次） */
+  private headsetWired: boolean = false;
+
+  /**
+   * 摘下耳机 / 断开蓝牙耳机 → 自动暂停
+   *
+   * 群反馈（2026-11-16 16:01，小冰）：「感觉可以加个摘掉耳机暂停的」。
+   * 系统不会替应用暂停（只是把声音改从扬声器出），所以得自己听音频路由的设备变化：
+   * 断开的是耳机类设备（有线 / 蓝牙 / USB）并且正在播放时，调一次 pause。
+   *
+   * 只在设置开着时暂停；挂载失败（老系统没有 getRoutingManager）只记日志，不影响播放。
+   */
+  private wireHeadsetOffPause(): void {
+    if (this.headsetWired) {
+      return;
+    }
+    this.headsetWired = true;
+    try {
+      const manager: audio.AudioRoutingManager = audio.getAudioManager().getRoutingManager();
+      const onChange: (action: audio.DeviceChangeAction) => void =
+        (action: audio.DeviceChangeAction): void => {
+          if (action.type !== audio.DeviceChangeType.DISCONNECT) {
+            return;
+          }
+          if (!PlaySettings.getInstance().isAutoPauseHeadsetOff()) {
+            return;
+          }
+          if (!isHeadsetOf(action.deviceDescriptors)) {
+            return;
+          }
+          if (this.status !== 'playing') {
+            return;
+          }
+          hilog.info(DOMAIN, TAG, 'headset disconnected, pause playback');
+          this.pause().catch((err: Error) => {
+            hilog.warn(DOMAIN, TAG, 'pause after headset off failed: %{public}s', err.message);
+          });
+        };
+      // AudioRoutingManager 的这个事件是三参形态：on('deviceChange', DeviceFlag, cb)
+      manager.on('deviceChange', audio.DeviceFlag.ALL_DEVICES_FLAG, onChange);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'wire headset-off pause failed: %{public}s',
+        JSON.stringify(e));
+    }
   }
 
   private avPlayer: media.AVPlayer | null = null;

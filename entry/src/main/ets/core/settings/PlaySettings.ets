@@ -105,6 +105,15 @@ export const K_AUTO_MATCH_LYRIC: string = 'cfg_auto_match_lyric';
 export const K_AUTO_RESUME_AFTER_INTERRUPT: string = 'cfg_auto_resume_after_interrupt';
 
 /**
+ * 摘下耳机 / 断开蓝牙耳机后自动暂停（设置 - 播放设置）
+ *
+ * 群反馈（2026-11-16 16:01，小冰）：「感觉可以加个摘掉耳机暂停的」。
+ * 默认开：这是绝大多数音乐 App 的行为（拔耳机后音乐突然外放很尴尬）。
+ * 落点在 LxPlayer 的音频路由设备变化监听：断开的是耳机类设备、且正在播放时暂停。
+ */
+export const K_AUTO_PAUSE_HEADSET_OFF: string = 'cfg_auto_pause_headset_off';
+
+/**
  * 播放页动效（设置 - 播放设置 - 播放页动效）
  *
  * 管的是播放页那几处「活的」视觉，分三档（`PLAYER_MOTION_LEVELS`）：
@@ -201,6 +210,8 @@ interface PlaySettingsData {
   autoMatchLyric?: boolean;
   bluetoothLyric?: boolean;
   autoResumeAfterInterrupt?: boolean;
+  /** 摘下耳机 / 断开蓝牙后自动暂停（见 K_AUTO_PAUSE_HEADSET_OFF） */
+  autoPauseHeadsetOff?: boolean;
   /**
    * 播放页动效（见 K_PLAYER_MOTION）
    *
@@ -282,6 +293,8 @@ export class PlaySettings {
    * （见 K_AUTO_RESUME_AFTER_INTERRUPT 的说明）。
    */
   private autoResumeAfterInterrupt: boolean = true;
+  /** 摘下耳机 / 断开蓝牙后自动暂停：默认开（见 K_AUTO_PAUSE_HEADSET_OFF） */
+  private autoPauseHeadsetOff: boolean = true;
   /**
    * 播放页动效档位，默认「轻量」（见 K_PLAYER_MOTION）
    *
@@ -367,6 +380,7 @@ export class PlaySettings {
       autoMatchLyric: this.autoMatchLyric,
       bluetoothLyric: this.bluetoothLyric,
       autoResumeAfterInterrupt: this.autoResumeAfterInterrupt,
+      autoPauseHeadsetOff: this.autoPauseHeadsetOff,
       playerMotion: this.playerMotion,
       defaultSource: this.defaultSource,
       autoSourceSwitch: this.autoSourceSwitch,
@@ -436,6 +450,9 @@ export class PlaySettings {
     if (data.autoResumeAfterInterrupt !== undefined) {
       this.autoResumeAfterInterrupt = data.autoResumeAfterInterrupt;
     }
+    if (data.autoPauseHeadsetOff !== undefined) {
+      this.autoPauseHeadsetOff = data.autoPauseHeadsetOff;
+    }
     /**
      * 播放页动效：v4 及更早的存档里是布尔值，v5 起是三档字符串
      *
@@ -489,6 +506,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_AUTO_MATCH_LYRIC, this.autoMatchLyric);
       AppStorage.setOrCreate(K_BLUETOOTH_LYRIC, this.bluetoothLyric);
       AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, this.autoResumeAfterInterrupt);
+      AppStorage.setOrCreate(K_AUTO_PAUSE_HEADSET_OFF, this.autoPauseHeadsetOff);
       AppStorage.setOrCreate(K_PLAYER_MOTION, this.playerMotion);
       AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
       AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, this.autoSourceSwitch);
@@ -752,6 +770,20 @@ export class PlaySettings {
     }
     this.autoResumeAfterInterrupt = value;
     AppStorage.setOrCreate(K_AUTO_RESUME_AFTER_INTERRUPT, value);
+    this.write();
+  }
+
+  /** 摘下耳机 / 断开蓝牙后是否自动暂停（见 K_AUTO_PAUSE_HEADSET_OFF） */
+  isAutoPauseHeadsetOff(): boolean {
+    return this.autoPauseHeadsetOff;
+  }
+
+  setAutoPauseHeadsetOff(value: boolean): void {
+    if (value === this.autoPauseHeadsetOff) {
+      return;
+    }
+    this.autoPauseHeadsetOff = value;
+    AppStorage.setOrCreate(K_AUTO_PAUSE_HEADSET_OFF, value);
     this.write();
   }
 

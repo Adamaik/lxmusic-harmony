@@ -5,7 +5,8 @@ import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
 import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
-  EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_RESUME_AFTER_INTERRUPT,
+  EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_PAUSE_HEADSET_OFF,
+  K_AUTO_RESUME_AFTER_INTERRUPT,
   K_BLUETOOTH_LYRIC, K_DEFAULT_SOURCE, K_DESKTOP_LYRIC,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
@@ -119,6 +120,8 @@ export struct PlaySettingsView {
   @StorageLink(K_AUTO_MATCH_LYRIC) autoMatchLyric: boolean = true;
   /** 被打断（来电 / 闹铃 / 别的应用出声）结束后自动接着放 */
   @StorageLink(K_AUTO_RESUME_AFTER_INTERRUPT) autoResume: boolean = true;
+  /** 摘下耳机 / 断蓝牙是否自动暂停（见 PlaySettings.K_AUTO_PAUSE_HEADSET_OFF） */
+  @StorageLink(K_AUTO_PAUSE_HEADSET_OFF) autoPauseHeadsetOff: boolean = true;
   /**
    * 播放页动效档位（'off' / 'light' / 'immersive'，见 PlaySettings.K_PLAYER_MOTION）
    *
@@ -241,6 +244,17 @@ export struct PlaySettingsView {
     return base;
   }
 
+  /**
+   * 摘下耳机自动暂停的说明
+   *
+   * 要讲清三件事：谁触发（拔有线 / 断蓝牙 / 拔 USB）、是暂停而不是静音、
+   * 以及「本来就没耳机」时不会有副作用 —— 否则用户会担心外放时被误暂停。
+   */
+  private autoPauseHeadsetOffHint(): string {
+    return '拔掉有线耳机、断开蓝牙耳机或拔掉 USB 耳机时自动暂停（否则声音会突然改从外放出来）。'
+      + '只是暂停，点播放就能接着听；本来就没插耳机时不生效。';
+  }
+
   build() {
     Column() {
       Scroll() {
@@ -342,6 +356,15 @@ export struct PlaySettingsView {
                 },
               })
               HintText({ text: this.autoResumeHint() })
+
+              ToggleSetting({
+                label: '摘下耳机自动暂停',
+                value: this.autoPauseHeadsetOff,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setAutoPauseHeadsetOff(next);
+                },
+              })
+              HintText({ text: this.autoPauseHeadsetOffHint() })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: 8, bottom: 8 })
