@@ -19,7 +19,9 @@ import { PlaylistCard, PlaylistRow, PlaylistRowSource } from '../ui/PlaylistGrid
 import { TileCard } from '../ui/TileCard';
 import { K_RECOMMEND_SOURCE } from '../core/settings/RecommendSettings';
 import { K_WINDOW_WIDTH } from '../ui/Layout';
-import { K_MUSIC_LOGGED_WY } from '../core/music/MusicAccount';
+import { K_MUSIC_LOGGED_TX, K_MUSIC_LOGGED_WY } from '../core/music/MusicAccount';
+import { fetchTxRadar } from '../core/music/TxRecommend';
+import { LxMusicInfo } from '../core/music/MusicSearch';
 
 /**
  * 推荐页（三个胶囊各是一套版面，全部照用户给的华为音乐截图）
@@ -314,6 +316,19 @@ export struct RecommendView {
   @State wyRecAsked: boolean = false;
   @State wyRecFailed: boolean = false;
   /**
+   * QQ 音乐登录态：登录后才有「私人雷达」
+   *
+   * 与网易私人推荐同一个思路：只在「推荐来源 = QQ 音乐」且已登录时出现这一块，
+   * 数据来自 `TxRecommend.fetchTxRadar()`（musicu 的 GetRadarSong，翻 4 页去重）。
+   * 匿名也能调（会退回大众口味），但那样和「推荐歌曲」重复，所以这里要求登录。
+   */
+  @StorageLink(K_MUSIC_LOGGED_TX) @Watch('onTxLoginChanged') txLogged: boolean = false;
+  @State txRadar: SongItem[] = [];
+  @State txRadarFailed: boolean = false;
+  private txRadarAsked: boolean = false;
+  /** 私人雷达那条横滑列表的数据源（常驻，不能每帧 new 一个） */
+  private txRadarSource: SongSource = new SongSource();
+  /**
    * 封面懒解析好后版本号会变，订阅它把歌行重画一遍
    *
    * 榜单接口回来的歌**很多是没有封面的**（酷狗榜单 `img` 直接给空串），列表里要用
@@ -370,10 +385,17 @@ export struct RecommendView {
     this.wyRec = [];
     this.wyRecAsked = false;
     this.wyRecFailed = false;
+    this.txRadar = [];
+    this.txRadarSource.setItems(this.txRadar);
+    this.txRadarAsked = false;
+    this.txRadarFailed = false;
     // 刷新后那块 ListItem 不一定再触发一次 onVisibleAreaChange（它本来就在可视区），
     // 所以这里主动补一次取数；未登录 / 非网易来源时 ensureWyRec 自己会跳过
     if (this.platform === 'wy' && this.wyLogged) {
       this.ensureWyRec();
+    }
+    if (this.platform === 'tx' && this.txLogged) {
+      this.ensureTxRadar();
     }
 
     const sections: SortSection[] = [];
@@ -445,6 +467,51 @@ export struct RecommendView {
       // Error 直接 JSON.stringify 会得到 {}，所以取 message。
       const message: string = e instanceof Error ? e.message : JSON.stringify(e);
       console.error(`wy personal recommend failed: ${message}`);
+    }
+  }
+
+  /** QQ 登录态变了：把私人雷达清掉重取（与网易那套同一个理由） */
+  private onTxLoginChanged(): void {
+    this.txRadar = [];
+    this.txRadarSource.setItems(this.txRadar);
+    this.txRadarAsked = false;
+    this.txRadarFailed = false;
+    if (this.platform === 'tx' && this.txLogged) {
+      this.ensureTxRadar();
+    }
+  }
+
+  /** 私人雷达那一块露出来了才取：未登录 / 非 QQ 来源一个请求都不发 */
+  private ensureTxRadar(): void {
+    if (this.platform !== 'tx' || !this.txLogged || this.txRadarAsked) {
+      return;
+    }
+    this.txRadarAsked = true;
+    void this.loadTxRadar();
+  }
+
+  /**
+   * 拉 QQ 私人雷达（GetRadarSong，翻 4 页去重，见 core/music/TxRecommend）
+   *
+   * 与网易私人推荐一样，失败只把这一块标成「取不到」：这是首页的加分项，
+   * 接口挂了（登录过期 / 风控）不能让整页跟着报错。
+   */
+  private async loadTxRadar(): Promise<void> {
+    try {
+      const infos: LxMusicInfo[] = await fetchTxRadar();
+      const quality: string = PlaySession.getInstance().quality;
+      const songs: SongItem[] = [];
+      for (const info of infos) {
+        songs.push(songFromSearch(info, quality));
+      }
+      this.txRadar = songs;
+      this.txRadarSource.setItems(songs);
+      // 成功也留一行：能区分「接口通了但返回空列表」和「请求失败」
+      console.info(`tx radar ok: ${songs.length}`);
+    } catch (e) {
+      this.txRadarFailed = true;
+      const message: string = e instanceof Error ? e.message : JSON.stringify(e);
+      console.error(`tx radar failed: ${message}`);
     }
   }
 
@@ -1263,8 +1330,20 @@ export struct RecommendView {
     .width('100%')
   }
 
+  /** 顶部「推荐歌曲」的卡（点一下从这一首开始播这条队列） */
   @Builder
   heroCard(song: SongItem, index: number) {
+    this.songTile(this.hero, song, index);
+  }
+
+  /**
+   * 一张「大封面歌曲卡」：封面铺满 + 底部压暗 + 歌名/歌手 + 播放钮
+   *
+   * 推荐歌曲与 QQ 私人雷达共用：两张卡的观感本来就该一样，点击时用**各自那条队列**
+   * （`list`）从这一首开始播，所以队列当参数传进来，不写死 this.hero。
+   */
+  @Builder
+  songTile(list: SongItem[], song: SongItem, index: number) {
     Stack({ alignContent: Alignment.BottomStart }) {
       CoverArt({
         url: this.songCover(song),
@@ -1313,7 +1392,7 @@ export struct RecommendView {
     .borderRadius(14)
     .clip(true)
     .onClick(() => {
-      this.playSongs(this.hero, index);
+      this.playSongs(list, index);
     })
     .accessibilityText(`${song.name}，${song.singer}，播放`)
     .accessibilityLevel('yes')
@@ -2264,6 +2343,59 @@ export struct RecommendView {
    * 网易才会给（匿名接口直接回 301），和平台公开榜单不是一个数据口径，所以单独一块，
    * 不并进「歌单分类 / 歌单广场」。未登录或推荐来源不是网易时整块不渲染。
    */
+  /**
+   * QQ 私人雷达（登录后才有）
+   *
+   * 群反馈里「私人雷达」是 QQ 音乐账号才有的那档推荐，数据来自 `GetRadarSong`。
+   * 卡片沿用推荐歌曲那张大卡（`songTile`），点哪首就从那一首开始播这条雷达队列。
+   * 未登录 / 推荐来源不是 QQ 时整块不渲染 —— 与网易私人推荐同一个开关口径。
+   */
+  @Builder
+  txRadarSection() {
+    Column() {
+      this.sectionTitle('私人雷达', 4)
+      Text('来自 QQ 音乐账号的私人雷达')
+        .fontSize(CARD_META_SIZE)
+        .fontColor(C_TEXT_WEAK)
+        .width('100%')
+        .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 8 })
+
+      if (this.txRadar.length === 0) {
+        if (this.txRadarFailed) {
+          Text('私人雷达暂时取不到（登录可能已过期，去「设置 - 登录音乐」重新登录试试）')
+            .fontSize(CARD_META_SIZE)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
+        } else {
+          Row({ space: CARD_GAP }) {
+            ForEach(boneIndexes(2), () => {
+              this.bone(this.heroCardWidth(), this.heroCardWidth(), 14)
+            }, (i: number) => `radarbone_${i}`)
+          }
+          .width('100%')
+          .padding({ left: PAGE_PAD, right: PAGE_PAD })
+        }
+      } else {
+        List({ space: CARD_GAP }) {
+          LazyForEach(this.txRadarSource, (song: SongItem, index: number) => {
+            ListItem() {
+              this.songTile(this.txRadar, song, index)
+            }
+          }, (song: SongItem, index: number) => `radar_${index}_${song.id}`)
+        }
+        .scrollBar(BarState.Off)
+        .listDirection(Axis.Horizontal)
+        .width('100%')
+        .height(this.heroCardWidth())
+        .padding({ left: PAGE_PAD, right: PAGE_PAD })
+      }
+    }
+    .width('100%')
+  }
+
   @Builder
   wyPrivateSection() {
     Column() {
@@ -2526,6 +2658,18 @@ export struct RecommendView {
               .onVisibleAreaChange([0.0, 0.05], (isVisible: boolean) => {
                 if (isVisible) {
                   this.ensureWyRec();
+                }
+              })
+            }
+
+            // ------------------------------------------------ QQ 私人雷达（登录后才有）
+            if (this.platform === 'tx' && this.txLogged && this.tab === TAB_FEATURED) {
+              ListItem() {
+                this.txRadarSection()
+              }
+              .onVisibleAreaChange([0.0, 0.05], (isVisible: boolean) => {
+                if (isVisible) {
+                  this.ensureTxRadar();
                 }
               })
             }
