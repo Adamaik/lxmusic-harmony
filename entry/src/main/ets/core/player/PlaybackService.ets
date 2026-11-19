@@ -241,9 +241,18 @@ export class PlaybackService {
    * 没有时间标签的纯文本系统解析不了，会显示异常。没有可用歌词时传空串清掉。
    */
   updateLyric(lrc: string): void {
-    if (lrc === this.lyric) {
+    /**
+     * 去掉首字节的 BOM（\uFEFF）
+     *
+     * 真机实测（2026-11-19）：酷狗/网易部分歌词文本带 UTF-8 BOM，原样推给系统后
+     * 桌面歌词解析失败，系统日志是 `MDL_Lyric, lyric error: [id:$00000000]`，
+     * 卡片显示「无歌词，请欣赏」。BOM 只可能出现在开头，剥掉一个字符即可。
+     */
+    const clean: string = lrc.length > 0 && lrc.charCodeAt(0) === 0xFEFF ? lrc.substring(1) : lrc;
+    if (clean === this.lyric) {
       return;
     }
+    lrc = clean;
     this.lyric = lrc;
     /**
      * 蓝牙歌词是按「当前这一句」推的，所以这里顺手把新歌词解析成行、并先定位到当前句，

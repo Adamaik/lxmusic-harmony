@@ -317,8 +317,27 @@ async function wyLyric(songmid: string): Promise<PlatformLyric> {
 
 // ------------------------------------------------------------------ 入口
 
+/**
+ * 剥掉文本开头的 BOM（\uFEFF）
+ *
+ * 实测：酷狗/网易部分歌词带 UTF-8 BOM。原样存进缓存、推给系统后，系统歌词窗解析失败
+ * （`MDL_Lyric, lyric error: [id:$00000000]`），桌面歌词卡片显示「无歌词，请欣赏」。
+ * BOM 只可能出现在最前面，剥一个字符即可。
+ */
+export function stripLyricBom(text: string): string {
+  return text.length > 0 && text.charCodeAt(0) === 0xFEFF ? text.substring(1) : text;
+}
+
 /** 按平台取内置歌词；任何失败都返回空，界面显示「暂无歌词」 */
 export async function fetchPlatformLyric(info: LxMusicInfo): Promise<PlatformLyric> {
+  const raw: PlatformLyric = await fetchPlatformLyricRaw(info);
+  if (raw.lyric.length === 0 && raw.tlyric.length === 0) {
+    return raw;
+  }
+  return { lyric: stripLyricBom(raw.lyric), tlyric: stripLyricBom(raw.tlyric) };
+}
+
+async function fetchPlatformLyricRaw(info: LxMusicInfo): Promise<PlatformLyric> {
   try {
     if (info.source === 'wy') {
       return await wyLyric(info.songmid);
