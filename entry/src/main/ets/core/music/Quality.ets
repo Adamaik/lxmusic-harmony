@@ -241,3 +241,48 @@ export function fallbackQuality(musicInfoJson: string, source: string, used: str
   }
   return '';
 }
+
+/**
+ * 完整音质阶梯（从高到低）：拓展档在上，普通档在下
+ *
+ * 顺序取自「拓展档高于 24Bit，24Bit 高于 FLAC…」这一条产品口径，
+ * 与 {@link MAIN_ORDER} / {@link EXTENDED_ORDER} 是同一套档位，只是排成一条可逐级下退的梯子。
+ */
+const QUALITY_LADDER: string[] = [
+  'master', 'atmos_plus', 'atmos', 'hires', 'flac24bit', 'flac', '320k', '128k',
+];
+
+/**
+ * 降一档：返回**严格低于** `used`、且「这首歌 + 这个源」能用的第一个档；没有就返回空串
+ *
+ * 与 {@link fallbackQuality} 的分工：
+ *   - `fallbackQuality` 只处理「拓展档 → 普通档」这一跳（母带没权限时的退路）；
+ *   - 这里处理**逐级下退**，普通档之间也能降（flac24bit → flac → 320k → 128k）。
+ *
+ * 为什么需要它（2026-11-19 真机反馈）：播放失败不只有「源拿不到链接」，还有
+ * 「链接拿到了、但播放器解不了这个容器」——实机报错是
+ * `Unsupported Format: CONTAINER_ERR-unsupport interface, unsupport container format type`。
+ * 这种情况**换源常常拿到同一种格式**（同一个后端同一批转码产物），降一档才是有意义的下一步；
+ * 用户原话也是「它不会自动降音质，所以无法播放」「这个回退没成功」。
+ */
+export function lowerQuality(musicInfoJson: string, source: string, used: string): string {
+  const from: number = QUALITY_LADDER.indexOf(used);
+  if (from < 0) {
+    return '';
+  }
+  const available: string[] = availableQualitys(musicInfoJson);
+  const supported: string[] = sourceQualitys(source);
+  const extendOn: boolean = PlaySettings.getInstance().isExtendQuality();
+  const sourceOnlyExtend: boolean = extendOn && extendedBySourceOnly(source);
+  for (let i = from + 1; i < QUALITY_LADDER.length; i++) {
+    const quality: string = QUALITY_LADDER[i];
+    // 用户没开拓展音质时，别再往拓展档上退（往下退也不会经过它们，这里只是兜底）
+    if (!extendOn && EXTENDED_ORDER.includes(quality)) {
+      continue;
+    }
+    if (qualityUsable(quality, available, supported, sourceOnlyExtend)) {
+      return quality;
+    }
+  }
+  return '';
+}

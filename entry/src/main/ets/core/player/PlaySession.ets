@@ -18,7 +18,7 @@ import { ShuffleBag } from './ShuffleBag';
 import { StartupTiming } from './StartupTiming';
 import { PlatformHealth } from './PlatformHealth';
 import { PlaySettings } from '../settings/PlaySettings';
-import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
+import { fallbackQuality, isExtendedQuality, lowerQuality, pickQuality, qualityLabel } from '../music/Quality';
 import { AutoDownloadSong, downloadedFile, removeDownloadedFile,
   requestAutoDownload } from '../download/DownloadIndex';
 import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
@@ -498,11 +498,24 @@ function isDeadUrlError(message: string): boolean {
  */
 function friendlyPlayError(message: string): string {
   const lower: string = message.toLowerCase();
+  // 音源侧明确要求人机验证 / 要卡密：这不是「地址坏了」，但同样只能换源
+  if (lower.indexOf('人机验证') >= 0 || lower.indexOf('captcha') >= 0 || lower.indexOf('verify') >= 0) {
+    return '这个音源需要人机验证，已尝试换源';
+  }
+  // 容器/编码解不了（真机实测原文：Unsupported Format: CONTAINER_ERR …）：降档后仍失败才会看到这句
+  if (lower.indexOf('container_err') >= 0
+    || (lower.indexOf('unsupported format') >= 0)
+    || (lower.indexOf('unsupport container') >= 0)) {
+    return '播放器解不了这个音频格式，已尝试降档 / 换源';
+  }
   if (isDeadUrlError(message)) {
     return '音频地址已失效（音源返回 404），已尝试自动换源';
   }
   if (lower.indexOf('errorcode: 401') >= 0 || lower.indexOf('errorcode: 403') >= 0) {
     return '音源拒绝了这次取流（可能需要会员或卡密）';
+  }
+  if (lower.indexOf('104003') >= 0) {
+    return '这首歌需要登录账号或会员才能取流';
   }
   if (lower.indexOf('timeout') >= 0 || lower.indexOf('timed out') >= 0) {
     return '取流超时，请检查网络后重试';
@@ -1230,16 +1243,48 @@ export class PlaySession {
    * @returns true = 已经安排重试，调用方不要再弹错误提示
    */
   private retryAfterPlayFailure(message: string): boolean {
-    if (!PlaySettings.getInstance().isAutoSourceSwitch()) {
-      // 只有一个源时「换源」= 再问同一个源要一条同样寿命的链，没意义
-      return false;
-    }
     if (this.failRetry >= 3 || this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
       hilog.warn(DOMAIN, TAG, 'play failure: no retry left (%{public}d): %{public}s',
         this.failRetry, message);
       return false;
     }
     const item: SongItem = this.queue[this.currentIndex];
+
+    /**
+     * 第一步：**先降一档**，再考虑换源。
+     *
+     * 真机反馈（2026-11-19）里有这么一类失败：链接拿到了、但播放器解不了这个容器 ——
+     * `Unsupported Format: CONTAINER_ERR …`。同一个源后端转码出来的格式往往一致，
+     * 换个源很可能还是同一种格式；而「降一档」大概率换成另一种容器，才是有效的下一步。
+     * 用户的自行诊断也是这句：「不会自动降音质，所以无法播放」「这个回退没成功」。
+     *
+     * 降档不受「自动切换音源」开关影响：单源用户同样需要这条路。
+     */
+    const used: string = item.quality.length > 0 ? item.quality : this.currentCacheQuality;
+    const lower: string = used.length > 0
+      ? lowerQuality(item.musicInfoJson, item.source, used) : '';
+    if (lower.length > 0 && lower !== used) {
+      this.failRetry += 1;
+      this.urlRetried = true;
+      if (this.currentCacheKey.length > 0) {
+        MediaCache.getInstance().dropMusicUrl(this.currentCacheKey, this.currentCacheQuality);
+        this.currentUrlFromCache = false;
+      }
+      // 这一次播放按降下来的档走（playAt 开头会把它读走并清空）
+      this.playQualityOverride = lower;
+      item.quality = lower;
+      hilog.warn(DOMAIN, TAG, 'play failed (%{public}s) at %{public}s, drop to %{public}s (#%{public}d)',
+        isDeadUrlError(message) ? 'dead url' : 'format/other', used, lower, this.failRetry);
+      StartupTiming.getInstance().note(`失败降档${used}->${lower}`);
+      this.notify(`「${item.name}」这个档位放不出来，已降到 ${qualityLabel(lower)} 重试`);
+      void this.playAt(this.currentIndex);
+      return true;
+    }
+
+    // 已经是最低档（或没有可降的档）：换源才有意义 —— 单源用户到这一步只能报错
+    if (!PlaySettings.getInstance().isAutoSourceSwitch()) {
+      return false;
+    }
     const bad: string = this.resolvedSourceId.length > 0
       ? this.resolvedSourceId : SourceEngine.getInstance().getLoadedSourceId();
     this.failRetry += 1;
