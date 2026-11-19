@@ -1930,6 +1930,9 @@ struct Index {
               ExploreView({
                 topInset: this.topInset + HDS_TITLE_BAR_HEIGHT,
                 bottomInset: this.bottomInset + 96,
+                // 心动模式的自动起播只允许发生在「本页确实是当前页签」时：
+                // 页签内容会被框架提前挂载，不传这个标志就会在冷启动/切页签时抢播（见 ExploreView）
+                active: this.activeTabKey === TAB_KEY_EXPLORE,
               })
             }
           }

@@ -37,6 +37,13 @@ export interface FailoverHooks {
    * 决定换源时谁让谁：播放不能让（用户就等这一下），下载要让（后台任务，晚点再下没关系）。
    */
   isPlayback?: boolean;
+  /**
+   * 这次解析要**跳过**的音源 id
+   *
+   * 用在「地址解析成功但放不出来」的场景：那个源给的链已经 404 了，重新解析时必须把它
+   * 排除掉，否则它会立刻再给一条同样失效的地址（同一批接口出来的链接寿命一样长）。
+   */
+  skipSources?: string[];
 }
 
 export interface FailoverOutcome {
@@ -95,7 +102,21 @@ export async function resolveUrlWithSourceFailover(
   }
   const loadedId: string = engine.getLoadedSourceId();
   const loadedSupports: boolean = loadedId.length > 0 && engine.supportsAction(platform, 'musicUrl');
-  const candidates: string[] = router.candidates(platform, loadedId, loadedSupports, allIds, wantQuality);
+  let candidates: string[] = router.candidates(platform, loadedId, loadedSupports, allIds, wantQuality);
+  const skip: string[] = hooks.skipSources !== undefined ? hooks.skipSources : [];
+  if (skip.length > 0) {
+    const kept: string[] = [];
+    for (const id of candidates) {
+      if (!skip.includes(id)) {
+        kept.push(id);
+      }
+    }
+    // 全被排除掉就只好照原样试一遍：宁可再撞一次，也不能因为这条规则把歌判死
+    if (kept.length > 0) {
+      candidates = kept;
+      hilog.info(DOMAIN, TAG, 'skip sources [%{public}s] on %{public}s', skip.join(','), platform);
+    }
+  }
   if (candidates.length === 0) {
     // 一个源都没有（或都被判定为不支持这个平台）：照老路子走，让引擎给出准确报错
     return await single();

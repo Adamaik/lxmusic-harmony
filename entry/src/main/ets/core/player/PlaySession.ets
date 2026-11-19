@@ -300,7 +300,15 @@ export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
  * 换回它等于原地打转。
  */
 const FALLBACK_PLATFORM_ORDER: string[] = ['wy', 'kw', 'kg'];
-
+/**
+ * 歌词跨平台兜底时去问的平台（顺序 = 优先度）
+ *
+ * 歌词是**公开资源**，跟你在哪个平台听没关系：酷狗的歌词搜索按「歌名 + hash + 时长」
+ * 匹配，老歌 / 冷门版本经常一条候选都没有（群里周杰伦《发如雪》就是这样），
+ * 但同一首在 QQ 音乐 / 网易上都有词。所以本平台取不到就换个平台按歌名+歌手严格匹配再取词。
+ * 汽水（qs）没有内置歌词通道，不放进来。
+ */
+const LYRIC_FALLBACK_PLATFORMS: string[] = ['tx', 'wy', 'kw', 'kg', 'mg'];
 /** 平台展示名（提示语里用，`QQ 音乐源不可用，已自动换源播放`） */
 const SOURCE_LABELS: Record<string, string> = {
   'kw': '酷我音乐',
@@ -442,6 +450,56 @@ function strictMatch(results: LxMusicInfo[], item: SongItem): LxMusicInfo | null
   return null;
 }
 
+/**
+ * 播放器报的这个错，是不是「地址本身已经废了」（而不是解码 / 设备 / 权限问题）
+ *
+ * 典型就是群里那张图：`播放错误：IO Resource Not Found: IO error, IO resource not found,
+ * requestError: true, errorType: server error, errorCode: 404` —— 音源给的直链已经过期，
+ * 服务端 404。这种**换一个源给的链就有救**，所以要认出来、走换源重试；
+ * 其它错误（解码失败、音频焦点被抢）换源没用，重试只是白等。
+ */
+function isDeadUrlError(message: string): boolean {
+  const lower: string = message.toLowerCase();
+  if (lower.indexOf('errorcode: 404') >= 0 || lower.indexOf('errorcode:404') >= 0) {
+    return true;
+  }
+  if (lower.indexOf('io resource not found') >= 0) {
+    return true;
+  }
+  if (lower.indexOf('404') >= 0 && (lower.indexOf('server error') >= 0 || lower.indexOf('requesterror') >= 0)) {
+    return true;
+  }
+  // 410 Gone / 403 有时也是源侧链接过期（鉴权参数过期），一并按「地址废了」处理
+  if (lower.indexOf('errorcode: 410') >= 0 || lower.indexOf('errorcode: 403') >= 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 把播放器的系统报错翻成人话
+ *
+ * `IO Resource Not Found: IO error, IO resource not found, requestError: true,
+ * errorType: server error, errorCode: 404, …` 这种原文糊到界面上，用户只会觉得软件坏了。
+ * 认得的错误给一句能看懂、且告诉他下一步的；认不得的原样返回（排障还要靠它）。
+ */
+function friendlyPlayError(message: string): string {
+  const lower: string = message.toLowerCase();
+  if (isDeadUrlError(message)) {
+    return '音频地址已失效（音源返回 404），已尝试自动换源';
+  }
+  if (lower.indexOf('errorcode: 401') >= 0 || lower.indexOf('errorcode: 403') >= 0) {
+    return '音源拒绝了这次取流（可能需要会员或卡密）';
+  }
+  if (lower.indexOf('timeout') >= 0 || lower.indexOf('timed out') >= 0) {
+    return '取流超时，请检查网络后重试';
+  }
+  if (lower.indexOf('unsupported') >= 0 || lower.indexOf('not supported') >= 0) {
+    return '播放器不支持这个音频格式';
+  }
+  return message;
+}
+
 export class PlaySession {
   private static instance: PlaySession | null = null;
 
@@ -550,6 +608,19 @@ export class PlaySession {
   /** 这一轮是读本地缓存文件播的（文件坏了要删掉重来，别一直卡在这首） */
   private currentLocalPath: string = '';
   private urlRetried: boolean = false;
+  /**
+   * 这一轮播放的地址是**哪个音源**给的
+   *
+   * 解析成功 ≠ 地址能用：有的源给的链接当场就 404（群里报的
+   * 「IO Resource Not Found … errorCode: 404」就是这种）。要换源重来，就得知道
+   * 刚才那条链是谁给的，才排得掉它（见 onPlayerState 里的失效地址分支）。
+   */
+  private resolvedSourceId: string = '';
+  /** 失效地址重试记账：同一首最多换源重来两次；换到别的歌就清零 */
+  private deadUrlSongId: string = '';
+  private deadUrlRetry: number = 0;
+  /** 下一次解析要排除的音源（刚给过一条放不出来的地址） */
+  private skipSourceId: string = '';
   /** 播放现场落盘 */
   private stateStore: PlayStateStore = new PlayStateStore();
   private stateInited: boolean = false;
@@ -1112,10 +1183,65 @@ export class PlaySession {
           return;
         }
       }
-      this.notify(message);
+      if (this.retryDeadUrl(message)) {
+        return;
+      }
+      const friendly: string = friendlyPlayError(message);
+      this.setStatus('error', friendly);
+      this.notify(friendly);
       return;
     }
     // idle / stopped 由会话自己管（切歌、清空队列），这里不覆盖
+  }
+
+  /**
+   * 地址失效（404 / IO Resource Not Found）→ 记账、排除这个源、换源重来
+   *
+   * 背景：解析成功不等于地址能用。群里「五一」的 `播放错误：IO Resource Not Found …
+   * errorCode: 404` 就是音源给了一条已经废掉的直链 —— 以前这种只会原地弹一句系统原文，
+   * 用户点重试还是同一条死链。地址是**源**给的，换一个源给的链往往就能放，所以：
+   *
+   *   1. 把这笔记到该源头上（路由表降级 + 平台冷却），下次不再优先用它；
+   *   2. 丢掉地址缓存（不丢的话这次重放又会命中同一条死链，白转一圈）；
+   *   3. 解析时把它排掉（skipSources），换源重新取流；
+   *   4. 同一首最多两次 —— 两次都拿不到能放的链，就认命报错，别无限循环。
+   *
+   * @returns true = 已经安排重试，调用方不要再弹错误提示
+   */
+  private retryDeadUrl(message: string): boolean {
+    if (!isDeadUrlError(message)) {
+      return false;
+    }
+    if (!PlaySettings.getInstance().isAutoSourceSwitch()) {
+      // 只有一个源时「换源」等于「再问同一个源要一条同样寿命的链」，没意义
+      return false;
+    }
+    if (this.deadUrlRetry >= 2 || this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
+      hilog.warn(DOMAIN, TAG, 'dead url: no retry left (%{public}d): %{public}s',
+        this.deadUrlRetry, message);
+      return false;
+    }
+    const item: SongItem = this.queue[this.currentIndex];
+    const bad: string = this.resolvedSourceId.length > 0
+      ? this.resolvedSourceId : SourceEngine.getInstance().getLoadedSourceId();
+    this.deadUrlRetry += 1;
+    this.urlRetried = true;
+    if (bad.length > 0) {
+      this.skipSourceId = bad;
+      SourceRouter.getInstance().markFailure(bad, item.source, '播放地址失效(404)');
+      PlatformHealth.getInstance().markFailure(bad, item.source, '播放地址失效(404)');
+    }
+    // 地址缓存必须丢掉：playAt 会先查它，留着就又拿到同一条死链
+    if (this.currentCacheKey.length > 0) {
+      MediaCache.getInstance().dropMusicUrl(this.currentCacheKey, this.currentCacheQuality);
+      this.currentUrlFromCache = false;
+    }
+    hilog.warn(DOMAIN, TAG, 'dead url from %{public}s on %{public}s, retry #%{public}d',
+      bad.length > 0 ? bad : '(unknown)', item.source, this.deadUrlRetry);
+    StartupTiming.getInstance().note(`地址失效换源#${this.deadUrlRetry}`);
+    this.notify('音频地址已失效，正在自动换源…');
+    void this.playAt(this.currentIndex);
+    return true;
   }
 
   // ------------------------------------------------------------ 状态同步
@@ -1290,6 +1416,8 @@ export class PlaySession {
       item.musicInfoJson, item.source, quality, {
         isPlayback: true,
         isCancelled: (): boolean => this.playToken !== token,
+        // 上一次给的地址放不出来（404）：这次解析把这个源排除掉，换个人给链
+        skipSources: this.skipSourceId.length > 0 ? [this.skipSourceId] : [],
         onSwitch: (sourceId: string, name: string): void => {
           this.setStatus('loading', name.length > 0 ? `正在切换到音源「${name}」…` : '正在切换音源…');
         },
@@ -1605,7 +1733,7 @@ export class PlaySession {
       // 4) 预取下一首
       void this.prefetchNext(token, index);
     } catch (e) {
-      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      const message: string = `播放「${item.name}」失败：${friendlyPlayError((e as Error).message)}`;
       hilog.error(DOMAIN, TAG, 'play webdav failed: %{public}s', (e as Error).message);
       this.setStatus('error', message);
       this.notify(message);
@@ -1705,7 +1833,7 @@ export class PlaySession {
       if (this.playToken !== token) {
         return;
       }
-      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      const message: string = `播放「${item.name}」失败：${friendlyPlayError((e as Error).message)}`;
       hilog.error(DOMAIN, TAG, 'play book failed: %{public}s', (e as Error).message);
       this.setStatus('error', message);
       this.notify(message);
@@ -1731,6 +1859,13 @@ export class PlaySession {
     // 换了歌：预取时给随机播放预订的那一签作废（下一首重新抽）
     this.clearReservedNext();
     this.urlRetried = false;
+    this.resolvedSourceId = '';
+    // 换了歌：失效地址的重试记账清零（同一首之内的重试才累计，见 onPlayerState）
+    if (this.deadUrlSongId !== this.queue[index].id) {
+      this.deadUrlSongId = this.queue[index].id;
+      this.deadUrlRetry = 0;
+      this.skipSourceId = '';
+    }
     this.currentLocalPath = '';
     this.pushQueueState();
 
@@ -1928,6 +2063,8 @@ export class PlaySession {
           cacheKey = altFromCooling.cacheKey;
           this.currentCacheKey = cacheKey;
           this.currentCacheQuality = quality;
+          // 冷却期换源成功：地址是「现在加载着的那个源」给的
+          this.resolvedSourceId = SourceEngine.getInstance().getLoadedSourceId();
           AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
           this.pushQueueState();
         } else {
@@ -1936,6 +2073,7 @@ export class PlaySession {
           try {
             const resolved: FailoverOutcome = await this.resolveWithSourceFailover(item, quality, token);
             url = resolved.url;
+            this.resolvedSourceId = resolved.sourceId;
             // 换源之后按新源重新协商过档位：实际用的那一档要回写，
             // 否则界面显示 320K、缓存键也按 320K 存，和真正在放的母带对不上
             if (resolved.quality !== quality) {
@@ -1962,6 +2100,7 @@ export class PlaySession {
               try {
                 const retried: FailoverOutcome = await this.resolveWithSourceFailover(item, retry, token);
                 url = retried.url;
+                this.resolvedSourceId = retried.sourceId;
                 if (retried.quality !== retry) {
                   quality = retried.quality;
                   item.quality = retried.quality;
@@ -1990,6 +2129,8 @@ export class PlaySession {
               url = alt.url;
               quality = alt.quality;
               cacheKey = alt.cacheKey;
+              // 平台换源成功：地址由「当前真正加载着的源」给出（switchSourceAndResolve 刚换过）
+              this.resolvedSourceId = engine.getLoadedSourceId();
               // 换源之后这一轮的缓存现场全都作废了：媒体键、音质档、以及「地址来自缓存」
               this.currentCacheKey = cacheKey;
               this.currentCacheQuality = quality;
@@ -2043,7 +2184,7 @@ export class PlaySession {
       // 起播耗时照打：buffer=未开始 说明地址都没取到（解析失败），
       // buffer 有值说明是送进播放器之后才失败的 —— 这两种在排障时完全是两件事
       StartupTiming.getInstance().markFailed('播放失败');
-      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      const message: string = `播放「${item.name}」失败：${friendlyPlayError((e as Error).message)}`;
       this.setStatus('error', message);
       this.notify(message);
     }
@@ -2713,6 +2854,19 @@ export class PlaySession {
     try {
       const info: LxMusicInfo = JSON.parse(item.musicInfoJson) as LxMusicInfo;
       const result: PlatformLyric = await fetchPlatformLyric(info);
+      if (hasTimeTag(result.lyric)) {
+        return result;
+      }
+      // 本平台没词（酷狗最典型）：换别的平台按「歌名 + 歌手」严格匹配同一首再取词。
+      // 纯音乐也会走到这里，多一两次搜索而已；宁可多问一句，也别让用户对着空词听歌。
+      if (SEARCH_PLATFORMS.includes(item.source)) {
+        const borrowed: PlatformLyric = await this.lyricFromOtherPlatform(item);
+        if (hasTimeTag(borrowed.lyric)) {
+          hilog.info(DOMAIN, TAG, 'lyric borrowed from another platform: %{public}s / %{public}s',
+            item.name, item.singer);
+          return borrowed;
+        }
+      }
       if (result.lyric.length === 0) {
         hilog.info(DOMAIN, TAG, 'no lyric for %{public}s %{public}s', item.source, item.name);
       }
@@ -2720,6 +2874,37 @@ export class PlaySession {
     } catch (e) {
       return { lyric: '', tlyric: '' };
     }
+  }
+
+  /**
+   * 去别的平台借歌词（见 LYRIC_FALLBACK_PLATFORMS 的说明）
+   *
+   * 匹配规则与换源一致：**歌名与歌手规范化后完全相等**才算同一首（见 strictlySameSong），
+   * 宁可没词也不能把别的歌的词显示上来。任何一步失败都直接放弃，不影响播放。
+   */
+  private async lyricFromOtherPlatform(item: SongItem): Promise<PlatformLyric> {
+    const keyword: string = item.singer.length > 0 ? `${item.name} ${item.singer}` : item.name;
+    for (const platform of LYRIC_FALLBACK_PLATFORMS) {
+      if (platform === item.source || !isSearchSupported(platform)) {
+        continue;
+      }
+      try {
+        const results: LxMusicInfo[] = await searchMusic(keyword, platform, 1, 10);
+        const hit: LxMusicInfo | null = strictMatch(results, item);
+        if (hit === null) {
+          continue;
+        }
+        const lyric: PlatformLyric = await fetchPlatformLyric(hit);
+        if (hasTimeTag(lyric.lyric)) {
+          return lyric;
+        }
+      } catch (e) {
+        // 这个平台搜不通 / 取词失败：换下一个，别让歌词兜底本身变成新的错误源
+        hilog.warn(DOMAIN, TAG, 'lyric fallback %{public}s failed: %{public}s',
+          platform, (e as Error).message);
+      }
+    }
+    return { lyric: '', tlyric: '' };
   }
 
   /** 切歌时先把上一首的歌词清掉，别让新歌配旧词 */

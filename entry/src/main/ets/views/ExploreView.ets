@@ -38,6 +38,16 @@ const HEART_FLASH_MS: number = 650;
 export struct ExploreView {
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
+  /**
+   * 本页是不是**当前页签**（由壳层 pages/Index.ets 按 activeTabKey 传进来）
+   *
+   * 这一页本来是「一进来就自动起播」的（心动模式），但页签内容会被框架提前挂载：
+   * 冷启动时「探索」虽然不可见、也会走一遍 aboutToAppear，于是它抢先把心动那首播出来，
+   * 把用户正在听的歌顶掉（群里报的「第一次进软件点开我的，稳定触发探索里的歌」）。
+   * 现在自动起播只在「真的切到探索」且「本来没在放任何东西」时才发生，
+   * 见 maybeAutoPlay。
+   */
+  @Prop @Watch('onActiveChanged') active: boolean = false;
   @State cards: ExploreCard[] = [];
   /** 当前是第几张；只增不减 —— 翻过去的回不来 */
   @State index: number = 0;
@@ -53,12 +63,11 @@ export struct ExploreView {
   private snapping: boolean = false;
 
   aboutToAppear(): void {
-    // 1) 先同步读缓存：有缓存就立刻出歌、立刻自动播，用户不用等
+    // 1) 先同步读缓存：有缓存就立刻出歌（**不在这里起播**，见 maybeAutoPlay）
     const cached: number = this.radio.prepareCached();
     if (cached > 0) {
       this.loading = false;
       this.cards = this.radio.batch(BATCH_SIZE);
-      this.playCurrent();
     } else {
       this.loading = true;
     }
@@ -73,11 +82,36 @@ export struct ExploreView {
         this.loading = false;
         this.cards = this.radio.batch(BATCH_SIZE);
         this.jumpTo(0);
-        this.playCurrent();
       }
+      this.maybeAutoPlay();
     }).catch(() => {
       this.loading = false;
     });
+    this.maybeAutoPlay();
+  }
+
+  /** 页签切换：切到探索这一栏时才考虑自动起播 */
+  private onActiveChanged(): void {
+    this.maybeAutoPlay();
+  }
+
+  /**
+   * 心动模式的「自动起播」——只在**两个条件同时成立**时才真的播
+   *
+   * 1. `active`：本页是当前页签。页签内容会被框架提前挂载（冷启动时「探索」不可见也会
+   *    aboutToAppear），条件不放宽就会被判成「一进软件就自动放歌」，还会顶掉用户的播放；
+   * 2. 播放器**不是在放**：只在 `idle/stopped/paused` 时接手。正在放的歌不许被打断 ——
+   *    这是群里反馈的那个 bug 的另一半（用户听着歌切页签，歌被换掉了）。
+   *    「暂停」不算在放：上次退出留下的暂停态很常见，用户主动点进探索时应该直接开始心动模式。
+   */
+  private maybeAutoPlay(): void {
+    if (!this.active || this.cards.length === 0) {
+      return;
+    }
+    if (this.playerStatus === 'playing' || this.playerStatus === 'loading') {
+      return;
+    }
+    this.playCurrent();
   }
 
   private card(): ExploreCard | null {
