@@ -1,5 +1,7 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { K_CURRENT_ID, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { K_CURRENT_ID, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem,
+  songFromSearch } from '../core/player/PlaySession';
+import { getPlaylistDetailAll, LxListDetail, PlaylistDetailProgress } from '../core/music/MusicList';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 // AddMusicResult：加歌的返回值从「加进去几首」改成了 { added, skipped }，要显式标类型
@@ -114,6 +116,8 @@ export struct PlaylistDetailView {
   /** 搜索关键词：只跟输入框走，过滤结果在 applyFilter 里算 */
   @State keyword: string = '';
   @State title: string = '';
+  /** 正在「从原歌单更新」：按钮禁用，避免连点重复拉取 */
+  @State updating: boolean = false;
   /**
    * 多选（长按任意一行进）
    *
@@ -817,6 +821,15 @@ export struct PlaylistDetailView {
   @Builder
   playlistMenu() {
     Menu() {
+      // 「从原歌单更新」：只对从线上歌单导入的本地歌单有意义（自建/收藏没有源头）
+      if (this.canUpdateFromSource()) {
+        MenuItem({ content: this.updating ? '正在更新…' : '从原歌单更新' })
+          .onClick(() => {
+            if (!this.updating) {
+              void this.updateFromSource();
+            }
+          })
+      }
       MenuItem({ content: '检查重复歌曲' })
         .onClick(() => {
           this.checkDuplicates();
@@ -1335,12 +1348,70 @@ export struct PlaylistDetailView {
     })
   }
 
+  /** 这张歌单能不能回源更新：必须是「从线上歌单导入」的（有平台 + 线上歌单标识） */
+  private canUpdateFromSource(): boolean {
+    if (this.isBuiltin()) {
+      return false;
+    }
+    const library = SyncManager.getInstance().getLibrary();
+    return library.playlistSourceOf(this.playlistId).length > 0
+      && library.sourceListIdOf(this.playlistId).length > 0;
+  }
+
+  /**
+   * 从原歌单更新：重新拉一遍线上歌单，整表替换本地这张
+   *
+   * 群反馈（2026-11-17 13:38，StarFlame）：「lx 有这个功能（跟着原歌单更新）」，
+   * 群主答「行，我加上」。落点复用导入链路：`LocalLibrary.importPlaylist` 对同一张线上歌单
+   * 本来就是**原地更新**（同一个 source + sourceListId 落到同一条本地歌单），
+   * 所以这里只要重新拉全量歌曲再喂给它。
+   *
+   * 语义按洛雪来：以线上为准整表替换（本地手动加的歌会被覆盖，这是「更新」的应有之义）；
+   * 拉不到 / 线上空了就保持原样并提示，绝不用空结果覆盖用户数据。
+   */
+  private async updateFromSource(): Promise<void> {
+    const library = SyncManager.getInstance().getLibrary();
+    const source: string = library.playlistSourceOf(this.playlistId);
+    const sourceListId: string = library.sourceListIdOf(this.playlistId);
+    if (source.length === 0 || sourceListId.length === 0) {
+      this.toast('这张歌单不是从线上导入的，没有可更新的来源');
+      return;
+    }
+    this.updating = true;
+    const name: string = this.title;
+    try {
+      this.toast('正在从原歌单拉取最新内容…');
+      // 不把进度写进 title：title 是这张歌单的名字，导入时还要用它
+      const detail: LxListDetail = await getPlaylistDetailAll(source, sourceListId);
+      const quality: string = PlaySession.getInstance().quality;
+      const items: SongItem[] = [];
+      for (const music of detail.list) {
+        items.push(songFromSearch(music, quality));
+      }
+      if (items.length === 0) {
+        this.toast('原歌单现在是空的，已保留本地内容');
+        return;
+      }
+      const summary: PlaylistSummary | null = library.importPlaylist(name, source,
+        sourceListId, items);
+      if (summary === null) {
+        this.toast('更新失败：没有可导入的歌曲');
+        return;
+      }
+      this.refresh();
+      this.toast(`已从原歌单更新：共 ${summary.count} 首`);
+    } catch (e) {
+      this.toast(`更新失败：${(e as Error).message}`);
+    } finally {
+      this.updating = false;
+    }
+  }
+
   /**
    * 靶心图标：外圈一道环 + 中间一个点（不依赖系统 symbol 里有没有「靶心」）
    *
    * 与参考图同观感：环和点都用主题红，点比环小一圈。
-   */
-  @Builder
+   */  @Builder
   locateButton() {
     Stack({ alignContent: Alignment.Center }) {
       Column()

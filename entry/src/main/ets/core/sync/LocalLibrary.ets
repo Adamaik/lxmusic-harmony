@@ -467,6 +467,20 @@ export class LocalLibrary implements LibrarySink {
     return item.source;
   }
 
+  /**
+   * 这张本地歌单对应的**线上歌单标识**（`source__歌单id` 的规范化形态）
+   *
+   * 只有「从分享链接导入」的歌单才有；手建歌单与内置收藏歌单返回空串。
+   * 「从原歌单更新」靠它回源重新拉一遍（见 views/ImportPlaylistSheet 的导入口径）。
+   */
+  sourceListIdOf(id: string): string {
+    const item = this.findPlaylist(id);
+    if (item === null || item.sourceListId === undefined) {
+      return '';
+    }
+    return item.sourceListId;
+  }
+
   playlistSongs(id: string): SongItem[] {
     // targetMusics 认 default / love / 用户歌单，所以内置收藏歌单也能按 id 取歌
     const musics: LxMusicInfoNew[] | null = this.targetMusics(id);
