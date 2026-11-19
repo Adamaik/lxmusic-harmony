@@ -438,6 +438,24 @@ export async function resolveShareText(text: string): Promise<PlaylistLink> {
       return retried;
     }
   }
+  /**
+   * 落地页可能是 JS 渲染的（URL 里没有 id，id 在 HTML/脚本里）。
+   * QQ 音乐的 `c6.y.qq.com/base/fcgi-bin/u?__=xxx` 就是这种：3xx 跳到 /n/ryqq/playlist/...，
+   * 但有时又跳到一个壳页面。这里再从落地页正文里捞一次 id。
+   */
+  if (finalUrl.length > 0) {
+    try {
+      const resp: LxResponse = await httpGet(finalUrl, 0);
+      const body: string = typeof resp.body === 'string' ? resp.body as string : '';
+      const id: string = playlistIdFromHtml(body);
+      const landingSource: string = platformOfUrl(finalUrl);
+      if (id.length > 0 && landingSource.length > 0) {
+        return makeLink(landingSource, id, finalUrl);
+      }
+    } catch (e) {
+      // 捞不到就继续往下给通用提示
+    }
+  }
   const source: string = platformOfUrl(finalUrl.length > 0 ? finalUrl : url);
   if (source.length === 0) {
     throw new Error('暂不支持这个平台，目前支持网易云 / QQ / 酷狗 / 酷我 / 咪咕的歌单链接');
@@ -445,5 +463,42 @@ export async function resolveShareText(text: string): Promise<PlaylistLink> {
   if (looksLikeSongLink(finalUrl.length > 0 ? finalUrl : url)) {
     throw new Error(`这是${platformName(source)}的单曲链接，不是歌单链接。请在歌单页右上角「分享」里复制链接`);
   }
+  // QQ 音乐客户端分享出来的是短链，服务器不给 id 时唯一可靠的办法是换长链（群友实测）
+  if (source === 'tx' && isQqShortLink(url)) {
+    throw new Error('这是 QQ 音乐客户端分享出来的短链接，服务器没有给出歌单 id。'
+      + '请用电脑浏览器打开这个歌单、复制地址栏里的长链接；'
+      + '或者把歌单分享到微信，再从微信里复制链接（群友验证过这样拿到的是长链接）。');
+  }
   throw new Error(`没能从${platformName(source)}链接里找到歌单 id，请确认是歌单的分享链接`);
+}
+
+/** QQ 音乐客户端分享出来的短链（`c6.y.qq.com/base/fcgi-bin/u?__=` 这种） */
+function isQqShortLink(url: string): boolean {
+  const lower: string = url.toLowerCase();
+  return lower.indexOf('c6.y.qq.com/base/fcgi-bin/u') >= 0
+    || lower.indexOf('c.y.qq.com/base/fcgi-bin/u') >= 0
+    || lower.indexOf('i.y.qq.com/base/fcgi-bin/u') >= 0;
+}
+
+/**
+ * 从落地页正文里找歌单 id
+ *
+ * 常见三种写法：`"disstid":123456`、`disstid=123456`、`/playlist/123456`。
+ * 只收 5 位以上纯数字：歌单 id 都是这个量级，短数字多半是别的参数（页码、版本号）。
+ */
+function playlistIdFromHtml(body: string): string {
+  if (body.length === 0) {
+    return '';
+  }
+  const patterns: RegExp[] = [
+    /(?:disstid|dissid)["']?\s*[:=]\s*["']?(\d{5,})/i,
+    /playlist\/(\d{5,})/i,
+  ];
+  for (const pattern of patterns) {
+    const matched: RegExpMatchArray | null = body.match(pattern);
+    if (matched !== null && matched[1] !== undefined) {
+      return matched[1];
+    }
+  }
+  return '';
 }
