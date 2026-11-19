@@ -6,7 +6,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SongItem } from '../player/PlaySession';
 import { LxPlayer } from '../player/LxPlayer';
 import { mediaKeyOf } from '../music/MediaCache';
-import { fallbackQuality, pickQuality } from '../music/Quality';
+import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
 import { PlaySettings } from '../settings/PlaySettings';
 import { SourceEngine } from '../source/SourceEngine';
 import { FailoverOutcome, resolveUrlWithSourceFailover } from '../source/SourceFailover';
@@ -1338,12 +1338,18 @@ export class DownloadManager {
     if (item.musicInfoJson.length === 0) {
       throw new Error('这首歌没有可解析的歌曲信息（不是平台搜索结果）');
     }
-    const quality: string = pickQuality(item.musicInfoJson, item.source, item.quality);
+    // 下载音质独立于播放音质（群反馈 2026-11-19：「下载时选择音质能加上不」）：
+    // 设置里选了档位就按它下；空串 = 老行为，跟随播放音质。
+    const downloadQuality: string = DownloadSettings.getInstance().getQuality();
+    const baseQuality: string = downloadQuality.length > 0 ? downloadQuality : item.quality;
+    const quality: string = pickQuality(item.musicInfoJson, item.source, baseQuality);
     item.quality = quality;
     // 与播放链路共用同一套「选源 + 协商 + 降级」（见 core/source/SourceFailover）：
     // 取流能力同源，能放的源当然也能下，没必要两套逻辑各写一遍、迟早不一致
     const settings = PlaySettings.getInstance();
-    const wantQuality: string = settings.isExtendQuality() ? settings.getExtendQualityType() : '';
+    const wantQuality: string = downloadQuality.length > 0
+      ? (isExtendedQuality(downloadQuality) ? downloadQuality : '')
+      : (settings.isExtendQuality() ? settings.getExtendQualityType() : '');
     try {
       const outcome: FailoverOutcome = await resolveUrlWithSourceFailover(
         item.musicInfoJson, item.source, quality, {}, wantQuality);

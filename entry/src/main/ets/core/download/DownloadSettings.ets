@@ -31,9 +31,20 @@ const SETTINGS_VERSION: number = 2;
 export const NAME_FORMATS: string[] = ['song', 'artist-title', 'title-artist'];
 export const NAME_FORMAT_LABELS: string[] = ['歌曲名', '艺术家-标题', '标题-艺术家'];
 
+/**
+ * 下载音质（独立于「播放音质」）
+ *
+ * 群反馈（2026-11-19 12:25，杯呗 is me）：「下载时选择音质能加上不」——洛雪的下载面板
+ * 就是让用户勾档位（128K/320K/FLAC/Atmos/母带）。这里先给一个全局选项：
+ * 空串 = 跟随播放音质（老行为），选了就按这一档下，互不影响听歌时的档位。
+ */
+export const DOWNLOAD_QUALITY_VALUES: string[] = ['', '128k', '320k', 'flac', 'flac24bit'];
+export const DOWNLOAD_QUALITY_LABELS: string[] = ['跟随播放', '128K', '320K', 'FLAC', '24Bit'];
+
 export const K_DOWNLOAD_NAME_FORMAT: string = 'cfg_download_name_format';
 export const K_DOWNLOAD_MARK_QUALITY: string = 'cfg_download_mark_quality';
 export const K_DOWNLOAD_DIR_URI: string = 'cfg_download_dir_uri';
+export const K_DOWNLOAD_QUALITY: string = 'cfg_download_quality';
 
 /** 落盘结构（字段全部可选：老文件可能缺字段） */
 interface DownloadSettingsData {
@@ -42,6 +53,8 @@ interface DownloadSettingsData {
   markQuality?: boolean;
   /** 系统实际给的公共下载目录 uri（file://docs/... 那种），写成功一次就记下来 */
   downloadDirUri?: string;
+  /** 下载音质（空串 = 跟随播放音质）；v2 之后新增 */
+  quality?: string;
 }
 
 export class DownloadSettings {
@@ -63,6 +76,8 @@ export class DownloadSettings {
   private markQuality: boolean = true;
   /** 系统给的公共下载目录 uri（第一次写进公共目录后才有值） */
   private downloadDirUri: string = '';
+  /** 下载音质：空串 = 跟随播放音质 */
+  private quality: string = '';
 
   init(context: common.Context): void {
     if (this.inited) {
@@ -102,6 +117,7 @@ export class DownloadSettings {
       nameFormat: this.nameFormat,
       markQuality: this.markQuality,
       downloadDirUri: this.downloadDirUri,
+      quality: this.quality,
     };
     try {
       const handle = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -130,6 +146,9 @@ export class DownloadSettings {
     if (data.downloadDirUri !== undefined) {
       this.downloadDirUri = data.downloadDirUri;
     }
+    if (data.quality !== undefined && (data.quality.length === 0 || DOWNLOAD_QUALITY_VALUES.includes(data.quality))) {
+      this.quality = data.quality;
+    }
   }
 
   private publish(): void {
@@ -137,6 +156,7 @@ export class DownloadSettings {
       AppStorage.setOrCreate(K_DOWNLOAD_NAME_FORMAT, this.nameFormat);
       AppStorage.setOrCreate(K_DOWNLOAD_MARK_QUALITY, this.markQuality);
       AppStorage.setOrCreate(K_DOWNLOAD_DIR_URI, this.downloadDirUri);
+      AppStorage.setOrCreate(K_DOWNLOAD_QUALITY, this.quality);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to publish download settings: %{public}s', JSON.stringify(e));
     }
@@ -150,6 +170,23 @@ export class DownloadSettings {
 
   isMarkQuality(): boolean {
     return this.markQuality;
+  }
+
+  /** 下载音质（空串 = 跟随播放音质） */
+  getQuality(): string {
+    return this.quality;
+  }
+
+  setQuality(value: string): void {
+    if (value !== '' && !DOWNLOAD_QUALITY_VALUES.includes(value)) {
+      return;
+    }
+    if (value === this.quality) {
+      return;
+    }
+    this.quality = value;
+    AppStorage.setOrCreate(K_DOWNLOAD_QUALITY, value);
+    this.write();
   }
 
   // ---------------------------------------------------------------- 写入

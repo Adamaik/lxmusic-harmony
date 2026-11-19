@@ -2,7 +2,8 @@ import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SettingLabel, ToggleSetting } from '../ui/SettingWidgets';
 import { DownloadManager } from '../core/download/DownloadManager';
-import { DownloadSettings, K_DOWNLOAD_DIR_URI, K_DOWNLOAD_MARK_QUALITY, K_DOWNLOAD_NAME_FORMAT,
+import { DownloadSettings, DOWNLOAD_QUALITY_LABELS, DOWNLOAD_QUALITY_VALUES,
+  K_DOWNLOAD_DIR_URI, K_DOWNLOAD_MARK_QUALITY, K_DOWNLOAD_NAME_FORMAT, K_DOWNLOAD_QUALITY,
   NAME_FORMAT_LABELS, NAME_FORMATS } from '../core/download/DownloadSettings';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
@@ -26,6 +27,8 @@ export struct DownloadSettingsView {
   @Prop bottomInset: number = 0;
   @StorageLink(K_DOWNLOAD_NAME_FORMAT) nameFormat: string = 'song';
   @StorageLink(K_DOWNLOAD_MARK_QUALITY) markQuality: boolean = true;
+  /** 下载音质（空串 = 跟随播放音质） */
+  @StorageLink(K_DOWNLOAD_QUALITY) downloadQuality: string = '';
   /** 公共下载目录 uri：写进去过一次才有值（下载成功后订阅它刷新） */
   @StorageLink(K_DOWNLOAD_DIR_URI) dirUri: string = '';
   /**
@@ -42,6 +45,12 @@ export struct DownloadSettingsView {
 
   private formatIndex(): number {
     const index: number = NAME_FORMATS.indexOf(this.nameFormat);
+    return index < 0 ? 0 : index;
+  }
+
+  /** 下载音质选项的下标（空串 = 跟随播放，排第一） */
+  private qualityIndex(): number {
+    const index: number = DOWNLOAD_QUALITY_VALUES.indexOf(this.downloadQuality);
     return index < 0 ? 0 : index;
   }
 
@@ -80,6 +89,16 @@ export struct DownloadSettingsView {
                 activeIndex: this.formatIndex(),
                 onPick: (index: number) => {
                   DownloadSettings.getInstance().setNameFormat(NAME_FORMATS[index]);
+                },
+              })
+
+              // 下载音质：单独一项，与听歌时的音质互不影响（群反馈 2026-11-19）
+              OptionSetting({
+                label: '下载音质',
+                options: DOWNLOAD_QUALITY_LABELS,
+                activeIndex: this.qualityIndex(),
+                onPick: (index: number) => {
+                  DownloadSettings.getInstance().setQuality(DOWNLOAD_QUALITY_VALUES[index]);
                 },
               })
 
