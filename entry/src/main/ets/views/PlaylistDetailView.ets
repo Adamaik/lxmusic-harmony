@@ -5,7 +5,7 @@ import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 // AddMusicResult：加歌的返回值从「加进去几首」改成了 { added, skipped }，要显式标类型
 // DuplicateGroup：「检查重复歌曲」扫出来的分组（保留哪一首由库里的 keepId 定）
 import { AddMusicResult, DuplicateGroup } from '../core/sync/LocalLibrary';
-import { C_BG, C_DIVIDER, C_FILL_SOFT, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
   F_SUB } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_CLOSE, I_DOWNLOAD, I_MORE, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_SEARCH,
   I_VOLUME, IconGlyph } from '../ui/Icons';
@@ -1335,6 +1335,51 @@ export struct PlaylistDetailView {
     })
   }
 
+  /**
+   * 靶心图标：外圈一道环 + 中间一个点（不依赖系统 symbol 里有没有「靶心」）
+   *
+   * 与参考图同观感：环和点都用主题红，点比环小一圈。
+   */
+  @Builder
+  locateButton() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width(18)
+        .height(18)
+        .borderRadius(9)
+        .border({ width: 1.6, color: C_RED })
+      Column()
+        .width(6)
+        .height(6)
+        .borderRadius(3)
+        .backgroundColor(C_RED)
+    }
+    .width(24)
+    .height(24)
+  }
+
+  /**
+   * 滚到正在播放的那首
+   *
+   * 列表可能正被搜索框过滤（`this.songs` 是过滤后的那份），所以在**当前显示的列表**里找：
+   * 找到就居中，找不到说明这首歌不在这张歌单（或是被搜索条件筛掉了），给一句提示。
+   */
+  private scrollToCurrent(): void {
+    if (this.currentId.length === 0) {
+      this.toast('还没有在播放的歌曲');
+      return;
+    }
+    for (let i = 0; i < this.songs.length; i++) {
+      if (this.songs[i].id === this.currentId) {
+        this.scroller.scrollToIndex(i, true, ScrollAlign.CENTER);
+        return;
+      }
+    }
+    this.toast(this.keyword.trim().length > 0
+      ? '正在播放的这首歌被当前搜索筛掉了'
+      : '正在播放的这首歌不在这个歌单里');
+  }
+
   build() {
     /**
      * 根容器是 Stack：鸿蒙7 那条悬浮栏由 Tabs 自己画、鸿蒙6 换成自绘的一条（见下面的
@@ -1387,6 +1432,44 @@ export struct PlaylistDetailView {
         .height('100%')
 
         this.fallbackMiniBar()
+      }
+
+      /**
+       * 「定位到正在播放的那一行」悬浮按钮（靶心）
+       *
+       * 群反馈（2026-11-16 07:55，看海）：「没有那个歌单里导航到歌曲那一行的按钮」，
+       * 附的参考图就是右侧这颗靶心。几百首的歌单里找正在放的那首确实得靠它。
+       *
+       * 只在「有歌在放 + 列表非空」时出现；点一下滚到那行并居中，找不到就提示一句。
+       * 图标用两层圆自绘（环 + 点），不依赖系统 symbol 里有没有靶心。
+       */
+      if (this.currentId.length > 0 && this.songs.length > 0) {
+        Column() {
+          Row() {
+            this.locateButton()
+          }
+          .width(42)
+          .height(42)
+          .justifyContent(FlexAlign.Center)
+          .borderRadius(21)
+          .backgroundColor(C_CARD)
+          .shadow({ radius: 14, color: '#33000000', offsetX: 0, offsetY: 3 })
+          .onClick(() => {
+            this.scrollToCurrent();
+          })
+          .accessibilityText('定位到正在播放的歌曲')
+          .accessibilityLevel('yes')
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.End)
+        .alignItems(HorizontalAlign.End)
+        // 让出底部那条悬浮迷你栏，别压住它
+        .padding({
+          right: 18,
+          bottom: this.bottomInset + HDS_BAR_HEIGHT + PAGE_BAR_BOTTOM_GAP + 14,
+        })
+        .hitTestBehavior(HitTestMode.Transparent)
       }
 
       // 「检查重复歌曲」面板：**单独挂一个节点**。
