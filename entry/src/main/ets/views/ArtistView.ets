@@ -7,6 +7,8 @@ import { C_BG, C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK,
   F_SUB, platformColor, platformTint } from '../ui/Theme';
 import { CoverArt, EmptyState } from '../ui/Widgets';
 import { SongListPane } from './SongListPane';
+import { MiniBarHost } from './MiniBarHost';
+import { HDS_BAR_HEIGHT } from '../ui/Hds';
 import { CONTENT_MAX_WIDTH, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED, contentColumnsFor } from '../ui/Layout';
 
 /** 每页取多少首：与搜索页同口径（50 首一页，滚到底再拉） */
@@ -38,9 +40,14 @@ export struct ArtistView {
   @Prop artistSongNum: number = 0;
   /** 让出标题栏那一段（壳层传来的「状态栏 + 标题栏」） */
   @Prop topInset: number = 0;
-  /** 列表底部要留出的空间（悬浮页签栏 / 手势条），由壳层给 */
+  /** 列表底部要留出的空间（手势条），由壳层给；页内那条迷你条的高度在这页自己补 */
   @Prop bottomInset: number = 0;
   @Prop currentId: string = '';
+  /** 点迷你播放条 → 打开播放页 / 播放列表（与其它页同一个壳层回调） */
+  onOpenPlayer: () => void = () => {
+  };
+  onOpenQueue: () => void = () => {
+  };
   /** 排序：最热 / 最新（只有 kg / tx / wy 认这一项，见 sortable） */
   @State order: LxArtistOrder = 'hot';
   /**
@@ -329,56 +336,70 @@ export struct ArtistView {
   }
 
   build() {
-    Column() {
-      this.header()
+    /**
+     * 页内挂一条迷你播放条（MiniBarHost）：这一页是压在路由栈上的 NavDestination，
+     * 会把壳层那条带迷你栏的 HdsTabs 整个盖住 —— 之前这里忘了套外壳，进来就没有播放条
+     * （群反馈 2026-11-19 11:33「这个界面有点突兀，看能不能把底部音乐栏加上去」）。
+     * 列表底部同时让出「条高 + 间距」，免得最后几首歌被那条悬浮栏压住。
+     */
+    MiniBarHost({
+      windowWidth: this.windowWidth,
+      bottomInset: this.bottomInset,
+      onOpenPlayer: this.onOpenPlayer,
+      onOpenQueue: this.onOpenQueue,
+    }) {
+      Column() {
+        this.header()
 
-      if (this.loading) {
-        Column() {
-          LoadingProgress().width(38).height(38).color(C_RED)
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .justifyContent(FlexAlign.Center)
-      } else if (this.songs.length === 0) {
-        Column() {
-          EmptyState({
-            text: '这个歌手没有可播放的歌',
-            hint: this.status.length > 0 ? this.status : '换一个平台或换一个歌手试试。',
-            topPadding: 48,
-          })
-        }
-        .width('100%')
-        .layoutWeight(1)
-      } else {
-        // SongListPane 自己是可滚动的懒加载列表，别再套 Scroll（嵌套滚动会打架）
-        SongListPane({
-          items: this.songs,
-          currentId: this.currentId,
-          emptyText: '',
-          // 这一页的歌都来自同一个平台，行上不必再标来源（平台已标在头部）
-          showSource: false,
-          bottomInset: this.bottomInset,
-          footerStatus: this.status,
-          onReachEnd: () => {
-            void this.loadMore();
-          },
-          onPick: (index: number) => {
-            if (index < 0 || index >= this.songs.length) {
-              return;
-            }
-            void PlaySession.getInstance().setQueueAndPlay(this.songs, index);
-            this.toast(`已加入播放列表并开始解析：${this.songs[index].name}`);
-          },
-        })
-          .layoutWeight(1)
+        if (this.loading) {
+          Column() {
+            LoadingProgress().width(38).height(38).color(C_RED)
+          }
           .width('100%')
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+        } else if (this.songs.length === 0) {
+          Column() {
+            EmptyState({
+              text: '这个歌手没有可播放的歌',
+              hint: this.status.length > 0 ? this.status : '换一个平台或换一个歌手试试。',
+              topPadding: 48,
+            })
+          }
+          .width('100%')
+          .layoutWeight(1)
+        } else {
+          // SongListPane 自己是可滚动的懒加载列表，别再套 Scroll（嵌套滚动会打架）
+          SongListPane({
+            items: this.songs,
+            currentId: this.currentId,
+            emptyText: '',
+            // 这一页的歌都来自同一个平台，行上不必再标来源（平台已标在头部）
+            showSource: false,
+            // 滚到底要停在悬浮迷你条上方：条高 + 与它的间距（与其它页同一口径）
+            bottomInset: this.bottomInset + HDS_BAR_HEIGHT + 26,
+            footerStatus: this.status,
+            onReachEnd: () => {
+              void this.loadMore();
+            },
+            onPick: (index: number) => {
+              if (index < 0 || index >= this.songs.length) {
+                return;
+              }
+              void PlaySession.getInstance().setQueueAndPlay(this.songs, index);
+              this.toast(`已加入播放列表并开始解析：${this.songs[index].name}`);
+            },
+          })
+            .layoutWeight(1)
+            .width('100%')
+        }
       }
+      .width('100%')
+      .height('100%')
+      // 宽屏下与搜索页同口径限宽：歌手页是一列内容，铺满整屏会让头像与歌名隔得老远
+      .constraintSize({ maxWidth: this.columns() > 1 ? CONTENT_MAX_WIDTH : LAYOUT_UNBOUNDED })
+      .alignItems(HorizontalAlign.Start)
+      .backgroundColor(C_BG)
     }
-    .width('100%')
-    .height('100%')
-    // 宽屏下与搜索页同口径限宽：歌手页是一列内容，铺满整屏会让头像与歌名隔得老远
-    .constraintSize({ maxWidth: this.columns() > 1 ? CONTENT_MAX_WIDTH : LAYOUT_UNBOUNDED })
-    .alignItems(HorizontalAlign.Start)
-    .backgroundColor(C_BG)
   }
 }

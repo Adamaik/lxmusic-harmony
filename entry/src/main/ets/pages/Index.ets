@@ -1523,8 +1523,16 @@ struct Index {
             artistPicUrl: this.routeArtistPicUrl,
             artistSongNum: this.routeArtistSongNum,
             topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
-            bottomInset: this.bottomInset + HDS_BAR_HEIGHT,
+            // 这一页现在自带一条页内迷你播放条（见 views/MiniBarHost），所以只让出手势条，
+            // 不再额外让出壳层那条栏的高度；条高由页面自己补给列表底部。
+            bottomInset: this.bottomInset,
             currentId: this.currentId,
+            onOpenPlayer: () => {
+              this.openPlayer();
+            },
+            onOpenQueue: () => {
+              this.openQueue();
+            },
           })
         }
       }
