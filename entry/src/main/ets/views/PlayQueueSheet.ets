@@ -1,10 +1,13 @@
 import { K_LIBRARY_VERSION, PlaySession, SongItem } from '../core/player/PlaySession';
-import { K_CURRENT_ID, K_QUEUE_COUNT } from '../core/player/PlaySession';
-import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
+import { K_CURRENT_ID, K_PLAY_MODE, K_QUEUE_COUNT } from '../core/player/PlaySession';
 import { SyncManager } from '../core/sync/SyncManager';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_SUB } from '../ui/Theme';
-import { I_QUEUE, I_TRASH, I_VOLUME, IconGlyph } from '../ui/Icons';
-import { CoverArt, EmptyState, SingerLink } from '../ui/Widgets';
+import { qualityLabel } from '../core/music/Quality';
+import { platformName } from '../core/music/MusicList';
+import { C_CARD, C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK } from '../ui/Theme';
+import {
+  I_CLOSE, I_ORDER_PLAY, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHUFFLE, I_TRASH, I_VOLUME, IconGlyph,
+} from '../ui/Icons';
+import { EmptyState, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
@@ -26,7 +29,8 @@ export struct PlayQueueContent {
   @Prop bottomInset: number = 0;
   @StorageLink(K_CURRENT_ID) currentId: string = '';
   @StorageLink(K_QUEUE_COUNT) queueCount: number = 0;
-  @StorageLink(K_COVER_VERSION) coverVersion: number = 0;
+  /** 播放模式：列表循环 / 单曲循环 / 顺序播放 / 随机。面板顶部那一行要用它画图标与文字 */
+  @StorageLink(K_PLAY_MODE) playMode: string = 'list';
   /** 收藏被同步服务端改动时刷新一下行内的爱心状态 */
   @StorageLink(K_LIBRARY_VERSION) libraryVersion: number = 0;
   @State items: SongItem[] = [];
@@ -62,6 +66,79 @@ export struct PlayQueueContent {
 
   private toast(message: string): void {
     this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
+  // ------------------------------------------------------------ 顶部操作行（照华为音乐）
+
+  private modeIcon(): Resource {
+    if (this.playMode === 'single') {
+      return I_REPEAT_ONE;
+    }
+    if (this.playMode === 'order') {
+      return I_ORDER_PLAY;
+    }
+    if (this.playMode === 'shuffle') {
+      return I_SHUFFLE;
+    }
+    return I_REPEAT;
+  }
+
+  private modeText(): string {
+    if (this.playMode === 'single') {
+      return '单曲循环';
+    }
+    if (this.playMode === 'order') {
+      return '顺序播放';
+    }
+    if (this.playMode === 'shuffle') {
+      return '随机播放';
+    }
+    return '列表循环';
+  }
+
+  /** 点一下换一种播放模式（与播放页那颗循环钮是同一个开关） */
+  private cycleMode(): void {
+    const mode: string = PlaySession.getInstance().cyclePlayMode();
+    this.toast(this.modeTextOf(mode));
+  }
+
+  private modeTextOf(mode: string): string {
+    if (mode === 'single') {
+      return '单曲循环';
+    }
+    if (mode === 'order') {
+      return '顺序播放';
+    }
+    if (mode === 'shuffle') {
+      return '随机播放';
+    }
+    return '列表循环';
+  }
+
+  /** 清空整个播放列表（华为音乐是同位置一个垃圾桶，这里给一次确认，避免误触把队列清掉） */
+  private clearQueue(): void {
+    if (this.items.length === 0) {
+      return;
+    }
+    const session = PlaySession.getInstance();
+    this.getUIContext().showAlertDialog({
+      title: '清空播放列表',
+      message: `将从播放列表移除 ${this.items.length} 首歌（正在播放的这一首也会停止）。\n已下载与收藏不受影响。`,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        },
+      },
+      secondaryButton: {
+        value: '清空',
+        fontColor: C_RED,
+        action: () => {
+          session.clearQueue();
+          this.refresh();
+          this.toast('播放列表已清空');
+        },
+      },
+    });
   }
 
   private toggleFavorite(item: SongItem): void {
@@ -152,43 +229,78 @@ export struct PlayQueueContent {
     })
   }
 
+  /**
+   * 一行歌曲（照华为音乐播放列表的排法）
+   *
+   * 华为音乐那边一行是两行文字、**没有封面图**：
+   *   第一行：歌名（正在播放的那首是红色，后面跟一排跳动的音量条图标）
+   *   第二行：小标签（VIP / 空间音频这类）+「歌手 - 专辑」灰字
+   *   最右：一个细的 ×（从列表里移除），没有圆圈、没有常驻垃圾桶
+   * 行与行之间是内缩的分割线。
+   *
+   * 我们这边没有专辑字段，第二行就用「音质档 + 平台」两个小标签 + 歌手名，信息量对等；
+   * 移除键沿用 ×，左滑删除与长按菜单都保留（那两个是额外能力，不占版面）。
+   */
+  @Builder
+  chip(text: string) {
+    Text(text)
+      .fontSize(10)
+      .fontColor(C_TEXT_SUB)
+      .maxLines(1)
+      .padding({ left: 5, right: 5, top: 1, bottom: 1 })
+      .backgroundColor(C_FILL_SOFT)
+      .borderRadius(4)
+  }
+
   @Builder
   songRow(item: SongItem, index: number) {
-    Row({ space: 12 }) {
-      CoverArt({
-        url: CoverStore.getInstance().coverFor(item.musicInfoJson, item.coverUrl),
-        name: item.name,
-        art: item.art,
-        boxSize: 44,
-        radius: 12,
-      })
-      Column({ space: 3 }) {
-        Text(item.name)
-          .fontSize(16)
-          .fontColor(this.currentId === item.id ? C_RED : C_TEXT)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-          .textAlign(TextAlign.Start)
-        if (item.singer.length > 0) {
-          // 歌手名：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
-          SingerLink({ singer: item.singer, source: item.source })
+    Row({ space: 10 }) {
+      Column({ space: 5 }) {
+        Row({ space: 6 }) {
+          Text(item.name)
+            .fontSize(17)
+            .fontColor(this.currentId === item.id ? C_RED : C_TEXT)
+            .fontWeight(this.currentId === item.id ? FontWeight.Medium : FontWeight.Normal)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+            .textAlign(TextAlign.Start)
+          if (this.currentId === item.id) {
+            // 正在播放：与华为音乐一样在歌名右侧放一排音量条
+            IconGlyph({ symbol: I_VOLUME, iconSize: 16, color: C_RED })
+          }
         }
+        .width('100%')
+
+        Row({ space: 6 }) {
+          this.chip(qualityLabel(item.quality))
+          if (platformName(item.source).length > 0) {
+            this.chip(platformName(item.source))
+          }
+          if (item.singer.length > 0) {
+            // 歌手名：点它进这位歌手的聚合页（共用组件，见 ui/Widgets.ets 的 SingerLink）
+            Column() {
+              SingerLink({ singer: item.singer, source: item.source })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+        }
+        .width('100%')
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      if (this.currentId === item.id) {
-        IconGlyph({ symbol: I_VOLUME, iconSize: 19, color: C_RED })
-      }
-      IconGlyph({ symbol: I_TRASH, iconSize: 19, color: C_TEXT_SUB })
+      IconGlyph({ symbol: I_CLOSE, iconSize: 18, color: C_TEXT_WEAK })
+        .padding({ left: 6, top: 8, bottom: 8, right: 2 })
         .onClick(() => {
           this.deleteAt(index);
         })
     }
     .width('100%')
-    .height(66)
-    .padding({ left: 16, right: 16 })
+    .height(74)
+    .padding({ left: 20, right: 14 })
+    .alignItems(VerticalAlign.Center)
     .onClick(() => {
       PlaySession.getInstance().playAt(index);
     })
@@ -200,6 +312,35 @@ export struct PlayQueueContent {
 
   build() {
     Column() {
+      /**
+       * 顶部操作行（照华为音乐播放列表）
+       *
+       * 左边是当前播放模式（图标 + 文字，点一下换一种），右边一个垃圾桶清空整个列表。
+       * 华为音乐在同一位置就是这两样，没有「全选 / 删除多选」那种工具条。
+       */
+      Row() {
+        Row({ space: 8 }) {
+          IconGlyph({ symbol: this.modeIcon(), iconSize: 20, color: C_TEXT })
+          Text(this.modeText())
+            .fontSize(15)
+            .fontColor(C_TEXT)
+        }
+        .padding({ top: 8, bottom: 8 })
+        .onClick(() => {
+          this.cycleMode();
+        })
+        Blank()
+        IconGlyph({ symbol: I_TRASH, iconSize: 20, color: C_TEXT_SUB })
+          .padding({ left: 12, top: 8, bottom: 8 })
+          .onClick(() => {
+            this.clearQueue();
+          })
+      }
+      .width('100%')
+      .height(52)
+      .padding({ left: 20, right: 20 })
+      .opacity(this.items.length === 0 ? 0.4 : 1)
+
       if (this.items.length === 0) {
         Column() {
           EmptyState({
@@ -212,40 +353,35 @@ export struct PlayQueueContent {
         .width('100%')
         .justifyContent(FlexAlign.Center)
       } else {
+        // 不再套 `ListItemGroup(CARD)`：华为音乐这一页是「直接铺在面板上的一列行」，
+        // 没有白卡、也没有每行一张封面，行与行之间只有一条内缩的分割线。
         List() {
-          ListItemGroup({ style: ListItemGroupStyle.CARD }) {
-            LazyForEach(this.source, (item: SongItem, index: number) => {
-              ListItem() {
-                this.songRow(item, index)
-              }
-              .swipeAction({
-                end: {
-                  builder: () => {
-                    this.deleteAction(index);
-                  },
-                  onAction: () => {
-                    this.deleteAt(index);
-                  },
+          LazyForEach(this.source, (item: SongItem, index: number) => {
+            ListItem() {
+              this.songRow(item, index)
+            }
+            .swipeAction({
+              end: {
+                builder: () => {
+                  this.deleteAction(index);
                 },
-              })
-            }, (item: SongItem, index: number) => `${index}_${item.id}`)
-          }
-          .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 72 })
+                onAction: () => {
+                  this.deleteAt(index);
+                },
+              },
+            })
+          }, (item: SongItem, index: number) => `${index}_${item.id}`)
         }
         .width('100%')
         .layoutWeight(1)
-        .padding({ left: 16, right: 16 })
+        .padding({ left: 0, right: 0 })
         .scrollBar(BarState.Off)
-        // 多备几行，别到要用的时候才建。
-        // `ListItemGroup` + `LazyForEach` 在显示区外的行默认是「进了视口才创建」，而半模态
-        // 从半屏拖到满屏时视口是一口气长高的：如果那几行还没建，新露出来的下半屏就会先空
-        // 一拍（外层白卡也跟着只铺到半屏），看起来就是「歌曲先显示一半，剩下的一会儿才
-        // 加载出来」。半模态那一侧的根治是 `scrollSizeMode: CONTINUOUS`（见 pages/Index.ets
-        // 播放列表 bindSheet 的说明），这里再用缓存把「刚长出来的那几行」提前备好，
-        // 两处配合才不会有空窗期。
-        // 行高 66：半屏约露 4~5 行、满屏约 9 行，长高那一下最多要补 5 行，缓存 6 行就够，
-        // 顺带给快速滑动留一点余量。与 SongListPane / SearchView 那两处 `cachedCount(3)`
-        // 同一口径（那两处行更高，所以行数少一些）。
+        .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 20, endMargin: 20 })
+        // 多备几行，别到要用的时候才建。半模态从半屏拖到满屏时视口是一口气长高的，
+        // 显示区外的行默认「进了视口才创建」，新露出来的下半屏会先空一拍。
+        // 根治在 `scrollSizeMode: CONTINUOUS`（见 pages/Index.ets 的 bindSheet 说明），
+        // 这里用缓存把「刚长出来的那几行」提前备好，两处配合才不会有空窗期。
+        // 行高 74：半屏约露 4 行、满屏约 8 行，长高那一下最多要补 4 行，缓存 6 行够用。
         .cachedCount(6)
       }
 
@@ -253,5 +389,9 @@ export struct PlayQueueContent {
     }
     .width('100%')
     .height('100%')
+    // 面板本体是半模态（半透明材质），纯文字行压在模糊的封面/页面上会发虚、不好读 ——
+    // 华为音乐那一页是「一整片近实色」。这里铺 c_card（浅色纯白 / 深色 #1C1C1F），
+    // 与 bindSheet 的 backgroundColor 同色（见 pages/Index.ets），标题栏与列表连成一片。
+    .backgroundColor(C_CARD)
   }
 }

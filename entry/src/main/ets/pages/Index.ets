@@ -12,7 +12,7 @@ import { WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { SourceEngine } from '../core/source/SourceEngine';
 import { SourceInfo, SourceLog } from '../core/source/LxTypes';
 import { OnlineRoute, LIST_PLATFORMS, platformName } from '../core/music/MusicList';
-import { C_BG, C_GLASS_SOLID, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, F_SUB } from '../ui/Theme';
+import { C_BG, C_CARD, C_GLASS_SOLID, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, F_SUB } from '../ui/Theme';
 import { glassLight, immersiveMaterialFor, immersiveMaterialForDialog, isGlassMaterialSupported, materialFirstGlass,
   thinGlass } from '../ui/Glass';
 import { DustLayer } from '../ui/Dust';
@@ -2254,9 +2254,15 @@ struct Index {
       // backgroundColor 默认是 Color.White，不改透明同样会把材质盖住。
       // 所以材质可用时两者一起让位，只有材质不可用才轮到 blurStyle 兜底
       // （见 ui/Glass.ets 的 immersiveMaterialForDialog）。
-      blurStyle: isGlassMaterialSupported() ? undefined : BlurStyle.COMPONENT_ULTRA_THICK,
-      backgroundColor: isGlassMaterialSupported() ? Color.Transparent : undefined,
-      systemMaterial: immersiveMaterialForDialog(this.materialLevel),
+      //
+      // 本面板例外：播放列表是「两行纯文字的行」，半透明材质下文字压在模糊的封面上发虚
+      // （群里反馈「太丑」有这一半）。照华为音乐的做法，整张面板用**不透明**的卡片色
+      // （c_card：浅色纯白 / 深色 #1C1C1F），标题栏与列表连成一片、不做分界。
+      // 试过 c_glass_solid（82% 白）：去掉背景模糊之后剩下那 18% 的透明会把背后的页面
+      // 文字透上来，比模糊时更花，所以这里要的是「实色」而不是「更浓的玻璃」。
+      blurStyle: undefined,
+      backgroundColor: C_CARD,
+      systemMaterial: undefined,
       title: { title: '播放列表', subtitle: `共 ${this.queueCount} 首` },
     })
   }

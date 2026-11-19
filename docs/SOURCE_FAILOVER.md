@@ -115,7 +115,7 @@
 再把最后一个错误抛给上层 —— 上层照旧走「换平台」（`switchSourceAndResolve`）或报错。
 所以**关掉开关**（`PlaySettings.isAutoSourceSwitch() == false`）时，行为与改动前完全一致。
 
-### 3.8 解析成功 ≠ 地址能用：失效地址（404）也要换源（2026-11-19 补）
+### 3.8 解析成功 ≠ 地址能用：播放失败也要换源（2026-11-19 补）
 
 群反馈（「五一」，2026-11-19 20:31）：
 
@@ -127,20 +127,22 @@ requestError: true, errorType: server error, errorCode: 404, …
 这是**音源给的直链已经废了**（服务端 404），不是解析失败：脚本正常返回了 url，播放器一拉就 404。
 改动前这种只会原地报错，点重试还是同一条死链 —— 因为地址缓存里存着它。
 
-现在的处理（`PlaySession.onPlayerState('error')` → `retryDeadUrl`）：
+**判据刻意放宽**（群主原话：「不管什么原因，只要播放失败、最后没有放出来，就说明这个源有问题，
+你就应该往下换源」）：不挑错误类型，只看结果。`isDeadUrlError()` 只用来区分日志口径
+（`dead url` / `no sound`），不影响是否重试；重试走 `PlaySession.onPlayerState('error')`
+→ `retryAfterPlayFailure`：
 
-1. `isDeadUrlError()` 认出 404 / IO Resource Not Found / 410 / 403 这类**换源有救**的错误
-   （解码失败、音频焦点被抢这类换源没用，不重试）；
-2. 记一笔到**给这条链的源**头上：`SourceRouter.markFailure` + `PlatformHealth.markFailure`
-   —— 下次不再优先用它（`resolvedSourceId` 在解析成功时记下，见 3.6）；
-3. `MediaCache.dropMusicUrl` 丢掉地址缓存 —— 不丢的话重放会再次命中同一条死链；
-4. 解析时把它排掉：`FailoverHooks.skipSources` 让 `SourceRouter.candidates` 过滤掉这个源，
-   换别的源重新取流；
-5. 同一首**最多两次**，两次都拿不到能放的链就认命报错，避免死循环；
-6. 最终失败才弹提示，且文案经 `friendlyPlayError()` 翻译（「音频地址已失效（音源返回 404）」等），
+1. 记一笔到**给这条链的源**头上：`SourceRouter.markFailure(source, platform)` +
+   `PlatformHealth.markFailure` —— 路由表是**按平台**存的（`routes: 平台 → SourceRoute[]`），
+   所以「同一个源在 A 平台能用、D 平台不能用」是分开记账的，下次同平台会换人；
+2. `MediaCache.dropMusicUrl` 丢掉地址缓存 —— 不丢的话重放会再次命中同一条废链；
+3. 解析时把它排掉：`FailoverHooks.skipSources` 让候选里去掉这些源（`resolvedSourceId`
+   在解析成功时记下，可累计多个），换别的源重新取流；
+4. 同一首**最多 3 次**，3 次都拿不到能放的链就认命报错，避免死循环；
+5. 最终失败才弹提示，且文案经 `friendlyPlayError()` 翻译（「音频地址已失效（音源返回 404）」等），
    不再把系统原文糊到界面上。
 
-日志关键字：`dead url from %s on %s, retry #%d` / `dead url: no retry left`。
+日志关键字：`play failed on %s from %s (%s), retry #%d` / `play failure: no retry left`。
 
 **已知未覆盖**：下载链路拿到 404 时不会自动换源重试（下载失败即失败），见第七节。
 
@@ -193,8 +195,9 @@ requestError: true, errorType: server error, errorCode: 404, …
 - [ ] 下载与播放同源：播放某首歌成功后立刻下载同一平台另一首 → 不再撞坏源、直接成功；
 - [ ] 下载母带：开拓展音质选「母带」，下载一首 QQ 歌 → 拿到母带文件；无权限时自动降档而不是失败；
 - [ ] 播放正在解析时点下载 → 下载失败/走当前源，**不会**打断那次起播（日志 `skip switching ... another resolve pending`）。
-- [ ] 地址失效换源：某源给的链 404 时 → 自动丢掉死链、换源重来并出声（日志 `dead url from …retry #1`）；
-      同一首连续两次 404 就停止重试并提示「音频地址已失效」（日志 `dead url: no retry left`）；
+- [ ] 播放失败换源：某源给的链放不出来（404 / 500 / 拉流中断）→ 自动丢掉死链、换源重来并出声
+      （日志 `play failed on … retry #1`）；同一首连续 3 次都失败就停止重试并提示
+      （日志 `play failure: no retry left`）；
 - [ ] 歌词跨平台兜底：播一首酷狗老歌（如周杰伦《发如雪》）→ 有歌词；
       日志 `lyric borrowed from another platform`；
 - [ ] 切页签不抢播：冷启动后点「我的」→ 正在播的歌不变；点「探索」且本来没在播 → 心动模式正常起播。
