@@ -177,7 +177,7 @@ export default function heartModeTest() {
       }
     });
 
-    it('profile_跳两次拉黑且口味会动', 0, () => {
+    it('profile_跳一次拉黑且口味会动', 0, () => {
       const profile: HeartProfile = new HeartProfile(4);
       const seedVec: Float32Array = l2normalize(new Float32Array([1, 0, 0, 0]));
       profile.seed([seedVec]);
@@ -186,8 +186,6 @@ export default function heartModeTest() {
       profile.update(d, FB_LIKE, other);
       expect(profile.isBlacklisted('k1')).assertFalse();
       expect(profile.affinityBonus(d) > 0).assertTrue();
-      profile.update(d, FB_SKIP, other);
-      expect(profile.isBlacklisted('k1')).assertFalse();
       profile.update(d, FB_SKIP, other);
       expect(profile.isBlacklisted('k1')).assertTrue();
     });

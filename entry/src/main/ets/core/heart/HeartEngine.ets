@@ -15,6 +15,7 @@
  */
 
 import {
+  FB_PLAY,
   FB_SKIP,
   HeartDoc,
   HeartItem,
@@ -69,7 +70,7 @@ export class HeartEngine {
   constructor(options?: HeartOptions) {
     this.options = options === undefined ? new HeartOptions() : options;
     this.encoder = new HeartEncoder(this.options.dim);
-    this.profile = new HeartProfile(this.options.dim);
+    this.profile = new HeartProfile(this.options.dim, this.options.blacklistSkips);
     this.weights = new HeartWeights();
     this.weights.eps = this.options.eps;
     this.rngState = this.options.seed >>> 0;
@@ -186,7 +187,6 @@ export class HeartEngine {
       pick.explore = true;
     }
     if (pick.item !== null) {
-      this.profile.recordExposure(pick.item.doc.id);
     }
     return pick;
   }
@@ -287,7 +287,6 @@ export class HeartEngine {
       picks.push(pick);
       used.add(id);
       usedArtists.add(artist);
-      this.profile.recordExposure(id);
     }
     return picks;
   }
@@ -408,7 +407,6 @@ export class HeartEngine {
     pick.item = best;
     pick.score = 0;
     pick.explore = false;
-    this.profile.recordExposure(best.doc.id);
     return pick;
   }
 
@@ -421,6 +419,9 @@ export class HeartEngine {
    * durationMs 之后调一次。**不改 ListenLog 现有口径**，只是旁挂订阅。
    */
   observe(doc: HeartDoc, kind: number): void {
+    if (kind === FB_PLAY) {
+      this.profile.recordExposure(doc.id);
+    }
     const item: HeartItem | undefined = this.byId.get(doc.id);
     const vec: Float32Array | null = item === undefined ? null : item.vec;
     // 跳过的歌不进历史：否则「我不想听」会被当成「我在听这一类」

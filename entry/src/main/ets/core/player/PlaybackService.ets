@@ -649,6 +649,16 @@ export class PlaybackService {
   refreshDesktopLyric(): void {
     const session = this.session;
     const want: boolean = PlaySettings.getInstance().isDesktopLyric();
+    if (session !== null && want && !this.lyricSupported) {
+      // 支持与否还没问过（没播过歌就进设置页）：先问一次，能支持就接着启用，
+      // 否则「打开开关没反应」会被当成开关坏了。
+      this.probeDesktopLyricSupport().then((supported: boolean) => {
+        if (supported) {
+          this.refreshDesktopLyric();
+        }
+      });
+      return;
+    }
     if (session !== null && want && this.lyricSupported && !this.lyricEnabled) {
       session.enableDesktopLyric(true).then(() => {
         this.lyricEnabled = true;
@@ -667,6 +677,12 @@ export class PlaybackService {
    * 有带时间轴的歌词、没被用户关掉、并且不是在「停播 / 出错」状态时显示，其余情况收起来。
    * 暂停时**不**收起：一会儿就续播了，窗口跟着一显一隐会闪；
    * 换歌、停止、没有词、用户关掉开关才收。
+   *
+   * **显示之前必须补推一次元数据**（2026-11-19 修）：
+   * 系统的歌词窗是拿 `AVMetadata.lyric` 来滚的，而这份元数据是**开歌那一刻**推的。
+   * 用户在一首歌播到一半时才打开开关时，系统此刻手上没有这份元数据 —— 窗口会开出来但空着，
+   * 要等下一首重新推元数据才「刷」出词来（真机反馈的原话：「等到下一首歌才刷出来」）。
+   * 所以在「从隐藏变成显示」的那一次，先把当前这首歌的元数据（含 lyric）再推一遍，再让窗口显示。
    */
   private syncDesktopLyric(): void {
     if (!this.lyricSupported || !this.lyricEnabled) {
@@ -684,7 +700,26 @@ export class PlaybackService {
       return;
     }
     this.lyricVisible = want;
-    session.setDesktopLyricVisible(want).catch((err: BusinessError) => {
+    if (want) {
+      // 先补推元数据（歌词随它一起到系统），再显示：否则窗口先出来、词后到，中间是空的
+      hilog.info(DOMAIN, TAG, 'desktop lyric: repush current metadata then show');
+      this.pushMetadata(this.coverForPush()).then(() => {
+        this.setDesktopLyricVisible(true);
+      }).catch(() => {
+        this.setDesktopLyricVisible(true);
+      });
+      return;
+    }
+    this.setDesktopLyricVisible(false);
+  }
+
+  /** 让系统显隐歌词窗（失败只记日志：桌面歌词不是主链路） */
+  private setDesktopLyricVisible(visible: boolean): void {
+    const session = this.session;
+    if (session === null) {
+      return;
+    }
+    session.setDesktopLyricVisible(visible).catch((err: BusinessError) => {
       hilog.warn(DOMAIN, TAG, 'setDesktopLyricVisible failed: %{public}s', JSON.stringify(err));
     });
   }

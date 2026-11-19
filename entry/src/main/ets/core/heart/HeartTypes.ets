@@ -35,7 +35,7 @@ export const HEART_EXCLUDE_ARTISTS: number = 3;
 /** 最近 N 首不进候选（不连续重复） */
 export const HEART_EXCLUDE_RECENT: number = 6;
 /** 同一首歌被跳过的次数达到该值就拉黑 */
-export const HEART_BLACKLIST_SKIPS: number = 2;
+export const HEART_BLACKLIST_SKIPS: number = 1;
 /**
  * 新歌窗口（天）：**入库时间**在这之内算 fresh，给曝光加成
  *

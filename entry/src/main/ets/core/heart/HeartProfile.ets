@@ -15,6 +15,7 @@
  */
 
 import {
+  HEART_BLACKLIST_SKIPS,
   FB_COMPLETE,
   FB_LIKE,
   FB_PLAY,
@@ -80,7 +81,10 @@ export class HeartProfile {
   private exposure: Map<string, number> = new Map<string, number>();
   private steps: number = 0;
 
-  constructor(dim: number) {
+  private blacklistSkips: number;
+
+  constructor(dim: number, blacklistSkips: number = HEART_BLACKLIST_SKIPS) {
+    this.blacklistSkips = blacklistSkips;
     this.dim = dim;
     this.taste = new Float32Array(dim);
   }
@@ -196,6 +200,9 @@ export class HeartProfile {
 
   private updateTaste(vec: Float32Array, kind: number): void {
     if (!this.hasTaste) {
+      if (kind === FB_SKIP) {
+        return;
+      }
       this.taste = l2normalize(copyVec(vec));
       this.hasTaste = true;
       return;
@@ -242,7 +249,7 @@ export class HeartProfile {
       return true;
     }
     const cur: number | undefined = this.skips.get(id);
-    return cur !== undefined && cur >= 2;
+    return cur !== undefined && cur >= this.blacklistSkips;
   }
 
   /** 已拉黑的 id 列表（持久化用） */
@@ -252,7 +259,7 @@ export class HeartProfile {
       out.push(id);
     });
     this.skips.forEach((count: number, id: string) => {
-      if (count >= 2 && !this.blacklist.has(id)) {
+      if (count >= this.blacklistSkips && !this.blacklist.has(id)) {
         out.push(id);
       }
     });
