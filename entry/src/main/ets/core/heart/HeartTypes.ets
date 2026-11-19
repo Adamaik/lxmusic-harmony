@@ -105,6 +105,8 @@ export class HeartDoc {
    * 位置**推断：新歌榜/飙升榜靠前的歌接近 1，经典榜靠后的歌接近 0，老歌单与艺人
    * 作品只给低值。生成逻辑见 HeartPool.boardFreshness / freshOfRank。
    */
+  recallOrigin: string = '';
+  fromCollectedPlaylist: boolean = false;
   freshBoost: number = 0;
   /** 本地累计播放次数（热度兜底与 UCB 初值用） */
   plays: number = 0;
@@ -125,6 +127,9 @@ export class HeartItem {
 
 /** 权重表：与仓库 DEFAULT_WEIGHTS 对齐（seq/din 权重恒为 0，不设） */
 export class HeartWeights {
+  contextScript: number = 0.18;
+  script: number = 0.18;
+  artistLink: number = 1;
   /** 多兴趣最大余弦（召回分 / 主信号） */
   dot: number = 1.0;
   /** 与口味 EMA 的余弦 */
@@ -152,6 +157,9 @@ export class HeartWeights {
     w.dot = this.dot;
     w.taste = this.taste;
     w.affinity = this.affinity;
+    w.contextScript = this.contextScript;
+    w.script = this.script;
+    w.artistLink = this.artistLink;
     w.fresh = this.fresh;
     w.ucb = this.ucb;
     w.eps = this.eps;
@@ -167,6 +175,9 @@ export class HeartWeights {
  * 调试时也能一眼看出是哪个信号在起作用 —— 这是仓库里反复强调的「不许静默降级」。
  */
 export class HeartPick {
+  contextScript: number = 0;
+  script: number = 0;
+  artistLink: number = 0;
   item: HeartItem | null = null;
   /** 总分（含抖动） */
   score: number = 0;
@@ -189,6 +200,10 @@ export class HeartPick {
       `相似 ${this.dot.toFixed(3)}`,
       `口味 ${this.taste.toFixed(3)}`,
       `亲和 ${this.affinity.toFixed(3)}`,
+      `艺人及专辑文字 ${this.contextScript.toFixed(3)}`,
+      `标题文字 ${this.script.toFixed(3)}`,
+      `关联艺人 ${this.artistLink.toFixed(3)}`,
+      `收藏歌单 ${this.item !== null && this.item.doc.fromCollectedPlaylist ? 0.35 : 0}`,
       `新歌 ${this.fresh.toFixed(3)}`,
       `探索 ${this.ucb.toFixed(3)}`
     ];

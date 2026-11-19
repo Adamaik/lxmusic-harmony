@@ -254,6 +254,23 @@ export default function heartModeTest() {
       expect(artists.size >= 5).assertTrue();
     });
 
+    it('coldStart_respectsFeedbackAndExclusions', 0, () => {
+      const docs = syntheticLibrary().slice(0, 3);
+      docs[2].fromCollectedPlaylist = true;
+      const engine = new HeartEngine(new HeartOptions());
+      engine.setLibrary(docs);
+      const first = engine.nextBatch(1);
+      expect(first[0].item?.doc.id).assertEqual(docs[2].id);
+      engine.recordStart(docs[2].id);
+      engine.observe(docs[2], FB_SKIP);
+      expect(engine.historyLength).assertEqual(0);
+      const excluded = new Set<string>();
+      excluded.add(docs[0].id);
+      const rest = engine.nextBatch(10, excluded);
+      expect(rest.length).assertEqual(1);
+      expect(rest[0].item?.doc.id).assertEqual(docs[1].id);
+    });
+
     it('engine_固定种子可复现', 0, () => {
       const docs: HeartDoc[] = syntheticLibrary();
       const a: HeartEngine = new HeartEngine(new HeartOptions());

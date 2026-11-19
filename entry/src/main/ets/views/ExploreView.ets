@@ -21,6 +21,7 @@
 
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_CURRENT_ID, K_PLAYER_STATUS, PlaySession, SongItem } from '../core/player/PlaySession';
+import { ListenTracker } from '../core/history/ListenTracker';
 import { ExploreCard, HeartRadio } from '../core/heart/HeartRadio';
 import { CoverStore } from '../core/music/CoverStore';
 import { C_RED, F_SUB } from '../ui/Theme';
@@ -60,10 +61,33 @@ export struct ExploreView {
   private radio: HeartRadio = new HeartRadio();
   private swiper: SwiperController = new SwiperController();
   /** 自己拨动 Swiper 时不要被 onChange 当成用户滑动 */
+  private ownedId: string = '';
+  private ownedSince: number = 0;
+
+  private seedFromCurrent(): void {
+    const current = PlaySession.getInstance().current;
+    if (!this.active || current === null || current.id === this.ownedId) { return; }
+    this.radio.setSessionSeed(current);
+    if (this.cards.length > this.index) {
+      this.cards = this.cards.slice(0, this.index).concat(this.radio.rerankUpcoming(this.cards.slice(this.index)));
+    }
+  }
+
+  private finishCurrent(swiped: boolean): void {
+    const card = this.card();
+    if (card === null || card.item.id !== this.ownedId) { return; }
+    const record = ListenTracker.getInstance().takeFeedback(this.ownedId, this.ownedSince);
+    this.ownedId = '';
+    if (record !== null) {
+      this.radio.finishListen(card.item, record.playedMs, record.durationMs, swiped);
+    }
+  }
+
   private snapping: boolean = false;
 
   aboutToAppear(): void {
     // 1) 先同步读缓存：有缓存就立刻出歌（**不在这里起播**，见 maybeAutoPlay）
+    this.seedFromCurrent();
     const cached: number = this.radio.prepareCached();
     if (cached > 0) {
       this.loading = false;
@@ -92,6 +116,7 @@ export struct ExploreView {
 
   /** 页签切换：切到探索这一栏时才考虑自动起播 */
   private onActiveChanged(): void {
+    this.seedFromCurrent();
     this.maybeAutoPlay();
   }
 
@@ -142,6 +167,8 @@ export struct ExploreView {
     for (let i = 0; i < this.cards.length; i++) {
       queue.push(this.cards[i].item);
     }
+    this.ownedSince = Date.now();
+    this.ownedId = card.item.id;
     PlaySession.getInstance().setQueueAndPlay(queue, this.index);
     this.radio.played(card.item.id);
   }
@@ -200,10 +227,9 @@ export struct ExploreView {
       this.snapping = false;
       return;
     }
-    const prev: ExploreCard | null = this.card();
-    if (prev !== null && !this.isFav(prev.item)) {
-      this.radio.dislike(prev.item.id);
-    }
+    this.finishCurrent(true);
+    const upcoming = this.radio.rerankUpcoming(this.cards.slice(next));
+    this.cards = this.cards.slice(0, next).concat(upcoming);
     this.index = next;
     this.playCurrent();
     if (this.cards.length - this.index <= REFILL_AHEAD) {
@@ -228,13 +254,14 @@ export struct ExploreView {
       return;
     }
     const next: number = this.indexOfCard(this.currentId);
-    if (next < 0 || next === this.index) {
-      return;
-    }
+    if (next === this.index || this.currentId === this.ownedId) { return; }
+    const owned = this.ownedId.length > 0;
+    this.finishCurrent(false);
     if (next > this.index) {
-      const prev: ExploreCard | null = this.card();
-      if (prev !== null) {
-        this.radio.completed(prev.item.id);
+      if (owned) {
+        this.ownedId = this.currentId;
+        this.ownedSince = 0;
+        this.radio.played(this.currentId);
       }
       this.jumpTo(next);
     }

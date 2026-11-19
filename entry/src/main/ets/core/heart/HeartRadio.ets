@@ -18,13 +18,14 @@ import { ListenLog, ListenSong } from '../history/ListenLog';
 import { RecommendSettings } from '../settings/RecommendSettings';
 import {
   FB_COMPLETE,
-  FB_LIKE,
   FB_PLAY,
+  FB_LIKE,
   FB_SKIP,
   HeartDoc,
   HeartOptions,
   HeartPick
 } from './HeartTypes';
+import { completionRatio } from './HeartFeedback';
 import { HeartEngine } from './HeartEngine';
 import { HeartPool, HeartPoolResult } from './HeartPool';
 import { HeartCache } from './HeartCache';
@@ -75,6 +76,12 @@ export class ExploreCard {
   /** 推荐依据：给卡片底部那行小字用 */
   reason(): string {
     const parts: string[] = [];
+    if (this.pick.item !== null && this.pick.item.doc.fromCollectedPlaylist) {
+      parts.push('来自你收藏的歌单');
+    }
+    if (this.pick.artistLink > 0) {
+      parts.push('与你常听的艺人出现在相同歌单');
+    }
     if (this.pick.dot > 0.5) {
       parts.push('和你常听的很像');
     }
@@ -167,6 +174,38 @@ export class HeartRadio {
   private docsByKey: Map<string, HeartDoc> = new Map<string, HeartDoc>();
   private songs: Map<string, SongItem> = new Map<string, SongItem>();
   private interestDocs: HeartDoc[] = [];
+  private sessionSeed: HeartDoc | null = null;
+  private consecutiveSkips: number = 0;
+
+  setSessionSeed(item: SongItem): void {
+    this.sessionSeed = docOfItem(item, this.isLiked(item), 0);
+    this.consecutiveSkips = 0;
+    if (this.ready) { this.engine.setSeeds([this.sessionSeed]); }
+  }
+
+  finishListen(item: SongItem, playedMs: number, durationMs: number, swiped: boolean): void {
+    if (playedMs <= 0 || this.isLiked(item)) { return; }
+    const doc = this.docsById.get(item.id) ?? docOfItem(item, false, 0);
+    const duration = durationMs > 0 ? durationMs : doc.durationMs;
+    const ratio = completionRatio(playedMs, duration);
+    if (duration > 0 && ratio >= 0.85) {
+      this.engine.observe(doc, FB_COMPLETE);
+    } else if (playedMs >= 30000 || (duration > 0 && ratio >= 0.2)) {
+      this.engine.observe(doc, FB_PLAY);
+    } else if (swiped) {
+      this.engine.observe(doc, FB_SKIP);
+      this.consecutiveSkips++;
+      if (this.consecutiveSkips >= 2 && this.sessionSeed !== null) {
+        this.sessionSeed = null;
+        this.engine.setSeeds(this.seeds);
+      }
+      return;
+    } else {
+      return;
+    }
+    this.consecutiveSkips = 0;
+  }
+
   private seeds: HeartDoc[] = [];
   /** 本会话已给过的卡（id 给引擎做排除，key 做跨音源去重） */
   private shownIds: Set<string> = new Set<string>();
@@ -189,7 +228,10 @@ export class HeartRadio {
   }
 
   get exhausted(): boolean {
-    return this.shownKeys.size >= this.poolSize;
+    for (const key of this.docsByKey.keys()) {
+      if (!this.shownKeys.has(key)) { return false; }
+    }
+    return true;
   }
 
   get shownCount(): number {
@@ -203,11 +245,14 @@ export class HeartRadio {
    */
   prepareCached(): number {
     this.collectInterest();
-    const cached: SongItem[] = HeartCache.getInstance().load();
+    const fresh = new Map<string, number>();
+    const collected = new Set<string>();
+    const origins = new Map<string, string>();
+    const cached = HeartCache.getInstance().load(RecommendSettings.getInstance().getSource(), fresh, collected, origins);
     if (cached.length === 0) {
       return 0;
     }
-    this.applyLibrary(cached);
+    this.applyLibrary(cached, fresh.size > 0 ? fresh : undefined, collected, origins);
     return cached.length;
   }
 
@@ -227,8 +272,8 @@ export class HeartRadio {
       return 0;
     }
     // 落盘只存 SongItem（缓存格式不动），新鲜度只在内存里带到 HeartDoc 上
-    HeartCache.getInstance().save(source, result.songs);
-    this.applyLibrary(result.songs, result.fresh);
+    HeartCache.getInstance().save(source, result.songs, result.fresh, result.collectedKeys, result.origins);
+    this.applyLibrary(result.songs, result.fresh, result.collectedKeys, result.origins);
     return result.songs.length;
   }
 
@@ -323,7 +368,7 @@ export class HeartRadio {
    * @param fresh 身份键 → 新鲜度（来自 HeartPool）；不传表示这是缓存池，
    *              按池内位次近似还原（缓存存的是上次按新鲜度排好的顺序）
    */
-  private applyLibrary(items: SongItem[], fresh?: Map<string, number>): void {
+  private applyLibrary(items: SongItem[], fresh?: Map<string, number>, collectedKeys?: Set<string>, origins?: Map<string, string>): void {
     this.docsById = new Map<string, HeartDoc>();
     this.docsByKey = new Map<string, HeartDoc>();
     this.songs = new Map<string, SongItem>();
@@ -339,14 +384,20 @@ export class HeartRadio {
         ? cacheFreshOfRank(i, items.length)
         : boostOf(fresh, key);
       const doc: HeartDoc = docOfItem(item, favKeys.has(key), boost);
+      doc.recallOrigin = origins?.get(key) ?? '';
+      doc.fromCollectedPlaylist = collectedKeys !== undefined && collectedKeys.has(key);
       docs.push(doc);
       this.docsById.set(doc.id, doc);
       this.docsByKey.set(key, doc);
       this.songs.set(item.id, item);
     }
     this.engine.setLibrary(docs);
-    this.engine.setHistory(this.interestDocs);
-    if (this.seeds.length > 0) {
+    const recent = ListenLog.getInstance().recentSongs(INTEREST_HISTORY).reverse();
+    this.engine.setHistory(recent.map((song: ListenSong): HeartDoc =>
+      docOfListen(song, favKeys.has(songKeyOf(song.name, song.singer)))));
+    if (this.sessionSeed !== null) {
+      this.engine.setSeeds([this.sessionSeed]);
+    } else if (this.seeds.length > 0) {
       this.engine.setSeeds(this.seeds);
     }
     this.poolSize = items.length;
@@ -380,6 +431,23 @@ export class HeartRadio {
     return out;
   }
 
+  rerankUpcoming(cards: ExploreCard[]): ExploreCard[] {
+    for (const card of cards) {
+      this.shownIds.delete(card.item.id);
+      this.shownKeys.delete(songKeyOfItem(card.item));
+    }
+    const ranked = this.batch(cards.length);
+    for (const card of cards) {
+      const key = songKeyOfItem(card.item);
+      if (ranked.length < cards.length && !this.shownKeys.has(key)) {
+        ranked.push(card);
+        this.shownIds.add(card.item.id);
+        this.shownKeys.add(key);
+      }
+    }
+    return ranked;
+  }
+
   /** 这首是否已收藏（按歌名+歌手，不分音源） */
   isLiked(item: SongItem): boolean {
     const key: string = songKeyOfItem(item);
@@ -399,6 +467,7 @@ export class HeartRadio {
       PlaySession.getInstance().addFavorite(item);
     }
     this.likedKeys.add(key);
+    this.setSessionSeed(item);
     const doc: HeartDoc | undefined = this.docsByKey.get(key);
     if (doc !== undefined) {
       doc.liked = true;
@@ -474,7 +543,7 @@ export class HeartRadio {
   played(id: string): void {
     const doc: HeartDoc | undefined = this.docsById.get(id);
     if (doc !== undefined) {
-      this.engine.observe(doc, FB_PLAY);
+      this.engine.recordStart(doc.id);
     }
   }
 

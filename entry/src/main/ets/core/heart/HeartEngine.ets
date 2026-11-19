@@ -15,7 +15,6 @@
  */
 
 import {
-  FB_PLAY,
   FB_SKIP,
   HeartDoc,
   HeartItem,
@@ -25,6 +24,7 @@ import {
   HEART_DIM
 } from './HeartTypes';
 import { cosine, HeartEncoder, normalizeText } from './HeartEncoder';
+import { artistLinks } from './HeartArtistLinks';
 import { HeartProfile } from './HeartProfile';
 import {
   bestCosine,
@@ -41,6 +41,25 @@ const RECENT_MAX: number = 200;
 const SHORTLIST: number = 400;
 
 /** 粗筛中间结果（ArkTS 的对象字面量要显式类，不能用匿名结构） */
+function titleScript(name: string): string {
+  if (/[ぁ-ヿ]/.test(name)) { return 'kana'; }
+  if (/[가-힣]/.test(name)) { return 'hangul'; }
+  if (/[一-鿿]/.test(name)) { return 'han'; }
+  if (/[a-zA-Z]/.test(name)) { return 'latin'; }
+  return '';
+}
+
+function scriptDistribution(values: string[]): Map<string, number> {
+  const shares = new Map<string, number>();
+  for (const value of values) {
+    const script = titleScript(value);
+    if (script.length > 0) {
+      shares.set(script, (shares.get(script) ?? 0) + 1 / values.length);
+    }
+  }
+  return shares;
+}
+
 class DotPair {
   item: HeartItem;
   dot: number;
@@ -123,9 +142,17 @@ export class HeartEngine {
   }
 
   /** 冷启动种子（收藏前 N 首 / 最近听过的几首 / 用户手选） */
+  private artistScriptShare: Map<string, number> = new Map<string, number>();
+  private albumScriptShare: Map<string, number> = new Map<string, number>();
+  private scriptShare: Map<string, number> = new Map<string, number>();
+  private linkedArtists: Map<string, number> = new Map<string, number>();
   private seedDocs: HeartDoc[] = [];
 
   setSeeds(docs: HeartDoc[]): void {
+    this.scriptShare = scriptDistribution(docs.map((doc: HeartDoc): string => doc.name));
+    this.artistScriptShare = scriptDistribution(docs.map((doc: HeartDoc): string => doc.singer));
+    this.albumScriptShare = scriptDistribution(docs.map((doc: HeartDoc): string => doc.album));
+    this.linkedArtists = artistLinks(docs.map((doc: HeartDoc): string => doc.singer));
     this.seedDocs = docs;
     this.encodeSeeds(docs);
   }
@@ -185,8 +212,6 @@ export class HeartEngine {
       const idx: number = Math.floor(this.nextRandom() * Math.min(board.length, 30));
       pick = board[idx];
       pick.explore = true;
-    }
-    if (pick.item !== null) {
     }
     return pick;
   }
@@ -253,20 +278,24 @@ export class HeartEngine {
     const queries: HeartQueries = this.buildUserQueries();
     if (queries.isEmpty()) {
       // 没有任何用户表示（连种子都没有）：按热度兜底，但同样要保证批内不重复
+      const originCounts = new Map<string, number>();
       const usedIds: Set<string> = new Set<string>();
+      excludeIds?.forEach((id: string) => { usedIds.add(id); });
       const usedArtists: Set<string> = new Set<string>();
       for (let i = 0; i < count; i++) {
-        const pick: HeartPick | null = this.popularityPick(usedIds, usedArtists);
+        const pick: HeartPick | null = this.popularityPick(usedIds, usedArtists, i % 2 === 0, originCounts);
         if (pick === null || pick.item === null) {
           break;
         }
         picks.push(pick);
+        const origin = pick.item.doc.recallOrigin;
+        originCounts.set(origin, (originCounts.get(origin) ?? 0) + 1);
         usedIds.add(pick.item.doc.id);
         usedArtists.add(normalizeText(pick.item.doc.singer));
       }
       return picks;
     }
-    const board: HeartPick[] = this.scoreBoard(queries);
+    const board: HeartPick[] = this.scoreBoard(queries, excludeIds);
     const used: Set<string> = new Set<string>();
     const usedArtists: Set<string> = new Set<string>();
     if (excludeIds !== undefined) {
@@ -274,19 +303,27 @@ export class HeartEngine {
         used.add(id);
       });
     }
-    for (let i = 0; i < board.length && picks.length < count; i++) {
-      const pick: HeartPick = board[i];
-      if (pick.item === null) {
-        continue;
+    // 每轮每位艺人最多一首，艺人不足一批时继续下一轮。
+    while (picks.length < count) {
+      const before = picks.length;
+      usedArtists.clear();
+      for (let i = 0; i < board.length && picks.length < count; i++) {
+        const pick: HeartPick = board[i];
+        if (pick.item === null) {
+          continue;
+        }
+        const id: string = pick.item.doc.id;
+        const artist: string = normalizeText(pick.item.doc.singer);
+        if (used.has(id) || usedArtists.has(artist)) {
+          continue;
+        }
+        picks.push(pick);
+        used.add(id);
+        usedArtists.add(artist);
       }
-      const id: string = pick.item.doc.id;
-      const artist: string = normalizeText(pick.item.doc.singer);
-      if (used.has(id) || usedArtists.has(artist)) {
-        continue;
+      if (picks.length === before) {
+        break;
       }
-      picks.push(pick);
-      used.add(id);
-      usedArtists.add(artist);
     }
     return picks;
   }
@@ -346,15 +383,11 @@ export class HeartEngine {
     const all: HeartItem[] = [];
     for (let i = 0; i < this.items.length; i++) {
       const item: HeartItem = this.items[i];
-      if (!this.profile.isBlacklisted(item.doc.id)) {
+      if (!this.profile.isBlacklisted(item.doc.id) && !excludeIds?.has(item.doc.id)) {
         all.push(item);
       }
     }
-    if (all.length > 0) {
-      return all;
-    }
-    // 全被拉黑：宁可推重复也不返回 null（心跳模式不能停）
-    return this.items;
+    return all;
   }
 
   /** 单曲打分明细（每一项都真的参与求和，不存在「算了没用」的静默项） */
@@ -363,7 +396,7 @@ export class HeartEngine {
     const pick: HeartPick = new HeartPick();
     pick.item = item;
     pick.explore = explore;
-    pick.dot = bestCosine(queries.queries, item.vec);
+    pick.dot = Math.max(-1, Math.min(1, bestCosine(queries.queries, item.vec)));
     pick.interest = bestQueryIndex(queries.queries, item.vec);
     pick.taste = tasteVec === null ? 0 : cosine(tasteVec, item.vec);
     pick.affinity = this.profile.affinityBonus(item.doc);
@@ -373,9 +406,15 @@ export class HeartEngine {
     pick.fresh = Math.max(this.isFresh(item.doc) ? 1 : 0, item.doc.freshBoost);
     pick.ucb = this.profile.ucbBonus(item.doc.id);
     pick.noise = (this.nextRandom() * 2 - 1) * this.weights.noise;
-    pick.score = this.weights.dot * pick.dot
+    pick.artistLink = (this.linkedArtists.get(item.doc.singer.trim().toLowerCase()) ?? 0) * this.weights.artistLink;
+    pick.script = (this.scriptShare.get(titleScript(item.doc.name)) ?? 0) * this.weights.script;
+    const artistScript = this.artistScriptShare.get(titleScript(item.doc.singer)) ?? 0;
+    const albumScript = this.albumScriptShare.get(titleScript(item.doc.album)) ?? 0;
+    pick.contextScript = this.weights.contextScript * (artistScript + albumScript) / 2;
+    pick.score = pick.contextScript + pick.script + pick.artistLink + this.weights.dot * pick.dot
       + this.weights.taste * pick.taste
       + this.weights.affinity * pick.affinity
+      + (item.doc.fromCollectedPlaylist ? 0.35 : 0)
       + this.weights.fresh * pick.fresh
       + this.weights.ucb * pick.ucb
       + pick.noise;
@@ -392,20 +431,27 @@ export class HeartEngine {
   }
 
   /** 无历史 / 无种子时的兜底：按本地播放次数取最热的一首（排除最近与拉黑） */
-  private popularityPick(excludeIds?: Set<string>, excludeArtists?: Set<string>): HeartPick | null {
+  private popularityPick(excludeIds?: Set<string>, excludeArtists?: Set<string>, preferCollected: boolean = true, originCounts?: Map<string, number>): HeartPick | null {
     if (this.items.length === 0) {
       return null;
     }
     const candidates: HeartItem[] = this.candidates(excludeIds, excludeArtists);
-    let best: HeartItem = candidates.length > 0 ? candidates[0] : this.items[0];
+    if (candidates.length === 0) {
+      return null;
+    }
+    let best: HeartItem = candidates[0];
     for (let i = 1; i < candidates.length; i++) {
-      if (candidates[i].doc.plays > best.doc.plays) {
+      const currentCount = originCounts?.get(candidates[i].doc.recallOrigin) ?? 0;
+      const bestCount = originCounts?.get(best.doc.recallOrigin) ?? 0;
+      if ((candidates[i].doc.fromCollectedPlaylist === preferCollected && best.doc.fromCollectedPlaylist !== preferCollected) ||
+        (candidates[i].doc.fromCollectedPlaylist === best.doc.fromCollectedPlaylist && (currentCount < bestCount ||
+          (currentCount === bestCount && candidates[i].doc.plays > best.doc.plays)))) {
         best = candidates[i];
       }
     }
     const pick: HeartPick = new HeartPick();
     pick.item = best;
-    pick.score = 0;
+    pick.score = best.doc.fromCollectedPlaylist ? 0.35 : 0;
     pick.explore = false;
     return pick;
   }
@@ -418,10 +464,11 @@ export class HeartEngine {
    * 调用点：ListenTracker 收尾（切歌 / 退后台 / 销毁前）拿到这首歌的 playedMs 与
    * durationMs 之后调一次。**不改 ListenLog 现有口径**，只是旁挂订阅。
    */
+  recordStart(id: string): void {
+    this.profile.recordExposure(id);
+  }
+
   observe(doc: HeartDoc, kind: number): void {
-    if (kind === FB_PLAY) {
-      this.profile.recordExposure(doc.id);
-    }
     const item: HeartItem | undefined = this.byId.get(doc.id);
     const vec: Float32Array | null = item === undefined ? null : item.vec;
     // 跳过的歌不进历史：否则「我不想听」会被当成「我在听这一类」
@@ -454,6 +501,10 @@ export class HeartEngine {
     this.historyIds = [];
     this.recentIds = [];
     this.profile.reset();
+    this.linkedArtists.clear();
+    this.scriptShare.clear();
+    this.artistScriptShare.clear();
+    this.albumScriptShare.clear();
     this.rngState = this.options.seed >>> 0;
   }
 

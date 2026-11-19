@@ -82,6 +82,27 @@ export class ListenTracker {
     return ListenTracker.instance;
   }
 
+  private openId: string = '';
+  private lastId: string = '';
+  private lastRecord: ListenRecord | null = null;
+  private consumed: ListenRecord | null = null;
+
+  /** 只读实际出声时长；同一条流水最多用于一次推荐收尾。 */
+  takeFeedback(id: string, since: number): ListenRecord | null {
+    const active = this.open !== null && this.openId === id;
+    const row = active ? this.open : (this.lastId === id ? this.lastRecord : null);
+    if (row === null || row === this.consumed || row.startedAt < since) {
+      return null;
+    }
+    this.consumed = row;
+    const elapsed = active && this.playingSince > 0 ? Math.max(0, Date.now() - this.playingSince) : 0;
+    const snapshot: ListenRecord = {
+      startedAt: row.startedAt, songKey: row.songKey, durationMs: row.durationMs,
+      playedMs: row.playedMs + elapsed
+    };
+    return snapshot;
+  }
+
   private wired: boolean = false;
   /** 正在听的那一条（已经进了流水，时长就地往上加） */
   private open: ListenRecord | null = null;
@@ -224,6 +245,7 @@ export class ListenTracker {
     hilog.info(DOMAIN, TAG, 'begin listening record: %{public}s', item.name);
     this.open = ListenLog.getInstance().begin(songOf(item));
     this.openKey = key;
+    this.openId = item.id;
   }
 
   /** 当前这首歌已经不是正在听的那一首时收尾（切歌 / 播完 / 停了） */
@@ -242,6 +264,11 @@ export class ListenTracker {
   /** 收尾正在听的那一条：不到 1 秒的残片摘掉，其余留在流水里（见 ListenLog.close） */
   private commit(): void {
     const record: ListenRecord | null = this.open;
+    if (record !== null) {
+      this.lastId = this.openId;
+      this.lastRecord = record;
+    }
+    this.openId = '';
     this.open = null;
     this.openKey = '';
     if (record === null) {

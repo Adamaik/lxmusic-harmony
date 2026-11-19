@@ -12,11 +12,12 @@
 
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
+import { songKeyOfItem } from './HeartIdentity';
 import { SongItem } from '../player/PlaySession';
 
 const FILE_NAME: string = 'heart_cache.json';
 /** 结构变了就 +1，读到不认识的版本当没有缓存（不硬扛） */
-const CACHE_VERSION: number = 1;
+const CACHE_VERSION: number = 2;
 
 /** 落盘的一条歌：只存播放/展示/编码都需要的字段（SongItem 的完整形状） */
 interface CachedSong {
@@ -29,6 +30,9 @@ interface CachedSong {
   quality: string;
   interval: string;
   musicInfoJson: string;
+  fresh?: number;
+  collected?: boolean;
+  origin?: string;
 }
 
 interface CachedPool {
@@ -87,7 +91,7 @@ export class HeartCache {
   }
 
   /** 读缓存；没有/损坏/版本不对都返回空数组，不抛 */
-  load(): SongItem[] {
+  load(source: string, fresh: Map<string, number>, collected: Set<string>, origins: Map<string, string>): SongItem[] {
     if (this.file.length === 0) {
       return [];
     }
@@ -97,12 +101,18 @@ export class HeartCache {
       }
       const text: string = fs.readTextSync(this.file);
       const data: CachedPool = JSON.parse(text) as CachedPool;
-      if (data.version !== CACHE_VERSION || data.songs === undefined) {
+      if ((data.version !== CACHE_VERSION && data.version !== 1) || data.source !== source || data.songs === undefined) {
         return [];
       }
       const out: SongItem[] = [];
       for (let i = 0; i < data.songs.length; i++) {
-        out.push(toSongItem(data.songs[i]));
+        const row = data.songs[i];
+        const item = toSongItem(row);
+        const key = songKeyOfItem(item);
+        if (row.fresh !== undefined) { fresh.set(key, row.fresh); }
+        if (row.origin !== undefined) { origins.set(key, row.origin); }
+        if (row.collected === true) { collected.add(key); }
+        out.push(item);
       }
       return out;
     } catch (e) {
@@ -111,7 +121,7 @@ export class HeartCache {
   }
 
   /** 写缓存：失败只记日志不抛（缓存坏了不该影响推荐） */
-  save(source: string, songs: SongItem[]): void {
+  save(source: string, songs: SongItem[], fresh: Map<string, number>, collected: Set<string>, origins: Map<string, string>): void {
     if (this.file.length === 0) {
       return;
     }
@@ -119,7 +129,14 @@ export class HeartCache {
       version: CACHE_VERSION,
       savedAt: Date.now(),
       source: source,
-      songs: songs.map((item: SongItem) => toCached(item)),
+      songs: songs.map((item: SongItem): CachedSong => {
+        const row = toCached(item);
+        const key = songKeyOfItem(item);
+        row.fresh = fresh.get(key) ?? 0;
+        row.origin = origins.get(key);
+        row.collected = collected.has(key);
+        return row;
+      }),
     };
     try {
       const handle = fs.openSync(this.file,

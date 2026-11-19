@@ -13,6 +13,8 @@
  * 所有入口都各自 try/catch：某一个平台接口挂了不影响其它入口，能拿多少算多少。
  */
 
+import { relatedArtists } from './HeartArtistLinks';
+import { CollectedPlaylists } from '../sync/CollectedPlaylists';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { getBoardSongs, getBoards, getPlaylistDetail, getRecommendPlaylists, sortListOf,
   LxBoardItem, LxListDetail, LxPlaylistItem, LxSortItem } from '../music/MusicList';
@@ -198,6 +200,9 @@ export class HeartPoolResult {
   /** 身份键（歌名+歌手）→ 新鲜度 */
   fresh: Map<string, number>;
 
+  origins: Map<string, string> = new Map<string, string>();
+  collectedKeys: Set<string> = new Set<string>();
+
   constructor(songs: SongItem[], fresh: Map<string, number>) {
     this.songs = songs;
     this.fresh = fresh;
@@ -231,8 +236,9 @@ export class HeartPool {
     const fresh: Map<string, number> = new Map<string, number>();
     // 按「歌名+歌手」去重：同一首歌从不同音源回来只留第一条；但新鲜度取各入口的
     // 最大值 —— 同一首歌既在飙升榜又在艺人作品里时，该按「它确实新」算，而不是先到先得
+    const origin = new Map<string, string>();
     const seen: Set<string> = new Set<string>();
-    const add = (info: LxMusicInfo, boost: number): boolean => {
+    const add = (info: LxMusicInfo, boost: number, channel: string): boolean => {
       const item: SongItem = songFromSearch(info, quality);
       const key: string = songKeyOfItem(item);
       if (item.id.length === 0 || excludeKeys.has(key) || excludeIds.has(item.id)) {
@@ -244,11 +250,28 @@ export class HeartPool {
         }
         return false;
       }
+      origin.set(key, channel);
       seen.add(key);
       fresh.set(key, boost);
       out.push(item);
       return true;
     };
+
+    const result: HeartPoolResult = new HeartPoolResult(out, fresh);
+    const collected = CollectedPlaylists.getInstance().list().filter(p => p.source === source).slice(0, 2);
+    for (const playlist of collected) {
+      try {
+        const detail = await getPlaylistDetail(source, playlist.id, 1);
+        for (const track of detail.list.slice(0, 30)) {
+          const key = songKeyOfItem(songFromSearch(track, quality));
+          if (add(track, LOW_FRESH, 'collected') || seen.has(key)) {
+            result.collectedKeys.add(key);
+          }
+        }
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, '收藏歌单召回失败 %{public}s', playlist.id);
+      }
+    }
 
     // 入口 1：榜单（不需要登录，最稳的一条）。不再盲取前 N 张：先按榜名挑「新」的
     const boards: LxBoardItem[] = getBoards(source);
@@ -265,9 +288,9 @@ export class HeartPool {
         const detail: LxListDetail = await getBoardSongs(source, board.bangid, 1,
           board.name, BOARD_LIMIT);
         let added: number = 0;
-        for (let j = 0; j < detail.list.length; j++) {
+        for (let j = 0; j < Math.min(BOARD_LIMIT, detail.list.length); j++) {
           // 榜内位置决定同一张榜内部的先后：第 1 首 ≈ weight，越靠后越接近 0
-          if (add(detail.list[j], freshOfRank(weight, j + 1, detail.list.length))) {
+          if (add(detail.list[j], freshOfRank(weight, j + 1, detail.list.length), 'board')) {
             added += 1;
           }
         }
@@ -292,19 +315,20 @@ export class HeartPool {
       } else {
         const sort: LxSortItem = sorts[sortIndex];
         const playlists: LxPlaylistItem[] = await getRecommendPlaylists(source, sort.id, 1);
-        // 先按名字筛掉「专辑盘」式的老歌单（见 playlistLooksOld 的注释）：
-        // 分类只说明歌单什么时候建的，不说明里面的歌是什么年代
+        // 优先不同编单者；年代不代表用户是否听过一首歌。
         const picked: LxPlaylistItem[] = [];
-        for (let i = 0; i < playlists.length && picked.length < PLAYLIST_COUNT; i++) {
-          if (playlistLooksOld(playlists[i].name)) {
-            hilog.info(DOMAIN, TAG, '歌单入口跳过疑似老歌专辑盘「%{public}s」', playlists[i].name);
-            continue;
+        for (const playlist of playlists) {
+          if (picked.length >= PLAYLIST_COUNT) { break; }
+          if (!picked.some((other: LxPlaylistItem): boolean =>
+            other.id === playlist.id || (playlist.author.length > 0 && other.author === playlist.author))) {
+            picked.push(playlist);
           }
-          picked.push(playlists[i]);
         }
-        // 全被判老：宁可只留第一张（它的歌仍只拿 LOW_FRESH，排不进前排），也不要整块灌老歌
-        if (picked.length === 0 && playlists.length > 0) {
-          picked.push(playlists[0]);
+        for (const playlist of playlists) {
+          if (picked.length >= PLAYLIST_COUNT) { break; }
+          if (!picked.some((other: LxPlaylistItem): boolean => other.id === playlist.id)) {
+            picked.push(playlist);
+          }
         }
         const playlistCount: number = picked.length;
         for (let i = 0; i < playlistCount && out.length < POOL_LIMIT; i++) {
@@ -312,9 +336,9 @@ export class HeartPool {
           try {
             const detail: LxListDetail = await getPlaylistDetail(source, playlist.id, 1);
             let added: number = 0;
-            for (let j = 0; j < detail.list.length; j++) {
+            for (let j = 0; j < detail.list.length && added < 50; j++) {
               // 歌单只能从分类判断「整体偏新」，逐首无从推断，统一给低值
-              if (add(detail.list[j], LOW_FRESH)) {
+              if (add(detail.list[j], LOW_FRESH, 'playlist')) {
                 added += 1;
               }
             }
@@ -337,6 +361,14 @@ export class HeartPool {
     // 入口 3：艺人作品（画像里最常听的几位 → 平台上认人 → 拿他的歌）
     // 常听艺人天然是旧歌，所以人数/首数都收紧，且只给低新鲜度，避免老歌淹没池子
     const artists: string[] = HeartPool.topArtists(interest, ARTIST_COUNT);
+    const familiar = new Set<string>(artists.map((name: string): string => name.toLowerCase()));
+    for (const seed of artists.slice()) {
+      const neighbor = relatedArtists(seed).find((name: string): boolean => !familiar.has(name));
+      if (neighbor !== undefined) {
+        artists.push(neighbor);
+        break;
+      }
+    }
     let artistAdded: number = 0;
     for (let i = 0; i < artists.length && out.length < POOL_LIMIT; i++) {
       const name: string = artists[i];
@@ -348,8 +380,8 @@ export class HeartPool {
         }
         const page = await getArtistSongs(artist, 1, ARTIST_LIMIT);
         let added: number = 0;
-        for (let j = 0; j < page.list.length; j++) {
-          if (add(page.list[j], LOW_FRESH)) {
+        for (let j = 0; j < Math.min(ARTIST_LIMIT, page.list.length); j++) {
+          if (add(page.list[j], LOW_FRESH, familiar.has(name.toLowerCase()) ? 'artist' : 'related')) {
             added += 1;
           }
         }
@@ -375,19 +407,29 @@ export class HeartPool {
       }
       return a - b;
     });
-    const songs: SongItem[] = [];
-    let sum: number = 0;
-    for (let i = 0; i < order.length; i++) {
-      const song: SongItem = out[order[i]];
-      songs.push(song);
-      sum += boostOf(fresh, songKeyOfItem(song));
+    // 冷启动时使用池内顺序破同分。先轮取各入口，各入口内部保留原排名。
+    const channels = new Map<string, SongItem[]>();
+    for (const index of order) {
+      const song = out[index];
+      const channel = origin.get(songKeyOfItem(song)) ?? '';
+      const group = channels.get(channel);
+      if (group === undefined) { channels.set(channel, [song]); } else { group.push(song); }
     }
-    const avg: number = songs.length === 0 ? 0 : sum / songs.length;
-    // 汇总一行，真机上直接看这一条就能判断池子是不是"全是老歌"
-    hilog.info(DOMAIN, TAG,
-      '池子 %{public}d 首｜榜单 %{public}d 首｜歌单 %{public}d 首｜艺人 %{public}d 首｜平均新鲜度 %{public}s',
-      songs.length, boardAdded, playlistAdded, artistAdded, avg.toFixed(2));
-    return new HeartPoolResult(songs, fresh);
+    const songs: SongItem[] = [];
+    const names: string[] = ['collected', 'board', 'playlist', 'related', 'artist'];
+    for (let rank = 0; songs.length < out.length && songs.length < POOL_LIMIT; rank++) {
+      for (const name of names) {
+        const group = channels.get(name);
+        if (group !== undefined && rank < group.length && songs.length < POOL_LIMIT) {
+          songs.push(group[rank]);
+        }
+      }
+    }
+    hilog.info(DOMAIN, TAG, '候选 %{public}d｜榜单 %{public}d｜推荐歌单 %{public}d｜艺人 %{public}d｜收藏歌单 %{public}d',
+      songs.length, boardAdded, playlistAdded, artistAdded, result.collectedKeys.size);
+    result.origins = origin;
+    result.songs = songs;
+    return result;
   }
 
   /** 画像里出现次数最多的艺人（去重后按次数降序） */
