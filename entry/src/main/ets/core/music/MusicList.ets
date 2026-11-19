@@ -1114,6 +1114,25 @@ const KG_GATEWAY_KEY: string = 'OIlwieks28dk2k092lksi2UIkp';
  */
 const KG_APP_UA: string = 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi';
 
+/**
+ * 酷狗歌曲封面：接口给的是带 `{size}` 占位的模板，替换成实际档位
+ *
+ * 群反馈（2026-11-19 15:28，佐手牵佑手）：「歌单广场里的歌好多都没有封面」。
+ * 真因是**映射里从来没读过封面字段**（`img: ''` 写死），所以歌单详情里整列都是首字占位
+ * 图。酷狗两套接口的字段名还不一样：
+ *   - 歌单详情走 gateway `/v2/album_audio/audio` → `album_info.sizable_cover`
+ *   - 榜单走 `mobilecdn/api/v3/rank/song` → `album_sizable_cover`
+ * 模板形如 `http://imge.kugou.com/stdmusic/{size}/20220507/xxx.jpg`，400 档实测可取
+ * （http / https 都通，统一升成 https 免得明文被系统拦）。
+ */
+function kgCoverUrl(template: string): string {
+  if (template.length === 0) {
+    return '';
+  }
+  const sized: string = template.replace('{size}', '400');
+  return sized.startsWith('http://') ? `https://${sized.substring('http://'.length)}` : sized;
+}
+
 async function kgPlaylists(sortId: string, page: number): Promise<LxPlaylistItem[]> {
   const url: string = 'http://www2.kugou.kugou.com/yueku/v9/special/getSpecial' +
     `?is_ajax=1&cdn=cdn&t=${encodeURIComponent(sortId)}&c=&p=${page}`;
@@ -1360,6 +1379,9 @@ function kgFilterGatewaySongs(rawList: Object[]): LxMusicInfo[] {
         asString(audio['hash_high']));
     }
     const album: Record<string, Object> = asRecord(item['album_info']);
+    // 封面：album_info.sizable_cover 为主，trans_param.union_cover 兜底（见 kgCoverUrl 的说明）
+    const albumCover: string = kgCoverUrl(asString(album['sizable_cover']));
+    const unionCover: string = kgCoverUrl(asString(asRecord(item['trans_param'])['union_cover']));
     const seed: SongSeed = {
       singer: decodeName(asString(item['author_name'])),
       name: decodeName(asString(item['songname'])),
@@ -1368,7 +1390,7 @@ function kgFilterGatewaySongs(rawList: Object[]): LxMusicInfo[] {
       songmid: audioId,
       source: 'kg',
       interval: formatPlayTime(Number.parseInt(asString(audio['timelength']), 10) / 1000),
-      img: '',
+      img: albumCover.length > 0 ? albumCover : unionCover,
       types: types,
       _types: map,
       hash: hash,
@@ -1426,7 +1448,8 @@ function kgFilterBoardSongs(rawList: Object[]): LxMusicInfo[] {
       songmid: asString(item['audio_id']),
       source: 'kg',
       interval: formatPlayTime(asNumber(item['duration'])),
-      img: '',
+      // 榜单接口的封面字段与歌单详情不同（album_sizable_cover），见 kgCoverUrl
+      img: kgCoverUrl(asString(item['album_sizable_cover'])),
       types: types,
       _types: map,
       hash: hash,

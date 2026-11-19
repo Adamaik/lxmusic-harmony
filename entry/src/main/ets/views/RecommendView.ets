@@ -288,6 +288,12 @@ export struct RecommendView {
   @State artistRows: ArtistRow[] = [];
   /** 歌单广场选中的分类（= sorts 的下标） */
   @State catIndex: number = 0;
+  /**
+   * 歌单分类卡上的封面（下标与 sorts 对齐；空串 = 还没取到，走玻璃卡）
+   *
+   * 见 loadCatCovers 的说明：分类本身没有封面，用该分类下第一张歌单的封面顶上。
+   */
+  @State catCovers: string[] = [];
   @State plaza: LxPlaylistItem[] = [];
   @State plazaPage: number = 0;
   @State plazaLoading: boolean = false;
@@ -322,6 +328,8 @@ export struct RecommendView {
   /** 推荐歌曲用哪张榜（热歌榜优先，见 pickOfficialIndexes） */
   private heroIndex: number = 0;
   private plazaAsked: boolean = false;
+  /** 分类卡封面是否已经有一轮在取了（同一时刻只跑一轮） */
+  private catCoversAsked: boolean = false;
 
   aboutToAppear(): void {
     this.sorts = sortListOf(this.platform);
@@ -356,6 +364,8 @@ export struct RecommendView {
     this.plazaError = '';
     this.plazaAsked = false;
     this.catIndex = 0;
+    this.catCovers = [];
+    this.catCoversAsked = false;
     // 私人推荐跟平台 / 登录态绑着：换平台或下拉刷新都重新取（问过标记一起清）
     this.wyRec = [];
     this.wyRecAsked = false;
@@ -387,6 +397,8 @@ export struct RecommendView {
     this.artistCatIndex = 0;
     this.artistRows = [];
     this.refreshing = false;
+    // 分类卡封面与「推荐歌曲」并发去取（互不依赖，别让首屏等它）
+    void this.loadCatCovers();
     await this.loadBoardColumn(this.heroIndex);
   }
 
@@ -876,6 +888,72 @@ export struct RecommendView {
 
   // ------------------------------------------------------------ 歌单广场
 
+  /**
+   * 取「歌单分类」那几张卡的封面
+   *
+   * 群反馈（2026-11-19 14:47，佐手牵佑手）：「这块怎么没有封面显示？」，
+   * 接着说「就用歌单里第一首歌的封面不行吗？有个封面观感好点」。
+   *
+   * 分类本身只是平台的排序档位（推荐 / 最热 / 最新），接口没有给封面，所以用
+   * **该档位下第一张歌单的封面**：广场第一页里现成就有 `img`，不必为了封面再去取
+   * 那张歌单的详情拿第一首歌（那是「取详情」级别的代价，为一张卡面不值）。
+   *
+   * 逐档顺序取、每档只取第一页，取不到就留空（继续走玻璃卡，功能一点不受影响）。
+   * 当前选中的那一档广场本来就要取，直接用它的第一张，不重复请求。
+   */
+  private async loadCatCovers(): Promise<void> {
+    if (this.catCoversAsked) {
+      return;
+    }
+    this.catCoversAsked = true;
+    const platform: string = this.platform;
+    const sorts: LxSortItem[] = this.sorts.slice();
+    try {
+      for (let i = 0; i < sorts.length; i++) {
+        // 平台 / 分类在取的过程中变了就作废（换平台已经清过表并重新发起）
+        if (this.platform !== platform || this.sorts.length !== sorts.length) {
+          return;
+        }
+        if (this.catCoverOf(i).length > 0) {
+          continue;
+        }
+        if (i === this.catIndex && this.plaza.length > 0) {
+          this.setCatCover(i, this.plaza[0].img);
+          continue;
+        }
+        try {
+          const list: LxPlaylistItem[] = await getRecommendPlaylists(platform, sorts[i].id, 1);
+          if (this.platform === platform && list.length > 0) {
+            this.setCatCover(i, list[0].img);
+          }
+        } catch (e) {
+          // 这一档取不到就留空：卡面退回玻璃卡，不影响点选
+        }
+      }
+    } finally {
+      this.catCoversAsked = false;
+    }
+  }
+
+  private catCoverOf(index: number): string {
+    if (index < 0 || index >= this.catCovers.length) {
+      return '';
+    }
+    return this.catCovers[index];
+  }
+
+  private setCatCover(index: number, img: string): void {
+    if (index < 0 || index >= this.sorts.length || img.length === 0 || this.catCoverOf(index) === img) {
+      return;
+    }
+    const next: string[] = this.catCovers.slice();
+    while (next.length <= index) {
+      next.push('');
+    }
+    next[index] = img;
+    this.catCovers = next;
+  }
+
   /** 广场 / 漫游那块滚到可视区才取第一页 */
   private ensurePlaza(): void {
     if (this.plazaAsked) {
@@ -915,6 +993,10 @@ export struct RecommendView {
         this.plazaRows.setItems(this.plaza, this.gridCols());
         this.plazaPage = page;
         this.plazaNoMore = list.length === 0;
+        // 第一页顺手把这一档分类卡的封面填上（白拿的，不多打请求）
+        if (!append && list.length > 0) {
+          this.setCatCover(this.catIndex, list[0].img);
+        }
       }
     } catch (e) {
       this.plazaError = (e as Error).message;
@@ -1906,9 +1988,13 @@ export struct RecommendView {
             this.catCard(sort, index)
           }
           // 选中态拼进 key：ForEach 对 key 没变的条目不会重跑生成器，只靠 @Prop 传不过去，
-          // 点哪张都不出红边（见 ListenView 分类卡那条注释）
-        }, (sort: LxSortItem, index: number) =>
-          `cat_${index}_${sort.id}_${this.catIndex === index ? 'on' : 'off'}`)
+          // 点哪张都不出红边（见 ListenView 分类卡那条注释）。
+          // 封面同样要拼进去：封面是**后到**的（loadCatCovers），key 不变就永远停在玻璃卡上。
+        }, (sort: LxSortItem, index: number) => {
+          const cover: string = this.catCoverOf(index);
+          const mark: string = cover.length > 0 ? cover.substring(Math.max(0, cover.length - 24)) : 'none';
+          return `cat_${index}_${sort.id}_${this.catIndex === index ? 'on' : 'off'}_${mark}`;
+        })
       }
       .scrollBar(BarState.Off)
       .listDirection(Axis.Horizontal)
@@ -1922,15 +2008,14 @@ export struct RecommendView {
   /**
    * 一张歌单分类卡（2026-10-21 重做：纯色渐变块 → 主题玻璃卡，见文件头「卡片形态」）
    *
-   * 平台的「排序」只是纯文字档位，没有现成封面，所以固定走 TileCard 的玻璃卡形态
-   * （`coverUrl: ''`）。**不为了卡面额外发歌单请求**：这一档的内容下面广场本来就要取，
-   * 为了一张图多打一次接口不值。
+   * 平台的「排序」只是纯文字档位，本身没有封面：取到该档位下第一张歌单的封面铺上，
+   * 还没取到 / 取不到时继续走玻璃卡（`coverUrl: ''`，见 loadCatCovers）。
    */
   @Builder
   catCard(sort: LxSortItem, index: number) {
     TileCard({
       title: sort.name,
-      coverUrl: '',
+      coverUrl: this.catCoverOf(index),
       cardWidth: 112,
       cardHeight: 112,
       radius: 12,
