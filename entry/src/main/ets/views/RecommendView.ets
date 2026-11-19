@@ -22,6 +22,7 @@ import { K_WINDOW_WIDTH } from '../ui/Layout';
 import { K_MUSIC_LOGGED_TX, K_MUSIC_LOGGED_WY } from '../core/music/MusicAccount';
 import { fetchTxRadar } from '../core/music/TxRecommend';
 import { LxMusicInfo } from '../core/music/MusicSearch';
+import { DismissedSongs } from '../core/music/DismissedSongs';
 
 /**
  * 推荐页（三个胶囊各是一套版面，全部照用户给的华为音乐截图）
@@ -504,10 +505,10 @@ export struct RecommendView {
       for (const info of infos) {
         songs.push(songFromSearch(info, quality));
       }
-      this.txRadar = songs;
-      this.txRadarSource.setItems(songs);
+      this.txRadar = this.keepRecommended(songs);
+      this.txRadarSource.setItems(this.txRadar);
       // 成功也留一行：能区分「接口通了但返回空列表」和「请求失败」
-      console.info(`tx radar ok: ${songs.length}`);
+      console.info(`tx radar ok: ${this.txRadar.length}`);
     } catch (e) {
       this.txRadarFailed = true;
       const message: string = e instanceof Error ? e.message : JSON.stringify(e);
@@ -837,7 +838,7 @@ export struct RecommendView {
       }
       column.songs = songs;
       if (index === this.heroIndex) {
-        this.hero = songs.slice(0, HERO_COUNT);
+        this.hero = this.keepRecommended(songs).slice(0, HERO_COUNT);
         this.heroSource.setItems(this.hero);
       }
     } catch (e) {
@@ -1127,6 +1128,48 @@ export struct RecommendView {
     session.addFavorite(song);
   }
 
+  // ------------------------------------------------------------ 「不感兴趣」
+  //
+  // 群反馈（2026-11-19 16:00，不喜欢吃鱼）：「这个推荐歌曲功能老是推荐各种抖音短视频
+  // 歌曲，全是各种变速和烟嗓版，有没有不感兴趣按钮」。名单与落盘在
+  // core/music/DismissedSongs，这里只负责「标记完立刻从这两排卡片里消失」。
+
+  /** 过滤掉已被标记「不感兴趣」的歌（取数时就过滤，免得先闪一下再消失） */
+  private keepRecommended(songs: SongItem[]): SongItem[] {
+    const store = DismissedSongs.getInstance();
+    const out: SongItem[] = [];
+    for (const song of songs) {
+      if (!store.isDismissed(song.name, song.singer)) {
+        out.push(song);
+      }
+    }
+    return out;
+  }
+
+  /** 标「不感兴趣」：落盘 + 当场从推荐歌曲 / 私人雷达里摘掉 */
+  private dismissSong(song: SongItem): void {
+    const added: boolean = DismissedSongs.getInstance().dismiss(song.name, song.singer);
+    const hero: SongItem[] = this.keepRecommended(this.hero);
+    if (hero.length !== this.hero.length) {
+      this.hero = hero;
+      this.heroSource.setItems(hero);
+    }
+    const radar: SongItem[] = this.keepRecommended(this.txRadar);
+    if (radar.length !== this.txRadar.length) {
+      this.txRadar = radar;
+      this.txRadarSource.setItems(radar);
+    }
+    if (!added) {
+      this.toast('这首已经在「不感兴趣」名单里了');
+      return;
+    }
+    this.toast(`已标记不感兴趣：${song.name}`);
+  }
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
   /** 歌行要画的那张封面：有就给、没有就排进懒解析队列（解好后 coverVersion 变了会重画） */
   private songCover(song: SongItem): string {
     return CoverStore.getInstance().coverFor(song.musicInfoJson, song.coverUrl);
@@ -1337,10 +1380,31 @@ export struct RecommendView {
   }
 
   /**
+   * 长按「推荐歌曲 / 私人雷达」那张大卡的菜单
+   *
+   * 「不感兴趣」放第一个：群反馈要的就是它，用户长按完只想一键点掉，
+   * 不该再往菜单底部去找。收藏放第二项（这两个动作都是「这首我以后还要不要看到」）。
+   */
+  @Builder
+  songMenu(song: SongItem) {
+    Menu() {
+      MenuItem({ content: '不感兴趣' })
+        .onClick(() => {
+          this.dismissSong(song);
+        })
+      MenuItem({ content: PlaySession.getInstance().isFavorite(song.id) ? '取消收藏' : '收藏' })
+        .onClick(() => {
+          this.toggleFavorite(song);
+        })
+    }
+  }
+
+  /**
    * 一张「大封面歌曲卡」：封面铺满 + 底部压暗 + 歌名/歌手 + 播放钮
    *
    * 推荐歌曲与 QQ 私人雷达共用：两张卡的观感本来就该一样，点击时用**各自那条队列**
    * （`list`）从这一首开始播，所以队列当参数传进来，不写死 this.hero。
+   * 长按出「不感兴趣 / 收藏」菜单（见 songMenu）。
    */
   @Builder
   songTile(list: SongItem[], song: SongItem, index: number) {
@@ -1394,6 +1458,7 @@ export struct RecommendView {
     .onClick(() => {
       this.playSongs(list, index);
     })
+    .bindContextMenu(this.songMenu(song), ResponseType.LongPress)
     .accessibilityText(`${song.name}，${song.singer}，播放`)
     .accessibilityLevel('yes')
   }

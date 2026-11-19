@@ -1,10 +1,11 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
 import { I_BOOK, I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
-  I_VOLUME, IconGlyph } from '../ui/Icons';
+  I_STAR, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { TopFade } from '../ui/Widgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { K_MUSIC_LOGGED_WY, K_MUSIC_NICK_WY, K_MUSIC_VIP_WY } from '../core/music/MusicAccount';
+import { DismissedSongs } from '../core/music/DismissedSongs';
 
 /** 设置项 */
 interface SettingRowDef {
@@ -32,6 +33,16 @@ const GROUP_PLAY: SettingRowDef[] = [
 
 const GROUP_THEME: SettingRowDef[] = [
   { icon: I_BRUSH, title: '外观', action: 'appearance' },
+];
+
+/**
+ * 推荐
+ *
+ * 目前只有一项「清空不感兴趣名单」：标记入口在推荐页（长按「推荐歌曲」/「私人雷达」的大卡），
+ * 但那里只能加、不能撤，所以这里给一个后悔的出口。这一行是本页自己处理的（action 不走壳层）。
+ */
+const GROUP_RECOMMEND: SettingRowDef[] = [
+  { icon: I_STAR, title: '清空不感兴趣名单', action: 'clear_dismissed' },
 ];
 
 /**
@@ -153,6 +164,40 @@ export struct SettingsView {
     return this.musicVip.length > 0 ? `已登录：${name} · ${this.musicVip}` : `已登录：${name}`;
   }
 
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message });
+  }
+
+  /**
+   * 清空「不感兴趣」名单（二次确认）
+   *
+   * 名单为空时不必弹框，直接说清楚「没有可清的」就行 —— 弹一个「确定清空吗」然后什么也没清
+   * 是最容易让人以为按钮坏了的做法。
+   */
+  private confirmClearDismissed(): void {
+    const count: number = DismissedSongs.getInstance().count();
+    if (count === 0) {
+      this.toast('「不感兴趣」名单还是空的（推荐页长按卡片就能标记）');
+      return;
+    }
+    this.getUIContext().showAlertDialog({
+      title: '清空不感兴趣名单',
+      message: `已标记 ${count} 首。清空后它们会重新出现在推荐里。`,
+      autoCancel: true,
+      buttons: [
+        { value: '取消', action: () => { } },
+        {
+          value: '清空',
+          fontColor: C_RED,
+          action: () => {
+            DismissedSongs.getInstance().clear();
+            this.toast('已清空「不感兴趣」名单');
+          },
+        },
+      ],
+    });
+  }
+
   /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
   private cardsSideBySide(): boolean {
     return cardColumnsFor(this.windowWidth) > 1;
@@ -176,6 +221,10 @@ export struct SettingsView {
           title: row.title,
           showDivider: i < this.filter(rows).length - 1,
           onTap: () => {
+            if (row.action === 'clear_dismissed') {
+              this.confirmClearDismissed();
+              return;
+            }
             this.onNavigate(row.action);
           },
         })
@@ -300,6 +349,14 @@ export struct SettingsView {
           // ------------------------------------------------ 播放 / 下载
           Column({ space: 14 }) {
             this.cardGroup(GROUP_PLAY)
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 推荐
+          Column({ space: 14 }) {
+            this.cardGroup(GROUP_RECOMMEND)
+            this.hint('推荐页长按「推荐歌曲」或「私人雷达」的大卡可以标「不感兴趣」，'
+              + '标过的歌不会再出现在这两排里；这里可以一次性清空。')
           }
           .width(cardWidthOf(this.windowWidth))
 

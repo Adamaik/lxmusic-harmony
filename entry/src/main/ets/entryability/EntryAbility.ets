@@ -25,6 +25,7 @@ import { RecognizeSettings } from '../core/settings/RecognizeSettings';
 import { DownloadSettings } from '../core/download/DownloadSettings';
 import { DownloadManager, K_APP_FOREGROUND } from '../core/download/DownloadManager';
 import { musicAccount } from '../core/music/MusicAccount';
+import { DismissedSongs } from '../core/music/DismissedSongs';
 import { HeartCache } from '../core/heart/HeartCache';
 
 const DOMAIN = 0x0000;
@@ -92,6 +93,9 @@ export default class EntryAbility extends UIAbility {
     // 用 @StorageLink 订阅登录状态；且网易请求侧要在第一次请求之前就能读到 Cookie
     // （登录后接口才会返回母带 / 沉浸声 / 杜比这类账号权益音质档）
     musicAccount().init(this.context);
+    // 「不感兴趣」名单（推荐页长按推荐歌曲 / 私人雷达标记的）：要早于界面创建 ——
+    // 推荐页取回歌曲列表时就要按它过滤，晚一步就会先闪出被标记过的歌
+    DismissedSongs.getInstance().init(this.context);
   }
 
   onDestroy(): void {
