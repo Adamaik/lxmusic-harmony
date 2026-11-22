@@ -6,6 +6,10 @@ import { LibrarySummary } from '../core/sync/LocalLibrary';
 import { K_SYNC_DATA_VERSION, K_SYNC_ENABLE, K_SYNC_MESSAGE, K_SYNC_PROGRESS, K_SYNC_STAGE,
   K_SYNC_STATUS, SyncManager } from '../core/sync/SyncManager';
 import { describeStatus, isSyncFailureMessage } from '../core/sync/SyncStatusText';
+import { K_WEBDAV_SYNC_AUTO, WebDavSettings } from '../core/webdav/WebDavSettings';
+import { ConfigSyncFile } from '../core/webdav/WebDavConfigData';
+import { ConfigSyncOutcome, ConfigSyncPreview, K_CONFIG_SYNC_NOTICE, WebDavConfigSync,
+  describeStamp } from '../core/webdav/WebDavConfigSync';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
@@ -34,6 +38,19 @@ export struct SyncSettingsView {
   @State newName: string = '';
   @State newSinger: string = '';
   @State hostHistory: string[] = [];
+  // ---- 网盘同步（WebDAV）：账号与目录在这里也能填，与「云音乐」页共用同一份设置
+  @State davHost: string = '';
+  @State davUser: string = '';
+  @State davPassword: string = '';
+  /** 已保存过密码时输入框留空 = 不修改（密码不进 AppStorage，也不回显） */
+  @State davPasswordSaved: boolean = false;
+  @State davDir: string = '';
+  @State davBusy: boolean = false;
+  @State davStatus: string = '';
+  /** 上次成功同步的时间（ISO；空串 = 还没同步过） */
+  @State davLastSync: string = '';
+  @StorageLink(K_WEBDAV_SYNC_AUTO) davAuto: boolean = false;
+  @StorageLink(K_CONFIG_SYNC_NOTICE) davNotice: string = '';
   @StorageLink(K_SYNC_ENABLE) @Watch('onSyncStateChanged') enable: boolean = false;
   @StorageLink(K_SYNC_STATUS) @Watch('onSyncStateChanged') connected: boolean = false;
   @StorageLink(K_SYNC_MESSAGE) @Watch('onSyncStateChanged') statusMessage: string = '';
@@ -59,6 +76,7 @@ export struct SyncSettingsView {
     this.deviceName = manager.deviceName();
     this.hostHistory = manager.hostHistory();
     this.refresh();
+    this.refreshDav();
   }
 
   onSyncStateChanged(): void {
@@ -188,6 +206,165 @@ export struct SyncSettingsView {
   private clearDislikeRules(): void {
     SyncManager.getInstance().getLibrary().clearDislike();
     this.refresh();
+  }
+
+  // ------------------------------------------------------------ 网盘同步（WebDAV）
+
+  /** 从设置单例读一遍（密码只读「有没有存过」，不回显） */
+  private refreshDav(): void {
+    const settings = WebDavSettings.getInstance();
+    this.davHost = settings.getUrl();
+    this.davUser = settings.getUsername();
+    this.davPasswordSaved = settings.getPassword().length > 0;
+    this.davDir = settings.getSyncDir();
+    this.davLastSync = settings.getLastSyncedAt();
+  }
+
+  /**
+   * 把这一段的输入存进设置
+   *
+   * 密码只在**这次真的填了**的时候写：输入框留空表示沿用已保存的那个，不能因为用户
+   * 没重填就把密码清掉。存完把输入框清空，占位符变「已保存，留空不修改」。
+   */
+  private saveDavInputs(): void {
+    const settings = WebDavSettings.getInstance();
+    settings.setUrl(this.davHost);
+    settings.setUsername(this.davUser);
+    settings.setSyncDir(this.davDir);
+    if (this.davPassword.length > 0) {
+      settings.setPassword(this.davPassword);
+      this.davPassword = '';
+      this.davPasswordSaved = true;
+    }
+  }
+
+  /** 测试连接：列一次根目录，再试建一次同步目录（目录不存在会自动创建） */
+  private async testDav(): Promise<void> {
+    if (this.davBusy) {
+      return;
+    }
+    this.saveDavInputs();
+    this.davBusy = true;
+    this.davStatus = '正在连接…';
+    try {
+      this.davStatus = await WebDavConfigSync.getInstance().testConnection();
+    } catch (e) {
+      this.davStatus = `连不上：${(e as Error).message}`;
+    } finally {
+      this.davBusy = false;
+    }
+  }
+
+  /** 手动上传：把歌单 + 播放设置写到网盘（用户明确点了，失败要给出原因） */
+  private async uploadDav(): Promise<void> {
+    if (this.davBusy) {
+      return;
+    }
+    this.saveDavInputs();
+    this.davBusy = true;
+    this.davStatus = '正在上传配置…';
+    try {
+      const outcome: ConfigSyncOutcome = await WebDavConfigSync.getInstance().uploadNow();
+      this.davStatus = outcome.message;
+      this.davLastSync = WebDavSettings.getInstance().getLastSyncedAt();
+      this.toast(outcome.ok ? '已上传到网盘' : outcome.message);
+    } catch (e) {
+      this.davStatus = `上传失败：${(e as Error).message}`;
+    } finally {
+      this.davBusy = false;
+    }
+  }
+
+  /**
+   * 从网盘恢复：先取回来算一份预览，弹框让用户看清再决定
+   *
+   * 「先预览、再确认」是这次同步的核心约定：不点「恢复」就不动本地库，也不静默双写。
+   */
+  private async restoreDav(): Promise<void> {
+    if (this.davBusy) {
+      return;
+    }
+    this.saveDavInputs();
+    this.davBusy = true;
+    this.davStatus = '正在读取网盘上的配置…';
+    try {
+      const preview: ConfigSyncPreview = await WebDavConfigSync.getInstance().previewRemote();
+      const remoteFile: ConfigSyncFile | null = preview.file;
+      if (!preview.ok || remoteFile === null) {
+        this.davStatus = preview.message;
+        return;
+      }
+      // 闭包里只用这个非空的局部量：直接捕获 remoteFile 会因为它带 null 而每处都要判一次
+      const target: ConfigSyncFile = remoteFile;
+      const when: string = describeStamp(preview.exportedAt);
+      const newer: string = preview.newer ? '（比本机上次同步的更新）' : '';
+      this.davStatus = `网盘上有一份配置：${preview.playlists} 个歌单、${preview.songs} 首歌`;
+      this.getUIContext().showAlertDialog({
+        title: '从网盘恢复配置',
+        message: `导出时间：${when}${newer}\n\n`
+          + `将导入 ${preview.playlists} 个歌单、共 ${preview.songs} 首歌曲\n`
+          + `设置：${preview.settingsText}\n\n`
+          + '重名歌单会加「 (2)」后缀，本机现有歌单不会被覆盖；本地音乐与云端音乐不会随配置迁移。',
+        autoCancel: true,
+        buttons: [
+          { value: '取消', action: () => {
+          } },
+          {
+            value: '恢复',
+            fontColor: C_RED,
+            action: () => {
+              void this.doRestore(target);
+            },
+          },
+        ],
+      });
+    } catch (e) {
+      this.davStatus = `读取失败：${(e as Error).message}`;
+    } finally {
+      this.davBusy = false;
+    }
+  }
+
+  /** 用户点了确认之后才真正合并（合并期间再挡一次重复点击） */
+  private async doRestore(file: ConfigSyncFile): Promise<void> {
+    if (this.davBusy) {
+      return;
+    }
+    this.davBusy = true;
+    this.davStatus = '正在恢复配置…';
+    try {
+      const outcome: ConfigSyncOutcome = await WebDavConfigSync.getInstance().restore(file);
+      this.davStatus = outcome.message;
+      this.davLastSync = WebDavSettings.getInstance().getLastSyncedAt();
+      // 歌单数变了：上面那张「同步内容」的统计要跟着重读
+      this.refresh();
+      this.toast(outcome.ok ? '已从网盘恢复配置' : outcome.message);
+    } catch (e) {
+      this.davStatus = `恢复失败：${(e as Error).message}`;
+    } finally {
+      this.davBusy = false;
+    }
+  }
+
+  /** 自动同步开关（打开后启动 / 退出各试一次，失败静默） */
+  private toggleDavAuto(on: boolean): void {
+    this.saveDavInputs();
+    WebDavSettings.getInstance().setAutoSync(on);
+    if (!on) {
+      this.davStatus = '已关闭自动同步（手动上传 / 恢复仍然可用）';
+    } else if (!WebDavSettings.getInstance().isConfigured()) {
+      this.davStatus = '自动同步已打开，但要先填服务器地址';
+    } else {
+      this.davStatus = '自动同步已打开：应用启动 / 退出时各试一次';
+    }
+  }
+
+  private toast(message: string): void {
+    try {
+      this.getUIContext().getPromptAction().showToast({ message: message });
+    } catch (e) {
+      // 没有 UI 上下文时（比如预加载）静默：状态行里已经有同样的字
+    }
   }
 
   @Builder
@@ -553,6 +730,234 @@ export struct SyncSettingsView {
     .clip(true)
   }
 
+  /**
+   * 网盘同步（WebDAV）
+   *
+   * 与上面那张卡的分工：上面是洛雪服务端同步（要自己搭服务端 / 开电脑端），这张是
+   * **普通用户能用的**换设备路径 —— 一个 WebDAV 网盘账号 + 一个目录就够。
+   *
+   * 账号直接复用「设置 - 云端音乐」那一份（WebDavSettings）：同一个人同一台网盘，
+   * 没必要填两遍；这里也能改，改的是同一个落盘文件。
+   */
+  @Builder
+  davSyncCard() {
+    Column() {
+      Row({ space: 8 }) {
+        Column({ space: 4 }) {
+          Text('网盘同步（WebDAV）')
+            .fontSize(F_SECTION)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(C_TEXT)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          Text(this.davAuto ? '自动同步：启动 / 退出各试一次' : '换手机时把歌单和设置搬过去')
+            .fontSize(F_SUB)
+            .fontColor(C_TEXT_WEAK)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.davAuto })
+          .selectedColor(C_RED)
+          .enabled(!this.davBusy)
+          .onChange((isOn: boolean) => {
+            this.toggleDavAuto(isOn);
+          })
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 14, bottom: 12 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 10 }) {
+        Text('服务器')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+        TextInput({ text: this.davHost, placeholder: 'https://dav.example.com/dav' })
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 13 })
+          .fontSize(13)
+          .backgroundColor('#00000000')
+          .layoutWeight(1)
+          .enabled(!this.davBusy)
+          .onChange((value: string) => {
+            this.davHost = value;
+          })
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 14, right: 14 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 10 }) {
+        Text('用户名')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+        TextInput({ text: this.davUser, placeholder: '网盘账号（可留空匿名）' })
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 13 })
+          .fontSize(13)
+          .backgroundColor('#00000000')
+          .layoutWeight(1)
+          .enabled(!this.davBusy)
+          .onChange((value: string) => {
+            this.davUser = value;
+          })
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 14, right: 14 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 10 }) {
+        Text('密码')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+        TextInput({
+          text: this.davPassword,
+          placeholder: this.davPasswordSaved ? '已保存，留空不修改' : '网盘密码 / 应用专用密码',
+        })
+          .type(InputType.Password)
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 13 })
+          .fontSize(13)
+          .backgroundColor('#00000000')
+          .layoutWeight(1)
+          .enabled(!this.davBusy)
+          .onChange((value: string) => {
+            this.davPassword = value;
+          })
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 14, right: 14 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 10 }) {
+        Text('目录')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+        TextInput({ text: this.davDir, placeholder: 'listen-config（不存在会自动创建）' })
+          .placeholderColor(C_TEXT_WEAK)
+          .placeholderFont({ size: 13 })
+          .fontSize(13)
+          .backgroundColor('#00000000')
+          .layoutWeight(1)
+          .enabled(!this.davBusy)
+          .onChange((value: string) => {
+            this.davDir = value;
+          })
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 14, right: 14 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Row({ space: 8 }) {
+        Button('测试连接')
+          .fontSize(13)
+          .height(34)
+          .layoutWeight(1)
+          .backgroundColor(C_FILL_SOFT)
+          .fontColor(C_TEXT)
+          .enabled(!this.davBusy)
+          .onClick(() => {
+            void this.testDav();
+          })
+        Button('上传配置')
+          .fontSize(13)
+          .height(34)
+          .layoutWeight(1)
+          .backgroundColor(C_RED)
+          .enabled(!this.davBusy)
+          .onClick(() => {
+            void this.uploadDav();
+          })
+        Button('从网盘恢复')
+          .fontSize(13)
+          .height(34)
+          .layoutWeight(1)
+          .backgroundColor(C_FILL_SOFT)
+          .fontColor(C_TEXT)
+          .enabled(!this.davBusy)
+          .onClick(() => {
+            void this.restoreDav();
+          })
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+
+      if (this.davStatus.length > 0) {
+        Text(this.davStatus)
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .width('100%')
+          .padding({ left: 14, right: 14, bottom: 8 })
+          .textAlign(TextAlign.Start)
+      }
+
+      if (this.davNotice.length > 0) {
+        Column() {
+          Text(this.davNotice)
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .backgroundColor(C_RED_TINT)
+            .borderRadius(6)
+            .width('100%')
+            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+            .textAlign(TextAlign.Start)
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, bottom: 8 })
+      }
+
+      Text(this.davLastSync.length > 0
+        ? `上次同步：${describeStamp(this.davLastSync)}`
+        : '还没有同步过')
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_WEAK)
+        .width('100%')
+        .padding({ left: 14, right: 14, bottom: 10 })
+        .textAlign(TextAlign.Start)
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      Column({ space: 4 }) {
+        Text('不需要洛雪服务端：两台设备填同一个网盘账号（Nextcloud / Alist / 群晖 / 坚果云等'
+          + '支持 WebDAV 的都行），配置文件只有几十 KB。这里填的账号与「设置 - 云端音乐」'
+          + '是同一份；不点那边的「重新扫描」就不会去列你的音乐目录。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        Text('同步内容是歌单（含曲目）与播放设置（音质 / 歌词 / 动效等）；本地音乐和云端音乐'
+          + '的歌不会跟着走 —— 换设备后它们的路径不成立。收藏与试听列表仍走上面的洛雪同步。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        Text('自动同步失败不会打扰你（下次启动再试）；网盘上有更新的配置时只提示、'
+          + '不会覆盖本机，点「从网盘恢复」并确认后才写入，重名歌单加后缀。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 10, bottom: 12 })
+    }
+    .width('100%')
+    .borderRadius(R_CARD)
+    .backgroundColor(C_CARD)
+    .clip(true)
+  }
+
   build() {
     Column() {
       Scroll() {
@@ -587,6 +992,12 @@ export struct SyncSettingsView {
             }
             .width(cardWidthOf(this.windowWidth))
           }
+
+          // 网盘同步（WebDAV）：与洛雪服务端同步并列的第二条换设备路径
+          Column({ space: 14 }) {
+            this.davSyncCard()
+          }
+          .width(cardWidthOf(this.windowWidth))
 
           Column({ space: 6 }) {
             this.sectionCard('同步内容', this.summaryText)

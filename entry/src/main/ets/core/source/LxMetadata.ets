@@ -15,13 +15,19 @@ import { SourceInfo, SourceMeta } from './LxTypes';
  *    *\/
  */
 
-/** 各字段的最大长度，与洛雪保持一致（超出会被截断并追加 ...） */
+/**
+ * 各字段的最大长度，与洛雪保持一致（超出会被截断并追加 ...）
+ *
+ * `updateUrl` 是洛雪官方列表之外的扩展字段（见 LxTypes.SourceMeta 的说明）：
+ * 一部分第三方源会在头部写它，读到就能做「检查更新」；没写也不影响导入。
+ */
 const INFO_NAME_MAX_LENGTH: Record<string, number> = {
   'name': 24,
   'description': 36,
   'author': 56,
   'homepage': 1024,
   'version': 36,
+  'updateUrl': 1024,
 };
 
 const HEADER_START = '/*';
@@ -66,6 +72,7 @@ export function parseSourceMeta(script: string): SourceMeta {
     version: infos['version'] !== undefined ? infos['version'] : '',
     author: infos['author'] !== undefined ? infos['author'] : '',
     homepage: infos['homepage'] !== undefined ? infos['homepage'] : '',
+    updateUrl: infos['updateUrl'] !== undefined ? infos['updateUrl'] : '',
   };
   const keys: string[] = Object.keys(INFO_NAME_MAX_LENGTH);
   for (const key of keys) {
@@ -84,6 +91,8 @@ export function parseSourceMeta(script: string): SourceMeta {
       meta.author = value;
     } else if (key === 'homepage') {
       meta.homepage = value;
+    } else if (key === 'updateUrl') {
+      meta.updateUrl = value;
     }
   }
   return meta;
@@ -115,6 +124,7 @@ export function buildSourceInfo(script: string): SourceInfo {
     version: meta.version,
     author: meta.author,
     homepage: meta.homepage,
+    updateUrl: meta.updateUrl,
     allowShowUpdateAlert: true,
     importedAt: Date.now(),
   };

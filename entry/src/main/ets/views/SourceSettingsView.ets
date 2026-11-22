@@ -7,10 +7,25 @@ import { SourceEngine } from '../core/source/SourceEngine';
 import { MAX_SCRIPT_SIZE } from '../core/source/LxMetadata';
 import { ImportResolveTestResult, SourceInfo, SourceLog } from '../core/source/LxTypes';
 import { DEFAULT_MUSIC_INFO_JSON, formatTestResult, runOfflineSelfTest } from '../core/source/SourceTest';
+import {
+  CheckupOptions,
+  CheckupProgress,
+  SourceCheckupResult,
+  SourceUpdateInfo,
+  VERDICT_DEAD,
+  VERDICT_OK,
+  VERDICT_PARTIAL,
+  applySourceUpdate,
+  checkSourceUpdates,
+  lastCheckupAt,
+  loadCheckupResults,
+  runSourceCheckup,
+} from '../core/source/SourceCheckup';
+import { SourceHealth, SourceRouter } from '../core/source/SourceRouter';
 import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '@kit.UIDesignKit';
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
-import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, F_TAB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_ICON_GREEN, C_ICON_ORANGE, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_SECTION, F_SUB, F_TAB, R_CARD } from '../ui/Theme';
 import { LengthMetrics } from '@kit.ArkUI';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { LogDetailView } from './LogDetailView';
@@ -82,6 +97,25 @@ export struct SourceSettingsView {
   @State detailTime: number = 0;
   @State testUrl: string = '';
   private logListener: ((log: SourceLog) => void) | null = null;
+
+  // ------------------------------------------------------------ 一键自检 / 检查更新
+
+  /** 上一次自检的结论（按 id 对应，进页面就从磁盘读，不必重跑） */
+  @State checkResults: SourceCheckupResult[] = [];
+  /** 上一次自检的时间（0 = 从没跑过） */
+  @State lastCheckAt: number = 0;
+  @State checking: boolean = false;
+  @State checkDone: number = 0;
+  @State checkTotal: number = 0;
+  /** 当前正在自检的音源名（进度文案用） */
+  @State checkCurrent: string = '';
+  /** 用户点了「停止」：在源/平台边界生效（见 SourceCheckup.runSourceCheckup） */
+  private checkCancelled: boolean = false;
+  /** 检查更新：找到的有更新的源 */
+  @State updates: SourceUpdateInfo[] = [];
+  @State checkingUpdates: boolean = false;
+  @State updating: boolean = false;
+
   /**
    * 窗口宽度（vp）：宽屏下这几段并排（0 = 还没量到，按手机一列）
    *
@@ -100,6 +134,8 @@ export struct SourceSettingsView {
     const engine = SourceEngine.getInstance();
     this.sandboxEnv = engine.getSandboxEnv();
     this.refreshSources();
+    this.checkResults = loadCheckupResults();
+    this.lastCheckAt = lastCheckupAt();
     this.logListener = (log: SourceLog) => {
       // 面板这行只留时分秒（保持原来那一行的长度），完整日期在详情页里给
       const time: string = new Date(log.time).toLocaleTimeString();
@@ -128,12 +164,317 @@ export struct SourceSettingsView {
     return this.getUIContext().getHostContext() as common.Context;
   }
 
+  /**
+   * 刷新列表
+   *
+   * 用 listAllSources() 而不是 listSources()：后者只给「启用中的源」（播放/下载的候选集合），
+   * 而这一页必须把停用的源也列出来 —— 否则停用之后用户就再也找不到它，没法启用回来。
+   */
   private refreshSources(): void {
     const engine = SourceEngine.getInstance();
-    this.sources = engine.listSources();
+    this.sources = engine.listAllSources();
     this.loadedId = engine.getLoadedSourceId();
     const supported: string[] = Object.keys(engine.getSupportedSources());
     this.supportedText = supported.length > 0 ? supported.map((p: string) => this.platformName(p)).join(' / ') : '-';
+  }
+
+  // ------------------------------------------------------------ 自检结论的展示口径
+
+  /** 某个源上一次的自检结论（没有就是 null） */
+  private resultOf(id: string): SourceCheckupResult | null {
+    for (const item of this.checkResults) {
+      if (item.id === id) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /** 有结论就用结论，没有就看路由记忆：界面上永远给一个「已知的状态」 */
+  private verdictOf(item: SourceInfo): string {
+    const result: SourceCheckupResult | null = this.resultOf(item.id);
+    if (result !== null) {
+      return result.verdict;
+    }
+    const health: SourceHealth = SourceRouter.getInstance().healthOf(item.id);
+    if (health.failStreak >= 2) {
+      return VERDICT_DEAD;
+    }
+    if (health.lastOkAt > 0 && health.failStreak === 0) {
+      return VERDICT_OK;
+    }
+    return 'unknown';
+  }
+
+  private verdictText(verdict: string): string {
+    if (verdict === VERDICT_OK) {
+      return '可用';
+    }
+    if (verdict === VERDICT_PARTIAL) {
+      return '部分可用';
+    }
+    if (verdict === VERDICT_DEAD) {
+      return '失效';
+    }
+    return '未验证';
+  }
+
+  private verdictColor(verdict: string): Resource {
+    if (verdict === VERDICT_OK) {
+      return C_ICON_GREEN;
+    }
+    if (verdict === VERDICT_PARTIAL) {
+      return C_ICON_ORANGE;
+    }
+    if (verdict === VERDICT_DEAD) {
+      return C_RED;
+    }
+    return C_TEXT_WEAK;
+  }
+
+  /** 「12-01 10:30」这种短时间（跨年才带年份，够用且省宽度） */
+  private shortTime(at: number): string {
+    if (at <= 0) {
+      return '从未';
+    }
+    const date: Date = new Date(at);
+    const now: Date = new Date();
+    const month: string = `${date.getMonth() + 1}`.padStart(2, '0');
+    const day: string = `${date.getDate()}`.padStart(2, '0');
+    const hour: string = `${date.getHours()}`.padStart(2, '0');
+    const minute: string = `${date.getMinutes()}`.padStart(2, '0');
+    if (date.getFullYear() !== now.getFullYear()) {
+      return `${date.getFullYear()}-${month}-${day}`;
+    }
+    return `${month}-${day} ${hour}:${minute}`;
+  }
+
+  /** 卡片副标题：自检结论的细节 / 路由记忆里的最后成功与失败原因 */
+  private subtitleOf(item: SourceInfo): string {
+    const result: SourceCheckupResult | null = this.resultOf(item.id);
+    if (result !== null) {
+      // 自检结论优先，但「最后成功时间」仍然值得带上：失效的源上次是什么时候好过，
+      // 是用户判断「要不要等作者修 / 直接删」的关键信息
+      return result.lastOkAt > 0
+        ? `${result.message}　（最后成功 ${this.shortTime(result.lastOkAt)}）`
+        : result.message;
+    }
+    const health: SourceHealth = SourceRouter.getInstance().healthOf(item.id);
+    if (health.lastFailAt > 0 && health.lastError.length > 0) {
+      const platform: string = health.failedPlatform.length > 0 ? this.platformName(health.failedPlatform) : '';
+      const okPart: string = health.lastOkAt > 0 ? `最后成功 ${this.shortTime(health.lastOkAt)} · ` : '';
+      return `${okPart}上次失败（${platform.length > 0 ? platform : '未知平台'}）：${health.lastError}`;
+    }
+    if (health.lastOkAt > 0) {
+      return `最后成功：${this.shortTime(health.lastOkAt)}`;
+    }
+    return '还没有使用记录，跑一次「一键自检」就能确定它还能不能用';
+  }
+
+  /** 顶部汇总：N 个可用 / M 个失效（还有几个没验证） */
+  private summaryText(): string {
+    let ok: number = 0;
+    let partial: number = 0;
+    let dead: number = 0;
+    let unknown: number = 0;
+    let disabled: number = 0;
+    for (const item of this.sources) {
+      if (item.disabled === true) {
+        disabled += 1;
+        continue;
+      }
+      const verdict: string = this.verdictOf(item);
+      if (verdict === VERDICT_OK) {
+        ok += 1;
+      } else if (verdict === VERDICT_PARTIAL) {
+        partial += 1;
+      } else if (verdict === VERDICT_DEAD) {
+        dead += 1;
+      } else {
+        unknown += 1;
+      }
+    }
+    const parts: string[] = [`${ok} 个可用`];
+    if (partial > 0) {
+      parts.push(`${partial} 个部分可用`);
+    }
+    if (dead > 0) {
+      parts.push(`${dead} 个失效`);
+    }
+    if (unknown > 0) {
+      parts.push(`${unknown} 个未验证`);
+    }
+    if (disabled > 0) {
+      parts.push(`${disabled} 个已停用`);
+    }
+    return parts.join(' / ');
+  }
+
+  /** 有没有源声明了更新地址（没有的话「检查更新」按钮要说明为什么没用） */
+  private sourcesWithUpdateUrl(): string[] {
+    const ids: string[] = [];
+    for (const item of this.sources) {
+      const url: string = item.updateUrl !== undefined ? item.updateUrl : '';
+      if (/^https?:\/\//.test(url)) {
+        ids.push(item.id);
+      }
+    }
+    return ids;
+  }
+
+  private async startCheckup(): Promise<void> {
+    if (this.checking || this.busy) {
+      return;
+    }
+    if (this.sources.length === 0) {
+      this.toast('还没有导入任何音源');
+      return;
+    }
+    // 只自检「启用中」的源：停用的源本来就该被自动选源跳过，没必要替它耗一个探测预算
+    const enabled: SourceInfo[] = SourceEngine.getInstance().listSources();
+    if (enabled.length === 0) {
+      this.toast('没有启用中的音源，先启用一个再自检');
+      return;
+    }
+    if (SourceEngine.getInstance().hasPendingResolve()) {
+      this.toast('正在解析播放地址，等这一下结束再自检');
+      return;
+    }
+    this.checkCancelled = false;
+    this.checking = true;
+    this.checkDone = 0;
+    this.checkTotal = enabled.length;
+    this.checkCurrent = '';
+    this.status = '正在自检全部音源（会自动切换音源，结束后还原）…';
+    try {
+      const options: CheckupOptions = {
+        isCancelled: () => this.checkCancelled,
+        onProgress: (progress: CheckupProgress) => {
+          this.checkDone = progress.done;
+          this.checkTotal = progress.total;
+          this.checkCurrent = progress.current;
+        },
+      };
+      const report = await runSourceCheckup(options);
+      this.checkResults = loadCheckupResults();
+      this.lastCheckAt = report.checkedAt;
+      this.status = `${report.cancelled ? '自检已停止（结果不完整）' : '自检完成'}：${this.summaryText()}`
+        + `，耗时 ${Math.round(report.totalMs / 1000)} 秒`;
+      this.refreshSources();
+    } catch (e) {
+      this.status = `自检失败: ${(e as Error).message}`;
+    } finally {
+      this.checking = false;
+      this.checkCurrent = '';
+    }
+  }
+
+  private cancelCheckup(): void {
+    this.checkCancelled = true;
+    this.status = '正在停止自检（当前这个平台测完就停）…';
+  }
+
+  private toggleDisabled(item: SourceInfo): void {
+    if (this.checking) {
+      this.toast('自检进行中，等它结束再改启用状态');
+      return;
+    }
+    const disabled: boolean = item.disabled === true;
+    this.refreshSourcesFromList(SourceEngine.getInstance().setSourceDisabled(item.id, !disabled));
+    this.status = disabled ? `已启用「${item.name}」，下次播放就会重新参与选源` : `已停用「${item.name}」`;
+  }
+
+  private refreshSourcesFromList(list: SourceInfo[]): void {
+    this.sources = list;
+    const engine = SourceEngine.getInstance();
+    this.loadedId = engine.getLoadedSourceId();
+    this.supportedText = Object.keys(engine.getSupportedSources()).length > 0
+      ? Object.keys(engine.getSupportedSources()).map((p: string) => this.platformName(p)).join(' / ')
+      : '-';
+  }
+
+  // ------------------------------------------------------------ 检查更新
+
+  private async startUpdateCheck(): Promise<void> {
+    if (this.checkingUpdates || this.checking || this.busy) {
+      return;
+    }
+    const ids: string[] = this.sourcesWithUpdateUrl();
+    if (ids.length === 0) {
+      this.toast('这些音源都没有声明更新地址，无法自动检查（可在群里问作者要新版链接后重新导入）');
+      return;
+    }
+    this.checkingUpdates = true;
+    this.updates = [];
+    this.status = `正在检查 ${ids.length} 个音源的更新（并发 3）…`;
+    try {
+      const found: SourceUpdateInfo[] = await checkSourceUpdates(ids, (done: number, total: number) => {
+        this.status = `正在检查更新：${done}/${total}…`;
+      }, () => false);
+      const updates: SourceUpdateInfo[] = [];
+      let failed: number = 0;
+      for (const item of found) {
+        if (item.hasUpdate) {
+          updates.push(item);
+        } else if (item.error.length > 0) {
+          failed += 1;
+        }
+      }
+      this.updates = updates;
+      this.status = updates.length > 0
+        ? `发现 ${updates.length} 个音源有新版本${failed > 0 ? `（${failed} 个检查失败）` : ''}`
+        : `都是最新版本${failed > 0 ? `（${failed} 个检查失败，可能是更新地址打不开）` : ''}`;
+    } catch (e) {
+      this.status = `检查更新失败: ${(e as Error).message}`;
+    } finally {
+      this.checkingUpdates = false;
+    }
+  }
+
+  private updateOne(update: SourceUpdateInfo): void {
+    if (this.updating) {
+      return;
+    }
+    this.updating = true;
+    try {
+      const info: SourceInfo = applySourceUpdate(update);
+      const remains: SourceUpdateInfo[] = this.updates.filter((item: SourceUpdateInfo) => item.id !== update.id);
+      this.updates = remains;
+      this.refreshSources();
+      this.status = `已把「${info.name}」更新到 ${this.versionText(info.version)}（点「加载」后新脚本才生效）`;
+      this.toast(`已更新「${info.name}」`);
+    } catch (e) {
+      this.status = `更新「${update.name}」失败: ${(e as Error).message}（原音源未改动）`;
+    } finally {
+      this.updating = false;
+    }
+  }
+
+  private async updateAll(): Promise<void> {
+    if (this.updating || this.updates.length === 0) {
+      return;
+    }
+    this.updating = true;
+    const pending: SourceUpdateInfo[] = this.updates.slice();
+    let ok: number = 0;
+    let failed: number = 0;
+    try {
+      for (let i = 0; i < pending.length; i++) {
+        this.status = `正在更新音源：${i + 1}/${pending.length}…`;
+        try {
+          applySourceUpdate(pending[i]);
+          ok += 1;
+        } catch (e) {
+          failed += 1;
+          hilog.warn(DOMAIN, TAG, 'update source failed: %{public}s', (e as Error).message);
+        }
+      }
+      this.updates = [];
+      this.refreshSources();
+      this.status = `更新完成：成功 ${ok} 个${failed > 0 ? `，失败 ${failed} 个（原音源未改动）` : ''}`;
+    } finally {
+      this.updating = false;
+    }
   }
 
   private platformName(id: string): string {
@@ -151,6 +492,11 @@ export struct SourceSettingsView {
 
   private async importAndLoad(): Promise<void> {
     if (this.busy) {
+      return;
+    }
+    if (this.checking) {
+      // 自检正在把各个源依次装进同一个沙箱：这时候再导一个源会把它顶掉，两边结论都不可信
+      this.toast('自检进行中，等它结束再导入（或先点「停止自检」）');
       return;
     }
     const input: string = this.sourceInput.trim();
@@ -203,9 +549,38 @@ export struct SourceSettingsView {
     }
   }
 
+  /**
+   * 点卡片/「加载」：停用的源先启用再加载
+   *
+   * 停用只是「不参与自动选源」，不是「不能用」——用户明确点了它，就说明想用它，
+   * 这时候悄悄加载一个停用的源只会让人困惑（列表上还写着已停用，播放候选里又没有）。
+   */
+  private async loadOrEnable(item: SourceInfo): Promise<void> {
+    if (this.checking) {
+      this.toast('自检进行中，等它结束再切换音源');
+      return;
+    }
+    if (item.disabled === true) {
+      this.refreshSourcesFromList(SourceEngine.getInstance().setSourceDisabled(item.id, false));
+    }
+    await this.loadSource(item.id);
+  }
+
   private removeSource(id: string): void {
+    if (this.checking) {
+      this.toast('自检进行中，等它结束再删除音源');
+      return;
+    }
     const engine = SourceEngine.getInstance();
     this.sources = engine.removeSource(id);
+    // 自检结论也要跟着丢掉，否则删掉又新建同 id 的源时会显示上一份结论（虽然 id 不会重用）
+    const remains: SourceCheckupResult[] = [];
+    for (const item of this.checkResults) {
+      if (item.id !== id) {
+        remains.push(item);
+      }
+    }
+    this.checkResults = remains;
     this.status = '已删除该音源';
     this.refreshSources();
   }
@@ -457,12 +832,142 @@ export struct SourceSettingsView {
           Column({ space: 10 }) {
             this.sectionCard('已导入音源')
             Column({ space: 10 }) {
-              if (this.sources.length === 0) {
-                Text('还没有导入任何音源')
-                  .fontSize(F_SUB)
-                  .fontColor(C_TEXT_WEAK)
-                  .padding(16)
+              /**
+               * 顶部汇总 + 两个入口
+               *
+               * 「一键自检」要解决的就是群里那句「音源又不行了、你换一个试试」：
+               * 用户不需要知道哪个源今天还活着，跑一次就看到「N 个可用 / M 个失效」，
+               * 失效的直接停用就行（停用后自动选源不会再试它，见 SourceEngine.listSources）。
+               */
+              Column({ space: 8 }) {
+                Row() {
+                  Text(this.sources.length > 0 ? this.summaryText() : '还没有导入任何音源')
+                    .fontSize(F_SUB)
+                    .fontColor(C_TEXT_SUB)
+                    .layoutWeight(1)
+                    .textAlign(TextAlign.Start)
+                  if (this.lastCheckAt > 0 && !this.checking) {
+                    Text(`上次自检 ${this.shortTime(this.lastCheckAt)}`)
+                      .fontSize(F_TAB)
+                      .fontColor(C_TEXT_WEAK)
+                  }
+                }
+                .width('100%')
+
+                // 进度：自检会把音源逐个加载进沙箱，慢是正常的，所以必须看得见、停得掉
+                if (this.checking) {
+                  Progress({
+                    value: this.checkDone,
+                    total: this.checkTotal > 0 ? this.checkTotal : 1,
+                    type: ProgressType.Linear,
+                  })
+                    .width('100%')
+                    .height(4)
+                    .color(C_RED)
+                  Text(this.checkCurrent.length > 0
+                    ? `正在检查 ${Math.min(this.checkDone + 1, this.checkTotal)}/${this.checkTotal}：${this.checkCurrent}`
+                    : '正在准备…')
+                    .fontSize(F_TAB)
+                    .fontColor(C_TEXT_WEAK)
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                }
+
+                Row({ space: 10 }) {
+                  Button(this.checking ? '停止自检' : '一键自检')
+                    .fontSize(13)
+                    .height(36)
+                    .layoutWeight(1)
+                    .backgroundColor(this.checking ? C_RED_TINT : C_RED)
+                    .fontColor(this.checking ? C_RED : Color.White)
+                    .enabled(this.sources.length > 0 && !this.busy)
+                    .onClick(() => {
+                      if (this.checking) {
+                        this.cancelCheckup();
+                      } else {
+                        this.startCheckup();
+                      }
+                    })
+                  Button(this.checkingUpdates ? '检查中…' : '检查更新')
+                    .fontSize(13)
+                    .height(36)
+                    .layoutWeight(1)
+                    .backgroundColor(C_FILL_SOFT_STRONG)
+                    .fontColor(C_TEXT)
+                    .enabled(!this.checkingUpdates && !this.checking && !this.busy)
+                    .onClick(() => {
+                      this.startUpdateCheck();
+                    })
+                }
+                .width('100%')
+
+                // 没有更新地址时说明清楚：这不是按钮坏了，是脚本没提供地址
+                if (this.sources.length > 0 && this.sourcesWithUpdateUrl().length === 0) {
+                  Text('「检查更新」需要脚本声明更新地址（头部 @updateUrl，或运行时 showUpdateAlert）；'
+                    + '当前这些源都没有，拿到新版链接后重新导入即可覆盖旧版。')
+                    .fontSize(F_TAB)
+                    .fontColor(C_TEXT_WEAK)
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                }
               }
+              .width('100%')
+              .padding(12)
+              .borderRadius(R_CARD)
+              .backgroundColor(C_CARD)
+
+              // 有新版时的批量更新条
+              if (this.updates.length > 0) {
+                Column({ space: 6 }) {
+                  Row() {
+                    Text(`发现 ${this.updates.length} 个音源有新版本`)
+                      .fontSize(F_SUB)
+                      .fontColor(C_ICON_ORANGE)
+                      .layoutWeight(1)
+                      .textAlign(TextAlign.Start)
+                    Text(this.updating ? '更新中…' : '全部更新')
+                      .fontSize(F_SUB)
+                      .fontColor(C_RED)
+                      .padding({ left: 8, top: 2, bottom: 2 })
+                      .onClick(() => {
+                        this.updateAll();
+                      })
+                  }
+                  .width('100%')
+                  ForEach(this.updates, (update: SourceUpdateInfo) => {
+                    Row({ space: 8 }) {
+                      Column({ space: 2 }) {
+                        Text(update.name)
+                          .fontSize(13)
+                          .fontColor(C_TEXT)
+                          .width('100%')
+                          .textAlign(TextAlign.Start)
+                        Text(`${this.versionText(update.localVersion)} → ${this.versionText(update.remoteVersion)}`
+                          + `${update.note.length > 0 ? `　${update.note}` : ''}`)
+                          .fontSize(11)
+                          .fontColor(C_TEXT_WEAK)
+                          .width('100%')
+                          .textAlign(TextAlign.Start)
+                      }
+                      .layoutWeight(1)
+                      .alignItems(HorizontalAlign.Start)
+                      Text('更新')
+                        .fontSize(12.5)
+                        .fontColor(C_RED)
+                        .padding({ left: 8, right: 4, top: 4, bottom: 4 })
+                        .onClick(() => {
+                          this.updateOne(update);
+                        })
+                    }
+                    .width('100%')
+                  }, (update: SourceUpdateInfo) => `${update.id}_${update.remoteVersion}`)
+                }
+                .width('100%')
+                .padding(12)
+                .borderRadius(R_CARD)
+                .backgroundColor(C_RED_TINT)
+              }
+
               ForEach(this.sources, (item: SourceInfo) => {
                 Column({ space: 8 }) {
                   // 一条音源就是一张 HDS 列表卡：官方符号图标 + 名称/版本，
@@ -486,7 +991,7 @@ export struct SourceSettingsView {
                         : new SuffixArrow({ color: C_CHEVRON }),
                       cardHeight: 68,
                       onClick: () => {
-                        this.loadSource(item.id);
+                        this.loadOrEnable(item);
                       },
                     })
                   }
@@ -495,15 +1000,56 @@ export struct SourceSettingsView {
                   .backgroundColor(C_CARD)
                   .clip(true)
 
+                  /**
+                   * 状态行：可用/部分可用/失效 + 一句人话的原因
+                   *
+                   * 「失效」不是猜的：来自上一次自检（真实解析过播放地址），
+                   * 或者路由表里「连续两次失败」的既有口径。没有记录就写「未验证」，
+                   * 不硬猜一个结论吓人。
+                   */
+                  Row({ space: 6 }) {
+                    Text(this.verdictText(this.verdictOf(item)))
+                      .fontSize(10.5)
+                      .fontColor(this.verdictColor(this.verdictOf(item)))
+                      .backgroundColor(C_FILL_SOFT)
+                      .borderRadius(5)
+                      .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                    if (item.disabled === true) {
+                      Text('已停用')
+                        .fontSize(10.5)
+                        .fontColor(C_TEXT_WEAK)
+                        .backgroundColor(C_FILL_SOFT)
+                        .borderRadius(5)
+                        .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                    }
+                    Text(this.subtitleOf(item))
+                      .fontSize(11)
+                      .fontColor(C_TEXT_WEAK)
+                      .layoutWeight(1)
+                      .maxLines(2)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Center)
+
                   Row({ space: 10 }) {
-                    Button('加载')
+                    Button(item.disabled === true ? '启用并加载' : '加载')
                       .fontSize(13)
                       .height(34)
                       .layoutWeight(1)
                       .backgroundColor(C_FILL_SOFT_STRONG)
                       .fontColor(C_TEXT)
                       .onClick(() => {
-                        this.loadSource(item.id);
+                        this.loadOrEnable(item);
+                      })
+                    Button(item.disabled === true ? '启用' : '停用')
+                      .fontSize(13)
+                      .height(34)
+                      .layoutWeight(1)
+                      .backgroundColor(C_FILL_SOFT_STRONG)
+                      .fontColor(C_TEXT)
+                      .onClick(() => {
+                        this.toggleDisabled(item);
                       })
                     Button('删除')
                       .fontSize(13)
@@ -518,7 +1064,9 @@ export struct SourceSettingsView {
                   .width('100%')
                 }
                 .width('100%')
-              }, (item: SourceInfo) => item.id)
+                // 失效 / 停用的源整体压暗：一眼能分出「哪些别指望了」
+                .opacity(item.disabled === true || this.verdictOf(item) === VERDICT_DEAD ? 0.6 : 1)
+              }, (item: SourceInfo) => `${item.id}_${item.disabled === true ? 'off' : 'on'}_${this.verdictOf(item)}`)
             }
             .width('100%')
           }
@@ -705,6 +1253,10 @@ export struct SourceSettingsView {
    */
   private pickSourceFile(): void {
     if (this.busy) {
+      return;
+    }
+    if (this.checking) {
+      this.toast('自检进行中，等它结束再导入');
       return;
     }
     try {

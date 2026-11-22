@@ -11,7 +11,7 @@
 |---|---|---|---|
 | `bundleName` | `com.example.listen` | 必须是**你自有域名反写**的包名（如 `com.yourname.listen`）；`example` 段会被判为占位包名 | ❌ 待改（改完要重新签名、重新安装，本地数据会因包名变化而清空，需提前告知用户） |
 | `vendor` | `example` | 改成你的开发者/公司名 | ❌ 待改 |
-| `versionName` / `versionCode` | 1.0.7 / 1000007 | 每次上架必须递增 `versionCode` | ✅ 机制已就绪 |
+| `versionName` / `versionCode` | 1.0.10 / 1000010（2026-11-23 已升） | 每次上架必须递增 `versionCode`；**同版本号重打包会让 AppTest 判定「已是最新、无需更新」**（群反馈「新版本不需要更新」的根因） | ✅ 机制已就绪 |
 | 应用名称 | 资源里的「聆听」 | 名称不得含他人商标、不得与已上架应用重名 | ⚠️ 需在 AGC 查重 |
 | 图标 / 启动页 | `layered_image` / `startIcon` | 需提供 216×216 等规格；分层图标要合规 | ⚠️ 待确认素材齐全 |
 
@@ -21,6 +21,7 @@
 |---|---|---|---|
 | 签名证书 | `build-profile.json5` 里 `signingConfigs.default` 指向 `C:\Users\Lenovo\.ohos\config\default_listen_*.p12`（**调试证书**） | 在 AGC 申请发布证书 + 发布 Profile（.p7b），替换 `storeFile/certpath/profile` 三项 | ❌ 待做 |
 | 调试证书泄漏风险 | 调试密钥密码以密文写在仓库的 `build-profile.json5` 里 | 上架前把带真实密码的 `build-profile.json5` 从公开仓库移除或改成本地注入 | ⚠️ 建议处理（该文件当前含 `storePassword`/`keyPassword` 字段） |
+| **测试包有效期** | 测试签名 HAP 约 3 个月到期，到期后应用内弹「应用已过期」，必须卸载重装 | 发版节奏上要**在到期前重新出包**（当前口径：有改动就顺手升 versionCode）；关于页已有 FAQ 兜底 | ⚠️ 需人工盯（群反馈 11-17「应用已过期」） |
 
 ## 三、权限（module.json5 实况）
 

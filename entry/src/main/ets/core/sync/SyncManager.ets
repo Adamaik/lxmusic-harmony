@@ -6,6 +6,7 @@ import { initGzip } from './SyncGzip';
 import { defaultDeviceName, SyncConfig, SyncStore } from './SyncStore';
 import { SyncStatus } from './SyncTypes';
 import { PlaySession } from '../player/PlaySession';
+import { WebDavConfigSync } from '../webdav/WebDavConfigSync';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SyncManager';
@@ -93,6 +94,11 @@ export class SyncManager {
         hilog.warn(DOMAIN, TAG, 'auto connect failed: %{public}s', err.message);
       });
     }
+
+    // 网盘配置同步（WebDAV）：只登记生命周期与初始状态。这里不能读 WebDAV 账号 ——
+    // WebDavSettings 在 EntryAbility.onCreate 里比 SyncManager 晚初始化（见那边的顺序说明），
+    // 真正的自动化尝试发生在「回到前台 / 退到后台」时（见 WebDavConfigSync.registerLifecycle）。
+    WebDavConfigSync.getInstance().init(context);
   }
 
   isInited(): boolean {
@@ -193,6 +199,9 @@ export class SyncManager {
    * 前台恢复就自己补上，不用用户手动点重连。
    */
   async ensureConnected(): Promise<void> {
+    // 网盘配置同步的「启动 / 回前台」时机也挂在同一个点上（生命周期回调之外的第二层保险：
+    // 某些设备上 applicationContext 的 abilityLifecycle 回调不保证最先到）
+    WebDavConfigSync.getInstance().onAppResumed();
     if (!this.config.enable || this.config.host.length === 0) {
       return;
     }

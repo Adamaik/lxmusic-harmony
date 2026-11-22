@@ -12,6 +12,8 @@ const INDEX_FILE: string = 'sources.json';
 const ACTIVE_FILE: string = 'active_source.json';
 /** 音源切换记忆：哪个源在哪个平台成功过（见 SourceRouter） */
 const ROUTER_FILE: string = 'source_router.json';
+/** 上一次「一键自检」的结论（见 SourceCheckup） */
+const EXTRAS_FILE: string = 'source_checkup.json';
 
 export interface ActiveSource {
   id: string;
@@ -129,6 +131,10 @@ export class SourceStore {
   /**
    * 覆盖更新一个已存在的源：id 不变（播放列表/已加载引用不会失效），
    * 脚本正文与元信息都用新的，importedAt 刷新。
+   *
+   * `disabled` 与运行期记下的 `updateUrl` 不在新解析出来的元信息里，
+   * 但它们是用户/脚本给出的、与「这一版脚本内容」无关的状态，覆盖时要原样带过去：
+   * 不带的话，重复导入一次就会把用户停用过的源悄悄启用回来。
    */
   replace(id: string, info: SourceInfo, script: string): SourceInfo {
     const list: SourceInfo[] = this.list();
@@ -143,8 +149,12 @@ export class SourceStore {
           version: info.version,
           author: info.author,
           homepage: info.homepage,
+          updateUrl: (info.updateUrl !== undefined && info.updateUrl.length > 0)
+            ? info.updateUrl
+            : (item.updateUrl !== undefined ? item.updateUrl : ''),
           allowShowUpdateAlert: info.allowShowUpdateAlert,
           importedAt: Date.now(),
+          disabled: item.disabled === true,
         };
         next.push(updated);
       } else {
@@ -154,6 +164,50 @@ export class SourceStore {
     this.saveScript(id, script);
     this.saveIndex(next);
     return updated;
+  }
+
+  /** 改「启用/停用」状态；音源不存在时返回 false */
+  setDisabled(id: string, disabled: boolean): boolean {
+    const list: SourceInfo[] = this.list();
+    let found: boolean = false;
+    for (const item of list) {
+      if (item.id === id) {
+        item.disabled = disabled;
+        found = true;
+      }
+    }
+    if (found) {
+      this.saveIndex(list);
+    }
+    return found;
+  }
+
+  /**
+   * 记下脚本运行时自报的更新地址（`lx.send('showUpdateAlert', { updateUrl })`）
+   *
+   * 返回 true = 地址**确实变了**并已写盘。脚本每次加载都可能发这句话，
+   * 地址没变就不重写索引文件、也不重复刷日志。
+   */
+  setUpdateUrl(id: string, url: string): boolean {
+    if (url.length === 0) {
+      return false;
+    }
+    const list: SourceInfo[] = this.list();
+    let changed: boolean = false;
+    for (const item of list) {
+      if (item.id !== id) {
+        continue;
+      }
+      const current: string = item.updateUrl !== undefined ? item.updateUrl : '';
+      if (current !== url) {
+        item.updateUrl = url;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.saveIndex(list);
+    }
+    return changed;
   }
 
   remove(ids: string[]): SourceInfo[] {
@@ -273,6 +327,51 @@ export class SourceStore {
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to save router state: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  // ------------------------------------------------------------ 自检结果
+
+  private extrasPath(): string {
+    return `${this.dir}/${EXTRAS_FILE}`;
+  }
+
+  /**
+   * 读「上一次一键自检的结果」（见 SourceCheckup）
+   *
+   * 和路由记忆一样：读不到 / 解析失败都返回空串，坏了就当没自检过。
+   * 这份缓存只是「进页面就能看到上次结论」，绝不能因为它把音源设置页带崩。
+   */
+  loadExtras(): string {
+    if (!this.ready) {
+      return '';
+    }
+    try {
+      const path: string = this.extrasPath();
+      if (!fs.accessSync(path)) {
+        return '';
+      }
+      return fs.readTextSync(path);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to read checkup state: %{public}s', JSON.stringify(e));
+      return '';
+    }
+  }
+
+  /** 写自检结果；写失败只记日志（下次自检会再写一次） */
+  saveExtras(json: string): void {
+    if (!this.ready) {
+      return;
+    }
+    try {
+      const file = fs.openSync(this.extrasPath(), fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, json);
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to save checkup state: %{public}s', JSON.stringify(e));
     }
   }
 }

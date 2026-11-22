@@ -38,6 +38,28 @@ export interface SourceRoute {
   lastError: string;
 }
 
+/**
+ * 一个音源跨平台的历史汇总（**只读视图**，给音源设置页显示用，见 healthOf）
+ *
+ * 不参与排序决策：排序只看 candidates() 里那套「失败次数 + 最近成功」的口径。
+ * 这里多出来的字段（上次失败在哪个平台、报的什么错）是给人看的线索，
+ * 让用户知道「到底哪个平台不行了」，而不是看到一个笼统的「不可用」。
+ */
+export interface SourceHealth {
+  /** 任意平台最后一次成功的时刻（0 = 从没成功过） */
+  lastOkAt: number;
+  /** 最近一次失败的时刻 */
+  lastFailAt: number;
+  /** 各平台里最大的连续失败次数 */
+  failStreak: number;
+  /** 最近一次失败的报错短语（可能为空） */
+  lastError: string;
+  /** 最近一次失败发生在哪个平台（空串 = 没有失败记录） */
+  failedPlatform: string;
+  /** 已知声明支持的平台 */
+  platforms: string[];
+}
+
 interface RouterFile {
   version: number;
   /** 平台 id -> 该平台的路由表 */
@@ -250,6 +272,55 @@ export class SourceRouter {
       }
     }
     return 0;
+  }
+
+  /** 这个源已知声明支持哪些平台（从没成功加载过就是空数组） */
+  platformsOf(id: string): string[] {
+    const platforms: string[] | undefined = this.caps.get(id);
+    return platforms !== undefined ? platforms : [];
+  }
+
+  /**
+   * 汇总一个源的路由历史（**只读**，不产生任何记账）
+   *
+   * 音源设置页要显示「最后成功时间 / 失败了几次 / 上次为什么失败」，这些恰恰都在
+   * 路由表里，但原来只有 `failStreakOf(id, platform)` 这种按平台的问法，
+   * 界面得把 6 个平台都问一遍再自己挑。这里加一个跨平台的只读视图，
+   * 排序与降级规则仍然只在 candidates() 里，别处不重复实现一套。
+   */
+  healthOf(id: string): SourceHealth {
+    let lastOkAt: number = 0;
+    let lastFailAt: number = 0;
+    let failStreak: number = 0;
+    let lastError: string = '';
+    let failedPlatform: string = '';
+    this.routes.forEach((routes: SourceRoute[], platform: string) => {
+      for (const route of routes) {
+        if (route.id !== id) {
+          continue;
+        }
+        if (route.lastOkAt > lastOkAt) {
+          lastOkAt = route.lastOkAt;
+        }
+        if (route.lastFailAt > lastFailAt) {
+          lastFailAt = route.lastFailAt;
+          lastError = route.lastError;
+          failedPlatform = platform;
+        }
+        if (route.failStreak > failStreak) {
+          failStreak = route.failStreak;
+        }
+      }
+    });
+    const health: SourceHealth = {
+      lastOkAt: lastOkAt,
+      lastFailAt: lastFailAt,
+      failStreak: failStreak,
+      lastError: lastError,
+      failedPlatform: failedPlatform,
+      platforms: this.platformsOf(id),
+    };
+    return health;
   }
 
   // ---------------------------------------------------------------- 写

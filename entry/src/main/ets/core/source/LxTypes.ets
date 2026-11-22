@@ -14,13 +14,22 @@
  */
 export type LxQuality = '128k' | '320k' | 'flac' | 'flac24bit' | 'hires' | 'atmos' | 'atmos_plus' | 'master';
 
-/** 源脚本头部注释里声明的元信息（@name / @description / @version / @author / @homepage） */
+/** 源脚本头部注释里声明的元信息（@name / @description / @version / @author / @homepage / @updateUrl） */
 export interface SourceMeta {
   name: string;
   description: string;
   version: string;
   author: string;
   homepage: string;
+  /**
+   * 脚本自己声明的更新地址
+   *
+   * 洛雪官方头部字段里**没有**这一项（见 LxMetadata 的说明），但有一部分第三方源会在
+   * 头部额外写 `@updateUrl https://.../latest.js`，也有源只在运行时通过
+   * `lx.send('showUpdateAlert', { updateUrl })` 报一次。两处都收进这个字段，
+   * 「检查更新」才有地址可拉（见 SourceCheckup）。
+   */
+  updateUrl: string;
 }
 
 /** 已导入的音源 */
@@ -28,6 +37,14 @@ export interface SourceInfo extends SourceMeta {
   id: string;
   allowShowUpdateAlert: boolean;
   importedAt: number;
+  /**
+   * 已被用户停用
+   *
+   * 停用只影响「能不能被自动选中」：`SourceEngine.listSources()` 只返回启用的源，
+   * 播放/下载的换源候选自然就不含它；脚本正文、设置页里的条目都照旧保留，
+   * 想用回来点一下「启用」即可（见 SourceSettingsView 的失效源快捷操作）。
+   */
+  disabled?: boolean;
 }
 
 /** 源脚本在 lx.send('inited') 中声明的单个平台能力 */

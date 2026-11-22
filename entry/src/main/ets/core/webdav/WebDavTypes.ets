@@ -38,6 +38,15 @@ export interface WebDavConfig {
   password: string;
 }
 
+/**
+ * 配置同步在网盘上的默认目录名（相对服务器地址）
+ *
+ * 放在这个叶子模块里而不是 WebDavConfigData：WebDavSettings 也要用它当默认值，
+ * 而 WebDavSettings 不能引 WebDavConfigData（那条路会经 LocalLibrary / PlaySession
+ * 绕回来形成循环依赖）。
+ */
+export const CONFIG_SYNC_DEFAULT_DIR: string = 'listen-config';
+
 /** 一个 PROPFIND 响应（服务器上的一个条目） */
 export interface WebDavEntry {
   /**

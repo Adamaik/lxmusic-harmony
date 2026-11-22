@@ -383,8 +383,89 @@ export class SourceEngine {
     return this.importSource(script);
   }
 
+  /**
+   * 已启用的音源（**播放/下载的候选集合**）
+   *
+   * 停用的源不在这里出现：换源候选来自这个方法（见 SourceFailover / DownloadFailover），
+   * 所以「停用」就等于「不参与自动选源」，不用改编排逻辑一行。
+   * 设置页要看全部（含停用的），用 listAllSources()。
+   */
   listSources(): SourceInfo[] {
+    const all: SourceInfo[] = this.store.list();
+    const enabled: SourceInfo[] = [];
+    for (const item of all) {
+      if (item.disabled !== true) {
+        enabled.push(item);
+      }
+    }
+    return enabled;
+  }
+
+  /** 全部音源（含用户停用的），音源设置页用 */
+  listAllSources(): SourceInfo[] {
     return this.store.list();
+  }
+
+  /**
+   * 停用 / 启用一个音源
+   *
+   * 只改一个标记位：脚本、元信息、路由记忆全都保留。停用不动路由表（那是「在哪成功过」
+   * 的客观记录），所以重新启用之后它原来的可信度还在，不用从头再观察一遍。
+   */
+  setSourceDisabled(id: string, disabled: boolean): SourceInfo[] {
+    const changed: boolean = this.store.setDisabled(id, disabled);
+    if (changed) {
+      this.pushLog('info', `${disabled ? '已停用' : '已启用'}音源：${id}`);
+    }
+    return this.store.list();
+  }
+
+  /** 读一个音源的脚本正文（检查更新时用来和新脚本比对） */
+  readSourceScript(id: string): string {
+    try {
+      return this.store.getScript(id);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /**
+   * 用一段新脚本**原地替换**一个已存在的音源（检查更新后「更新」用）
+   *
+   * 为什么不用 importSource：它的去重键是「名字+版本+作者」，新版本号一变就被当成
+   * 另一个音源，于是列表里会同时留着旧版和新版 —— 用户还得自己删掉旧的那条。
+   * 这里保持 id 不变（列表里就一条，路由记忆也按 id 索引），脚本正文与元信息换成新的。
+   *
+   * 路由记忆必须清掉：脚本换了内容等于换了一套后端，它上次声明支持哪些平台、
+   * 在哪些平台成功过都不该继续沿用（与 importSource 覆盖更新时同一口径）。
+   */
+  replaceSourceScript(id: string, script: string): SourceInfo {
+    if (!this.prepared) {
+      throw new Error('SourceEngine 未初始化，请先调用 prepare(context)');
+    }
+    if (script.length > MAX_SCRIPT_SIZE) {
+      throw new Error('源脚本过大（超过 9MB）');
+    }
+    const existing: SourceInfo | null = this.store.find(id);
+    if (existing === null) {
+      throw new Error(`音源不存在：${id}`);
+    }
+    const info: SourceInfo = buildSourceInfo(script);
+    const updated: SourceInfo = this.store.replace(id, info, script);
+    SourceRouter.getInstance().forget([id]);
+    this.pushLog('info', `已更新音源：${updated.name} ${updated.version} [${id}]`);
+    return updated;
+  }
+
+  // ------------------------------------------------------------ 自检结果
+
+  /** 上一次「一键自检」的原始 JSON（见 SourceCheckup；读不到返回空串） */
+  loadCheckupState(): string {
+    return this.store.loadExtras();
+  }
+
+  saveCheckupState(json: string): void {
+    this.store.saveExtras(json);
   }
 
   removeSource(id: string): SourceInfo[] {
@@ -725,6 +806,7 @@ export class SourceEngine {
         version: info.version,
         author: info.author,
         homepage: info.homepage,
+        updateUrl: info.updateUrl ?? '',
       },
     };
     await this.callJs(`window.__lx_bootstrap__ = ${JSON.stringify(boot)};`);
@@ -1248,6 +1330,17 @@ export class SourceEngine {
       const data = JSON.parse(dataJson) as UpdateAlertData;
       const name: string = data.name !== undefined ? data.name : '';
       const log: string = data.log !== undefined ? data.log : '';
+      const updateUrl: string = data.updateUrl !== undefined ? data.updateUrl : '';
+      // 脚本自报的更新地址要留下来：这是「检查更新」唯一的地址来源
+      // （洛雪头部字段里没有 updateUrl，见 LxMetadata）。记在**当前加载的源**名下，
+      // 因为这条消息只会由正在跑的脚本发出。
+      const loadedId: string = this.loadedSourceId;
+      if (updateUrl.length > 0 && loadedId.length > 0) {
+        const changed: boolean = this.store.setUpdateUrl(loadedId, updateUrl);
+        if (changed) {
+          this.pushLog('log', `已记下音源「${name.length > 0 ? name : loadedId}」的更新地址，可在音源设置里检查更新`);
+        }
+      }
       this.pushLog('warn', `音源 ${name} 有更新提示：${log}`, true);
     } catch (e) {
       // ignore
