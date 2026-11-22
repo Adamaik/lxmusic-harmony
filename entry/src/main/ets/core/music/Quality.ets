@@ -70,6 +70,83 @@ function qualityUsable(quality: string, available: string[], supported: string[]
 export const LOCAL_QUALITY_MARK: string = 'local';
 export const CLOUD_QUALITY_MARK: string = 'webdav';
 
+/**
+ * 完整音质阶梯（从高到低）：拓展档在上，普通档在下
+ *
+ * 顺序取自「拓展档高于 24Bit，24Bit 高于 FLAC…」这一条产品口径，
+ * 与 {@link MAIN_ORDER} / {@link EXTENDED_ORDER} 是同一套档位，只是排成一条可逐级下退的梯子。
+ * 除了 {@link lowerQuality} 逐级下退，{@link qualityFallbackNote} 也用它判断
+ * 「实际档位是不是真的比目标档低」——两处必须用同一份顺序，所以提到文件靠上的位置。
+ */
+const QUALITY_LADDER: string[] = [
+  'master', 'atmos_plus', 'atmos', 'hires', 'flac24bit', 'flac', '320k', '128k',
+];
+
+/**
+ * 本次**实际生效**的音质档（AppStorage key）
+ *
+ * 为什么要跟 `K_CURRENT_QUALITY` 分开：
+ *   - `K_CURRENT_QUALITY`（PlaySession 里那个）是「这一次按哪一档去要地址」，
+ *     它在解析**开始之前**就写进去了 —— 本质上是**目标档**：可能因为音源没声明、
+ *     会员没权限、换源、容器解不了而降档，真正放出声的那一档更低；
+ *   - 这里是「地址真的拿到了、播放器真的在放」的那一档，只在解析成功 / 降档成功 /
+ *     改走本地缓存这些**落定**的时刻写。
+ * 界面按它显示，才不会出现「设置里选了母带、其实在放 FLAC」的困惑
+ * （群反馈 2026-11-18 22:07、11-19 09:28 / 15:24）。
+ *
+ * 取值口径与 `K_CURRENT_QUALITY` 完全一致：真档位字符串，或 local / webdav 标记。
+ * 空串 = 这一首还没解析出结果（界面退回当前档显示，不要显示成空白）。
+ */
+export const K_ACTUAL_QUALITY: string = 'ps_actual_quality';
+
+/**
+ * 用户设置里的「目标档位」
+ *
+ * 开了拓展音质就是选的那一档（母带 / 全景声+ …），否则是「播放音质」那档。
+ * 它是**设置项**的当前值，与正在放的那一首无关（每首歌能协商到的档不一样）。
+ */
+export function targetQuality(): string {
+  const settings = PlaySettings.getInstance();
+  return settings.isExtendQuality() ? settings.getExtendQualityType() : settings.getQuality();
+}
+
+/**
+ * 界面上该显示的那一档
+ *
+ * 实际生效的优先；还没解析出来（空串，比如刚切歌、还在取地址）时退回当前档，
+ * 免得音质钮在一瞬间变成空白。
+ */
+export function displayQuality(actual: string, current: string): string {
+  return actual.length > 0 ? actual : current;
+}
+
+/**
+ * 「实际档位低于用户设置的目标档位」时的一句轻提示，例如「源不支持 母带」
+ *
+ * 什么时候返回空串（也就是不提示）：
+ *   - 实际 / 目标有一个还没确定；
+ *   - 两者相同；
+ *   - 本地 / 云端文件（音质由文件本身决定，谈不上「支不支持」）；
+ *   - 认不出的档，或实际并不比目标低（用户自己往下切过档，设置已经跟着改了）。
+ *
+ * 只作为**面板里的一行小字**用：降档本身不弹 toast（那是骚扰），用户主动点开
+ * 音质面板时才解释一句就够。
+ */
+export function qualityFallbackNote(actual: string, target: string): string {
+  if (actual.length === 0 || target.length === 0 || actual === target) {
+    return '';
+  }
+  if (isFileQuality(actual) || isFileQuality(target)) {
+    return '';
+  }
+  const actualIndex: number = QUALITY_LADDER.indexOf(actual);
+  const targetIndex: number = QUALITY_LADDER.indexOf(target);
+  if (actualIndex < 0 || targetIndex < 0 || actualIndex <= targetIndex) {
+    return '';
+  }
+  return `源不支持 ${qualityLabel(target)}`;
+}
+
 export function isExtendedQuality(quality: string): boolean {
   return EXTENDED_ORDER.includes(quality);
 }
@@ -241,16 +318,6 @@ export function fallbackQuality(musicInfoJson: string, source: string, used: str
   }
   return '';
 }
-
-/**
- * 完整音质阶梯（从高到低）：拓展档在上，普通档在下
- *
- * 顺序取自「拓展档高于 24Bit，24Bit 高于 FLAC…」这一条产品口径，
- * 与 {@link MAIN_ORDER} / {@link EXTENDED_ORDER} 是同一套档位，只是排成一条可逐级下退的梯子。
- */
-const QUALITY_LADDER: string[] = [
-  'master', 'atmos_plus', 'atmos', 'hires', 'flac24bit', 'flac', '320k', '128k',
-];
 
 /**
  * 降一档：返回**严格低于** `used`、且「这首歌 + 这个源」能用的第一个档；没有就返回空串

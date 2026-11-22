@@ -1,13 +1,17 @@
 import { LengthMetrics } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { connection } from '@kit.NetworkKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { K_CURRENT_ID, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem,
   songFromSearch } from '../core/player/PlaySession';
-import { getPlaylistDetailAll, LxListDetail, PlaylistDetailProgress } from '../core/music/MusicList';
+import { getPlaylistDetailAll, LxListDetail, PlaylistDetailProgress,
+  playlistDetailTruncated } from '../core/music/MusicList';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 // AddMusicResult：加歌的返回值从「加进去几首」改成了 { added, skipped }，要显式标类型
 // DuplicateGroup：「检查重复歌曲」扫出来的分组（保留哪一首由库里的 keepId 定）
-import { AddMusicResult, DuplicateGroup } from '../core/sync/LocalLibrary';
+// PlaylistSyncResult：「跟随源歌单」对齐的结果（+几 / -几，以及是否因没拉全而放弃）
+import { AddMusicResult, DuplicateGroup, PlaylistSyncResult } from '../core/sync/LocalLibrary';
 import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM,
   F_SUB } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_CLOSE, I_DOWNLOAD, I_MORE, I_MORE_CIRCLE, I_PLAY_CIRCLE, I_SEARCH,
@@ -31,6 +35,9 @@ import { isWebDavSong } from '../core/webdav/WebDavLibrary';
 
 /** 页内悬浮迷你播放条的离底距离：与壳层那条 HdsTabs 悬浮栏同一个口径 */
 const PAGE_BAR_BOTTOM_GAP: number = 10;
+/** 日志域 / 标签（只在「跟随源歌单」失败时留一条日志，不给用户弹错） */
+const DOMAIN: number = 0x0001;
+const TAG: string = 'PlaylistDetailView';
 /**
  * 悬浮栏底下那层渐隐蒙版：色值与高度都取壳层 `gradientMask` 的那组
  *
@@ -121,6 +128,13 @@ export struct PlaylistDetailView {
   /** 正在「从原歌单更新」：按钮禁用，避免连点重复拉取 */
   @State updating: boolean = false;
   /**
+   * 这一页还在不在（自动同步是后台任务，用户可能在拉取途中就退出了）
+   *
+   * 退出后**不能再碰本页 @State、也不能 showToast**：UIContext 已经释放，弹提示会抛错。
+   * 数据那边不用救 —— LocalLibrary 在拉取完成时已经落盘并镜像过，下次打开歌单自然读到新数据。
+   */
+  private pageAlive: boolean = true;
+  /**
    * 多选（长按任意一行进）
    *
    * 进去后点行 = 勾选，行尾的爱心 / 更多换成勾选圈；工具条不画在页里 ——
@@ -174,7 +188,15 @@ export struct PlaylistDetailView {
     this.selecting = false;
     this.selectedIds = [];
     SelectSession.getInstance().end();
+    // 组件实例可能被复用：上一次退出时置过 false，这里必须拉回来
+    this.pageAlive = true;
+    // 同理，「正在更新」的标记也要归零：上一次那条请求如果是在页面退出时被放弃的，
+    // 这个实例复用时不能一直卡在「正在更新…」而让菜单里那一项点不动
+    this.updating = false;
     this.refresh();
+    // 打开就从原歌单对齐一次（有 sourceListId 的导入歌单才做；节流 / 防重入在库里）。
+    // 不 await：页面先按本地数据画出来，网络那一路在后台跑，慢也不会白屏。
+    void this.autoSyncFromSource();
   }
 
   private refresh(): void {
@@ -659,6 +681,8 @@ export struct PlaylistDetailView {
 
   /** 页面被弹掉时把工具条一起收走（不然它会留在下一层页面上） */
   aboutToDisappear(): void {
+    // 后台同步还可能在跑：标记一下，回来时不再对本页 @State / UIContext 做任何事
+    this.pageAlive = false;
     SelectSession.getInstance().end();
   }
 
@@ -1389,52 +1413,166 @@ export struct PlaylistDetailView {
   }
 
   /**
-   * 从原歌单更新：重新拉一遍线上歌单，整表替换本地这张
+   * 从原歌单更新（手动入口）：**立即强制对齐一次**，不受 10 分钟节流限制
    *
    * 群反馈（2026-11-17 13:38，StarFlame）：「lx 有这个功能（跟着原歌单更新）」，
-   * 群主答「行，我加上」。落点复用导入链路：`LocalLibrary.importPlaylist` 对同一张线上歌单
-   * 本来就是**原地更新**（同一个 source + sourceListId 落到同一条本地歌单），
-   * 所以这里只要重新拉全量歌曲再喂给它。
+   * 群主答「行，我加上」。落点与「打开歌单时的自动对齐」是同一条链路
+   * （{@link runSourceSync} + `LocalLibrary.syncWithSource`），只是这里 manual = true：
+   * 过程与结果都要给回执，用户点了钮不能看起来没反应。
    *
-   * 语义按洛雪来：以线上为准整表替换（本地手动加的歌会被覆盖，这是「更新」的应有之义）；
-   * 拉不到 / 线上空了就保持原样并提示，绝不用空结果覆盖用户数据。
+   * 与老版的区别：不再拿整表覆盖（importPlaylist）。对齐口径能区分「源里删了」与
+   * 「本地手动加的歌 / 本地歌 / 云端歌」，老版整表替换会把它们一起冲掉。
    */
   private async updateFromSource(): Promise<void> {
-    const library = SyncManager.getInstance().getLibrary();
-    const source: string = library.playlistSourceOf(this.playlistId);
-    const sourceListId: string = library.sourceListIdOf(this.playlistId);
-    if (source.length === 0 || sourceListId.length === 0) {
+    if (!this.canUpdateFromSource()) {
       this.toast('这张歌单不是从线上导入的，没有可更新的来源');
       return;
     }
-    this.updating = true;
-    const name: string = this.title;
+    await this.runSourceSync(true);
+  }
+
+  // ------------------------------------------------------------ 跟随源歌单
+
+  /**
+   * 打开歌单时：距上次同步够久、有网，就在后台静默对齐一次
+   *
+   * 群反馈（2026-11-20 15:19，CharlotteZero）要的是「打开一次同步一次」（多就加、少就删），
+   * 所以触发点只有 aboutToAppear 这一处：**不做定时器、不做后台轮询** —— 用户不打开歌单
+   * 就不联网，也就不会因为轮询被平台风控。
+   */
+  private async autoSyncFromSource(): Promise<void> {
+    if (!this.canUpdateFromSource() || this.updating) {
+      return;
+    }
+    const library = SyncManager.getInstance().getLibrary();
+    if (!library.shouldSyncToSource(this.playlistId)) {
+      return;
+    }
+    if (!this.networkLikelyAvailable()) {
+      return;
+    }
+    await this.runSourceSync(false);
+  }
+
+  /**
+   * 网络是否可用（粗判，只用来省掉「离线时必然失败」的那一次请求）
+   *
+   * `connection.hasDefaultNetSync()` 需要 ohos.permission.GET_NETWORK_INFO，本应用目前
+   * 只声明了 INTERNET：没有该权限时这个调用可能抛 201，那就当「不知道」按可用处理 ——
+   * 真离线时 getPlaylistDetailAll 会很快失败，由 runSourceSync 的 catch 静默吃掉。
+   * 为一个预判去加一条权限不划算。
+   */
+  private networkLikelyAvailable(): boolean {
     try {
-      this.toast('正在从原歌单拉取最新内容…');
-      // 不把进度写进 title：title 是这张歌单的名字，导入时还要用它
+      return connection.hasDefaultNetSync();
+    } catch (e) {
+      return true;
+    }
+  }
+
+  /**
+   * 回源对齐一次（自动与手动共用）
+   *
+   * @param manual true = 用户点「从原歌单更新」：过程与结果都要提示；
+   *               false = 打开歌单时的自动对齐：只有真的改了才轻提示一句，失败全静默。
+   *
+   * 失败 / 无差异 / 没拉全都不打断浏览：这里的 catch 只写日志，绝不让网络问题变成弹窗。
+   */
+  private async runSourceSync(manual: boolean): Promise<void> {
+    const library = SyncManager.getInstance().getLibrary();
+    const listId: string = this.playlistId;
+    const source: string = library.playlistSourceOf(listId);
+    const sourceListId: string = library.sourceListIdOf(listId);
+    if (source.length === 0 || sourceListId.length === 0) {
+      if (manual) {
+        this.toast('这张歌单不是从线上导入的，没有可更新的来源');
+      }
+      return;
+    }
+    if (this.updating) {
+      return;
+    }
+    // 防重入（按歌单、跨入口）：自动对齐与手动更新同时跑会各自拿旧快照互相覆盖
+    if (!library.beginSyncToSource(listId)) {
+      if (manual) {
+        this.toast('这张歌单正在同步，稍候');
+      }
+      return;
+    }
+    if (manual && !this.networkLikelyAvailable()) {
+      library.endSyncToSource(listId);
+      this.toast('当前没有网络，稍后再试');
+      return;
+    }
+    this.updating = true;
+    try {
+      if (manual) {
+        this.toast('正在从原歌单拉取最新内容…');
+      }
       const detail: LxListDetail = await getPlaylistDetailAll(source, sourceListId);
+      if (playlistDetailTruncated(detail)) {
+        // 只拿到一部分：按半份源歌单对齐会误删，整体放弃（本地一个字都不动）
+        hilog.warn(DOMAIN, TAG, 'source list truncated: %{public}d/%{public}d',
+          detail.list.length, detail.total);
+        if (manual && this.pageAlive) {
+          this.toast('原歌单没拉全（可能被接口限流），已保留本地内容');
+        }
+        return;
+      }
       const quality: string = PlaySession.getInstance().quality;
       const items: SongItem[] = [];
       for (const music of detail.list) {
         items.push(songFromSearch(music, quality));
       }
       if (items.length === 0) {
-        this.toast('原歌单现在是空的，已保留本地内容');
+        if (manual && this.pageAlive) {
+          this.toast('原歌单现在是空的，已保留本地内容');
+        }
         return;
       }
-      const summary: PlaylistSummary | null = library.importPlaylist(name, source,
-        sourceListId, items);
-      if (summary === null) {
-        this.toast('更新失败：没有可导入的歌曲');
+      const result: PlaylistSyncResult = library.syncWithSource(listId, items);
+      if (result.aborted) {
+        if (manual && this.pageAlive) {
+          this.toast('原歌单变化太大，这次先不同步（可能是接口没返回全）');
+        }
+        return;
+      }
+      if (!result.changed) {
+        // 无差异：不打扰。手动点的那次还是要给回执，否则看起来像没反应
+        if (manual && this.pageAlive) {
+          this.toast('已是最新，和原歌单一致');
+        }
+        return;
+      }
+      // 用户已经退出这一页：只是别再碰本页状态 / 弹提示。
+      // 数据那边已经由 LocalLibrary 落盘并镜像过，下次打开歌单自然读到新数据。
+      if (!this.pageAlive) {
         return;
       }
       this.refresh();
-      this.toast(`已从原歌单更新：共 ${summary.count} 首`);
+      this.toast(this.syncSummary(result));
     } catch (e) {
-      this.toast(`更新失败：${(e as Error).message}`);
+      // 拉取失败：浏览照常。手动那次要给用户一个交代，自动那次只留日志
+      hilog.warn(DOMAIN, TAG, 'sync from source failed: %{public}s', (e as Error).message);
+      if (manual && this.pageAlive) {
+        this.toast(`更新失败：${(e as Error).message}`);
+      }
     } finally {
+      library.endSyncToSource(listId);
       this.updating = false;
     }
+  }
+
+  /** 同步结果的轻提示文案：`已与源歌单同步：+3 / -1`（某一侧为 0 就不写它） */
+  private syncSummary(result: PlaylistSyncResult): string {
+    const parts: string[] = [];
+    if (result.added > 0) {
+      parts.push(`+${result.added}`);
+    }
+    if (result.removed > 0) {
+      parts.push(`-${result.removed}`);
+    }
+    return `已与源歌单同步：${parts.join(' / ')}`;
   }
 
   /**

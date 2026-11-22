@@ -9,8 +9,10 @@ import { mediaKeyOf } from '../music/MediaCache';
 import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
 import { PlaySettings } from '../settings/PlaySettings';
 import { SourceEngine } from '../source/SourceEngine';
+import { SourceRouter } from '../source/SourceRouter';
 import { FailoverOutcome, resolveUrlWithSourceFailover } from '../source/SourceFailover';
 import { DownloadSettings } from './DownloadSettings';
+import { DownloadFailover, isDeadAddressFailure } from './DownloadFailover';
 import { DownloadTagData, collectDownloadTags, tagSummary } from './DownloadTags';
 import { AutoDownloadSong, clearDownloadedFiles, downloadedFile, removeDownloadedFile,
   setAutoDownloadHandler, setDownloadedFile } from './DownloadIndex';
@@ -86,6 +88,13 @@ const STALL_CHECK_MS: number = 5000;
  * 明确被拒的（链接过期也会给 403/404）不重试 —— 那只会白跑一遍。
  */
 const MAX_RETRY: number = 1;
+/**
+ * 一次下载最多走几轮「解析 + 拉流」的硬保险
+ *
+ * 正常轮数由 `DownloadFailover.canSwitch` 管着（最多 3 个音源），这里只是万一那套判断
+ * 被改坏时的兜底 —— 换源绝不能变成无限循环，一个任务能占着并发位把音源轮着扫。
+ */
+const MAX_ATTEMPT_ROUNDS: number = 4;
 
 /** 音质 -> 扩展名（拿不到链接后缀时用） */
 const EXT_BY_QUALITY: Record<string, string> = {
@@ -156,6 +165,20 @@ export interface DownloadItem {
   auto: boolean;
   /** 已经自动重试过几次（见 MAX_RETRY）：到上限就不再自动重试，等用户手点 */
   retries: number;
+  /**
+   * 已经换源重试过几次（见 DownloadFailover）
+   *
+   * 与 `retries` 分开记：`retries` 是「同一个源再来一次」（网络抖动），这里是
+   * 「换一个源再来一次」（这个源给的地址下不动）。列表里显示成「已换源重试 N 次」。
+   */
+  failovers: number;
+  /**
+   * 本次已经判定「下不动」的音源 id
+   *
+   * 落盘保存：自动重试再跑一遍时据此排除它们，不然又会从废掉的源开始
+   * （同一批接口出来的链接寿命一样长）。用户手点「重新下载」时才清空。
+   */
+  triedSources: string[];
   createdAt: number;
 }
 
@@ -198,6 +221,16 @@ interface DownloadIndexData {
 }
 
 const INDEX_VERSION: number = 1;
+
+/**
+ * 一次「打开保存位置 + 拉流落盘」的结论
+ *
+ *   - `done`         成功；
+ *   - `finished`     已经有最终结果（失败 / 取消 / 延后到前台），调用方不要再动这个任务；
+ *   - `retry-source` 这个音源给的地址下不动（404 / 4xx / 拉流失败 / 停滞），
+ *                    且还有别的源可换 —— 调用方换源后从解析开始重来。
+ */
+type AttemptVerdict = 'done' | 'finished' | 'retry-source';
 
 /**
  * 下载记录的唯一键
@@ -269,6 +302,41 @@ function retryableNetworkFailure(message: string): boolean {
  */
 function orEmpty(value: string | undefined): string {
   return value !== undefined && value !== null ? value : '';
+}
+
+/**
+ * 老索引里没有的字符串数组字段补成空数组
+ *
+ * `triedSources` 是后加的（见 DownloadItem），升级前写下的文件里没有这个键；
+ * 顺手把非字符串、空串筛掉，免得后面 `includes` 之类的调用拿到脏数据。
+ */
+function restoreStringList(value: string[] | undefined): string[] {
+  const out: string[] = [];
+  if (value === undefined || value === null) {
+    return out;
+  }
+  for (const one of value) {
+    if (typeof one === 'string' && one.length > 0) {
+      out.push(one);
+    }
+  }
+  return out;
+}
+
+/**
+ * 两段提示拼成一行
+ *
+ * `DownloadItem.note` 一格里要同时装「已换源重试 N 次」和「已存到应用内目录」，
+ * 界面只渲染这一个字段（见 DownloadListView），所以在这里拼好、不覆盖掉彼此。
+ */
+function joinNote(first: string, second: string): string {
+  if (first.length === 0) {
+    return second;
+  }
+  if (second.length === 0) {
+    return first;
+  }
+  return `${first}　·　${second}`;
 }
 
 /**
@@ -602,6 +670,10 @@ export class DownloadManager {
         existed.error = '';
         existed.tagNote = '';
         existed.retries = 0;
+        // 重新排一次就是从头开始：上回换过哪些源、换了几次都不再算
+        existed.failovers = 0;
+        existed.triedSources = [];
+        existed.note = '';
         existed.received = 0;
         existed.total = 0;
         this.persist();
@@ -629,6 +701,8 @@ export class DownloadManager {
       tagNote: '',
       auto: auto,
       retries: 0,
+      failovers: 0,
+      triedSources: [],
       createdAt: Date.now(),
     };
     this.items.push(item);
@@ -667,6 +741,9 @@ export class DownloadManager {
     item.total = 0;
     // 用户主动重来一次：自动重试的次数也归零
     item.retries = 0;
+    // 换源记账也归零：用户手点就是「从头再试一遍」，包括那些上次失败的源
+    item.failovers = 0;
+    item.triedSources = [];
     this.persist();
     this.pump();
   }
@@ -1146,6 +1223,10 @@ export class DownloadManager {
     item.tagNote = '';
     item.received = 0;
     item.total = 0;
+    // 换源的记账跟着记录走（DownloadItem.triedSources / failovers）：自动重试再跑一遍时，
+    // 上一轮已经废掉的源还在名单里，不会又拿同一个源去解析出同样失效的地址
+    const failover: DownloadFailover = new DownloadFailover(item.source, item.triedSources, item.failovers);
+    item.note = failover.note();
     this.bump();
 
     // 0) 有声书串行 + 集间间隔：下一集要抓页面 + 跑规则，整本连着下就是对站点的扫描
@@ -1156,25 +1237,71 @@ export class DownloadManager {
       }
     }
 
-    // 1) 解析播放链接（要几秒，期间可能被删掉）
-    //    封面与歌词同时开跑：标签必须赶在音频数据落盘之前凑齐（见 TagSink）。
-    //    有声书不凑标签：那是音乐那套（歌名/歌手/歌词），书这边没有可凑的东西，
-    //    硬凑还会拿书名去平台搜一轮，纯属白跑。
+    // 封面与歌词同时开跑：标签必须赶在音频数据落盘之前凑齐（见 TagSink）。
+    // 有声书不凑标签：那是音乐那套（歌名/歌手/歌词），书这边没有可凑的东西，
+    // 硬凑还会拿书名去平台搜一轮，纯属白跑。
     const tagsTask: Promise<DownloadTagData> = item.source === BOOK_SOURCE
       ? Promise.resolve(NO_TAGS)
       : collectDownloadTags(item.name, item.singer, item.musicInfoJson, item.coverUrl);
-    let resolved: ResolvedAudio;
-    try {
-      resolved = await this.resolveUrl(item);
-    } catch (e) {
-      this.failOrRetry(item, (e as Error).message, retryableResolveFailure((e as Error).message));
-      return;
+
+    // 1) 解析 → 拉流，失败换个音源再来（见 DownloadFailover）
+    //
+    // 换源走**任务内循环**，不回队列：回队列会重新走一遍 pump + openTarget，还可能再问一次
+    // 系统「保存位置」；任务内重来只占原来那个并发位，排队 / 并发上限 / 自动下载让路都不变。
+    // 每轮要么成功收尾、要么换掉一个源（bad 只增不减），所以轮数是有限的；
+    // MAX_ATTEMPT_ROUNDS 只是万一有人改坏了 canSwitch 时的硬保险。
+    for (let round = 0; round < MAX_ATTEMPT_ROUNDS; round++) {
+      let resolved: ResolvedAudio;
+      try {
+        resolved = await this.resolveUrl(item, failover);
+      } catch (e) {
+        const message: string = (e as Error).message;
+        // 这次解析途中被换掉的源也要落盘：failOrRetry 万一放回队列，下一轮别再撞它们
+        this.syncFailover(item, failover);
+        this.failOrRetry(item, `${message}${failover.attemptSummary()}`,
+          retryableResolveFailure(message));
+        return;
+      }
+      if (item.status !== 'downloading') {
+        return;
+      }
+      const tags: DownloadTagData = await tagsTask;
+      if (item.status !== 'downloading') {
+        return;
+      }
+      const verdict: AttemptVerdict = await this.downloadAttempt(item, resolved, tags, failover);
+      this.syncFailover(item, failover);
+      if (verdict !== 'retry-source') {
+        return;
+      }
+      // 换源：半截文件已经在 downloadAttempt 里清掉了，进度归零重新走
+      hilog.warn(DOMAIN, TAG, 'switch source and retry: %{public}s (%{public}s, tried=%{public}d)',
+        item.name, failover.note(), failover.badList().length);
+      item.received = 0;
+      item.total = 0;
+      item.note = failover.note();
+      this.persist();
+      this.bump();
     }
-    if (item.status !== 'downloading') {
-      return;
-    }
+    // 正常走不到这里（每轮都会 return）：兜底标失败，别让任务悬着
+    this.fail(item, '下载失败（已换源重试多次）');
+  }
+
+  /** 把换源记账写回记录（落盘字段，见 DownloadItem） */
+  private syncFailover(item: DownloadItem, failover: DownloadFailover): void {
+    item.failovers = failover.switchTotal();
+    item.triedSources = failover.badList();
+  }
+
+  /**
+   * 一次「打开保存位置 + 拉流落盘」
+   *
+   * 从 runTask 里抽出来是为了让换源重试能**只重来这一步**：解析 → 这一轮失败 → 换源 →
+   * 再解析 → 再来一轮。判定与收尾都留在这里，runTask 只根据返回值决定是否继续。
+   */
+  private async downloadAttempt(item: DownloadItem, resolved: ResolvedAudio,
+    tags: DownloadTagData, failover: DownloadFailover): Promise<AttemptVerdict> {
     const url: string = resolved.url;
-    const tags: DownloadTagData = await tagsTask;
 
     // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）
     const ext: string = this.extOf(url, item.quality);
@@ -1188,21 +1315,23 @@ export class DownloadManager {
       if (message === DEFER_BACKGROUND) {
         // 不是失败：放回队列，等回到前台再拿保存位置（EntryAbility.onForeground -> resume）
         this.deferForForeground(item);
-        return;
+        return 'finished';
       }
       this.fail(item, `保存位置不可用：${message}`);
-      return;
+      return 'finished';
     }
     if (write === null) {
       this.fail(item, '已取消（没有选择保存位置）');
-      return;
+      return 'finished';
     }
-    item.note = write.fallback
+    // 换源提示与「存到应用内目录」共用 note 这一格（界面只渲染它），拼起来别互相盖掉
+    const dirNote: string = write.fallback
       ? `已存到应用内目录（「文件管理」看不到）：${write.reason}`
       : '';
+    item.note = joinNote(failover.note(), dirNote);
     if (item.status !== 'downloading') {
       this.closeQuietly(write.handle);
-      return;
+      return 'finished';
     }
     const target: string = write.path;
     const part: string = write.part;
@@ -1269,22 +1398,23 @@ export class DownloadManager {
       if (item.status !== 'downloading') {
         // 期间被取消：丢掉半截文件
         this.cleanupFailed(part, target);
-        return;
+        return 'finished';
       }
       if (stalled) {
-        this.failOrRetry(item, `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）`, true);
-        return;
+        this.cleanupFailed(part, target);
+        return this.afterStreamFailure(item, failover, 0,
+          `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）`, true);
       }
       if (code !== 200) {
-        // 4xx 多半是链接过期 / 被拒（重试没用），5xx 与 0 是服务端或连接问题（值得再来一次）
+        // 4xx 多半是链接过期 / 被拒，换一个源才是有效的下一步（见 afterStreamFailure）；
+        // 5xx 与 0 是服务端或连接问题，同样先换源，没有源可换才走「同源再来一次」
         this.cleanupFailed(part, target);
-        this.failOrRetry(item, `下载失败（HTTP ${code}）`, code >= 500 || code === 0);
-        return;
+        return this.afterStreamFailure(item, failover, code, `下载失败（HTTP ${code}）`,
+          code >= 500 || code === 0);
       }
       if (item.received === 0) {
         this.cleanupFailed(part, target);
-        this.failOrRetry(item, '下载失败（没收到数据）', true);
-        return;
+        return this.afterStreamFailure(item, failover, 0, '下载失败（没收到数据）', true);
       }
       item.tagNote = this.tagNoteOf(sink, tags, ext);
       try {
@@ -1300,7 +1430,9 @@ export class DownloadManager {
       } catch (e) {
         this.cleanupFailed(part, target);
         this.fail(item, `写入文件失败：${(e as BusinessError).message}`);
+        return 'finished';
       }
+      return 'done';
     } catch (e) {
       clearInterval(watchdog);
       this.closeQuietly(file);
@@ -1309,9 +1441,11 @@ export class DownloadManager {
       if (item.status === 'downloading') {
         // 看门狗掐断的那次：错误消息是「请求被中止」这类，按可重试处理（本来也是网络问题）
         const message: string = (e as BusinessError).message;
-        this.failOrRetry(item, stalled ? `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）` : message,
+        return this.afterStreamFailure(item, failover, 0,
+          stalled ? `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）` : message,
           stalled || retryableNetworkFailure(message));
       }
+      return 'finished';
     } finally {
       clearInterval(watchdog);
       try {
@@ -1323,11 +1457,56 @@ export class DownloadManager {
   }
 
   /**
+   * 拉流失败之后往哪走
+   *
+   * 判据跟播放链路一致：**只看结果、不看错误类型** —— 地址拿到了却下不动，就说明这个源
+   * 给的这条链不行（链接过期、防盗链拒掉、源那边转码坏了）。用户反馈里「播放能播、下载
+   * 不能」正是这一类：播放侧早就会换源，下载侧以前只会在原地标失败。
+   *
+   * 顺序：
+   *   1. 把这个源记进本任务的排除表（同一批接口出来的链接寿命一样长，重解析必须绕开它）；
+   *      如果失败原因是「地址本身废了」（4xx），再按平台记一笔到**共用**路由表，
+   *      下次选源时它会被排到后面；
+   *   2. 还有源可换（见 DownloadFailover.canSwitch）→ 换源，回 runTask 再解析一轮；
+   *   3. 换不了了（关着「自动切换音源」/ 只有一个源 / 已经试满 3 个）→ 退回老规矩：
+   *      可重试的放回队列再来一次（见 MAX_RETRY），4xx 这类当场标失败。
+   *
+   * 失败原因统一补上「已尝试 N 个音源」：用户能看出换源也救不了，不是没试就放弃。
+   */
+  private afterStreamFailure(item: DownloadItem, failover: DownloadFailover,
+    code: number, message: string, retryable: boolean): AttemptVerdict {
+    const badId: string = failover.usedSourceId();
+    if (badId.length > 0) {
+      failover.markBad(badId);
+      const dead: boolean = isDeadAddressFailure(code, message);
+      const reason: string = dead ? '下载地址失效' : '拉流失败';
+      if (dead) {
+        // 只有「地址本身废了」（4xx）才记进**共用**路由表：那是这个源在这个平台上给不出
+        // 可用链接的证据，播放侧也该知道。超时 / 停滞 / 5xx 更像手机网络的问题，
+        // 只在本任务里排除这个源就够了，不该让播放也跟着绕开一个其实能放的源。
+        SourceRouter.getInstance().markFailure(badId, item.source, reason);
+      }
+      hilog.warn(DOMAIN, TAG, 'stream failed on %{public}s (%{public}s, http=%{public}d), %{public}d source(s) tried',
+        badId, reason, code, failover.badList().length);
+    }
+    if (failover.canSwitch()) {
+      failover.beginSwitch();
+      item.note = failover.note();
+      const nextName: string = failover.nextSourceName();
+      hilog.info(DOMAIN, TAG, 'switch source for %{public}s -> %{public}s (switch #%{public}d)',
+        item.name, nextName.length > 0 ? nextName : failover.nextSourceId(), failover.switchTotal());
+      return 'retry-source';
+    }
+    this.failOrRetry(item, `${message}${failover.attemptSummary()}`, retryable);
+    return 'finished';
+  }
+
+  /**
    * 解析出可下载的地址（连带请求头）
    *
    * 分两条链路：平台歌 / 洛雪音源走音质协商；有声书走书源规则（见 resolveBookUrl）。
    */
-  private async resolveUrl(item: DownloadItem): Promise<ResolvedAudio> {
+  private async resolveUrl(item: DownloadItem, failover: DownloadFailover): Promise<ResolvedAudio> {
     if (item.source === BOOK_SOURCE) {
       return await this.resolveBookUrl(item);
     }
@@ -1352,8 +1531,9 @@ export class DownloadManager {
       : (settings.isExtendQuality() ? settings.getExtendQualityType() : '');
     try {
       const outcome: FailoverOutcome = await resolveUrlWithSourceFailover(
-        item.musicInfoJson, item.source, quality, {}, wantQuality);
+        item.musicInfoJson, item.source, quality, failover.hooks(), wantQuality);
       item.quality = outcome.quality;
+      failover.setUsed(outcome.sourceId);
       return { url: outcome.url, headers: {} };
     } catch (err) {
       const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
@@ -1363,8 +1543,9 @@ export class DownloadManager {
       hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s', quality, retry);
       item.quality = retry;
       const outcome: FailoverOutcome = await resolveUrlWithSourceFailover(
-        item.musicInfoJson, item.source, retry, {}, '');
+        item.musicInfoJson, item.source, retry, failover.hooks(), '');
       item.quality = outcome.quality;
+      failover.setUsed(outcome.sourceId);
       return { url: outcome.url, headers: {} };
     }
   }
@@ -1631,6 +1812,8 @@ export class DownloadManager {
         item.tagNote = orEmpty(item.tagNote);
         item.auto = item.auto === true;
         item.retries = asNumber(item.retries);
+        item.failovers = asNumber(item.failovers);
+        item.triedSources = restoreStringList(item.triedSources);
         // 重启时正在下的那些没法接着下（链接带时效），标成可重试
         if (item.status === 'downloading' || item.status === 'waiting') {
           item.status = 'error';

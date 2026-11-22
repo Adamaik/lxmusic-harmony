@@ -14,6 +14,7 @@ import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
   PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LABELS, PLAYER_MOTION_LEVELS, PLAYER_MOTION_LIGHT,
   PlaySettings } from '../core/settings/PlaySettings';
+import { isFileQuality, K_ACTUAL_QUALITY, qualityFallbackNote, qualityLabel, targetQuality } from '../core/music/Quality';
 
 /** 拓展音质：开关 +（开着时）档位 + 说明 */
 @Component
@@ -107,6 +108,14 @@ export struct PlaySettingsView {
   @StorageLink(K_DEFAULT_SOURCE) defaultSource: string = '';
   @StorageLink(K_EXTEND_QUALITY) extend: boolean = false;
   @StorageLink(K_EXTEND_QUALITY_TYPE) extendType: string = 'hires';
+  /**
+   * 正在播的那一首**实际生效**的音质档（见 Quality.ets 的 K_ACTUAL_QUALITY）
+   *
+   * 设置页显示的仍然是用户选的目标档（那是设置项，不该被一首歌带偏）；
+   * 这一项只用来补一句「刚才那一首实际到了哪一档」，让用户明白设置没失效，
+   * 是这首歌 / 这个音源只给到这一档。
+   */
+  @StorageLink(K_ACTUAL_QUALITY) actualQuality: string = '';
   @StorageLink(K_PLAY_WITH_OTHERS) playWithOthers: boolean = false;
   @StorageLink(K_SHOW_MINI_LYRIC) showMiniLyric: boolean = false;
   @StorageLink(K_LYRIC_BLUR) lyricBlur: boolean = true;
@@ -164,6 +173,29 @@ export struct PlaySettingsView {
   private qualityIndex(): number {
     const index: number = MAIN_QUALITYS.indexOf(this.quality);
     return index < 0 ? MAIN_QUALITYS.length - 1 : index;
+  }
+
+  /**
+   * 「设置里的目标档」与「刚才那一首实际生效档」不一致时的一句轻提示（空串 = 不显示）
+   *
+   * 为什么设置页也要这一句：用户群多次反馈「开了拓展音质却看不到高品 / 实际音质不符」
+   * （2026-11-18 22:07、11-19 09:28 / 15:24）。设置页保留用户选的目标档不动，
+   * 但在这里如实说一句「实际是 FLAC（源不支持 母带）」，困惑就解开了。
+   * 只在真的有歌在放的时候显示 —— 没播歌时这一项无意义。
+   */
+  private actualQualityHint(): string {
+    if (this.actualQuality.length === 0) {
+      return '';
+    }
+    if (isFileQuality(this.actualQuality)) {
+      return '当前播放的是本地 / 云端音频文件，音质由文件本身决定。';
+    }
+    const note: string = qualityFallbackNote(this.actualQuality, targetQuality());
+    if (note.length > 0) {
+      return `正在播放的这首实际是 ${qualityLabel(this.actualQuality)}（${note}），`
+        + '设置里的目标档仍然保留。';
+    }
+    return `正在播放的这首实际是 ${qualityLabel(this.actualQuality)}。`;
   }
 
   /** 默认渠道胶囊选中的是第几枚（存档里是空串 / 不认识的平台都落在「自动」上） */
@@ -338,6 +370,12 @@ export struct PlaySettingsView {
                   PlaySettings.getInstance().setExtendQualityType(EXTEND_QUALITYS[index]);
                 },
               })
+
+              // 目标档与「实际生效档」不一致时的一句实情（见 actualQualityHint）：
+              // 设置项本身照旧显示用户选的那档，这里只补事实，不替用户改设置
+              if (this.actualQualityHint().length > 0) {
+                HintText({ text: this.actualQualityHint() })
+              }
 
               ToggleSetting({
                 label: '与其他应用同时播放',

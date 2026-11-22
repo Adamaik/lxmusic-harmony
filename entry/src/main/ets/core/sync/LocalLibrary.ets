@@ -42,6 +42,47 @@ export interface AddMusicResult {
 }
 
 /**
+ * 一次「跟随源歌单」对齐的结果
+ *
+ * added / removed 都是**条目条数**（不是去重后的首数）：源歌单里同一首歌出现两次、
+ * 本地只留了一条时，added 会是 1；本地多留了一条时 removed 会是 1。
+ */
+export interface PlaylistSyncResult {
+  /** 从源歌单补进来的条目数 */
+  added: number;
+  /** 因为源歌单里已经没有了而摘掉的条目数 */
+  removed: number;
+  /** 本地数据是否真的被改动（added / removed 至少一个不为 0） */
+  changed: boolean;
+  /**
+   * 这次因为「源歌单看起来没拉全」而整体放弃（本地一个字都没动）
+   *
+   * 与 changed 分开是因为界面要说的话不一样：「没拉全」要提示，而「没差异」不该打扰。
+   */
+  aborted: boolean;
+}
+
+/**
+ * 打开歌单时最多多久回源对齐一次（10 分钟）
+ *
+ * 群反馈要的是「打开一次对齐一次」，不是后台轮询（那样既费流量又会被平台风控）。
+ * 十分钟这个量级：用户改完源歌单再切回本应用基本都能对上，同时反复进出歌单
+ * 不会把同一张歌单拉几十遍。
+ */
+export const SOURCE_SYNC_INTERVAL_MS: number = 10 * 60 * 1000;
+
+/**
+ * 「疑似源歌单没拉全」的删除闸门：一次要删掉的条目同时满足下面两条就整体放弃
+ *
+ * 为什么需要：接口被限流 / 中途断掉时 getPlaylistDetailAll 可能只拿回前一部分，
+ * 按那半份结果对齐就等于「把用户歌单删掉一大半」。宁可这次不同步（下次再对），
+ * 也不能按不完整的数据删歌。
+ * 只在大批量删除时启用比例判断（小歌单删两首是正常操作，不该被拦）。
+ */
+const SOURCE_SYNC_REMOVE_GUARD_MIN: number = 30;
+const SOURCE_SYNC_REMOVE_GUARD_RATIO10: number = 8;
+
+/**
  * 一组重复歌曲里的一条（一条 = 歌单里的一行，不是「一首歌」）
  *
  * 面板要用它逐条展示、让用户点选「保留哪一条」，所以这里带的是**展示字段的快照**：
@@ -144,6 +185,15 @@ export class LocalLibrary implements LibrarySink {
   private applying: boolean = false;
   /** 上行出口：连接并完成列表同步后由 SyncClient 装上，断开时清掉 */
   private actionSink: SyncActionSink | null = null;
+  /**
+   * 每张歌单「上次回源对齐的**尝试**时间」（毫秒）
+   *
+   * 只放内存：重启应用后第一次打开歌单会再对一次 —— 这正是用户想要的「打开就同步」，
+   * 不是需要跨进程保留的状态。失败也记时间，见 beginSyncToSource。
+   */
+  private sourceSyncAt: Map<string, number> = new Map<string, number>();
+  /** 正在回源对齐的歌单 id（同一张歌单同时只允许一个请求，见 beginSyncToSource） */
+  private sourceSyncing: Set<string> = new Set<string>();
 
   init(context: common.Context): void {
     this.store.init(context);
@@ -674,6 +724,8 @@ export class LocalLibrary implements LibrarySink {
       this.mirrorToSession();
       this.emitOverwrite(targetId, musics);
       this.emit({ action: 'list_update', data: [buildUserListInfo(existing)] }, 'list');
+      // 刚按源歌单写了一遍，十分钟内不必再回源对齐（打开歌单时的自动同步会看这个时间戳）
+      this.sourceSyncAt.set(targetId, Date.now());
       return { id: targetId, name: name, count: musics.length + this.sideCountOf(targetId) };
     }
     const item: LxUserListInfoFull = {
@@ -692,7 +744,222 @@ export class LocalLibrary implements LibrarySink {
       listInfos: [buildUserListInfo(item)],
     };
     this.emit({ action: 'list_create', data: data }, 'list');
+    // 刚导入就是源歌单的完整快照：十分钟内打开它不必立刻再拉一遍
+    this.sourceSyncAt.set(id, Date.now());
     return { id: id, name: name, count: musics.length };
+  }
+
+  // ------------------------------------------------------------ 跟随源歌单（打开即对齐）
+
+  /**
+   * 打开歌单时是否该回源对齐一次
+   *
+   * 群反馈（2026-11-20 15:19，CharlotteZero）：「他的导入好像是实时的」「我 qq 里面删除，
+   * 他这边也自动删除」，小冰补「打开一次同步一次？多就加，少就删」。所以要的是
+   * **打开时对齐**，不是后台轮询 —— 节流就落在这里：同一张歌单距上次**尝试**
+   * （不管成败）超过 SOURCE_SYNC_INTERVAL_MS 才再拉一次。
+   */
+  shouldSyncToSource(id: string): boolean {
+    if (this.sourceSyncing.has(id)) {
+      return false;
+    }
+    const last: number | undefined = this.sourceSyncAt.get(id);
+    if (last === undefined) {
+      return true;
+    }
+    return Date.now() - last >= SOURCE_SYNC_INTERVAL_MS;
+  }
+
+  /**
+   * 占坑：同一张歌单同一时刻只允许一个回源请求
+   *
+   * 手动「从原歌单更新」与打开歌单的自动对齐走同一条链路，两边同时跑就是把同一张歌单
+   * 拉两遍，而且各自拿着**旧快照**去对齐对方刚改过的列表 —— 轻则重复加歌，重则互相删掉。
+   *
+   * **顺手把「上次尝试时间」记成现在**：失败也要记，否则离线时每进出一次歌单就重试一遍。
+   * @returns true = 拿到了这次同步的执行权，必须配对调用 endSyncToSource
+   */
+  beginSyncToSource(id: string): boolean {
+    if (this.sourceSyncing.has(id)) {
+      return false;
+    }
+    this.sourceSyncAt.set(id, Date.now());
+    this.sourceSyncing.add(id);
+    return true;
+  }
+
+  /** 放开占坑（放 finally 里调，失败路径也要走） */
+  endSyncToSource(id: string): void {
+    this.sourceSyncing.delete(id);
+  }
+
+  /**
+   * 把「源歌单当前的内容」对齐到本地这张歌单
+   *
+   * 语义就是「跟随源歌单」（派音 / 洛雪那套）：源里有的补进来，源里已经删掉的摘掉，
+   * 其余内容原样不动。三条硬约束：
+   *
+   *   1. **只动本来就从这张源歌单导入的那部分**：只处理 `source === 歌单的 source`
+   *      的在线歌。别的平台的手动加歌、本地歌 / 云端歌 / 听书条目一律不参与 ——
+   *      它们本来就不在源歌单里，「源里没有」不构成删除理由（误删本地条目是最坏的后果）。
+   *      侧表（LocalMusic / WebDavLibrary）的成员本来就不在 target.list 里，天然不受影响。
+   *   2. **多重集对齐，不按 id 去重**：上一批特意允许歌单里有合法重复（导入时同一首歌
+   *      出现两次就存两条）。所以「源里有 N 条 → 本地留 N 条」，多退少补，
+   *      绝不因为「这个 id 已经有了」把第二条吃掉。
+   *   3. **拉不全就整体放弃**：删得太多（≥30 条且超过同平台条目 80%）时判定为接口
+   *      截断 / 限流，返回 aborted 并且一个字都不改；源歌单与本地**一条都对不上**时也放弃
+   *      （那更像整张换掉 / 指错歌单，按源删本地等于清空用户歌单）。
+   *
+   * 匹配口径：先 `source + songId`（compositeMatchIdOf），对不上的再按「歌名·歌手」
+   * （duplicateKeyOf，与加歌判重、重复检测完全同一套口径）兜一层 —— 平台偶尔会给同一首歌
+   * 换 id（重新上架 / 版权变动），只按 id 比就会把它算成「删一条 + 加一条」，
+   * 用户的播放次数、排序位置都会跟着丢。
+   *
+   * @param sourceSongs 刚从源歌单拉回来的全量歌曲（顺序即源歌单顺序）
+   */
+  syncWithSource(listId: string, sourceSongs: SongItem[]): PlaylistSyncResult {
+    const unchanged: PlaylistSyncResult = { added: 0, removed: 0, changed: false, aborted: false };
+    const target = this.findPlaylist(listId);
+    if (target === null) {
+      return unchanged;
+    }
+    const platform: string = target.source !== undefined && target.source !== null ? target.source : '';
+    if (platform.length === 0) {
+      return unchanged;
+    }
+    // 源歌单的条目：**保留重复**（keepDuplicates = true），多重集口径的前提
+    const incoming: LxMusicInfoNew[] = musicsOf(sourceSongs, true);
+    if (incoming.length === 0) {
+      // 源是空的：一律不动。宁可这次不同步，也不能按空结果把本地删干净
+      hilog.warn(DOMAIN, TAG, 'source list %{public}s returned empty, skip align', listId);
+      return unchanged;
+    }
+
+    // ---- 本地：只挑出「同平台的在线歌」，并记下它们各自的匹配键
+    const localItems: LxMusicInfoNew[] = [];
+    const localIdKeys: string[] = [];
+    const localNameKeys: string[] = [];
+    for (const info of target.list) {
+      if (info.source !== platform) {
+        continue;
+      }
+      localItems.push(info);
+      localIdKeys.push(compositeMatchIdOf(info));
+      localNameKeys.push(duplicateKeyOf(info.name, info.singer));
+    }
+    if (localItems.length === 0) {
+      // 本地这条歌单里一首同平台的歌都没有（可能全是本地歌 / 别的平台）：不猜，什么都不做
+      return unchanged;
+    }
+
+    // ---- 源侧索引：每个匹配键对应「源里的第几条」，用来做一对一（多重集）配对
+    const claimed: boolean[] = [];
+    const srcIds: Map<string, number[]> = new Map<string, number[]>();
+    const srcNames: Map<string, number[]> = new Map<string, number[]>();
+    for (let i = 0; i < incoming.length; i++) {
+      claimed.push(false);
+      const info: LxMusicInfoNew = incoming[i];
+      pushIndex(srcIds, compositeMatchIdOf(info), i);
+      const nameKey: string = duplicateKeyOf(info.name, info.singer);
+      if (nameKey.length > 0) {
+        pushIndex(srcNames, nameKey, i);
+      }
+    }
+
+    // ---- 第一轮：本地每条歌按 id 去源里认领一条（同一 id 的第 N 条认领源里的第 N 条）
+    const kept: boolean[] = [];
+    let matchedCount: number = 0;
+    for (let i = 0; i < localItems.length; i++) {
+      const at: number = takeUnclaimed(srcIds.get(localIdKeys[i]), claimed);
+      if (at >= 0) {
+        claimed[at] = true;
+        kept.push(true);
+        matchedCount++;
+      } else {
+        kept.push(false);
+      }
+    }
+    // ---- 第二轮：按「歌名·歌手」兜（平台给同一首歌换了 id 时别当成一删一加）
+    for (let i = 0; i < localItems.length; i++) {
+      if (kept[i] || localNameKeys[i].length === 0) {
+        continue;
+      }
+      const at: number = takeUnclaimed(srcNames.get(localNameKeys[i]), claimed);
+      if (at >= 0) {
+        claimed[at] = true;
+        kept[i] = true;
+        matchedCount++;
+      }
+    }
+
+    // ---- 差异：本地没被认领的 = 源里已经删掉（按条数计配额，同 id 两条只删该删的条数）
+    const removalQuota: Map<string, number> = new Map<string, number>();
+    const removalIds: string[] = [];
+    let removedCount: number = 0;
+    for (let i = 0; i < localItems.length; i++) {
+      if (kept[i]) {
+        continue;
+      }
+      const info: LxMusicInfoNew = localItems[i];
+      removedCount++;
+      removalQuota.set(info.id, (removalQuota.get(info.id) ?? 0) + 1);
+      if (!removalIds.includes(info.id)) {
+        removalIds.push(info.id);
+      }
+    }
+    // 源里没被本地认领的 = 源里新增的（顺序即源歌单顺序，统一放到最前面，与加歌规则一致）
+    const additions: LxMusicInfoNew[] = [];
+    for (let i = 0; i < incoming.length; i++) {
+      if (!claimed[i]) {
+        additions.push(incoming[i]);
+      }
+    }
+    if (removedCount === 0 && additions.length === 0) {
+      return unchanged;
+    }
+    // 一条都对不上：更像是「源歌单被整张换掉 / sourceListId 指到了别的歌单」，而不是正常增删。
+    // 这种时候按源删本地 = 清空用户歌单，收益远小于代价，宁可这次不对齐（下次再对）。
+    if (matchedCount === 0) {
+      hilog.warn(DOMAIN, TAG, 'align %{public}s aborted: no overlap with source (%{public}d)',
+        listId, localItems.length);
+      return { added: 0, removed: 0, changed: false, aborted: true };
+    }
+    // 删除闸门：一次删掉这么多，更像是「源歌单没拉全」而不是「用户真删了这么多」
+    if (removedCount > SOURCE_SYNC_REMOVE_GUARD_MIN
+      && removedCount * 10 > localItems.length * SOURCE_SYNC_REMOVE_GUARD_RATIO10) {
+      hilog.warn(DOMAIN, TAG,
+        'align %{public}s aborted: remove %{public}d of %{public}d, source may be truncated',
+        listId, removedCount, localItems.length);
+      return { added: 0, removed: 0, changed: false, aborted: true };
+    }
+
+    // ---- 落地：先删后加。删除复用 removeMusicFromPlaylist 的配额口径（上行 / 落盘 /
+    // 界面镜像都在那里），加歌**不能**走 addMusicToPlaylist —— 那个按 id 判重，
+    // 源里出现两次的同一首歌会被吃掉一条（见约束 2）。
+    if (removedCount > 0) {
+      this.removeMusicFromPlaylist(listId, removalIds, removalQuota);
+    }
+    if (additions.length > 0) {
+      // 删除那一步换掉了 list 数组，必须重新取一次引用
+      const after = this.findPlaylist(listId);
+      if (after !== null) {
+        after.list = additions.concat(after.list);
+        this.persist();
+        this.mirrorToSession();
+        const data: LxListMusicAddData = {
+          id: listId,
+          musicInfos: additions,
+          addMusicLocationType: ADD_MUSIC_TOP,
+        };
+        this.emit({ action: 'list_music_add', data: data }, 'list');
+      }
+    }
+    return {
+      added: additions.length,
+      removed: removedCount,
+      changed: removedCount > 0 || additions.length > 0,
+      aborted: false,
+    };
   }
 
   renamePlaylist(id: string, name: string): void {    if (this.isBuiltinPlaylist(id)) {
@@ -1532,6 +1799,45 @@ function idsOf(musics: LxMusicInfoNew[]): string[] {
 
 /** 判重键里隔开歌名与歌手的字符（与对外说明的「歌名·歌手」写法一致，只是个分隔符） */
 const DUPLICATE_KEY_SEP: string = '·';
+
+/**
+ * 「跟随源歌单」匹配用的主键：`平台__歌曲id`
+ *
+ * 为什么不用裸 id：歌单里可能同时有不同平台的歌（用户手动加的），id 命名空间各平台
+ * 互不相干，裸 id 撞上的概率不为零。带上来源才符合「source + songId」这个口径。
+ */
+function compositeMatchIdOf(info: LxMusicInfoNew): string {
+  return `${info.source}__${info.id}`;
+}
+
+/** 往 Map<string, number[]> 的桶里追加一个下标（没有桶就先建一个） */
+function pushIndex(map: Map<string, number[]>, key: string, index: number): void {
+  const bucket: number[] | undefined = map.get(key);
+  if (bucket === undefined) {
+    map.set(key, [index]);
+    return;
+  }
+  bucket.push(index);
+}
+
+/**
+ * 从桶里取出「第一条还没被认领」的下标；都认领完了返回 -1
+ *
+ * 这就是多重集配对的全部奥秘：同一个键在源里有 N 条、本地有 M 条时，
+ * 前 min(N, M) 条一一配对，多出来的 N-M 条算新增、M-N 条算删除。
+ * 桶的大小通常是 1（没有重复），所以这个扫描实际上不花时间。
+ */
+function takeUnclaimed(bucket: number[] | undefined, claimed: boolean[]): number {
+  if (bucket === undefined) {
+    return -1;
+  }
+  for (const index of bucket) {
+    if (!claimed[index]) {
+      return index;
+    }
+  }
+  return -1;
+}
 
 /** 标准化歌手拼回去用的分隔符，与 MusicSearch 的 normalizeSingers 一致 */
 const SINGER_JOIN: string = '、';

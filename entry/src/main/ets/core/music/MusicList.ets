@@ -648,6 +648,26 @@ export async function getPlaylistDetailAll(source: string, id: string,
   };
 }
 
+/**
+ * 这份「全量歌单」看起来是不是**没拉全**（接口被限流 / 翻页中途被截断）
+ *
+ * 给「跟随源歌单自动同步」当删除闸门用：拿半份源歌单去对齐，等于把用户歌单删掉一大半。
+ * 判定口径：
+ *   - `total` 是平台声明的曲目数（去重口径，各平台一致），`list.length` 是我们收到的条目数
+ *     （可能大于 total：同一首歌在源歌单里出现两次是合法的，见 getPlaylistDetailAll）；
+ *   - 只有 `total > 0`（平台确实给了数）**且** `list.length < total` 才算没拉全 ——
+ *     total 为 0 表示平台没给这个数，不猜；
+ *   - 反过来 `list.length > total` 是正常的重复条目，不算截断。
+ *
+ * 宁可漏判（某平台 total 报得不准）也不能误判：误判只会让这次同步不做，误删却是不可逆的。
+ */
+export function playlistDetailTruncated(detail: LxListDetail): boolean {
+  if (detail === null || detail === undefined) {
+    return true;
+  }
+  return detail.total > 0 && detail.list.length < detail.total;
+}
+
 /** 排行榜列表 */
 export function getBoards(source: string): LxBoardItem[] {  if (source === 'kw') {
     return KW_BOARDS;

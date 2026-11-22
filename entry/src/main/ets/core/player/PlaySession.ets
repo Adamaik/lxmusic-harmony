@@ -18,7 +18,8 @@ import { ShuffleBag } from './ShuffleBag';
 import { StartupTiming } from './StartupTiming';
 import { PlatformHealth } from './PlatformHealth';
 import { PlaySettings } from '../settings/PlaySettings';
-import { fallbackQuality, isExtendedQuality, lowerQuality, pickQuality, qualityLabel } from '../music/Quality';
+import { fallbackQuality, isExtendedQuality, K_ACTUAL_QUALITY,
+  lowerQuality, pickQuality, qualityLabel } from '../music/Quality';
 import { AutoDownloadSong, downloadedFile, removeDownloadedFile,
   requestAutoDownload } from '../download/DownloadIndex';
 import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
@@ -1478,6 +1479,18 @@ export class PlaySession {
 
   // ------------------------------------------------------------ 状态同步
 
+  /**
+   * 写「本次实际生效的音质档」
+   *
+   * 与 `K_CURRENT_QUALITY` 的区别见 Quality.ets 里 `K_ACTUAL_QUALITY` 的说明：
+   * 那个是「这一次要按哪一档去要地址」（解析前就写、可能被换源 / 降档改写），
+   * 这个是「地址真的拿到了、真的要放出声」的那一档。只在落定时刻调用，
+   * 界面据此显示实际档位，避免「设置母带、其实在放 FLAC」。
+   */
+  private setActualQuality(quality: string): void {
+    AppStorage.setOrCreate(K_ACTUAL_QUALITY, quality);
+  }
+
   private pushQueueState(): void {
     AppStorage.setOrCreate(K_QUEUE_COUNT, this.queue.length);
     AppStorage.setOrCreate(K_PLAY_MODE, this.playMode);
@@ -1500,6 +1513,8 @@ export class PlaySession {
       AppStorage.setOrCreate(K_CURRENT_COVER, '');
       AppStorage.setOrCreate(K_CURRENT_ART, false);
       AppStorage.setOrCreate(K_CURRENT_QUALITY, '128k');
+      // 没有在播的歌了：实际档位一并清空，别让界面停在上一次播放的档位上
+      this.setActualQuality('');
       AppStorage.setOrCreate(K_DURATION, 0);
       AppStorage.setOrCreate(K_PROGRESS, 0);
     }
@@ -1747,7 +1762,11 @@ export class PlaySession {
       const from: string = item.source;
       // 身份字段原地写回：队列 / 推荐 / 收藏里是同一个对象（与 applyResolved 同一做法）
       this.applyResolved(item, candidate);
-      item.quality = nextQuality;
+      // 注意写回的是 candidate.quality —— resolveWithSourceFailover 已经按**新源**
+      // 重新协商过并写回真正用的那一档（见它返回的 FailoverOutcome.quality）。
+      // 以前这里用的是换源**之前**算出来的 nextQuality：源声明了母带却只给得出 FLAC 时，
+      // 条目和界面就会一直显示母带（11-20 报告里「界面与实际不符」的根因之一）。
+      item.quality = candidate.quality;
       hilog.info(DOMAIN, TAG, 'switch source %{public}s -> %{public}s: %{public}s / %{public}s',
         from, platform, item.name, item.singer);
       StartupTiming.getInstance().note(`换源${from}->${platform}`);
@@ -1762,7 +1781,8 @@ export class PlaySession {
       this.notify(tip);
       const result: AltPlayback = {
         url: nextUrl,
-        quality: nextQuality,
+        // 同上：交给调用方的是**实际生效**的那一档，不是换源前协商出来的目标档
+        quality: candidate.quality,
         cacheKey: mediaKeyOf(item.musicInfoJson),
       };
       return result;
@@ -1879,6 +1899,8 @@ export class PlaySession {
       if (this.playToken !== token) {
         return;
       }
+      // 本地歌没有音质档可协商：实际生效的就是这个文件本身（local 标记由条目带着）
+      this.setActualQuality(item.quality);
       // 队列里下一首可能是在线歌，预取照旧（本地歌自己会早退）
       void this.prefetchNext(token, index);
     } catch (e) {
@@ -1942,6 +1964,8 @@ export class PlaySession {
         if (this.playToken !== token) {
           return;
         }
+        // 云端文件的音质由文件本身决定：实际生效档位就是 webdav 标记
+        this.setActualQuality(item.quality);
         void this.prefetchNext(token, index);
         return;
       } catch (e) {
@@ -1960,6 +1984,8 @@ export class PlaySession {
       if (this.playToken !== token) {
         return;
       }
+      // 云端流播：音质由服务器上的文件本身决定（webdav 标记）
+      this.setActualQuality(item.quality);
       // 3) 边听边下：下完整首，下次播放就走上面的本地分支
       audioCache.cacheSong(cacheKey, WEBDAV_QUALITY, url, headers);
       // 4) 预取下一首
@@ -2099,6 +2125,9 @@ export class PlaySession {
       this.skipSourceIds = [];
     }
     this.currentLocalPath = '';
+    // 换歌 / 重新解析：上一首的「实际档位」立刻作废，别让音质钮在解析期间显示上一首的档
+    // （清成空串 = 界面退回 K_CURRENT_QUALITY 显示，等这里解析出结果再覆盖）
+    this.setActualQuality('');
     this.pushQueueState();
 
     // 新的一次起播（换章 / 重试 / 切档）：听书「跳过片头片尾」的记账清零。
@@ -2237,6 +2266,10 @@ export class PlaySession {
           // 复播永远不出耗时日志，排障时会把「缓存救回来了」误读成「没触发」。
           StartupTiming.getInstance().beginBuffer(item.source, quality, true);
           await LxPlayer.getInstance().playLocal(downloaded);
+          // 放的是已下载到本机的那一份：实际生效的就是这一轮协商到的档（文件按它下的）
+          if (this.playToken === token) {
+            this.setActualQuality(quality);
+          }
           void this.prefetchNext(token, index);
           return;
         } catch (e) {
@@ -2260,6 +2293,10 @@ export class PlaySession {
         // 否则「第二次播放快了多少」在数据上是空白
         StartupTiming.getInstance().beginBuffer(item.source, quality, true);
         await LxPlayer.getInstance().playLocal(local);
+        // 沙箱里这份缓存就是按 quality 存的：实际生效档位即 quality（不是用户设置的目标档）
+        if (this.playToken === token) {
+          this.setActualQuality(quality);
+        }
         void this.prefetchNext(token, index);
         return;
       }
@@ -2415,6 +2452,11 @@ export class PlaySession {
       // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
+      // 地址真的到手、播放器也接下了：negotiate / 换源 / 降档折腾完，这一档才是本次实际生效的档位。
+      // 期间用户可能已经切了歌（playAt 会把实际档位清空），旧的那一次不许覆盖新歌的显示。
+      if (this.playToken === token) {
+        this.setActualQuality(quality);
+      }
       // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支。
       //    下载文件夹里那一份在开头已经排过队了（见上面「自动下载」那段），这里只管
       //    沙箱这份 —— 两份落盘的分工见 AudioCache.autoDownload。

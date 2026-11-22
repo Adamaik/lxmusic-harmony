@@ -28,7 +28,8 @@ import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS,
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
-import { LOCAL_QUALITY_MARK, isExtendedQuality, isFileQuality, qualityLabel, switchableQualitys } from '../core/music/Quality';
+import { displayQuality, K_ACTUAL_QUALITY, LOCAL_QUALITY_MARK, isExtendedQuality, isFileQuality,
+  qualityFallbackNote, qualityLabel, switchableQualitys, targetQuality } from '../core/music/Quality';
 import { PlaySettings } from '../core/settings/PlaySettings';
 import { isWideWindow } from '../ui/Layout';
 
@@ -133,6 +134,14 @@ export struct PlayerView {
   @StorageLink(K_CURRENT_COVER) @Watch('onCoverChanged') cover: string = '';
   @StorageLink(K_CURRENT_ART) art: boolean = false;
   @StorageLink(K_CURRENT_QUALITY) quality: string = '128k';
+  /**
+   * 本次**实际生效**的音质档（见 Quality.ets 的 K_ACTUAL_QUALITY）
+   *
+   * 与上面那项分开：`quality` 是「这一次按哪一档去要地址」，换源 / 降档之前就写进去了；
+   * 这一项只在真正出声那一刻写。界面显示音质一律走 {@link displayQuality}，
+   * 以免「设置里选了母带、其实在放 FLAC」。空串 = 还没解析出来。
+   */
+  @StorageLink(K_ACTUAL_QUALITY) actualQuality: string = '';
   @StorageLink(K_PLAYER_STATUS) @Watch('onStatusChanged') status: string = 'idle';
   /** 播放页封面圆角（外观设置里可调，默认 12） */
   @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
@@ -931,21 +940,43 @@ export struct PlayerView {
   // ------------------------------------------------------------ 音质
 
   /**
+   * 界面上该显示的那一档：**实际生效的优先**
+   *
+   * 实际档位还没解析出来（空串，刚切歌 / 正在取地址）时退回 `quality`（这一轮的目标档），
+   * 免得音质钮一瞬间变成空白。实际档位偏低时也不再谎报成用户设置的那一档。
+   */
+  private displayedQuality(): string {
+    return displayQuality(this.actualQuality, this.quality);
+  }
+
+  /**
+   * 目标档位没生效时的那句说明（如「源不支持 母带」），不用说明时是空串
+   *
+   * 只挂在音质面板里：降档本身不弹 toast（不骚扰），用户主动点开面板时才解释一句。
+   */
+  private fallbackNote(): string {
+    return qualityFallbackNote(this.displayedQuality(), targetQuality());
+  }
+
+  /**
    * 这首歌现在能切到哪几档（空数组 = 没得切，见 Quality.switchableQualitys）
    *
    * 读「正在播的那一首」而不是界面上的字段：音质档列表来自歌曲条目里的 musicInfo。
+   * current 传实际生效的那一档：本地 / 云端文件据此直接返回空数组。
    */
   private qualityOptions(): string[] {
     const item: SongItem | null = PlaySession.getInstance().current;
     if (item === null) {
       return [];
     }
-    return switchableQualitys(item.musicInfoJson, item.source, this.quality);
+    return switchableQualitys(item.musicInfoJson, item.source, this.displayedQuality());
   }
 
-  /** 面板顶上那行「当前：xxx」 */
+  /** 面板顶上那行「当前：xxx（源不支持 母带）」 */
   private currentQualityText(): string {
-    return `当前：${qualityLabel(this.quality)}`;
+    const label: string = qualityLabel(this.displayedQuality());
+    const note: string = this.fallbackNote();
+    return note.length > 0 ? `当前：${label}（${note}）` : `当前：${label}`;
   }
 
   /**
@@ -963,7 +994,7 @@ export struct PlayerView {
     if (!PlaySettings.getInstance().isExtendQuality()) {
       return '';
     }
-    if (isFileQuality(this.quality) || PlaySession.getInstance().current === null) {
+    if (isFileQuality(this.displayedQuality()) || PlaySession.getInstance().current === null) {
       return '';
     }
     for (const quality of this.qualityOptions()) {
@@ -989,9 +1020,9 @@ export struct PlayerView {
     if (PlaySession.getInstance().current === null) {
       return '还没有正在播放的歌。';
     }
-    if (isFileQuality(this.quality)) {
+    if (isFileQuality(this.displayedQuality())) {
       // isFileQuality 为真时只可能是「本地」或「云端」两个标记之一，所以拿其中一个当判断
-      return this.quality === LOCAL_QUALITY_MARK
+      return this.displayedQuality() === LOCAL_QUALITY_MARK
         ? '这是本机上的音频文件，音质由文件本身决定，没法切换。'
         : '这是云端服务器上的音频文件，音质由文件本身决定，没法切换。';
     }
@@ -1018,7 +1049,7 @@ export struct PlayerView {
   @Builder
   qualityButton() {
     Row({ space: 3 }) {
-      Text(qualityLabel(this.quality))
+      Text(qualityLabel(this.displayedQuality()))
         .fontSize(11.5)
         .fontColor('#CCFFFFFF')
       if (this.qualityOptions().length > 1) {
@@ -1031,7 +1062,7 @@ export struct PlayerView {
     .onClick(() => {
       this.qualityOpen = true;
     })
-    .accessibilityText(`音质：${qualityLabel(this.quality)}，点按切换`)
+    .accessibilityText(`音质：${qualityLabel(this.displayedQuality())}，点按切换`)
     .accessibilityLevel('yes')
   }
 
@@ -1041,8 +1072,8 @@ export struct PlayerView {
     Row({ space: 6 }) {
       Text(qualityLabel(quality))
         .fontSize(16)
-        .fontColor(this.quality === quality ? C_RED : '#F2FFFFFF')
-      if (this.quality === quality) {
+        .fontColor(this.displayedQuality() === quality ? C_RED : '#F2FFFFFF')
+      if (this.displayedQuality() === quality) {
         IconGlyph({ symbol: I_CHECK_CIRCLE, iconSize: 15, color: C_RED })
           .accessibilityLevel('no')
       }
@@ -1053,7 +1084,7 @@ export struct PlayerView {
     .onClick(() => {
       this.pickQuality(quality);
     })
-    .accessibilityText(this.quality === quality
+    .accessibilityText(this.displayedQuality() === quality
       ? `${qualityLabel(quality)}，当前音质`
       : `切换到 ${qualityLabel(quality)}`)
     .accessibilityLevel('yes')
