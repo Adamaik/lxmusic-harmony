@@ -216,6 +216,14 @@ export class LxPlayer {
   private message: string = '';
   private durationMs: number = 0;
   private currentMs: number = 0;
+  /**
+   * 期望的播放速率（1 = 原速）
+   *
+   * AVPlayer 的速率是**跟着实例走**的：每次 preparePlayer 建的新实例都是 1.0x，
+   * 所以这里存「用户想要多少」，在 prepared 态重新落地一次（见 applySpeed）。
+   * 默认 1.0x —— 音乐链路从不改它，行为与改动前完全一致。
+   */
+  private speedRate: number = 1;
 
   private stateListeners: LxPlayerStateListener[] = [];
   private timeListeners: LxPlayerTimeListener[] = [];
@@ -647,6 +655,8 @@ export class LxPlayer {
           const withOthers: boolean = PlaySettings.getInstance().isPlayWithOthers();
           this.applyInterruptMode(player, withOthers);
           this.applyConcurrency(withOthers);
+          // 倍速：新实例默认是 1.0x，出声前把用户要的速率补上（听书 1.5x 换集后不掉回原速）
+          this.applySpeed(player);
           player.play().catch((err: BusinessError) => {
             this.update('error', `播放失败：${err.message}`);
           });
@@ -791,6 +801,70 @@ export class LxPlayer {
     const player = this.avPlayer;
     if (player !== null && this.status === 'playing') {
       await player.pause();
+    }
+  }
+
+  /**
+   * 设置播放速率（1 = 原速；听书倍速用它）
+   *
+   * 两件事：
+   *   1. 记下期望值 —— 换集 / 切音质都会重建 AVPlayer 实例，新实例一定是 1.0x，
+   *      要在 prepared 态重新设一次（见 preparePlayer 的 stateChange）；
+   *   2. 当前实例已经能设就立刻设 —— 用户在播着的时候改倍速要马上听出来。
+   *
+   * 只在 prepared / playing / paused / completed 态可设（SDK 原文），所以其它状态
+   * 只记账、不调用，免得抛 5400102。
+   */
+  setSpeed(rate: number): void {
+    this.speedRate = rate > 0 ? rate : 1;
+    const player = this.avPlayer;
+    if (player === null) {
+      return;
+    }
+    if (this.status !== 'playing' && this.status !== 'paused') {
+      return;
+    }
+    this.applySpeed(player);
+  }
+
+  /** 期望的播放速率（1 = 原速） */
+  getSpeed(): number {
+    return this.speedRate;
+  }
+
+  /**
+   * 速率 -> 系统枚举
+   *
+   * AVPlayer.setSpeed 只收 `media.PlaybackSpeed`（不是任意小数），可选档位就是
+   * 0.50 / 0.75 / 1.00 / 1.25 / 1.50 / 2.00 这几档（后两档 API 12 起，本工程最低 23）。
+   * 传进来的值已经由 BookPlaySettings 夹到这几档，这里再兜一次，宁可回到 1.0x 也不抛错。
+   */
+  private speedEnumOf(rate: number): media.PlaybackSpeed {
+    if (rate <= 0.6) {
+      return media.PlaybackSpeed.SPEED_FORWARD_0_50_X;
+    }
+    if (rate <= 0.85) {
+      return media.PlaybackSpeed.SPEED_FORWARD_0_75_X;
+    }
+    if (rate <= 1.1) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_00_X;
+    }
+    if (rate <= 1.35) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_25_X;
+    }
+    if (rate <= 1.7) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_50_X;
+    }
+    return media.PlaybackSpeed.SPEED_FORWARD_2_00_X;
+  }
+
+  /** 把期望速率落到播放器上（失败只记日志：设不了就退回原速，别影响出声） */
+  private applySpeed(player: media.AVPlayer): void {
+    try {
+      player.setSpeed(this.speedEnumOf(this.speedRate));
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'setSpeed failed, keep default speed: %{public}s',
+        JSON.stringify(err));
     }
   }
 

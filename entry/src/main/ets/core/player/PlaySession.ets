@@ -31,6 +31,7 @@ import { WEBDAV_QUALITY } from '../webdav/WebDavTypes';
 import { BookEngine } from '../book/BookEngine';
 import { BookAudio, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE, bookShelfId, parseBookPayload } from '../book/BookTypes';
 import { BookShelf } from '../book/BookShelf';
+import { BookPlaySettings } from '../book/BookPlaySettings';
 import { publishFavoriteIds } from './FavoriteIndex';
 import { intervalMs, ListenLog, ListenSong } from '../history/ListenLog';
 import { common } from '@kit.AbilityKit';
@@ -41,6 +42,14 @@ const TAG: string = 'PlaySession';
 
 /** 后台预取的单次预算：比前台宽一点，但同样不许它一直占着沙箱（换源/超时规则见 SourceFailover） */
 const SOURCE_PREFETCH_TIMEOUT_MS: number = 8000;
+
+/**
+ * 听书「跳过片头」的判定窗口（毫秒）
+ *
+ * 只有播放头还在开头这么一小段里，才算「这一集刚起播」，才允许跳片头。
+ * 否则「暂停 5 分钟后接着播」也会被当成新起播、把进度拽回片头 —— 那是灾难。
+ */
+const BOOK_INTRO_HEAD_MS: number = 2500;
 
 /**
  * 播放会话 / 播放队列
@@ -688,6 +697,25 @@ export class PlaySession {
   private playQualityOverride: string = '';
 
   /**
+   * 听书「跳过片头」这次已经跳过的条目 id
+   *
+   * 为什么需要它：状态回调 `playing` 在「暂停后接着播」时也会来一次，进度回调更是每秒都来、
+   * 拖一下进度条还会连着来。没有这个记账，用户把进度条拖回 40 秒，下一拍就会被拽去片头。
+   * 记的是「哪一集已经跳过了」，换集 / 重新起播（playAt）时清零。
+   */
+  private bookIntroSkippedId: string = '';
+  /**
+   * 听书「跳过片尾」已经触发过的条目 id
+   *
+   * 与下面的 bookPlayingId 配合：进度回调在**切章的那一刻**还会带着上一集的进度进来一次，
+   * 那时 currentIndex 已经指向新一集 —— 只看「当前条目」会拿上一集的进度去判新一集，
+   * 表现为「一连跳好几集」。所以还要求「这一集真的开始播了」（bookPlayingId）。
+   */
+  private bookOutroFiredId: string = '';
+  /** 真正开始播的那一集 id（playing 回调里写，playAt 开头清空；空串 = 还在切章/解析） */
+  private bookPlayingId: string = '';
+
+  /**
    * 绑定沙箱目录（播放现场落盘用）。
    * EntryAbility.onCreate 里调一次，必须早于 bootstrap()（它末尾会读现场）。
    */
@@ -884,6 +912,104 @@ export class PlaySession {
     this.noticeListener = listener;
   }
 
+  // ------------------------------------------------------------ 听书：倍速 / 跳过片头片尾
+
+  /**
+   * 听书倍速：落盘 + 立刻作用到当前这一集
+   *
+   * 只认听书条目：LxPlayer 的速率是实例级的，音乐不该因为听书设过 2x 而跟着变快
+   * （换到音乐条目时 playAt 会显式把速率归位到 1.0，见那里的注释）。
+   * 界面（书籍详情页）调它，不用关心播放器在哪一层。
+   */
+  setBookPlaybackSpeed(rate: number): void {
+    const settings: BookPlaySettings = BookPlaySettings.getInstance();
+    settings.setSpeed(rate);
+    const item: SongItem | null = this.current;
+    if (item === null || item.source !== BOOK_SOURCE) {
+      return;
+    }
+    LxPlayer.getInstance().setSpeed(settings.getSpeed());
+  }
+
+  /**
+   * 听书「跳过片头」：每一集**第一次真正出声**时跳到第 N 秒
+   *
+   * 三个要点（也是「拖动进度条不反复跳」的全部实现）：
+   *   1. 触发点是**状态回调**（playing），不是进度回调 —— 进度每秒都来、拖动也算，
+   *      挂在那里就是「拖到 30 秒又被拽回片头」；
+   *   2. 播放头必须还在开头（BOOK_INTRO_HEAD_MS 之内）：暂停后接着播、拖完再播都不算新起播；
+   *   3. 这一集已经跳过一次就不再跳（bookIntroSkippedId）—— 暂停/继续来回按也只跳一次。
+   *
+   * 片头比整集还长（或长到只剩几秒）时不跳：那不是「跳过片头」，是「直接播完」。
+   */
+  private applyBookSkipIntro(): void {
+    if (this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
+      return;
+    }
+    const item: SongItem = this.queue[this.currentIndex];
+    if (item.source !== BOOK_SOURCE) {
+      return;
+    }
+    const intro: number = BookPlaySettings.getInstance().getSkipIntroSec();
+    if (intro <= 0) {
+      return;
+    }
+    if (this.bookIntroSkippedId === item.id) {
+      return;
+    }
+    const player: LxPlayer = LxPlayer.getInstance();
+    if (player.getCurrentMs() > BOOK_INTRO_HEAD_MS) {
+      return;
+    }
+    const durationMs: number = player.getDurationMs();
+    if (durationMs > 0 && intro * 1000 >= durationMs - 1000) {
+      return;
+    }
+    this.bookIntroSkippedId = item.id;
+    hilog.info(DOMAIN, TAG, 'book skip intro %{public}ds: %{public}s', intro, item.name);
+    this.seek(intro);
+  }
+
+  /**
+   * 听书「跳过片尾」：播到「总时长 - M 秒」自动切下一集
+   *
+   * - 挂在进度回调上，但只按「这一集是否已经跳过」去重（bookOutroFiredId），
+   *   所以一集里反复来的进度事件最多触发一次、不会连跳好几集；
+   * - 还要求「这一集真的开始播了」（bookPlayingId）：切章那一拍旧进度不许算到新一集头上；
+   * - 总时长还不知道（durationMs <= 0）时不动，避免按 0 算成「已经到片尾」；
+   * - **最后一集不跳**：让它自然播完（列表循环下 next() 会绕回第一集，那不是「正常结束」）。
+   */
+  private checkBookSkipOutro(currentMs: number, durationMs: number): void {
+    if (this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
+      return;
+    }
+    const item: SongItem = this.queue[this.currentIndex];
+    if (item.source !== BOOK_SOURCE) {
+      return;
+    }
+    if (this.bookPlayingId !== item.id) {
+      return;
+    }
+    const outro: number = BookPlaySettings.getInstance().getSkipOutroSec();
+    if (outro <= 0 || durationMs <= 0) {
+      return;
+    }
+    const cutMs: number = durationMs - outro * 1000;
+    if (cutMs <= 0 || currentMs < cutMs) {
+      return;
+    }
+    if (this.bookOutroFiredId === item.id) {
+      return;
+    }
+    if (this.currentIndex >= this.queue.length - 1) {
+      return;
+    }
+    this.bookOutroFiredId = item.id;
+    hilog.info(DOMAIN, TAG, 'book skip outro %{public}ds at %{public}dms/%{public}dms: %{public}s',
+      outro, currentMs, durationMs, item.name);
+    void this.next();
+  }
+
   setLibrarySink(sink: LibrarySink | null): void {
     this.librarySink = sink;
   }
@@ -992,6 +1118,8 @@ export class PlaySession {
       }
       // 缓冲段跟着往前走（缓冲事件只在数据变化时来，中间几秒要靠这里推）
       this.pushBuffered();
+      // 听书「跳过片尾」：播到「总时长 - M 秒」就切下一集（最后一章不跳，让它正常结束）
+      this.checkBookSkipOutro(currentMs, durationMs);
     };
     const onCompleted: LxPlayerCompletionListener = () => {
       this.onTrackCompleted();
@@ -1198,11 +1326,21 @@ export class PlaySession {
 
   private onPlayerState(status: LxPlayerStatus, message: string): void {    if (status === 'playing') {
       this.setStatus('playing', '正在播放');
+      // 这一集真的开始出声了：给「跳过片尾」挂上武装标记（切章期间它一直是空的，
+      // 那份旧进度就不会被算到新一集头上，见 checkBookSkipOutro）
+      this.bookPlayingId = this.currentIndex >= 0 && this.currentIndex < this.queue.length
+        ? this.queue[this.currentIndex].id : '';
       // 切音质后接着放：先判暂停态（它要读 resumeIndex，applyResumeSeek 会把它清掉），
       // 再跳到原来的位置
       this.applyResumePaused();
+      // 这一次出声是不是「接着上次的进度放」：要在 applyResumeSeek 把它清掉之前判
+      const resuming: boolean = this.resumePosition > 0 && this.resumeIndex === this.currentIndex;
       // 重启恢复后第一次出声：跳到退出时的位置接着放
       this.applyResumeSeek();
+      // 听书「跳过片头」：只在真正开始播一集时跳（续播已经跳走的位置不能被片头冲掉）
+      if (!resuming) {
+        this.applyBookSkipIntro();
+      }
       return;
     }
     if (status === 'paused') {
@@ -1963,6 +2101,13 @@ export class PlaySession {
     this.currentLocalPath = '';
     this.pushQueueState();
 
+    // 新的一次起播（换章 / 重试 / 切档）：听书「跳过片头片尾」的记账清零。
+    // 不清的话，同一集重播时片头就不再跳了（用户会以为设置没生效）。
+    // bookPlayingId 一起清空：在下一集真正出声之前，任何进度回调都不许触发「跳过片尾」。
+    this.bookIntroSkippedId = '';
+    this.bookOutroFiredId = '';
+    this.bookPlayingId = '';
+
     // 先把上一首停掉再解析：解析要几秒，期间旧歌还在响的话，界面上的进度条
     // 会先走一段再被新歌重置回去——「先变后执行」就是这么来的。
     await LxPlayer.getInstance().release();
@@ -1977,6 +2122,11 @@ export class PlaySession {
     // 播放历史不在这里记：ListenTracker 盯着播放器，开播时把这首写进 ListenLog
     // （历史与回响共用那份流水，不到 30 秒的也进历史），切歌只管换歌。
     let item: SongItem = this.queue[index];
+
+    // 速率按条目归位：听书用用户设的倍速，其余（本地 / 云端 / 在线歌）一律 1.0x。
+    // LxPlayer 的速率是实例级设置，不显式归位的话「听书设了 2x，接着放音乐也变 2x」。
+    LxPlayer.getInstance().setSpeed(item.source === BOOK_SOURCE
+      ? BookPlaySettings.getInstance().getSpeed() : 1);
 
     // 本地音乐（设备里导入进来的音频）：直接读沙箱文件，不联网、不看音源脸色。
     // 位置必须在音源检查之前 —— 没导入音源的用户也要能听自己手机里的歌。

@@ -19,6 +19,7 @@ import {
   BookSourceInfo,
 } from './BookTypes';
 import { BookCookieJar, BookResponse, bookRequest } from './BookHttp';
+import { BookPlaySettings } from './BookPlaySettings';
 import { BookSourceStore, sourceText } from './BookSourceStore';
 import { bytesToUtf8, utf8Bytes } from '../music/PlatformCrypto';
 import { unwrapJsonString } from '../source/SourceEngine';
@@ -120,6 +121,9 @@ export class BookEngine {
       return;
     }
     this.store.init(context);
+    // 听书播放设置（倍速 / 跳过片头片尾）也在这里读回来：prepare 是应用启动时最早
+    // 拿到 context 的听书入口，比任何听书界面都早，界面用 @StorageLink 订阅才不会先空一下。
+    BookPlaySettings.getInstance().init(context);
     this.prepared = true;
     try {
       const decoder = util.TextDecoder.create('utf-8');

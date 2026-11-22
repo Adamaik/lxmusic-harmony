@@ -1,4 +1,5 @@
 import { LengthMetrics } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
 import { K_CURRENT_ID, K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem,
   songFromSearch } from '../core/player/PlaySession';
 import { getPlaylistDetailAll, LxListDetail, PlaylistDetailProgress } from '../core/music/MusicList';
@@ -25,6 +26,7 @@ import { AddToPlaylistSheet } from './AddToPlaylistSheet';
 import { DuplicateSongsSheet } from './DuplicateSongsSheet';
 import { DownloadItem, DownloadManager, downloadKeyOf } from '../core/download/DownloadManager';
 import { isLocalSong } from '../core/local/LocalMusic';
+import { ExportOutcome, PlaylistPort } from '../core/local/PlaylistPort';
 import { isWebDavSong } from '../core/webdav/WebDavLibrary';
 
 /** 页内悬浮迷你播放条的离底距离：与壳层那条 HdsTabs 悬浮栏同一个口径 */
@@ -834,6 +836,11 @@ export struct PlaylistDetailView {
         .onClick(() => {
           this.checkDuplicates();
         })
+      // 导出整张歌单：换设备时把文件传过去，在「我的 -> 导入文件」一键导入
+      MenuItem({ content: '导出为文件' })
+        .onClick(() => {
+          void this.exportPlaylistFile();
+        })
     }
     .font({ size: 16 })
     .menuItemDivider({
@@ -1031,6 +1038,29 @@ export struct PlaylistDetailView {
   /** 是不是内置收藏歌单（它里面的歌都已收藏，收藏相关入口要藏起来） */
   private isBuiltin(): boolean {
     return SyncManager.getInstance().getLibrary().isBuiltinPlaylist(this.playlistId);
+  }
+
+  /**
+   * 导出这张歌单为 JSON 文件（换设备迁移用，不经过服务器）
+   *
+   * 导出的是**整张歌单**（按 id 从库里重新取），不是当前搜索结果 —— 搜索框只是查看用的过滤，
+   * 拿它去导出会让用户得到一份「少了歌」的文件。本地/云端歌曲会被跳过并计数。
+   */
+  private async exportPlaylistFile(): Promise<void> {
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      this.toast('当前环境不支持保存文件');
+      return;
+    }
+    try {
+      const result: ExportOutcome = await PlaylistPort.getInstance()
+        .exportToFile(context as common.Context, [this.playlistId], this.title);
+      if (!result.canceled) {
+        this.toast(result.message);
+      }
+    } catch (e) {
+      this.toast('导出失败，请重试');
+    }
   }
 
   /**

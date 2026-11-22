@@ -1,3 +1,4 @@
+import { common } from '@kit.AbilityKit';
 import { K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
 import { K_ECHO_VERSION, ListenLog } from '../core/history/ListenLog';
 import { BottomBar } from '../ui/BottomBar';
@@ -7,12 +8,13 @@ import { CollectedPlaylist, CollectedPlaylists, K_COLLECTED_VERSION, collectedKe
 import { OnlineRoute, platformName } from '../core/music/MusicList';
 import { LOVE_LIST_NAME } from '../core/sync/SyncTypes';
 import { K_LOCAL_VERSION, LocalMusic } from '../core/local/LocalMusic';
+import { ExportOutcome, ImportFileOutcome, PlaylistPort } from '../core/local/PlaylistPort';
 import { K_DOWNLOAD_VERSION, DownloadManager } from '../core/download/DownloadManager';
 import { K_WEBDAV_VERSION, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT, C_PRESSED, C_RED, C_RED_TINT, C_TEXT,
   C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
-import { I_CHEVRON_RIGHT, I_CLOCK, I_CLOUD, I_DOWNLOAD, I_FOLDER, I_GEAR, I_HEART_FILLED, I_HELP,
-  I_IMPORT, I_PLAYLIST, I_PLUS, IconGlyph } from '../ui/Icons';
+import { I_CHECK_CIRCLE, I_CHEVRON_RIGHT, I_CIRCLE, I_CLOCK, I_CLOUD, I_DOC, I_DOWNLOAD, I_FOLDER,
+  I_GEAR, I_HEART_FILLED, I_HELP, I_IMPORT, I_PLAYLIST, I_PLUS, IconGlyph } from '../ui/Icons';
 import { CoverArt, TopFade } from '../ui/Widgets';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { ImportPlaylistSheet } from './ImportPlaylistSheet';
@@ -107,6 +109,16 @@ export struct MineView {
   @State editName: string = '';
   /** 「导入歌单」面板（粘贴第三方歌单分享链接） */
   @State importOpen: boolean = false;
+  /**
+   * 自建歌单的「多选导出」状态
+   *
+   * 群反馈（2026-11-22）的诉求是「多选几个歌单，一次性导出一个文件」，
+   * 所以选择态只作用于自建歌单段：勾中的 id 存在这里，导完自动退出选择态。
+   */
+  @State selecting: boolean = false;
+  @State selectedIds: string[] = [];
+  /** 正在读写文件：防连点（保存 / 选择对话框同一时间只能有一个） */
+  @State transferring: boolean = false;
   /** 最近一次触摸点：删除歌单时在这里撒一把粒子（普通字段，不引起重绘） */
   private dustX: number = 0;
   private dustY: number = 0;
@@ -150,6 +162,27 @@ export struct MineView {
   private refresh(): void {
     const library = SyncManager.getInstance().getLibrary();
     this.playlists = library.playlistSummaries();
+    // 歌单在别处被删了（同步 / 长按删除）时，勾选里不能留着已经不存在的 id：
+    // 留着会让「已选 N 个」比实际能导出的多，全选/取消全选的判断也会错
+    if (this.selectedIds.length > 0) {
+      const alive: Set<string> = new Set<string>();
+      for (const item of this.playlists) {
+        alive.add(item.id);
+      }
+      const kept: string[] = [];
+      for (const id of this.selectedIds) {
+        if (alive.has(id)) {
+          kept.push(id);
+        }
+      }
+      if (kept.length !== this.selectedIds.length) {
+        this.selectedIds = kept;
+      }
+    }
+    if (this.playlists.length === 0 && this.selecting) {
+      this.selecting = false;
+      this.selectedIds = [];
+    }
     this.collected = CollectedPlaylists.getInstance().list();
     this.favoriteCount = library.favoritePlaylistSummary().count;
     this.localCount = LocalMusic.getInstance().songsForUi().length;
@@ -225,6 +258,130 @@ export struct MineView {
         },
       ],
     });
+  }
+
+  // ------------------------------------------------------------ 歌单导出 / 导入文件
+
+  /** 文件对话框要的应用上下文（与本地音乐导入同一套取法） */
+  private hostContext(): common.Context | null {
+    const context = this.getUIContext().getHostContext();
+    return context === undefined ? null : context as common.Context;
+  }
+
+  /** 「选择」/「完成」：退出选择态时清空勾选，避免下次进来还留着上次的 id */
+  private toggleSelecting(): void {
+    this.selecting = !this.selecting;
+    if (!this.selecting) {
+      this.selectedIds = [];
+    }
+  }
+
+  private isPicked(id: string): boolean {
+    return this.selectedIds.includes(id);
+  }
+
+  /** 点一行：选择态勾选 / 取消，普通态进歌单详情 */
+  private togglePick(id: string): void {
+    const next: string[] = [];
+    let found: boolean = false;
+    for (const item of this.selectedIds) {
+      if (item === id) {
+        found = true;
+      } else {
+        next.push(item);
+      }
+    }
+    if (!found) {
+      next.push(id);
+    }
+    this.selectedIds = next;
+  }
+
+  /** 全选 / 取消全选 */
+  private toggleSelectAll(): void {
+    if (this.selectedIds.length === this.playlists.length) {
+      this.selectedIds = [];
+      return;
+    }
+    const ids: string[] = [];
+    for (const item of this.playlists) {
+      ids.push(item.id);
+    }
+    this.selectedIds = ids;
+  }
+
+  /** 单张歌单：长按菜单里的「导出为文件」 */
+  private exportOne(item: PlaylistSummary): void {
+    void this.runExport([item.id], item.name);
+  }
+
+  /** 多选导出：一个文件里装多张歌单 */
+  private exportSelected(): void {
+    if (this.selectedIds.length === 0) {
+      this.toast('先勾选要导出的歌单');
+      return;
+    }
+    const day: string = new Date().toISOString().substring(0, 10);
+    void this.runExport(this.selectedIds, `聆听歌单-${day}`);
+  }
+
+  /**
+   * 导出到用户选的位置
+   *
+   * 取消保存不提示（用户主动取消，弹一句「已取消」反而多余）；成功才退出选择态 ——
+   * 失败时勾选还在，用户可以直接重试，不必重新选一遍歌单。
+   */
+  private async runExport(ids: string[], suggestedName: string): Promise<void> {
+    if (this.transferring) {
+      return;
+    }
+    const context: common.Context | null = this.hostContext();
+    if (context === null) {
+      this.toast('当前环境不支持保存文件');
+      return;
+    }
+    this.transferring = true;
+    try {
+      const result: ExportOutcome =
+        await PlaylistPort.getInstance().exportToFile(context, ids, suggestedName);
+      if (!result.canceled) {
+        this.toast(result.message);
+      }
+      if (result.ok) {
+        this.selecting = false;
+        this.selectedIds = [];
+      }
+    } catch (e) {
+      this.toast('导出失败，请重试');
+    } finally {
+      this.transferring = false;
+    }
+  }
+
+  /** 「导入文件」：选一个聆听导出的 JSON，建成新歌单 */
+  private async importPlaylistFile(): Promise<void> {
+    if (this.transferring) {
+      return;
+    }
+    const context: common.Context | null = this.hostContext();
+    if (context === null) {
+      this.toast('当前环境不支持选择文件');
+      return;
+    }
+    this.transferring = true;
+    try {
+      const result: ImportFileOutcome = await PlaylistPort.getInstance().importFromFile(context);
+      if (!result.canceled) {
+        this.toast(result.message);
+      }
+      if (result.ok) {
+        this.refresh();
+      }
+    } catch (e) {
+      this.toast('导入失败，请重试');
+    } finally {
+      this.transferring = false;
+    }
   }
 
   /** 把整张歌单的歌批量加进收藏（收藏是参与同步的数据，只上行一次） */
@@ -346,17 +503,24 @@ export struct MineView {
   }
 
   /**
-   * 歌单卡里那块浅灰底的「动作区」（照华为音乐：新建歌单 / 歌单导入 并排）
+   * 歌单卡里那块浅灰底的「动作区」
    *
+   * 三格并排：新建歌单 / 歌单导入（粘贴分享链接）/ 导入文件（换设备迁移用的 JSON）。
+   * 后两项容易混，文案上刻意区分开：一个「歌单导入」是线上歌单链接，一个「导入文件」是本机 JSON。
    * 参数只用一个下标（@Builder 的参数按值传，回调统一走本页的方法）。
    */
   @Builder
   cardAction(index: number) {
     Column({ space: 6 }) {
-      IconGlyph({ symbol: index === 0 ? I_PLUS : I_IMPORT, iconSize: 23, color: C_TEXT })
-      Text(index === 0 ? '新建歌单' : '歌单导入')
+      IconGlyph({
+        symbol: index === 0 ? I_PLUS : (index === 1 ? I_IMPORT : I_DOC),
+        iconSize: 23,
+        color: C_TEXT,
+      })
+      Text(index === 0 ? '新建歌单' : (index === 1 ? '歌单导入' : '导入文件'))
         .fontSize(F_SUB + 0.5)
         .fontColor(C_TEXT)
+        .maxLines(1)
     }
     .layoutWeight(1)
     .height('100%')
@@ -368,12 +532,56 @@ export struct MineView {
     .onClick(() => {
       if (index === 0) {
         this.openCreate();
-      } else {
+      } else if (index === 1) {
         this.importOpen = true;
+      } else {
+        void this.importPlaylistFile();
       }
     })
-    .accessibilityText(index === 0 ? '新建歌单' : '导入歌单')
+    .accessibilityText(index === 0 ? '新建歌单' : (index === 1 ? '导入歌单' : '从文件导入歌单'))
     .accessibilityLevel('yes')
+  }
+
+  /**
+   * 多选导出工具条（选择态才出现）
+   *
+   * 放在动作区的位置上：进选择态后「新建 / 导入」这些入口先让位，屏幕上只有
+   * 「全选 / 导出所选」两件事，避免勾到一半误点到别处。
+   */
+  @Builder
+  exportBar() {
+    Row({ space: 12 }) {
+      Text(`已选 ${this.selectedIds.length} 个`)
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT)
+      Blank()
+      Text(this.selectedIds.length === this.playlists.length ? '取消全选' : '全选')
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_SUB)
+        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+        .onClick(() => {
+          this.toggleSelectAll();
+        })
+      Text(this.transferring ? '正在导出…' : '导出所选')
+        .fontSize(F_SUB)
+        .fontColor(Color.White)
+        .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+        .borderRadius(16)
+        .backgroundColor(C_RED)
+        .opacity(this.transferring || this.selectedIds.length === 0 ? 0.5 : 1)
+        .onClick(() => {
+          if (!this.transferring) {
+            this.exportSelected();
+          }
+        })
+        .accessibilityText('导出所选歌单为 JSON 文件')
+        .accessibilityLevel('yes')
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 14, right: 14 })
+    .borderRadius(16)
+    .backgroundColor(C_FILL_SOFT)
   }
 
   /** 歌单行：图形占位封面 + 名字 + 曲目数 + 右箭头（长按是重命名 / 删除那套菜单） */
@@ -388,6 +596,16 @@ export struct MineView {
       }
 
       Row({ space: 12 }) {
+        // 选择态：行首多一枚勾选圈；普通态保留歌单占位封面
+        if (this.selecting) {
+          IconGlyph({
+            symbol: this.isPicked(item.id) ? I_CHECK_CIRCLE : I_CIRCLE,
+            iconSize: 22,
+            color: this.isPicked(item.id) ? C_RED : C_TEXT_WEAK,
+          })
+            .accessibilityLevel('no')
+        }
+
         // 歌单没有封面图，用一块淡底 + 歌单图形占位（位置与华为音乐那排封面一致）
         Stack({ alignContent: Alignment.Center }) {
           Column()
@@ -419,14 +637,21 @@ export struct MineView {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
 
-        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_CHEVRON })
-          .accessibilityLevel('no')
+        // 勾选态不画右箭头：这一行现在是「选它」，不是「进去」
+        if (!this.selecting) {
+          IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_CHEVRON })
+            .accessibilityLevel('no')
+        }
       }
       .width('100%')
       .height(70)
       .padding({ left: 14, right: 14 })
       .onClick(() => {
-        this.onOpenPlaylist(item);
+        if (this.selecting) {
+          this.togglePick(item.id);
+        } else {
+          this.onOpenPlaylist(item);
+        }
       })
       .onTouch((event: TouchEvent) => {
         this.rememberTouch(event);
@@ -439,6 +664,11 @@ export struct MineView {
   @Builder
   rowMenu(item: PlaylistSummary) {
     Menu() {
+      // 单张导出：换设备迁移的最小入口（多选导出在卡片头部的「选择」里）
+      MenuItem({ content: '导出为文件' })
+        .onClick(() => {
+          this.exportOne(item);
+        })
       MenuItem({ content: '添加到收藏' })
         .onClick(() => {
           this.addPlaylistToFavorites(item);
@@ -551,11 +781,27 @@ export struct MineView {
           .fontColor(this.playlistTab === 1 ? C_TEXT : C_TEXT_SUB)
           .onClick(() => {
             this.playlistTab = 1;
+            // 换段就退出选择态：勾着自建歌单去收藏段，导出按钮还在，容易误操作
+            if (this.selecting) {
+              this.toggleSelecting();
+            }
           })
         Text(`${this.collected.length}`)
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
         Blank()
+        // 多选导出入口：只在自建歌单段、且有歌单时出现
+        if (this.playlistTab === 0 && this.playlists.length > 0) {
+          Text(this.selecting ? '完成' : '选择')
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .padding({ left: 6, right: 2, top: 6, bottom: 6 })
+            .onClick(() => {
+              this.toggleSelecting();
+            })
+            .accessibilityText(this.selecting ? '完成选择' : '选择多个歌单导出')
+            .accessibilityLevel('yes')
+        }
       }
       .width('100%')
       .height(54)
@@ -583,28 +829,39 @@ export struct MineView {
         }
       } else {
         /**
-         * 动作区（新建歌单 / 歌单导入）
+         * 动作区（新建歌单 / 歌单导入 / 导入文件）
          *
          * 左右必须离卡片边留出一段：这里**外面套一层带内边距的容器**，而不是给这条
          * `width('100%')` 再叠 `margin` —— 百分比宽度是按父容器算的，叠上外边距就比卡片还宽，
          * 右边被 `clip(true)` 切掉、左边贴着边，看着就是「这条没留边」。
+         *
+         * 选择态下这块换成「全选 / 导出所选」：入口让位，屏幕上只剩导出这一件事。
          */
-        Column() {
-          Row() {
-            this.cardAction(0)
-            this.cardAction(1)
+        if (this.selecting) {
+          Column() {
+            this.exportBar()
           }
           .width('100%')
-          .height(64)
-          .borderRadius(16)
-          .backgroundColor(C_FILL_SOFT)
-          .clip(true)
+          .padding({ left: 14, right: 14, bottom: 10 })
+        } else {
+          Column() {
+            Row() {
+              this.cardAction(0)
+              this.cardAction(1)
+              this.cardAction(2)
+            }
+            .width('100%')
+            .height(64)
+            .borderRadius(16)
+            .backgroundColor(C_FILL_SOFT)
+            .clip(true)
+          }
+          .width('100%')
+          .padding({ left: 14, right: 14, bottom: 10 })
         }
-        .width('100%')
-        .padding({ left: 14, right: 14, bottom: 10 })
 
         if (this.playlists.length === 0) {
-          Text('还没有歌单，点上面的「新建歌单」建一个，或者用「歌单导入」粘贴一张分享链接')
+          Text('还没有歌单，点上面的「新建歌单」建一个；也可以用「歌单导入」粘贴分享链接，或用「导入文件」导入另一台设备导出的歌单文件')
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
             .width('100%')

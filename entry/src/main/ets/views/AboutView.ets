@@ -298,8 +298,8 @@ export struct AboutView {
   /**
    * 更新公告入口
    *
-   * 副标题直接给「最近一次更新是几月几号 / 一共几次」——用户不用点进去就知道有没有新东西，
-   * 点进去看到的是从新到旧连成一条线的时间线（见 views/ChangelogView.ets）。
+   * 副标题给「本机版本 + 公告更新到哪天」——用户不用点进去就知道自己装的是哪一版、
+   * 这一版更新到哪天；点进去看到的是从新到旧连成一条线的时间线（见 views/ChangelogView.ets）。
    * 与反馈卡同一套行式布局：左边圆底图标、中间标题 + 副标题、右边箭头。
    */
   @Builder
@@ -323,7 +323,17 @@ export struct AboutView {
           .fontColor(C_TEXT)
           .width('100%')
           .textAlign(TextAlign.Start)
-        Text(`最近更新 ${latestMonthDayOf()} · 共 ${updateCount()} 次`)
+        /**
+         * 副标题一行同时给两块信息：本机版本 + 公告最新到哪天
+         *
+         * 只写「最近更新」时，用户没法把自己装的版本和公告对上 —— 群反馈
+         * 「为啥新版本不需要更新啊」问的就是这个：本机到底是哪一版、有没有新的一版，
+         * 界面上没有一处能直接看。带上 `v1.0.9` 之后，群置顶装完包回来一看就知道有没有变。
+         * 文案刻意压在 ~16 个字符：这张卡高度固定 70，窄屏 + 字体放大时多一行就会被裁。
+         */
+        Text(this.version.length > 0
+          ? `v${this.version} · 更新至 ${latestMonthDayOf()}`
+          : `更新至 ${latestMonthDayOf()} · 共 ${updateCount()} 次`)
           .fontSize(11.5)
           .fontColor(C_TEXT_WEAK)
           .width('100%')
@@ -346,7 +356,9 @@ export struct AboutView {
     .onClick(() => {
       this.onOpenChangelog();
     })
-    .accessibilityText(`查看更新公告，最近更新 ${latestMonthDayOf()}`)
+    .accessibilityText(this.version.length > 0
+      ? `查看更新公告，本机 v${this.version}，公告更新至 ${latestMonthDayOf()}`
+      : `查看更新公告，公告更新至 ${latestMonthDayOf()}`)
     .accessibilityLevel('yes')
   }
 
@@ -404,6 +416,13 @@ export struct AboutView {
           Column({ space: 14 }) {
             HintText({ text: '安装测试包：群置顶链接会跳到 AppTest，如果停在白页，先点右上角「…」选「在浏览器打开」，再在浏览器里下载安装。' })
             HintText({ text: '提示「应用已过期」：装的是有期限的测试包，卸载后从群置顶重装最新的那一版就好。卸载会清掉本地数据（歌单 / 收藏 / 播放现场），装之前先在「设置 - 同步」同步一份。' })
+            /**
+             * 群反馈（2026-11-20 10:57 自取其乐。：「为啥新版本不需要更新啊」）：
+             * 本应用**没有**应用内检查更新（没有后端可拉，也不请求任何服务器），
+             * 新包只靠群置顶的 AppTest 链接分发。用户看不到「有新版」的提示、
+             * 又不知道去哪对版本，就只能靠猜。这一条把「怎么看自己是不是最新」说清楚。
+             */
+            HintText({ text: '是不是最新版：上面「聆听」卡里显示的就是本机版本号（如 v1.0.9），「更新公告」第一条的日期是这一版更新到哪天。从群置顶装完新的测试包再回来对一下，版本号变大就是更新成功；直接覆盖安装即可，歌单和收藏都还在，不用卸载。' })
             HintText({ text: '车机 / HiCar：受审核限制，应用无法安装到车机系统；现在支持在车机上显示蓝牙歌词，用蓝牙连手机播放即可。' })
             HintText({ text: '自己编译：装好 DevEco Studio 打开工程即可一键编译；自己签名安装最简单，给别人分发要联网走 AppTest 的测试签名。' })
           }

@@ -2,12 +2,14 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 import { BookEngine } from '../core/book/BookEngine';
 import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
+import { BookPlaySettings, BOOK_SPEED_CHOICES, bookSpeedText, K_BOOK_SKIP_INTRO,
+  K_BOOK_SKIP_OUTRO, K_BOOK_SPEED } from '../core/book/BookPlaySettings';
 import { BookChapter, BookDetail, BookHit, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE,
   parseBookPayload } from '../core/book/BookTypes';
 import { DownloadManager, DownloadItem } from '../core/download/DownloadManager';
 import { PlaySession, SongItem } from '../core/player/PlaySession';
-import { C_BG, C_CARD, C_DIVIDER, C_ICON, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION,
-  F_SUB, R_COVER } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ICON, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB,
+  C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_COVER, R_PILL } from '../ui/Theme';
 import { I_CLOCK, I_DOC, I_DOWNLOAD, I_HEART, I_HEART_FILLED, I_PLAY, I_REFRESH, I_VOLUME,
   IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, SectionTitle } from '../ui/Widgets';
@@ -57,6 +59,23 @@ export struct BookDetailView {
   @State lastChapter: number = 0;
   /** 播放中那一章的序号（-1 = 没有） */
   @State playingIndex: number = -1;
+
+  /**
+   * 听书播放设置（倍速 / 跳过片头片尾）
+   *
+   * 用 @StorageLink 而不是每次 aboutToAppear 去读一遍：设置由 BookPlaySettings 落盘并写进
+   * AppStorage，这里订阅同一个 key，面板里改完、播放页改了，两处显示立刻一致。
+   */
+  @StorageLink(K_BOOK_SPEED) speed: number = 1;
+  @StorageLink(K_BOOK_SKIP_INTRO) skipIntro: number = 0;
+  @StorageLink(K_BOOK_SKIP_OUTRO) skipOutro: number = 0;
+  /** 倍速面板开合 */
+  @State speedOpen: boolean = false;
+  /** 跳过片头片尾面板开合 */
+  @State skipOpen: boolean = false;
+  /** 面板里两个输入框的文本（数字键盘直接填，改完立刻落盘） */
+  @State introSecText: string = '';
+  @State outroSecText: string = '';
 
   aboutToAppear(): void {
     const shelved: ShelvedBook | null = BookShelf.getInstance().find(this.book.id);
@@ -316,7 +335,216 @@ export struct BookDetailView {
     return state !== null && state.status === 'done';
   }
 
+  /**
+   * 选倍速：落盘 + 立刻作用到正在播的这一集
+   *
+   * 真正的「设到播放器上」在 PlaySession.setBookPlaybackSpeed 里（它知道当前条目是不是听书），
+   * 这里只负责把用户的选择交出去 —— 界面不碰 LxPlayer，音乐播放也就不会被带快。
+   */
+  private pickSpeed(rate: number): void {
+    PlaySession.getInstance().setBookPlaybackSpeed(rate);
+    this.speedOpen = false;
+  }
+
+  /** 头部那颗胶囊上的文案：两个都 0 就是「没启用」 */
+  private skipSummary(): string {
+    if (this.skipIntro <= 0 && this.skipOutro <= 0) {
+      return '跳过片头片尾';
+    }
+    const parts: string[] = [];
+    if (this.skipIntro > 0) {
+      parts.push(`片头 ${this.skipIntro}s`);
+    }
+    if (this.skipOutro > 0) {
+      parts.push(`片尾 ${this.skipOutro}s`);
+    }
+    return parts.join(' · ');
+  }
+
+  /** 打开面板前把输入框对齐到当前设置（否则面板里显示的还是上次的旧值） */
+  private openSkipSheet(): void {
+    this.introSecText = `${this.skipIntro}`;
+    this.outroSecText = `${this.skipOutro}`;
+    this.skipOpen = true;
+  }
+
+  /** 输入框文本 -> 秒数（空 / 非数字都算 0，也就是关掉这一项） */
+  private secondsOf(text: string): number {
+    const trimmed: string = text.trim();
+    if (trimmed.length === 0) {
+      return 0;
+    }
+    const value: number = Number.parseInt(trimmed, 10);
+    if (Number.isNaN(value) || value <= 0) {
+      return 0;
+    }
+    return value;
+  }
+
+  private onIntroInput(value: string): void {
+    this.introSecText = value;
+    BookPlaySettings.getInstance().setSkipIntroSec(this.secondsOf(value));
+  }
+
+  private onOutroInput(value: string): void {
+    this.outroSecText = value;
+    BookPlaySettings.getInstance().setSkipOutroSec(this.secondsOf(value));
+  }
+
   // ------------------------------------------------------------ 界面片段
+
+  /**
+   * 听书播放选项：倍速 / 跳过片头片尾
+   *
+   * 放在「继续听」按钮下面，而不是塞进「更多」菜单：这两个都是听书时**经常改**的东西
+   * （不同的书、不同的主播片头长度都不一样），藏进二级菜单等于每次都要点三层。
+   */
+  @Builder
+  playOptionsRow() {
+    Row({ space: 8 }) {
+      Text(`倍速 ${bookSpeedText(this.speed)}`)
+        .fontSize(F_SUB)
+        .fontColor(C_RED)
+        .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+        .backgroundColor(C_RED_TINT)
+        .borderRadius(R_PILL)
+        .onClick(() => {
+          this.speedOpen = true;
+        })
+        .accessibilityText(`听书倍速，当前 ${bookSpeedText(this.speed)}`)
+
+      Text(this.skipSummary())
+        .fontSize(F_SUB)
+        .fontColor(this.skipIntro > 0 || this.skipOutro > 0 ? C_RED : C_TEXT_SUB)
+        .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+        .backgroundColor(this.skipIntro > 0 || this.skipOutro > 0 ? C_RED_TINT : C_FILL_SOFT)
+        .borderRadius(R_PILL)
+        .onClick(() => {
+          this.openSkipSheet();
+        })
+        .accessibilityText(`跳过片头片尾，当前 ${this.skipSummary()}`)
+    }
+    .width('100%')
+  }
+
+  /** 倍速面板：六档胶囊，点一下立刻生效并落盘 */
+  @Builder
+  speedSheet() {
+    Column({ space: 14 }) {
+      Text('只影响听书，音乐播放始终保持原速。')
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_SUB)
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      Row({ space: 10 }) {
+        this.speedChip(BOOK_SPEED_CHOICES[0])
+        this.speedChip(BOOK_SPEED_CHOICES[1])
+        this.speedChip(BOOK_SPEED_CHOICES[2])
+      }
+      .width('100%')
+
+      Row({ space: 10 }) {
+        this.speedChip(BOOK_SPEED_CHOICES[3])
+        this.speedChip(BOOK_SPEED_CHOICES[4])
+        this.speedChip(BOOK_SPEED_CHOICES[5])
+      }
+      .width('100%')
+
+      Text('选好立刻生效，下次进来还是这一档。')
+        .fontSize(F_SUB - 1)
+        .fontColor(C_TEXT_WEAK)
+        .width('100%')
+        .textAlign(TextAlign.Start)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+  }
+
+  @Builder
+  speedChip(rate: number) {
+    Text(bookSpeedText(rate))
+      .fontSize(F_ITEM)
+      .fontColor(this.speed === rate ? C_RED : C_TEXT)
+      .height(44)
+      .layoutWeight(1)
+      .textAlign(TextAlign.Center)
+      .backgroundColor(this.speed === rate ? C_RED_TINT : C_FILL_SOFT)
+      .borderRadius(R_PILL)
+      .onClick(() => {
+        this.pickSpeed(rate);
+      })
+  }
+
+  /**
+   * 跳过片头 / 片尾面板
+   *
+   * 用两个数字输入框而不是滑杆：片头长度是个「知道就填、不知道就试」的数，
+   * 键盘直接填比拖滑杆准得多（要跳 45 秒时滑杆很难停在 45）。
+   * 改完立刻落盘，不设「保存」按钮 —— 少一步操作。
+   */
+  @Builder
+  skipSheet() {
+    Column({ space: 12 }) {
+      Text('每集自动从「片头」秒数之后开始；播到「总时长 − 片尾」秒时自动接下一集。填 0 表示不启用。')
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_SUB)
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      Row({ space: 10 }) {
+        Text('跳过片头')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+          .width(76)
+          .textAlign(TextAlign.Start)
+        TextInput({ text: this.introSecText, placeholder: '0' })
+          .type(InputType.Number)
+          .fontSize(F_ITEM)
+          .height(44)
+          .layoutWeight(1)
+          .backgroundColor(C_FILL_SOFT)
+          .placeholderColor(C_TEXT_WEAK)
+          .onChange((value: string) => {
+            this.onIntroInput(value);
+          })
+        Text('秒')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+      }
+      .width('100%')
+
+      Row({ space: 10 }) {
+        Text('跳过片尾')
+          .fontSize(F_ITEM)
+          .fontColor(C_TEXT)
+          .width(76)
+          .textAlign(TextAlign.Start)
+        TextInput({ text: this.outroSecText, placeholder: '0' })
+          .type(InputType.Number)
+          .fontSize(F_ITEM)
+          .height(44)
+          .layoutWeight(1)
+          .backgroundColor(C_FILL_SOFT)
+          .placeholderColor(C_TEXT_WEAK)
+          .onChange((value: string) => {
+            this.onOutroInput(value);
+          })
+        Text('秒')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+      }
+      .width('100%')
+
+      Text('只对听书生效。拖动进度条不会反复跳回片头；最后一集不会被「跳过片尾」掐掉，会正常播完。')
+        .fontSize(F_SUB - 1)
+        .fontColor(C_TEXT_WEAK)
+        .width('100%')
+        .textAlign(TextAlign.Start)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+  }
 
   @Builder
   headerCard() {
@@ -400,6 +628,9 @@ export struct BookDetailView {
         })
       }
       .width('100%')
+
+      // 听书播放选项（倍速 / 跳过片头片尾）：贴在「继续听」下面，播放中随时能改
+      this.playOptionsRow()
 
       if (this.introText().length > 0) {
         Text(this.introText())
@@ -488,10 +719,37 @@ export struct BookDetailView {
       .scrollBar(BarState.Off)
       .divider({ strokeWidth: 0.6, color: C_DIVIDER, startMargin: 46, endMargin: 0 })
       .padding({ top: this.topInset })
+
+      /**
+       * 「跳过片头片尾」面板单独挂一个 1×1 节点
+       *
+       * 同一个节点叠两个 bindSheet 会互相干扰（下滑关掉一个、另一个跟着弹），
+       * 工程里同一处结论见 views/PlaylistDetailView.ets。1×1 + 贴左上角：只是挂载点，
+       * 不参与布局、也点不到。
+       */
+      Column()
+        .width(1)
+        .height(1)
+        .position({ x: 0, y: 0 })
+        .bindSheet($$this.skipOpen, this.skipSheet(), {
+          preferType: SheetType.BOTTOM,
+          detents: [SheetSize.MEDIUM],
+          dragBar: true,
+          showClose: true,
+          title: { title: '跳过片头 / 片尾' },
+        })
     }
     .width('100%')
     .height('100%')
     .backgroundColor(C_BG)
+    // 倍速面板挂在外层节点上
+    .bindSheet($$this.speedOpen, this.speedSheet(), {
+      preferType: SheetType.BOTTOM,
+      detents: [SheetSize.MEDIUM],
+      dragBar: true,
+      showClose: true,
+      title: { title: '听书倍速' },
+    })
   }
 
   /** 列表头部：书籍信息卡 + 「目录」标题行（宽屏通栏，见 build 的说明） */
