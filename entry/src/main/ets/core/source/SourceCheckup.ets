@@ -288,10 +288,64 @@ export function compareVersion(a: string, b: string): number {
   return 0;
 }
 
+// ------------------------------------------------------------------ 自检互斥
+
+/**
+ * 自检是否正在跑
+ *
+ * 自检会把一个个源依次装进**同一个全局沙箱**，同时跑两批（或跑到一半又被
+ * 「一键离线自检」「切换兼容模式」插一脚）只会把彼此的脚本顶掉，两边的结论都不可信。
+ * 这里做进程级互斥，设置页再据此把相关按钮禁掉。
+ */
+let checkupRunning: boolean = false;
+
+/** 自检是否正在进行（设置页据此拦住「离线自检 / 切换兼容模式」） */
+export function isSourceCheckupRunning(): boolean {
+  return checkupRunning;
+}
+
 // ------------------------------------------------------------------ 单平台探针
 
 /**
- * 测一个平台：内置搜索找一首真歌 -> 让**当前已加载的音源**解析它的播放地址
+ * 确认沙箱里现在加载的就是「被测源」，不是就重装回被测源
+ *
+ * 自检复用的是播放/下载用的那个全局单例沙箱：探测期间用户点一下播放、换一个源，
+ * 沙箱里的脚本就变成别家的了。这时**绝不能**拿别人的解析结果给当前源记账
+ * （会写成假成功/假失败，还会污染共享路由表）。所以每次探测前都要确认一次：
+ *   - 当前源就是被测源且已初始化 → 直接测；
+ *   - 已经有解析在等沙箱回调（用户刚点播放）→ 不抢，返回 false，这次记为「不算数」；
+ *     重装被测源会把用户这次解析 abort 掉，那是比自检更重要的事；
+ *   - 否则把被测源重新装回沙箱。
+ */
+async function ensureProbeSource(id: string): Promise<boolean> {
+  const engine: SourceEngine = SourceEngine.getInstance();
+  if (engine.getLoadedSourceId() === id && engine.isInited()) {
+    return true;
+  }
+  if (engine.hasPendingResolve()) {
+    return false;
+  }
+  try {
+    await engine.loadSource(id);
+  } catch (e) {
+    return false;
+  }
+  return engine.getLoadedSourceId() === id && engine.isInited();
+}
+
+/** 这次探测「不算数」的统一结果（沙箱被别人改了 / 抢不到） */
+function inconclusiveProbe(platform: string, detail: string, startedAt: number): PlatformProbe {
+  return {
+    platform: platform,
+    ok: false,
+    inconclusive: true,
+    detail: detail,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+/**
+ * 测一个平台：内置搜索找一首真歌 -> 让**被测音源**解析它的播放地址
  *
  * 为什么不用 SourceTest 的现成函数：那些函数是「导入一个在线源再测」，每次都会新导入
  * 一条记录；批量自检要对**列表里已有的源**逐个测，而且必须复用同一个已加载的沙箱。
@@ -300,7 +354,7 @@ export function compareVersion(a: string, b: string): number {
  * 各平台不一样，凭空造一个必然被源脚本判成「参数不对」而误判失效。用应用真实搜索出来的
  * 歌曲，与用户点播放时走的是同一条数据链路。
  */
-async function probePlatform(platform: string): Promise<PlatformProbe> {
+async function probePlatform(ownerId: string, platform: string): Promise<PlatformProbe> {
   const engine: SourceEngine = SourceEngine.getInstance();
   const started: number = Date.now();
   let songs: LxMusicInfo[] = [];
@@ -333,8 +387,19 @@ async function probePlatform(platform: string): Promise<PlatformProbe> {
   let lastError: string = '';
   for (let i = 0; i < attempts; i++) {
     const song: LxMusicInfo = songs[i];
+    // 每次解析前都确认「沙箱里就是被测源」：探测期间用户点播放/换源会把它换成别家，
+    // 这时解析出来的地址不是这个源给的，记成成功/失败都是错的
+    const ready: boolean = await ensureProbeSource(ownerId);
+    if (!ready) {
+      return inconclusiveProbe(platform,
+        '自检期间音源被切换或正在解析播放地址，这次结果不算数', started);
+    }
     try {
       const url: string = await engine.getMusicUrl(JSON.stringify(song), PROBE_QUALITY, platform, RESOLVE_TIMEOUT_MS);
+      // 解析这 8 秒里用户可能又换了源：返回值就不再是这个源的结论了
+      if (engine.getLoadedSourceId() !== ownerId || !engine.isInited()) {
+        return inconclusiveProbe(platform, '解析途中音源被切换，这次结果不算数', started);
+      }
       if (url.length === 0) {
         throw new Error('音源返回了空地址');
       }
@@ -349,14 +414,10 @@ async function probePlatform(platform: string): Promise<PlatformProbe> {
       lastError = messageOf(e as Error);
       // 自检途中如果用户开始播放/下载，换源会把沙箱里的脚本换成别家的，这时报的
       // 「音源未加载 / 不支持该平台」是自检自己的现场被改了，不能算到源头上
-      if (isEngineStateError(lastError)) {
-        return {
-          platform: platform,
-          ok: false,
-          inconclusive: true,
-          detail: `自检期间音源被切换，这次结果不算数：${truncate(lastError, 50)}`,
-          elapsedMs: Date.now() - started,
-        };
+      if (engine.getLoadedSourceId() !== ownerId || !engine.isInited()
+        || isEngineStateError(lastError)) {
+        return inconclusiveProbe(platform,
+          `自检期间音源被切换，这次结果不算数：${truncate(lastError, 50)}`, started);
       }
       // 只有「这首歌本身取不到」才值得换一首再试；超时/脚本报错再试一遍只是白白多等
       if (!mayTryAnotherSong(lastError)) {
@@ -439,7 +500,7 @@ async function checkOneSource(item: SourceInfo, index: number, total: number,
       break;
     }
     progress('probe', `${item.name} · ${platformLabel(platform)}`);
-    const probe: PlatformProbe = await probePlatform(platform);
+    const probe: PlatformProbe = await probePlatform(item.id, platform);
     probes.push(probe);
     // 结论立刻写回路由表：可用的排前、失效的排后（排序规则仍在 SourceRouter 里）
     if (!probe.inconclusive) {
@@ -534,6 +595,13 @@ async function checkOneSource(item: SourceInfo, index: number, total: number,
  */
 export async function runSourceCheckup(options: CheckupOptions): Promise<CheckupReport> {
   const engine: SourceEngine = SourceEngine.getInstance();
+  if (checkupRunning) {
+    throw new Error('自检已经在内进行中，等它结束再试');
+  }
+  // 开头这一下是「别在用户点播放的瞬间抢沙箱」；之后每个源/平台前还有一次同样的检查
+  if (engine.hasPendingResolve()) {
+    throw new Error('正在解析播放地址，等这一下结束再自检');
+  }
   const startedAt: number = Date.now();
   const previousId: string = engine.getLoadedSourceId();
   const previousEnv: string = engine.getSandboxEnv();
@@ -545,8 +613,17 @@ export async function runSourceCheckup(options: CheckupOptions): Promise<Checkup
       targets.push(item);
     }
   }
+  /**
+   * 这批自检「最后装进沙箱的源 id」
+   *
+   * 只记最后一次，不记全部被测源：用户自检期间切到的源很可能也在自检列表里，
+   * 用「是否出现在被测列表」判断就分不清是谁留下的。只有「当前源 === 我们最后装的那个」
+   * 才能确定现场是我们的、可以还原。
+   */
+  let lastLoadedId: string = '';
   const results: SourceCheckupResult[] = [];
   let cancelled: boolean = false;
+  checkupRunning = true;
   try {
     for (let i = 0; i < targets.length; i++) {
       if (cancelledBy(options)) {
@@ -554,6 +631,13 @@ export async function runSourceCheckup(options: CheckupOptions): Promise<Checkup
         break;
       }
       const item: SourceInfo = targets[i];
+      // 用户正在解析播放地址时不要换源：loadSource 会重新注入脚本，把这次解析 abort 掉。
+      // 这个源**不写结果**（连「未验证」也不写）：上一次自检的结论还留着，比抹成灰色有用。
+      if (engine.hasPendingResolve()) {
+        hilog.info(DOMAIN, TAG, 'skip checkup of %{public}s: a resolve is pending', item.id);
+        continue;
+      }
+      lastLoadedId = item.id;
       if (options.onProgress !== undefined) {
         options.onProgress({ done: i, total: targets.length, current: item.name, phase: 'load' });
       }
@@ -587,9 +671,20 @@ export async function runSourceCheckup(options: CheckupOptions): Promise<Checkup
     }
   } finally {
     try {
-      await engine.restoreSourceSnapshot(previousId, previousEnv);
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'restore source after checkup failed: %{public}s', messageOf(e as Error));
+      // 还原前再看一眼现场：只有当沙箱里还是「这批自检最后装进去的那个源」时才还原。
+      // 用户在自检期间主动换了源时，restoreSourceSnapshot 会按 expectedId 拒绝还原，
+      // 免得把他刚选好的源和 active_source.json 一起改回去。
+      const currentId: string = engine.getLoadedSourceId();
+      if (currentId !== previousId || engine.getSandboxEnv() !== previousEnv) {
+        try {
+          await engine.restoreSourceSnapshot(previousId, previousEnv, lastLoadedId);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'restore source after checkup failed: %{public}s', messageOf(e as Error));
+        }
+      }
+    } finally {
+      // 放到还原之后：还原本身也是一次 loadSource，这批没走完之前不能让第二批进来
+      checkupRunning = false;
     }
   }
   const report: CheckupReport = {

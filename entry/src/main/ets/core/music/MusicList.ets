@@ -700,6 +700,35 @@ const TRUNCATE_MIN_SHORTFALL: number = 5;
 const TRUNCATE_SHORTFALL_RATE: number = 0.02;
 
 /**
+ * 判「单页是不是回满了上限」用的页大小
+ *
+ * 几个平台的真实页大小：酷我 `rn=1000`、网易 `limit=1000`、酷狗请求 `-5-9999` 实际一次
+ * 也只给一千条上下、QQ 新版一页 500 上下。接口被砍时返回的条数往往正好卡在整数上
+ * （酷狗 999 / 1919 的现场），所以「回满一页 + 平台自己没给可信的 total」要按
+ * 「可能没拉全」处理。
+ */
+const DETAIL_PAGE_CAP: number = 1000;
+/**
+ * 「回满一页」的判定余量
+ *
+ * 被砍过的响应往往不是正好 1000 条，而是 999 / 998（服务端会先剔掉下架曲目再截断），
+ * 所以留 8 条余量。代价是「本来就有 992~999 首的酷狗歌单」会被判成可能没拉全 ——
+ * 那只会让**删除**这次不做（新增照做，手动更新照常），不会误删，方向是安全的。
+ */
+const DETAIL_CAP_FUZZ: number = 8;
+
+/**
+ * 这个平台的歌单详情接口**不返回可信的曲目总数**
+ *
+ * 酷狗与 QQ 老接口都是 `total: songs.length`（拿到几首就报几首），于是
+ * `total - list.length` 恒为 0，上面那套差额判据对它们**完全失效**：
+ * 源歌单真被砍到 999/1919 也会被当成「拉全了」，接着按 999 条去删本地几十首。
+ */
+function totalUntrustworthyOf(source: string): boolean {
+  return source === 'kg' || source === 'tx';
+}
+
+/**
  * 这份「全量歌单」看起来是不是**没拉全**（接口被限流 / 翻页中途被截断）
  *
  * 给「跟随源歌单自动同步」当删除闸门用：拿半份源歌单去对齐，等于把用户歌单删掉一大半。
@@ -708,15 +737,26 @@ const TRUNCATE_SHORTFALL_RATE: number = 0.02;
  *     （可能大于 total：同一首歌在源歌单里出现两次是合法的，见 getPlaylistDetailAll）；
  *   - 只有 `total > 0`（平台确实给了数）**且**少掉的条数超过容忍额度才算没拉全 ——
  *     total 为 0 表示平台没给这个数（咪咕翻过最后一页时 `totalCount` 就没了），不猜；
- *   - 反过来 `list.length > total` 是正常的重复条目，不算截断。
+ *   - 反过来 `list.length > total` 是正常的重复条目，不算截断；
+ *   - **total 不可信的平台**（酷狗 / QQ 老接口，见 totalUntrustworthyOf）另有一条保守判据：
+ *     单页条数接近页上限（≥ DETAIL_PAGE_CAP - DETAIL_CAP_FUZZ）就按「可能没拉全」处理 ——
+ *     宁可这次不同步删除，也不能拿一份被砍过的源去删本地歌。
  *
  * 容忍额度见 TRUNCATE_MIN_SHORTFALL / TRUNCATE_SHORTFALL_RATE：平台把下架曲目
  * 从 total 里算、却给不出歌，这属于「本来就拉不到」，不该让整次同步作废。
  *
  * 宁可漏判（某平台 total 报得不准）也不能误判：误判只会让这次同步不做，误删却是不可逆的。
+ *
+ * @param source 平台（kw/kg/mg/tx/wy/qs）；空串表示调用方不知道，只按 total 判
  */
-export function playlistDetailTruncated(detail: LxListDetail): boolean {
+export function playlistDetailTruncated(detail: LxListDetail, source: string = ''): boolean {
   if (detail === null || detail === undefined) {
+    return true;
+  }
+  // 单页回满 + 平台不报可信 total：很可能被砍在整页上限上（999/1919 那种现场）
+  if (totalUntrustworthyOf(source)
+    && detail.list.length >= DETAIL_PAGE_CAP - DETAIL_CAP_FUZZ
+    && detail.list.length >= detail.total) {
     return true;
   }
   if (detail.total <= 0) {
@@ -1961,7 +2001,12 @@ const TX_DISS_SONG_NUM: number = 1000;
 
 /** 新版歌单详情（musicu）的请求体，字段照抄洛雪 tx/songList.js 的 getListDetail2 */
 interface TxDissInfoParam {
-  disstid: number;
+  /**
+   * 歌单 id。短 id 用 number（与历史行为一致），超过 15 位时按 string 传：
+   * JS 的 number 只有 2^53 精度，长 disstid 转 number 会被改写成另一个 id，
+   * 接口就会回「没取到歌曲」。
+   */
+  disstid: number | string;
   userinfo: number;
   tag: number;
   orderlist: number;
@@ -2130,10 +2175,20 @@ async function txPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   }
 }
 
+/**
+ * 歌单 id 的传输形态：短 id 用 number（保持历史行为），超过 15 位按 string 传。
+ *
+ * JS 的 number 只有 2^53（≈9.0e15）精度，16 位以上的 disstid 转 number 会被改写成
+ * **另一个 id**，接口于是回「没取到歌曲」——而且错误码与「歌单不存在」长得一样，很难查。
+ */
+function txDissIdOf(id: string): number | string {
+  return /^\d{1,15}$/.test(id) ? asNumber(id) : id;
+}
+
 /** 新版：music.srfDissInfo.aiDissInfo / uniform_get_Dissinfo（洛雪 tx/songList.js 的 getListDetail2） */
 async function txPlaylistDetailMusicu(id: string, page: number): Promise<LxListDetail> {
   const param: TxDissInfoParam = {
-    disstid: asNumber(id),
+    disstid: txDissIdOf(id),
     userinfo: 1,
     tag: 1,
     orderlist: 1,

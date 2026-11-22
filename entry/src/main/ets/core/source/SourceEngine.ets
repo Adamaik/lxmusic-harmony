@@ -532,10 +532,21 @@ export class SourceEngine {
    *
    * @param snapshotId  自检前已加载的音源 id（空串 = 自检前没有加载任何音源）
    * @param snapshotEnv 自检前的沙箱环境（mobile / desktop）
+   * @param expectedId  可选：这批自检「最后装进沙箱的源 id」。传了就多一道校验 ——
+   *                    当前源既不是它就是快照源时，说明用户在自检期间自己换了源，
+   *                    此时**不还原**（还原会把用户刚选好的源和 active_source.json 一起改回去）
    * @returns 是否还原成功；失败时也会把 active_source.json 改回去，避免重启又恢复示例源
    */
-  async restoreSourceSnapshot(snapshotId: string, snapshotEnv: string): Promise<boolean> {
+  async restoreSourceSnapshot(snapshotId: string, snapshotEnv: string,
+    expectedId?: string): Promise<boolean> {
     const env: string = snapshotEnv === 'desktop' ? 'desktop' : 'mobile';
+    const currentId: string = this.loadedSourceId;
+    if (expectedId !== undefined && expectedId.length > 0
+      && currentId.length > 0 && currentId !== expectedId && currentId !== snapshotId) {
+      // 自检期间用户自己换了源：别把沙箱环境与 active_source.json 一起改回去
+      this.pushLog('info', `自检结束：检测到音源已被切换为 ${currentId}，保留当前选择，不还原快照`);
+      return false;
+    }
     this.setSandboxEnv(env);
     if (snapshotId.length === 0) {
       // 自检前本来就没有音源：内存现场清空，并把「上次用的源」记录删掉。

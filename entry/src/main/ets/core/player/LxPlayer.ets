@@ -76,7 +76,7 @@ const LOADED_PROBE_MS: number = 1000;
  * 拔耳机时系统上报的是断开的那几个设备，所以只要其中有一个是耳机类就认为「耳机没了」。
  * 内置扬声器/听筒不算 —— 切到外放不暂停会吵到别人，也正是这个功能要解决的问题。
  */
-function isHeadsetOf(devices: audio.AudioDeviceDescriptors): boolean {
+function isHeadsetType(deviceType: number): boolean {
   const headsets: number[] = [
     audio.DeviceType.WIRED_HEADSET,
     audio.DeviceType.WIRED_HEADPHONES,
@@ -84,8 +84,12 @@ function isHeadsetOf(devices: audio.AudioDeviceDescriptors): boolean {
     audio.DeviceType.BLUETOOTH_A2DP,
     audio.DeviceType.USB_HEADSET,
   ];
+  return headsets.includes(deviceType);
+}
+
+function isHeadsetOf(devices: audio.AudioDeviceDescriptors): boolean {
   for (let i = 0; i < devices.length; i++) {
-    if (headsets.includes(devices[i].deviceType)) {
+    if (isHeadsetType(devices[i].deviceType)) {
       return true;
     }
   }
@@ -109,6 +113,8 @@ export class LxPlayer {
   private routingManager: audio.AudioRoutingManager | null = null;
   /** 取路由管理器失败过（环境不支持）：不再反复试 */
   private routingManagerFailed: boolean = false;
+  /** 拔耳机「延迟复核」的定时器 id（-1 = 没有待执行的复核） */
+  private headsetRecheckTimer: number = -1;
 
   /**
    * 摘下耳机 / 断开蓝牙耳机 → 自动暂停
@@ -147,16 +153,22 @@ export class LxPlayer {
          * 灭屏、蓝牙在 A2DP 与 SCO 之间来回切、通话建立、系统重新排一次输出路由，
          * 都会整批上报一次 DISCONNECT，而事件里带着的恰恰是原来那副耳机 ——
          * 只按事件列表判断，就会在还戴着耳机、声音根本没跑到外放的时候把音乐停掉。
-         * 所以再问一次系统「当下首选输出设备是谁」：还有一个耳机类设备在输出，就不暂停。
+         * 所以再问一次系统「当下首选输出设备是谁」：还有一个**别的**耳机类设备在输出，
+         * 就不暂停。
          */
-        if (this.stillOutputsToHeadset()) {
-          hilog.info(DOMAIN, TAG, 'headset reported disconnected, but it is still the output; keep playing');
+        if (this.stillOutputsToHeadset(action.deviceDescriptors)) {
+          /*
+           * 还有一种「复核早于路由更新」的情形：拔耳机后系统改输出是异步的，
+           * 这一拍问到的首选输出仍然是那副刚拔掉的耳机（id 相同）。
+           * 上面的判定已经把这批刚断开的设备剔除了，所以这里剩下的「还在输出」
+           * 是真的还有另一副耳机；但路由表本身也可能还没刷完，于是再等 400ms 复核一次，
+           * 那一次仍判「没有耳机在输出」就照常暂停 —— 宁可晚停 0.4 秒，也不要漏停。
+           */
+          this.scheduleHeadsetRecheck(action.deviceDescriptors);
           return;
         }
         hilog.info(DOMAIN, TAG, 'headset disconnected, pause playback');
-        this.pause().catch((err: Error) => {
-          hilog.warn(DOMAIN, TAG, 'pause after headset off failed: %{public}s', err.message);
-        });
+        this.pauseAfterHeadsetOff();
       };
     try {
       // 只订阅**输出**设备：麦克风（输入）的插拔跟「声音跑到外放」没有关系，
@@ -166,6 +178,37 @@ export class LxPlayer {
       hilog.warn(DOMAIN, TAG, 'wire headset-off pause failed: %{public}s',
         JSON.stringify(e));
     }
+  }
+
+  /** 拔耳机后的暂停（失败只记日志，不影响播放） */
+  private pauseAfterHeadsetOff(): void {
+    this.pause().catch((err: Error) => {
+      hilog.warn(DOMAIN, TAG, 'pause after headset off failed: %{public}s', err.message);
+    });
+  }
+
+  /**
+   * 路由更新是异步的：第一次复核说「还有耳机在输出」时，隔 400ms 再问一次。
+   *
+   * 只保留一个待执行的复核（同一批断开事件会连报好几次）；到期时如果播放已经停了
+   * （用户自己按了暂停 / 换了首歌）就什么都不做。
+   */
+  private scheduleHeadsetRecheck(gone: audio.AudioDeviceDescriptors): void {
+    if (this.headsetRecheckTimer >= 0) {
+      return;
+    }
+    this.headsetRecheckTimer = setTimeout(() => {
+      this.headsetRecheckTimer = -1;
+      if (this.status !== 'playing') {
+        return;
+      }
+      if (this.stillOutputsToHeadset(gone)) {
+        hilog.info(DOMAIN, TAG, 'headset reported disconnected, but it is still the output; keep playing');
+        return;
+      }
+      hilog.info(DOMAIN, TAG, 'headset disconnected (recheck), pause playback');
+      this.pauseAfterHeadsetOff();
+    }, 400);
   }
 
   /** 音频路由管理器：拿一次存着；环境不支持时只记一次失败，不反复试 */
@@ -187,22 +230,43 @@ export class LxPlayer {
   }
 
   /**
-   * 当下真正在出声的是不是耳机类设备
+   * 当下真正在出声的是不是**另一副**耳机类设备
+   *
+   * `gone` 是刚刚上报 DISCONNECT 的那批设备：查询结果里必须把它们剔除再看。
+   * 不剔除的话，拔耳机的那一刻「首选输出」往往还挂着刚拔掉的那副（路由更新是异步的），
+   * 于是复核会误判成「耳机还在」，一次都不停 —— 声音直接跑到外放上。
    *
    * 查询失败（老系统 / 偶发系统错误）返回 false，也就是**沿用旧行为**（暂停）：
    * 宁可偶发多停一次（用户按一下播放就回来），也不要让「摘下耳机自动暂停」这个功能失效。
    */
-  private stillOutputsToHeadset(): boolean {
+  private stillOutputsToHeadset(gone: audio.AudioDeviceDescriptors): boolean {
     const manager: audio.AudioRoutingManager | null = this.routingManagerOf();
     if (manager === null) {
       return false;
+    }
+    // 刚断开的设备 id：同一副设备在「首选输出」里再出现，不算「还有耳机在输出」
+    const goneIds: Set<number> = new Set<number>();
+    for (let i = 0; i < gone.length; i++) {
+      goneIds.add(gone[i].id);
     }
     try {
       const info: audio.AudioRendererInfo = {
         usage: audio.StreamUsage.STREAM_USAGE_MUSIC,
         rendererFlags: 0,
       };
-      return isHeadsetOf(manager.getPreferredOutputDeviceForRendererInfoSync(info));
+      const current: audio.AudioDeviceDescriptors =
+        manager.getPreferredOutputDeviceForRendererInfoSync(info);
+      for (let i = 0; i < current.length; i++) {
+        const device: audio.AudioDeviceDescriptor = current[i];
+        if (!isHeadsetType(device.deviceType)) {
+          continue;
+        }
+        if (goneIds.has(device.id)) {
+          continue;
+        }
+        return true;
+      }
+      return false;
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'query preferred output device failed: %{public}s', JSON.stringify(e));
       return false;
@@ -670,6 +734,14 @@ export class LxPlayer {
             StartupTiming.getInstance().markPlaying();
           }
           this.update('playing', '正在播放');
+          /*
+           * 倍速补一次：用户在「起播 / 缓冲」窗口里切了倍速（那时 status 还是 loading，
+           * setSpeed 只记账）时，prepared 里的那次 applySpeed 早就执行过了，这一次
+           * playing 才是唯一能把新速率落到这个实例上的时机。
+           * 已按条目归位（见 PlaySession.playAt）：音乐条目 speedRate 就是 1.0x，
+           * 这里再设一次仍是 1.0x，不会把听书的倍速带到音乐上。
+           */
+          this.applySpeed(player);
           break;
         case 'paused':
           // 这次暂停已经落地：打断期间就先结束了的恢复请求（见 resumeAfterInterrupt）到这里补上
@@ -821,6 +893,8 @@ export class LxPlayer {
     if (player === null) {
       return;
     }
+    // 起播 / 缓冲窗口（loading）：这一刻 setSpeed 会抛 5400102，所以只记账，
+    // 由 prepared 与 playing 两处回调各补一次（见 preparePlayer 的 stateChange）。
     if (this.status !== 'playing' && this.status !== 'paused') {
       return;
     }
@@ -1129,6 +1203,11 @@ export class LxPlayer {
     this.loadedEndMs = 0;
     this.loadedProbeAt = 0;
     this.lastProgressAt = 0;
+    // 待执行的「拔耳机延迟复核」属于旧现场：换实例后不能让它把新的一集停掉
+    if (this.headsetRecheckTimer >= 0) {
+      clearTimeout(this.headsetRecheckTimer);
+      this.headsetRecheckTimer = -1;
+    }
     // 打断的现场也跟着实例走：旧实例上的「等 paused 就恢复」不能留到新实例上
     this.focusPaused = false;
     this.interruptPauseIssued = false;

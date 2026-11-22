@@ -157,7 +157,11 @@ class TxDailyBody {
  * 每日 30 首是**账号私有**的动态歌单，少带一个标记可能只回歌单外壳、`songlist` 为空。
  */
 class TxDissParam {
-  disstid: number = 0;
+  /**
+   * disstid **必须是字符串**：动态歌单 id 是长数字，超出 2^53 时 JSON 里当 number 走
+   * 会被改写成另一个数，CgiGetDiss 就查不到那个歌单（每日推荐整块显示「取不到」）。
+   */
+  disstid: string = '';
   dirid: number = 0;
   tag: boolean = true;
   song_begin: number = 0;
@@ -286,33 +290,43 @@ export async function fetchTxGuess(): Promise<LxMusicInfo[]> {
     const req: TxGuessReq = new TxGuessReq();
     req.param.Page = page;
     const body: TxGuessBody = new TxGuessBody(buildComm(), req);
+    let failed: boolean = false;
     try {
       const resp: Record<string, Object> = await httpPostJson(GATEWAY, body, txHeaders(),
         `QQ音乐猜你喜欢(第${page}页)`);
       const data: Record<string, Object> | null = blockOf(resp);
       if (data === null) {
-        continue;
-      }
-      const list: Object[] = asObjectArray(data['tracks']);
-      let added: number = 0;
-      for (const raw of list) {
-        // 这一条是**扁平** Track（不是雷达那种 { Track: {...} }）
-        const track: Record<string, Object> = asRecord(raw);
-        const mid: string = asString(track['mid']);
-        if (mid.length === 0 || seen.has(mid)) {
-          continue;
+        failed = true;
+      } else {
+        const list: Object[] = asObjectArray(data['tracks']);
+        let added: number = 0;
+        for (const raw of list) {
+          // 这一条是**扁平** Track（不是雷达那种 { Track: {...} }）
+          const track: Record<string, Object> = asRecord(raw);
+          const mid: string = asString(track['mid']);
+          if (mid.length === 0 || seen.has(mid)) {
+            continue;
+          }
+          seen.add(mid);
+          tracks.push(track);
+          added += 1;
         }
-        seen.add(mid);
-        tracks.push(track);
-        added += 1;
-      }
-      hilog.info(DOMAIN, TAG, 'guess page %{public}d: %{public}d 首，新增 %{public}d 首',
-        page, list.length, added);
-      if (added === 0) {
-        break;
+        hilog.info(DOMAIN, TAG, 'guess page %{public}d: %{public}d 首，新增 %{public}d 首',
+          page, list.length, added);
+        if (added === 0) {
+          break;
+        }
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'guess page %{public}d failed: %{public}s', page, (e as Error).message);
+      failed = true;
+    }
+    /*
+     * 首页就失败（网络断了 / 登录态失效）：后 3 页只会一样失败，
+     * 没有必要再连打 3 个请求（还会让界面等更久、白耗流量）。
+     */
+    if (failed && page === 1) {
+      break;
     }
   }
   const songs: LxMusicInfo[] = parseTxSongs(tracks);
@@ -444,7 +458,7 @@ export async function fetchTxDaily(): Promise<LxMusicInfo[]> {
   }
   const dissId: string = cardIdOf(card);
   const dissReq: TxDissReq = new TxDissReq();
-  dissReq.param.disstid = asNumber(dissId);
+  dissReq.param.disstid = dissId;
   const dissBody: TxDissBody = new TxDissBody(buildComm(), dissReq);
   const resp: Record<string, Object> =
     await httpPostJson(GATEWAY, dissBody, txHeaders(), 'QQ音乐每日推荐歌单');

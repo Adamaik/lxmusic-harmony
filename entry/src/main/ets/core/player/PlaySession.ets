@@ -977,7 +977,11 @@ export class PlaySession {
    * - 挂在进度回调上，但只按「这一集是否已经跳过」去重（bookOutroFiredId），
    *   所以一集里反复来的进度事件最多触发一次、不会连跳好几集；
    * - 还要求「这一集真的开始播了」（bookPlayingId）：切章那一拍旧进度不许算到新一集头上；
+   * - **只在实际播放中才跳**（isPlaying）：暂停后把进度拖到片尾区间，timeUpdate 照样会来，
+   *   不判状态就等于「暂停中自动播下一集」；
    * - 总时长还不知道（durationMs <= 0）时不动，避免按 0 算成「已经到片尾」；
+   * - **单曲循环不跳**：那一档的语义是「本章反复播」，跳片尾再 next() 会离开本章；
+   *   本章会自然播完并被单曲循环接回来，跳过片尾在这里没有意义；
    * - **最后一集不跳**：让它自然播完（列表循环下 next() 会绕回第一集，那不是「正常结束」）。
    */
   private checkBookSkipOutro(currentMs: number, durationMs: number): void {
@@ -989,6 +993,13 @@ export class PlaySession {
       return;
     }
     if (this.bookPlayingId !== item.id) {
+      return;
+    }
+    // 暂停 / 缓冲停住时才不会真的「播到片尾」：状态不是 playing 就一律不算
+    if (!LxPlayer.getInstance().isPlaying()) {
+      return;
+    }
+    if (this.playMode === 'single') {
       return;
     }
     const outro: number = BookPlaySettings.getInstance().getSkipOutroSec();

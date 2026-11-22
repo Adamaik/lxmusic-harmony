@@ -428,17 +428,23 @@ class MusicAccountStore {
     if (this.txCookie.length === 0) {
       return { nickname: '', vip: '' };
     }
-    const uin: string = txUinOf(this.txCookie);
+    /**
+     * 发起时的 Cookie：请求是异步的，这期间用户可能已经重新登录 / 退出登录。
+     * 落地时 Cookie 变了就说明这份响应属于**上一个账号**，必须整份丢掉 ——
+     * 否则启动时那次 fire-and-forget 的补拉会把旧昵称写回新账号（甚至写进存档）。
+     */
+    const cookieAtStart: string = this.txCookie;
+    const uin: string = txUinOf(cookieAtStart);
     /**
      * 2026-11-23 真机实测：老接口 `fcg_get_profile_homepage` 对新登录态返回 200 + **空 body**，
      * 昵称拉不到，界面于是显示「账号信息没拉到」。改用 musicu 的 GetLoginUserInfo：
      * comm 里除了 uin 还必须带 authst（= `qm_keyst` / `qqmusic_key`），否则服务端回 code=1000。
      */
-    const authst: string = txMusicKeyOf(this.txCookie);
+    const authst: string = txMusicKeyOf(cookieAtStart);
     const headers: Record<string, string> = {
       'User-Agent': TX_UA,
       'Referer': 'https://y.qq.com/',
-      'Cookie': this.txCookie,
+      'Cookie': cookieAtStart,
       'Content-Type': 'application/json',
     };
     try {
@@ -448,6 +454,12 @@ class MusicAccountStore {
       };
       const body: Record<string, Object> = await httpPostJson('https://u.y.qq.com/cgi-bin/musicu.fcg',
         reqBody, headers, 'QQ音乐账号');
+      // Cookie 在这期间换了（重新登录 / 退出登录）：这份响应属于上一个账号，整份丢掉。
+      // 不丢的话启动补拉的旧昵称会盖到新账号上（存档也会被写脏），界面显示错人。
+      if (cookieAtStart !== this.txCookie) {
+        hilog.info(DOMAIN, TAG, 'tx profile response dropped: cookie changed during request');
+        return { nickname: this.txNick, vip: this.txVip };
+      }
       const info: Record<string, Object> = asRecord(asRecord(asRecord(body['req_0'])['data'])['info']);
       const nickname: string = asString(info['nick']).length > 0
         ? asString(info['nick']) : asString(info['hostname']);

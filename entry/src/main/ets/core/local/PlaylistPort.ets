@@ -359,7 +359,10 @@ export class PlaylistPort {
 
     let created: number = 0;
     let added: number = 0;
-    let skipped: number = 0;
+    /** 文件里有、但本机曲库里认不出来（也没法用文件元数据重建）的条目 */
+    let unmatched: number = 0;
+    /** 因为「这首歌已经在歌单里」被跳过的条目（keepDuplicates 后只剩侧表那一类） */
+    let duplicated: number = 0;
     let renamed: number = 0;
     let emptyPlaylists: number = 0;
     for (const playlist of playlists) {
@@ -368,7 +371,7 @@ export class PlaylistPort {
       for (const raw of playlist.songs) {
         const song: SongItem | null = resolveSong(raw, index);
         if (song === null) {
-          skipped++;
+          unmatched++;
           continue;
         }
         resolved.push(song);
@@ -383,9 +386,14 @@ export class PlaylistPort {
       }
       names.add(normalizeName(unique));
       const id: string = library.createPlaylist(unique);
-      const result: AddMusicResult = library.addMusicToPlaylist(id, resolved);
+      /**
+       * keepDuplicates = true：导出刻意保留了歌单里的重复条目，导入必须原样还原。
+       * 走默认的「按 id + 歌名判重」会把它们静默吃掉（换机迁移就少歌），
+       * 而且还会混进「重复跳过」的计数里，用户根本查不出来。
+       */
+      const result: AddMusicResult = library.addMusicToPlaylist(id, resolved, true);
       added += result.added;
-      skipped += result.skipped;
+      duplicated += result.skipped;
       created++;
     }
 
@@ -396,14 +404,18 @@ export class PlaylistPort {
         canceled: false,
         playlists: 0,
         songs: 0,
-        skippedSongs: skipped,
+        skippedSongs: unmatched + duplicated,
         renamed: renamed,
         message: `这个文件里没有可导入的歌曲${hint}`,
       };
     }
     let message: string = `已导入 ${created} 个歌单、共 ${added} 首歌曲`;
-    if (skipped > 0) {
-      message += `\n${skipped} 首没能导入（未匹配或重复），已跳过`;
+    // 「没匹配上」与「重复跳过」分开说：以前合成一句「未匹配或重复」，用户看不出到底哪边出了问题
+    if (unmatched > 0) {
+      message += `\n${unmatched} 首没能导入（本机曲库里没匹配到这首歌）`;
+    }
+    if (duplicated > 0) {
+      message += `\n${duplicated} 首重复已跳过`;
     }
     if (renamed > 0) {
       message += `\n${renamed} 个同名歌单已自动改名（原歌单没有动）`;
@@ -416,7 +428,7 @@ export class PlaylistPort {
       canceled: false,
       playlists: created,
       songs: added,
-      skippedSongs: skipped,
+      skippedSongs: unmatched + duplicated,
       renamed: renamed,
       message: message,
     };
@@ -765,7 +777,12 @@ function parseFile(text: string): ParsedFile {
     }
     const name: string = typeof entry.name === 'string' ? entry.name : '';
     const songs: ExportSong[] = [];
-    if (entry.songs !== undefined && entry.songs !== null) {
+    /**
+     * `songs` 必须是数组：手改过的文件里写成 `"songs": 123` 时，直接 `for...of` 会抛
+     * TypeError（`is not iterable`），绕过下面那些「人话错误」，用户只看到一句系统报错。
+     * 这里当空处理 —— 整张歌单没歌就按「空歌单已忽略」计数，行为与「songs: []」一致。
+     */
+    if (Array.isArray(entry.songs)) {
       const songList: ExportSong[] = entry.songs;
       for (const song of songList) {
         const clean: ExportSong | null = sanitizeSong(song);
@@ -879,7 +896,24 @@ function readText(uri: string): string {
       throw new Error(`文件太大（${Math.round(size / 1024 / 1024)} MB）`);
     }
     const buffer: ArrayBuffer = new ArrayBuffer(size);
-    const read: number = fs.readSync(file.fd, buffer);
+    /**
+     * `readSync` 不保证一次读满：picker 给的 uri 走的是沙箱外的 provider（可能是网盘 /
+     * 文档服务的流式实现），大文件被截在半路只读到一部分时，JSON.parse 会报
+     * 「不是有效的 JSON 文件」，用户换台手机导入就无解。这里循环读到 size 为止。
+     *
+     * 注意 readSync 没有「写进 buffer 的哪个位置」这个参数，只能每次读进临时 buffer
+     * 再拼到尾部 —— 直接用 options.offset 会变成「跳过文件前 N 字节」，越读越错。
+     */
+    let read: number = fs.readSync(file.fd, buffer);
+    while (read > 0 && read < size) {
+      const rest: ArrayBuffer = new ArrayBuffer(size - read);
+      const got: number = fs.readSync(file.fd, rest);
+      if (got <= 0) {
+        break;
+      }
+      new Uint8Array(buffer).set(new Uint8Array(rest, 0, got), read);
+      read += got;
+    }
     const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
     const text: string = decoder.decodeToString(new Uint8Array(buffer, 0, read));
     return text.charCodeAt(0) === 0xFEFF ? text.substring(1) : text;

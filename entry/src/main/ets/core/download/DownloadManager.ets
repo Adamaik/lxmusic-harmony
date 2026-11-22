@@ -204,6 +204,22 @@ interface WriteTarget {
 }
 
 /**
+ * 一个下载任务的「保存位置」缓存
+ *
+ * 换源重试只该重来「解析 + 拉流」，不该每轮都去问一次保存位置：
+ *   - 首轮 picker 失败/超时后，第二轮会再弹一次、再等一次超时；
+ *   - 后台时每轮都会抛 DEFER_BACKGROUND，任务被反复踢回队列。
+ * 这里把位置与后缀记下来，后续轮次只按原路径重开句柄。
+ */
+interface WriteSlot {
+  target: WriteTarget | null;
+  /** 上一次落盘用的后缀：换源后容器变了（mp3 -> flac）才需要另起文件 */
+  ext: string;
+  /** 「已存到应用内目录」那句提示：note 一格还要装换源提示，别互相盖掉 */
+  dirNote: string;
+}
+
+/**
  * 解析出来的下载地址
  *
  * 与链接一起把请求头带出来：普通歌走音源不需要头，有声书的音频 CDN 常常校验
@@ -535,11 +551,13 @@ export class DownloadManager {
   }
 
   /**
-   * 自动下载现在能不能开工（保存位置这一关）
+   * 现在能不能开工（保存位置这一关）
    *
    * 前台：随便下（拿不到系统目录也能弹对话框，或者如实退回应用内目录）。
    * 后台：只有「本次会话已经写成功过系统下载目录」才开工 —— 否则先等着，
-   * 免得因为后台拿不到目录而静默落进「文件管理」看不见的应用内目录。
+   * 免得因为后台拿不到目录而静默落进「文件管理」看不见的应用内目录，
+   * 也免得「解析一次 → 抛 DEFER_BACKGROUND → 回队列 → 再解析一次」空转。
+   * 用户手动点的下载同样适用：后台本来就拿不到保存位置，等回前台由 resume() 接着排。
    */
   private canAutoWriteNow(): boolean {
     if (this.inForeground()) {
@@ -937,6 +955,47 @@ export class DownloadManager {
   }
 
   /**
+   * 拿到本轮要写的目标（同一个任务只解析一次保存位置）
+   *
+   * 首轮走 openTarget（可能要等一次系统保存对话框、后台还会抛 DEFER_BACKGROUND）；
+   * 之后的换源轮次只按原路径把句柄重开（TRUNC，从头写），不再弹框、不再重问系统。
+   * 唯一的例外是换源后容器后缀变了（mp3 变 flac）：文件名不同，必须另起一个目标，
+   * 否则会把 flac 数据写进 .mp3 里、标签也按错格式嵌。
+   */
+  private async acquireWriteTarget(item: DownloadItem, fileName: string, ext: string,
+    slot: WriteSlot): Promise<WriteTarget | null> {
+    const cached: WriteTarget | null = slot.target;
+    if (cached !== null) {
+      if (slot.ext === ext) {
+        const reopened: fs.File | null = this.reopenTarget(cached);
+        if (reopened !== null) {
+          cached.handle = reopened;
+          return cached;
+        }
+      }
+      // 后缀变了 / 原路径重开失败（目录被删、授权过期）：旧目标作废，重新解析一次
+      this.closeQuietly(cached.handle);
+      this.cleanupFailed(cached.part, cached.path);
+      slot.target = null;
+    }
+    const target: WriteTarget | null = await this.openTarget(fileName, item.key);
+    slot.target = target;
+    slot.ext = target !== null ? ext : '';
+    return target;
+  }
+
+  /** 按已有目标重开一个从头写的句柄（不碰系统对话框） */
+  private reopenTarget(target: WriteTarget): fs.File | null {
+    const path: string = target.part.length > 0 ? target.part : target.path;
+    try {
+      return fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'reopen download target failed: %{public}s', JSON.stringify(e));
+      return null;
+    }
+  }
+
+  /**
    * 打开这次下载要写的位置
    *
    * 目标固定是**应用自己的下载目录**（用户不再选保存位置），按三条路试：
@@ -1110,11 +1169,13 @@ export class DownloadManager {
         return;
       }
       // 保存位置这一关：后台、又还没验证过能写系统下载目录时先不下（见 canAutoWriteNow）。
+      // 这条对用户手动点的下载同样有效：后台本来就弹不出保存对话框，放它开工只会
+      // 「解析一次 -> 抛 DEFER_BACKGROUND -> 回队列 -> 再解析一次」，白耗网络还停不下来。
       // 回到前台 EntryAbility 会调 resume()，不用靠定时器轮询也能马上开工。
-      if (next.auto && !this.canAutoWriteNow()) {
+      if (!this.canAutoWriteNow()) {
         hilog.info(DOMAIN, TAG,
-          'auto task waits for foreground (save dir not verified): %{public}s, active=%{public}d',
-          next.name, this.active);
+          'task waits for foreground (save dir not verified): %{public}s, auto=%{public}s, active=%{public}d',
+          next.name, next.auto ? 'yes' : 'no', this.active);
         this.schedulePump();
         return;
       }
@@ -1244,6 +1305,9 @@ export class DownloadManager {
       ? Promise.resolve(NO_TAGS)
       : collectDownloadTags(item.name, item.singer, item.musicInfoJson, item.coverUrl);
 
+    // 保存位置在整个任务里只解析一次（见 WriteSlot）：换源只重来「解析 + 拉流」
+    const slot: WriteSlot = { target: null, ext: '', dirNote: '' };
+
     // 1) 解析 → 拉流，失败换个音源再来（见 DownloadFailover）
     //
     // 换源走**任务内循环**，不回队列：回队列会重新走一遍 pump + openTarget，还可能再问一次
@@ -1269,7 +1333,7 @@ export class DownloadManager {
       if (item.status !== 'downloading') {
         return;
       }
-      const verdict: AttemptVerdict = await this.downloadAttempt(item, resolved, tags, failover);
+      const verdict: AttemptVerdict = await this.downloadAttempt(item, resolved, tags, failover, slot);
       this.syncFailover(item, failover);
       if (verdict !== 'retry-source') {
         return;
@@ -1279,7 +1343,8 @@ export class DownloadManager {
         item.name, failover.note(), failover.badList().length);
       item.received = 0;
       item.total = 0;
-      item.note = failover.note();
+      // 换源提示与「已存到应用内目录」拼在一起：直接覆盖会把后者弄丢
+      item.note = joinNote(failover.note(), slot.dirNote);
       this.persist();
       this.bump();
     }
@@ -1300,16 +1365,17 @@ export class DownloadManager {
    * 再解析 → 再来一轮。判定与收尾都留在这里，runTask 只根据返回值决定是否继续。
    */
   private async downloadAttempt(item: DownloadItem, resolved: ResolvedAudio,
-    tags: DownloadTagData, failover: DownloadFailover): Promise<AttemptVerdict> {
+    tags: DownloadTagData, failover: DownloadFailover, slot: WriteSlot): Promise<AttemptVerdict> {
     const url: string = resolved.url;
 
-    // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）
+    // 2) 打开保存位置（固定存进应用自己的下载目录，见 openTarget）。
+    //    同一个任务只解析一次：换源重来的是「解析 + 拉流」，不是「再问一次系统存哪」。
     const ext: string = this.extOf(url, item.quality);
     const fileName: string = this.buildFileName(item, ext);
     item.fileName = fileName;
     let write: WriteTarget | null = null;
     try {
-      write = await this.openTarget(fileName, item.key);
+      write = await this.acquireWriteTarget(item, fileName, ext, slot);
     } catch (e) {
       const message: string = (e as Error).message;
       if (message === DEFER_BACKGROUND) {
@@ -1328,6 +1394,7 @@ export class DownloadManager {
     const dirNote: string = write.fallback
       ? `已存到应用内目录（「文件管理」看不到）：${write.reason}`
       : '';
+    slot.dirNote = dirNote;
     item.note = joinNote(failover.note(), dirNote);
     if (item.status !== 'downloading') {
       this.closeQuietly(write.handle);
@@ -1403,18 +1470,18 @@ export class DownloadManager {
       if (stalled) {
         this.cleanupFailed(part, target);
         return this.afterStreamFailure(item, failover, 0,
-          `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）`, true);
+          `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）`, true, dirNote);
       }
       if (code !== 200) {
         // 4xx 多半是链接过期 / 被拒，换一个源才是有效的下一步（见 afterStreamFailure）；
         // 5xx 与 0 是服务端或连接问题，同样先换源，没有源可换才走「同源再来一次」
         this.cleanupFailed(part, target);
         return this.afterStreamFailure(item, failover, code, `下载失败（HTTP ${code}）`,
-          code >= 500 || code === 0);
+          code >= 500 || code === 0, dirNote);
       }
       if (item.received === 0) {
         this.cleanupFailed(part, target);
-        return this.afterStreamFailure(item, failover, 0, '下载失败（没收到数据）', true);
+        return this.afterStreamFailure(item, failover, 0, '下载失败（没收到数据）', true, dirNote);
       }
       item.tagNote = this.tagNoteOf(sink, tags, ext);
       try {
@@ -1443,7 +1510,7 @@ export class DownloadManager {
         const message: string = (e as BusinessError).message;
         return this.afterStreamFailure(item, failover, 0,
           stalled ? `下载停滞（${Math.round(STALL_LIMIT_MS / 1000)} 秒没有数据）` : message,
-          stalled || retryableNetworkFailure(message));
+          stalled || retryableNetworkFailure(message), dirNote);
       }
       return 'finished';
     } finally {
@@ -1465,8 +1532,9 @@ export class DownloadManager {
    *
    * 顺序：
    *   1. 把这个源记进本任务的排除表（同一批接口出来的链接寿命一样长，重解析必须绕开它）；
-   *      如果失败原因是「地址本身废了」（4xx），再按平台记一笔到**共用**路由表，
-   *      下次选源时它会被排到后面；
+   *      只有 404 / 410 / 451（见 isDeadAddressFailure）才按平台记一笔到**共用**路由表，
+   *      下次选源时它会被排到后面；401（Cookie 过期）、403（音质/权益/防盗链）、
+   *      429（限流）不算「源坏了」，只在本任务里排除。
    *   2. 还有源可换（见 DownloadFailover.canSwitch）→ 换源，回 runTask 再解析一轮；
    *   3. 换不了了（关着「自动切换音源」/ 只有一个源 / 已经试满 3 个）→ 退回老规矩：
    *      可重试的放回队列再来一次（见 MAX_RETRY），4xx 这类当场标失败。
@@ -1474,15 +1542,15 @@ export class DownloadManager {
    * 失败原因统一补上「已尝试 N 个音源」：用户能看出换源也救不了，不是没试就放弃。
    */
   private afterStreamFailure(item: DownloadItem, failover: DownloadFailover,
-    code: number, message: string, retryable: boolean): AttemptVerdict {
+    code: number, message: string, retryable: boolean, dirNote: string): AttemptVerdict {
     const badId: string = failover.usedSourceId();
     if (badId.length > 0) {
       failover.markBad(badId);
       const dead: boolean = isDeadAddressFailure(code, message);
       const reason: string = dead ? '下载地址失效' : '拉流失败';
       if (dead) {
-        // 只有「地址本身废了」（4xx）才记进**共用**路由表：那是这个源在这个平台上给不出
-        // 可用链接的证据，播放侧也该知道。超时 / 停滞 / 5xx 更像手机网络的问题，
+        // 只有 404/410/451 才记进**共用**路由表：那是这个源在这个平台上给不出
+        // 可用链接的证据，播放侧也该知道。401/403/429 与超时 / 停滞 / 5xx 都不算，
         // 只在本任务里排除这个源就够了，不该让播放也跟着绕开一个其实能放的源。
         SourceRouter.getInstance().markFailure(badId, item.source, reason);
       }
@@ -1491,7 +1559,8 @@ export class DownloadManager {
     }
     if (failover.canSwitch()) {
       failover.beginSwitch();
-      item.note = failover.note();
+      // 换源提示与「已存到应用内目录」拼起来：直接覆盖会把后者弄丢
+      item.note = joinNote(failover.note(), dirNote);
       const nextName: string = failover.nextSourceName();
       hilog.info(DOMAIN, TAG, 'switch source for %{public}s -> %{public}s (switch #%{public}d)',
         item.name, nextName.length > 0 ? nextName : failover.nextSourceId(), failover.switchTotal());

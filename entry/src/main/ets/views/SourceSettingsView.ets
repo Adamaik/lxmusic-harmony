@@ -17,6 +17,7 @@ import {
   VERDICT_PARTIAL,
   applySourceUpdate,
   checkSourceUpdates,
+  isSourceCheckupRunning,
   lastCheckupAt,
   loadCheckupResults,
   runSourceCheckup,
@@ -326,6 +327,12 @@ export struct SourceSettingsView {
     if (this.checking || this.busy) {
       return;
     }
+    // 页面被销毁重建后 this.checking 会丢（自检还在后台跑），以模块级状态为准：
+    // 两批自检同时跑只会把彼此的脚本顶掉
+    if (isSourceCheckupRunning()) {
+      this.toast('自检正在后台进行，等它结束再试');
+      return;
+    }
     if (this.sources.length === 0) {
       this.toast('还没有导入任何音源');
       return;
@@ -586,6 +593,12 @@ export struct SourceSettingsView {
   }
 
   private toggleSandboxEnv(): void {
+    // 自检正在把各个源依次装进同一个沙箱：这时改 lx.env 会被下一次 loadSource 覆盖，
+    // 用户以为切了、实际没生效。直接拦住，别做「悄悄被还原」的事。
+    if (this.checking || this.busy) {
+      this.toast(this.checking ? '自检进行中，等它结束再切换兼容模式' : '正在加载音源，等这一下结束再切换');
+      return;
+    }
     const engine = SourceEngine.getInstance();
     const next: string = engine.getSandboxEnv() === 'mobile' ? 'desktop' : 'mobile';
     engine.setSandboxEnv(next);
@@ -605,6 +618,11 @@ export struct SourceSettingsView {
 
   private async runSelfTest(): Promise<void> {
     if (this.busy) {
+      return;
+    }
+    if (this.checking || isSourceCheckupRunning()) {
+      // 离线自检也要往同一个沙箱里装示例源，会把自检正在测的源顶掉、两边结论都不可信
+      this.toast('一键自检进行中，等它结束再做离线自检（或先点「停止自检」）');
       return;
     }
     const engine = SourceEngine.getInstance();
@@ -1130,6 +1148,7 @@ export struct SourceSettingsView {
                   .layoutWeight(1)
                   .backgroundColor(C_FILL_SOFT_STRONG)
                   .fontColor(C_TEXT)
+                  .enabled(!this.busy && !this.checking)
                   .onClick(() => {
                     this.toggleSandboxEnv();
                   })
@@ -1139,7 +1158,7 @@ export struct SourceSettingsView {
                   .layoutWeight(1)
                   .backgroundColor(C_FILL_SOFT_STRONG)
                   .fontColor(C_TEXT)
-                  .enabled(!this.busy)
+                  .enabled(!this.busy && !this.checking)
                   .onClick(() => {
                     this.runSelfTest();
                   })

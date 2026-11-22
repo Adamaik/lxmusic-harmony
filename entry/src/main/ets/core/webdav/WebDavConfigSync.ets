@@ -22,7 +22,7 @@
 
 import { ApplicationStateChangeCallback, common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { WebDavClient } from './WebDavClient';
+import { WebDavClient, describeUrlForMessage } from './WebDavClient';
 import { WebDavConfig, WebDavProbeResult } from './WebDavTypes';
 import { WebDavSettings } from './WebDavSettings';
 import {
@@ -195,7 +195,8 @@ export class WebDavConfigSync {
       }
       const folder: string = buildFolderUrl(config.url, settings.getSyncDir());
       await WebDavClient.getInstance().ensureFolder(config, folder);
-      return `连上了，配置目录可用：${folder}`;
+      // 地址里可能带 user:pass@：只回 host + 路径，别把密码显示到界面/日志里
+      return `连上了，配置目录可用：${describeUrlForMessage(folder)}`;
     } catch (e) {
       return `连不上：${describeError(e as Error)}`;
     } finally {
@@ -235,6 +236,8 @@ export class WebDavConfigSync {
         hilog.info(DOMAIN, TAG, 'skip remote check before upload: %{public}s', describeError(e as Error));
       }
       await this.uploadFile(config, snapshot, hash);
+      // 用户手动上传 = 明确要覆盖网盘：之前「刚恢复过、别自动上传」的标记作废
+      settings.clearRestoredPendingSkip();
       const message: string = this.uploadMessage(snapshot, note);
       this.publishStatus(`已上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
       this.publishNotice('');
@@ -337,9 +340,16 @@ export class WebDavConfigSync {
       if (file.settings !== undefined) {
         applied = applySettings(file.settings);
       }
+      const ok: boolean = merged.playlists > 0 || applied > 0;
       // 恢复成功 = 本机与网盘对齐了：记下这份的 exportedAt 与指纹，之后自动同步才不会
       // 又把用户刚恢复的这份当成「网盘上更新的」反复提示
       settings.setSyncState(file.exportedAt, fingerprintOf(file));
+      if (ok) {
+        // 但恢复是**合并**（重名加 (2)、跳过的歌），本地指纹必然不等于网盘那份。
+        // 只写同步戳的话，下一轮 runAuto 会判成「本机改过」并把合并结果上传回去，
+        // 把另一台设备的配置覆盖成带 (2) 的重复歌单。这里落一个「跳过下一轮上传」的标记。
+        settings.markRestoredPendingSkip();
+      }
       this.publishSyncedAt();
       let message: string = `已恢复 ${merged.playlists} 个歌单、${merged.songs} 首歌曲`;
       if (applied > 0) {
@@ -354,9 +364,14 @@ export class WebDavConfigSync {
       if (merged.emptyPlaylists > 0) {
         message += `\n${merged.emptyPlaylists} 个空歌单已忽略`;
       }
-      const ok: boolean = merged.playlists > 0 || applied > 0;
+      if (ok) {
+        message += '\n已恢复的是合并结果：下一轮自动同步不会自动上传，避免把网盘覆盖成重复歌单'
+          + '（确认本机歌单无误后，可点「上传配置」手动覆盖）。';
+      }
       this.publishStatus(ok ? message : '网盘上的配置里没有可恢复的内容');
-      this.publishNotice('');
+      this.publishNotice(ok
+        ? '已从网盘恢复配置。下一轮自动同步不会自动上传（本机是合并结果）；需要覆盖网盘时请点「上传配置」。'
+        : '');
       return {
         ok: ok,
         message: message,
@@ -427,6 +442,8 @@ export class WebDavConfigSync {
     }
     if (remote.text === null) {
       await this.uploadFile(config, snapshot, localHash);
+      // 网盘上没有文件就没有「覆盖别人的合并副本」这回事，恢复后的跳过标记到这里失效
+      settings.clearRestoredPendingSkip();
       this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
       this.publishNotice('');
       return;
@@ -438,6 +455,8 @@ export class WebDavConfigSync {
     if (remote.hash === localHash) {
       // 内容一样：只把同步戳对齐到网盘那份（以后网盘再变才算「更新」）
       settings.setSyncState(remoteFile.exportedAt, remote.hash);
+      // 内容已经一致，恢复后要防的「把合并副本传上去」已经不成立
+      settings.clearRestoredPendingSkip();
       this.publishSyncedAt();
       this.publishStatus('网盘配置与本机一致');
       this.publishNotice('');
@@ -449,7 +468,17 @@ export class WebDavConfigSync {
         + '点下面的「从网盘恢复」可以取回来');
       return;
     }
-    // 走到这里说明：内容不同，且网盘那份不比本机上次同步的新 —— 是本机改过
+    // 走到这里说明：内容不同，且网盘那份不比本机上次同步的新 —— 一般是本机改过。
+    // 例外：刚「从网盘恢复」过（合并结果，指纹必然与网盘不同）。此时绝不能上传，
+    // 否则会把另一台设备的配置覆盖成带「 (2)」的合并副本。
+    // 标记**保留到用户手动上传**（或云端无文件 / 内容已一致）才清：
+    // 只跳过一轮的话，下一轮自动同步仍会上传合并副本，等于把问题推后一次。
+    if (settings.isRestoredPendingSkip()) {
+      this.publishStatus('已从网盘恢复配置，自动同步暂停上传（避免把网盘覆盖成合并后的重复歌单）');
+      this.publishNotice('已恢复网盘配置；自动同步不会上传。确认本机歌单无误后点「上传配置」手动覆盖网盘。');
+      hilog.info(DOMAIN, TAG, 'skip auto upload after restore (%{public}s), pending manual upload', trigger);
+      return;
+    }
     await this.uploadFile(config, snapshot, localHash);
     this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
     this.publishNotice('');

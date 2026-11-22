@@ -1079,11 +1079,18 @@ export struct PlaylistDetailView {
     try {
       const result: ExportOutcome = await PlaylistPort.getInstance()
         .exportToFile(context as common.Context, [this.playlistId], this.title);
+      // 导出要等用户在系统文件选择器里点完「保存」，这期间页面可能已经被弹掉：
+      // UIContext 释放后再 showToast 会抛错，所以退出后连提示都不给
+      if (!this.pageAlive) {
+        return;
+      }
       if (!result.canceled) {
         this.toast(result.message);
       }
     } catch (e) {
-      this.toast('导出失败，请重试');
+      if (this.pageAlive) {
+        this.toast('导出失败，请重试');
+      }
     }
   }
 
@@ -1490,6 +1497,10 @@ export struct PlaylistDetailView {
       return;
     }
     if (this.updating) {
+      // 后台自动对齐正在跑：以前这里直接 return，用户点了「从原歌单更新」看起来像没反应
+      if (manual) {
+        this.toast('正在同步，稍候');
+      }
       return;
     }
     // 防重入（按歌单、跨入口）：自动对齐与手动更新同时跑会各自拿旧快照互相覆盖
@@ -1510,7 +1521,8 @@ export struct PlaylistDetailView {
         this.toast('正在从原歌单拉取最新内容…');
       }
       const detail: LxListDetail = await getPlaylistDetailAll(source, sourceListId);
-      if (playlistDetailTruncated(detail)) {
+      // 带上平台：酷狗 / QQ 老接口的 total 恒等于 list.length，只按差额判永远判不出截断
+      if (playlistDetailTruncated(detail, source)) {
         // 只拿到一部分：按半份源歌单对齐会误删，整体放弃（本地一个字都不动）
         hilog.warn(DOMAIN, TAG, 'source list truncated: %{public}d/%{public}d',
           detail.list.length, detail.total);
@@ -1530,11 +1542,39 @@ export struct PlaylistDetailView {
         }
         return;
       }
-      const result: PlaylistSyncResult = library.syncWithSource(listId, items);
+      // manual 传下去：手动那次「要删的歌」不会直接删，而是落成待确认计划（见下面 pendingRemoval）
+      const result: PlaylistSyncResult = library.syncWithSource(listId, items, manual);
       if (result.aborted) {
+        /**
+         * 自动路径：删除被闸门拦下，但**新增已经落库**（见 syncWithSource 的闸门说明），
+         * 界面必须跟着重画，否则用户看到的是少了新歌的旧列表。
+         * 手动路径只在「一条都对不上」时走到这里，那时什么也没加。
+         */
+        if (this.pageAlive && result.added > 0) {
+          this.refresh();
+          // 自动路径平时就是这样轻提示一句「+N」，闸门拦下删除时新增照做，提示保持一致
+          if (!manual) {
+            this.toast(this.syncSummary(result));
+          }
+        }
         if (manual && this.pageAlive) {
           this.toast('原歌单变化太大，这次先不同步（可能是接口没返回全）');
         }
+        return;
+      }
+      if (result.pendingRemoval > 0) {
+        /**
+         * 有需要移除的条目：本次**新增已经落库**，删除等用户确认。
+         *
+         * 自动路径不会走到这里（它在库里就按 5 条 / 3% 的闸门处理掉了），
+         * 所以这里只可能是用户刚点的「从原歌单更新」——弹窗不打扰浏览。
+         */
+        if (!this.pageAlive) {
+          library.discardPendingSourceRemoval(listId);
+          return;
+        }
+        this.refresh();
+        this.confirmSourceRemoval(listId, result);
         return;
       }
       if (!result.changed) {
@@ -1559,8 +1599,55 @@ export struct PlaylistDetailView {
       }
     } finally {
       library.endSyncToSource(listId);
-      this.updating = false;
+      // 页面已经被弹掉时不要再写 @State（UIContext 已释放）；实例复用时 aboutToAppear 会归零
+      if (this.pageAlive) {
+        this.updating = false;
+      }
     }
+  }
+
+  /**
+   * 「原歌单少了这些歌」的确认弹窗（手动「从原歌单更新」专用）
+   *
+   * 为什么必须确认：本地歌单里同平台的歌，既有从源歌单导入的，也有用户自己手动加的
+   * （他在网易歌单里从网易再加一首）。删之前把清单列出来，用户才可能发现「这首是我自己
+   * 加的」。点「保留」= 什么都不动（快照也不刷，下次还会问）；点「删除」才真的移除。
+   */
+  private confirmSourceRemoval(listId: string, result: PlaylistSyncResult): void {
+    const library = SyncManager.getInstance().getLibrary();
+    const lines: string[] = [];
+    for (const name of result.pendingNames) {
+      lines.push(`· ${name}`);
+    }
+    if (result.pendingRemoval > result.pendingNames.length) {
+      lines.push(`· 等共 ${result.pendingRemoval} 首`);
+    }
+    const head: string = result.added > 0 ? `已先补进 ${result.added} 首新歌。` : '';
+    this.getUIContext().showAlertDialog({
+      title: '原歌单少了这些歌',
+      message: `${head}源歌单里已经没有这 ${result.pendingRemoval} 首了：\n${lines.join('\n')}\n要从本地歌单里一起删掉吗？（选「保留」不动本地）`,
+      autoCancel: true,
+      buttons: [
+        {
+          value: '保留',
+          action: () => {
+            library.discardPendingSourceRemoval(listId);
+          },
+        },
+        {
+          value: '删除',
+          fontColor: C_RED,
+          action: () => {
+            const removed: number = library.applyPendingSourceRemoval(listId);
+            if (!this.pageAlive) {
+              return;
+            }
+            this.refresh();
+            this.toast(`已移除 ${removed} 首`);
+          },
+        },
+      ],
+    });
   }
 
   /** 同步结果的轻提示文案：`已与源歌单同步：+3 / -1`（某一侧为 0 就不写它） */

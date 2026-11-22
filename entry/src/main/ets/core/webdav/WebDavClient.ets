@@ -274,9 +274,16 @@ export class WebDavClient {
       if (code >= 200 && code < 300) {
         continue;
       }
-      // 405 Method Not Allowed / 409 Conflict：目录已经在了（各家实现不一致，都认）
-      if (code === 405 || code === 409 || code === 301 || code === 302 || code === 304) {
+      // 405 Method Not Allowed / 409 Conflict：目录已经在了（各家实现不一致，都认）。
+      // 301/302 不在这里：它不是「已存在」，而是「这个地址不是真正入口」——
+      // 在 mkcol 里已经按 Location 重试过一次，还重定向就是地址写错了，必须报出来，
+      // 否则后面的 PUT 会写到一个不存在的目录上（409），用户看到的却是「上传失败」。
+      if (code === 405 || code === 409 || code === 304) {
         continue;
+      }
+      if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
+        throw new Error(`服务器把建目录请求重定向到了别处（HTTP ${code}），`
+          + '请把「服务器地址」改成重定向之后的地址（常见于 http 被强制跳 https、或地址少了路径）');
       }
       if (code === 401) {
         throw new Error('用户名或密码不对，建不了目录');
@@ -290,12 +297,35 @@ export class WebDavClient {
       if (code === 507) {
         throw new Error('网盘空间不够了，建不了目录');
       }
-      throw new Error(`在网盘上创建目录失败（HTTP ${code}）：${current}`);
+      // 地址里可能带 user:pass@（Basic 认证的另一种写法），错误文案只给 host + 相对路径
+      throw new Error(`在网盘上创建目录失败（HTTP ${code}）：${describeUrlForMessage(current)}`);
     }
   }
 
-  /** 发一次 MKCOL，只回状态码（调用方按 RFC 语义判断「已存在」） */
+  /**
+   * 发一次 MKCOL；被 3xx 重定向时按 Location 重试一次
+   *
+   * 有的服务器（子路径反代、强制 https）对 MKCOL 先回 301/302。直接当「目录已存在」
+   * 跳过是错的：真实目录可能根本不在这个地址上。优先用 Location 重试；没有 Location
+   * 就补尾斜杠再试一次（部分服务器只在「集合地址」上接受 MKCOL）。
+   * 重试后仍是 3xx 就把状态码交回去，由 ensureFolder 报清楚。
+   */
   private async mkcol(config: WebDavConfig, url: string): Promise<number> {
+    const first: MkcolResult = await this.mkcolOnce(config, url);
+    if (!isRedirect(first.code)) {
+      return first.code;
+    }
+    const fromLocation: string = resolveLocation(first.location, url);
+    const retryUrl: string = fromLocation.length > 0 ? fromLocation : withTrailingSlash(url);
+    if (retryUrl.length === 0 || retryUrl === url) {
+      return first.code;
+    }
+    const second: MkcolResult = await this.mkcolOnce(config, retryUrl);
+    return second.code;
+  }
+
+  /** 发一次 MKCOL，回状态码与 Location（调用方按 RFC 语义判断「已存在 / 重定向」） */
+  private async mkcolOnce(config: WebDavConfig, url: string): Promise<MkcolResult> {
     const request = http.createHttp();
     try {
       const options: http.HttpRequestOptions = {
@@ -306,7 +336,10 @@ export class WebDavClient {
         readTimeout: LIST_TIMEOUT_MS,
       };
       const response: http.HttpResponse = await request.request(url, options);
-      return response.responseCode;
+      return {
+        code: response.responseCode,
+        location: headerValue(response.header, 'location'),
+      };
     } finally {
       request.destroy();
     }
@@ -443,6 +476,59 @@ function headerValue(header: Object | undefined, name: string): string {
     }
   }
   return '';
+}
+
+/** 一次 MKCOL 的结果：状态码 + 服务器可能给的 Location（重定向用） */
+interface MkcolResult {
+  code: number;
+  location: string;
+}
+
+function isRedirect(code: number): boolean {
+  return code === 301 || code === 302 || code === 303 || code === 307 || code === 308;
+}
+
+/**
+ * 把 Location 解析成可请求的绝对地址（相对跳转按 base 补全）
+ *
+ * 只处理 WebDAV 里常见的两种写法：绝对 URL、以 `/` 开头的站内路径；
+ * 其它相对形式（`../`）不猜，返回空串交给调用方走「补尾斜杠」的兜底。
+ */
+function resolveLocation(location: string, base: string): string {
+  const wanted: string = location.trim();
+  if (wanted.length === 0) {
+    return '';
+  }
+  if (/^https?:\/\//i.test(wanted)) {
+    return wanted;
+  }
+  const origin: string = originOf(base);
+  if (origin.length === 0) {
+    return '';
+  }
+  if (wanted.charAt(0) === '/') {
+    return `${origin}${wanted}`;
+  }
+  const cut: number = base.lastIndexOf('/');
+  return cut > 0 ? `${base.substring(0, cut + 1)}${wanted}` : '';
+}
+
+/**
+ * 错误文案里只保留「host + 相对路径」
+ *
+ * 服务器地址允许写成 `https://user:pass@host/dav`（Basic 认证的另一种写法），
+ * 整条 URL 打进日志 / 弹给用户就等于把密码泄出去了。认证本身已经在 Authorization 头里，
+ * 这里只丢掉 userinfo 与协议头。
+ */
+export function describeUrlForMessage(url: string): string {
+  const schemeEnd: number = url.indexOf('://');
+  const rest: string = schemeEnd >= 0 ? url.substring(schemeEnd + 3) : url;
+  const slash: number = rest.indexOf('/');
+  const authority: string = slash >= 0 ? rest.substring(0, slash) : rest;
+  const path: string = slash >= 0 ? rest.substring(slash) : '';
+  const at: number = authority.lastIndexOf('@');
+  const host: string = at >= 0 ? authority.substring(at + 1) : authority;
+  return `${host}${path}`;
 }
 
 function countFolders(entries: WebDavEntry[]): number {

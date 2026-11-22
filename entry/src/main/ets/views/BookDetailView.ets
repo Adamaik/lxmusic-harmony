@@ -2,8 +2,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 import { BookEngine } from '../core/book/BookEngine';
 import { BookShelf, ShelvedBook } from '../core/book/BookShelf';
-import { BookPlaySettings, BOOK_SPEED_CHOICES, bookSpeedText, K_BOOK_SKIP_INTRO,
-  K_BOOK_SKIP_OUTRO, K_BOOK_SPEED } from '../core/book/BookPlaySettings';
+import { BookPlaySettings, BOOK_SKIP_MAX_SEC, BOOK_SPEED_CHOICES, bookSpeedText,
+  K_BOOK_SKIP_INTRO, K_BOOK_SKIP_OUTRO, K_BOOK_SPEED } from '../core/book/BookPlaySettings';
 import { BookChapter, BookDetail, BookHit, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE,
   parseBookPayload } from '../core/book/BookTypes';
 import { DownloadManager, DownloadItem } from '../core/download/DownloadManager';
@@ -71,11 +71,22 @@ export struct BookDetailView {
   @StorageLink(K_BOOK_SKIP_OUTRO) skipOutro: number = 0;
   /** 倍速面板开合 */
   @State speedOpen: boolean = false;
-  /** 跳过片头片尾面板开合 */
-  @State skipOpen: boolean = false;
-  /** 面板里两个输入框的文本（数字键盘直接填，改完立刻落盘） */
+  /** 跳过片头片尾面板开合（关闭时兜一次落盘，见 onSkipOpenChanged） */
+  @State @Watch('onSkipOpenChanged') skipOpen: boolean = false;
+  /** 面板里两个输入框的文本（数字键盘直接填，失焦 / 关面板时才落盘） */
   @State introSecText: string = '';
   @State outroSecText: string = '';
+
+  /**
+   * 面板被划走 / 点关闭时，输入框不一定会收到 onBlur（它随面板一起被移出树）。
+   * 这里再兜一次落盘，否则用户「改完直接划走」的那次修改会静默丢掉。
+   */
+  onSkipOpenChanged(): void {
+    if (!this.skipOpen) {
+      this.commitIntro();
+      this.commitOutro();
+    }
+  }
 
   aboutToAppear(): void {
     const shelved: ShelvedBook | null = BookShelf.getInstance().find(this.book.id);
@@ -368,7 +379,7 @@ export struct BookDetailView {
     this.skipOpen = true;
   }
 
-  /** 输入框文本 -> 秒数（空 / 非数字都算 0，也就是关掉这一项） */
+  /** 输入框文本 -> 秒数（空 / 非数字都算 0，也就是关掉这一项；超过上限按上限算） */
   private secondsOf(text: string): number {
     const trimmed: string = text.trim();
     if (trimmed.length === 0) {
@@ -378,17 +389,37 @@ export struct BookDetailView {
     if (Number.isNaN(value) || value <= 0) {
       return 0;
     }
-    return value;
+    return value > BOOK_SKIP_MAX_SEC ? BOOK_SKIP_MAX_SEC : value;
   }
 
+  /**
+   * 输入过程中只改文本，**不落盘**
+   *
+   * 以前每个字符都 `setSkipIntroSec`：输入「120」的过程中会依次把 1 / 12 / 120 写进
+   * 设置与 AppStorage（还各写一次存档文件），播放侧也会跟着闪三下；
+   * 而且输入「9999」时输入框显示 9999、实际存的却是夹到 600 的值，两边对不上。
+   * 现在改成失焦 / 提交时才落盘，并把夹过的值回写输入框。
+   */
   private onIntroInput(value: string): void {
     this.introSecText = value;
-    BookPlaySettings.getInstance().setSkipIntroSec(this.secondsOf(value));
   }
 
   private onOutroInput(value: string): void {
     this.outroSecText = value;
-    BookPlaySettings.getInstance().setSkipOutroSec(this.secondsOf(value));
+  }
+
+  /** 片头输入框失焦 / 回车：落盘并把夹过的值回写（9999 -> 600） */
+  private commitIntro(): void {
+    const sec: number = this.secondsOf(this.introSecText);
+    BookPlaySettings.getInstance().setSkipIntroSec(sec);
+    this.introSecText = `${sec}`;
+  }
+
+  /** 片尾输入框失焦 / 回车：同上 */
+  private commitOutro(): void {
+    const sec: number = this.secondsOf(this.outroSecText);
+    BookPlaySettings.getInstance().setSkipOutroSec(sec);
+    this.outroSecText = `${sec}`;
   }
 
   // ------------------------------------------------------------ 界面片段
@@ -508,6 +539,13 @@ export struct BookDetailView {
           .onChange((value: string) => {
             this.onIntroInput(value);
           })
+          // 失焦 / 回车才落盘（输入途中不写设置，见 onIntroInput 的注释）
+          .onBlur(() => {
+            this.commitIntro();
+          })
+          .onSubmit(() => {
+            this.commitIntro();
+          })
         Text('秒')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_SUB)
@@ -529,6 +567,12 @@ export struct BookDetailView {
           .placeholderColor(C_TEXT_WEAK)
           .onChange((value: string) => {
             this.onOutroInput(value);
+          })
+          .onBlur(() => {
+            this.commitOutro();
+          })
+          .onSubmit(() => {
+            this.commitOutro();
           })
         Text('秒')
           .fontSize(F_SUB)

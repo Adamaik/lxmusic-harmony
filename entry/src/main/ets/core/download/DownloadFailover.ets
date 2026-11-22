@@ -19,11 +19,20 @@ const TAG: string = 'DownloadFailover';
  */
 export const MAX_DOWNLOAD_SOURCES: number = 3;
 
-/** 明确表示「这条地址已经废了」的 HTTP 状态（过期 / 被拒 / 下架） */
-const DEAD_CODES: number[] = [401, 403, 404, 410, 451];
+/**
+ * 只有这几种状态码才算「这个源在这个平台上给不出地址」
+ *
+ * 其余 4xx 一律**不进共享路由表**：
+ *   - 401：Cookie / 令牌过期，换个源确实能下，但源本身没坏；
+ *   - 403：音质 / 版权 / CDN 防盗链（Referer 不对也是 403），播放侧往往还是好的；
+ *   - 429：限流，等一下就能用。
+ * 以前把任意 4xx 都记进 SourceRouter，两次下载失败就能把一个「播放明明正常」的源
+ * 降级 30 分钟 —— 用户会觉得播放莫名其妙开始换源。
+ */
+const ROUTER_DEAD_CODES: number[] = [404, 410, 451];
 
 /**
- * 这个拉流结果是不是「地址本身不行了」
+ * 这个拉流结果算不算「地址本身废了」（用于写共享路由表）
  *
  * 4xx 基本都是链接过期、被防盗链拒掉、源那边下架：**换一个源**才是有效的下一步，
  * 在同一个源上重试只会再拿到同一批寿命一样长的链接。5xx / 超时 / 停滞属于服务端或
@@ -31,14 +40,11 @@ const DEAD_CODES: number[] = [401, 403, 404, 410, 451];
  * 所以调用方对两类都换源，只是日志与提示的措辞不同。
  */
 export function isDeadAddressFailure(code: number, message: string): boolean {
-  if (DEAD_CODES.includes(code)) {
+  if (ROUTER_DEAD_CODES.includes(code)) {
     return true;
   }
-  if (code >= 400 && code < 500) {
-    return true;
-  }
-  // 异常里只有文本时（requestInStream 抛错）按词边界认一下 4xx，别把 4041 这种码算进去
-  return /\b4\d{2}\b/.test(message);
+  // 异常里只有文本时（requestInStream 抛错）按词边界认一下，别把 4041 这种码算进去
+  return /\b(404|410|451)\b/.test(message);
 }
 
 /**

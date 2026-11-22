@@ -849,13 +849,11 @@ export class PlaySettings {
   /**
    * 上下滑动切歌（见 K_SWIPE_SWITCH_SONG）
    *
-   * 播放页在每次纵向拖动松手时现读这一项（AppStorage + 本单例），
-   * 所以开关一拨立刻生效，不必重进播放页 —— 与「播放页动效」同一套做法。
+   * 开关一拨立刻生效：写入 AppStorage 后，播放页的 `@StorageLink(K_SWIPE_SWITCH_SONG)`
+   * 会自己跟着变，松手时现读一次就能拿到新值，不必重进播放页 —— 与「播放页动效」同一套做法。
+   * （之前这里还有一个 `isSwipeSwitchSong()` 读方法，但没有任何调用方 ——
+   *  视图侧全走 StorageLink，留着只会让人以为另有生效路径，已删。）
    */
-  isSwipeSwitchSong(): boolean {
-    return this.swipeSwitchSong;
-  }
-
   setSwipeSwitchSong(value: boolean): void {
     if (value === this.swipeSwitchSong) {
       return;

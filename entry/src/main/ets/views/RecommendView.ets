@@ -340,14 +340,18 @@ export struct RecommendView {
   @StorageLink(K_MUSIC_LOGGED_TX) @Watch('onTxLoginChanged') txLogged: boolean = false;
   @State txRadar: SongItem[] = [];
   @State txRadarFailed: boolean = false;
+  /** 接口是成功的，但返回的歌全被「不感兴趣」过滤光了（文案不能再说「取不到」） */
+  @State txRadarFilteredEmpty: boolean = false;
   private txRadarAsked: boolean = false;
   /** 每日推荐（每日 30 首；登录后按天换一批） */
   @State txDaily: SongItem[] = [];
   @State txDailyFailed: boolean = false;
+  @State txDailyFilteredEmpty: boolean = false;
   private txDailyAsked: boolean = false;
   /** 猜你喜欢（接口一次只回几首，翻几页凑成一行） */
   @State txGuess: SongItem[] = [];
   @State txGuessFailed: boolean = false;
+  @State txGuessFilteredEmpty: boolean = false;
   private txGuessAsked: boolean = false;
   /** 私人雷达那条横滑列表的数据源（常驻，不能每帧 new 一个） */
   private txRadarSource: SongSource = new SongSource();
@@ -414,14 +418,17 @@ export struct RecommendView {
     this.txRadarSource.setItems(this.txRadar);
     this.txRadarAsked = false;
     this.txRadarFailed = false;
+    this.txRadarFilteredEmpty = false;
     this.txDaily = [];
     this.txDailySource.setItems(this.txDaily);
     this.txDailyAsked = false;
     this.txDailyFailed = false;
+    this.txDailyFilteredEmpty = false;
     this.txGuess = [];
     this.txGuessSource.setItems(this.txGuess);
     this.txGuessAsked = false;
     this.txGuessFailed = false;
+    this.txGuessFilteredEmpty = false;
     // 刷新后那块 ListItem 不一定再触发一次 onVisibleAreaChange（它本来就在可视区），
     // 所以这里主动补一次取数；未登录 / 非网易来源时 ensureWyRec 自己会跳过
     if (this.platform === 'wy' && this.wyLogged) {
@@ -517,14 +524,17 @@ export struct RecommendView {
     this.txDailySource.setItems(this.txDaily);
     this.txDailyAsked = false;
     this.txDailyFailed = false;
+    this.txDailyFilteredEmpty = false;
     this.txRadar = [];
     this.txRadarSource.setItems(this.txRadar);
     this.txRadarAsked = false;
     this.txRadarFailed = false;
+    this.txRadarFilteredEmpty = false;
     this.txGuess = [];
     this.txGuessSource.setItems(this.txGuess);
     this.txGuessAsked = false;
     this.txGuessFailed = false;
+    this.txGuessFilteredEmpty = false;
     if (this.platform === 'tx' && this.txLogged) {
       this.ensureTxDaily();
       this.ensureTxRadar();
@@ -577,8 +587,16 @@ export struct RecommendView {
       this.txDailySource.setItems(this.txDaily);
       // 成功也留一行：能区分「接口通了但返回空列表」和「请求失败」
       console.info(`tx daily ok: ${this.txDaily.length}`);
+      /*
+       * 两种「0 首」要分开：接口回了歌、但全被「不感兴趣」过滤光 —— 这不是故障，
+       * 提示语不能指去「重新登录」；接口本来就没回歌才算取不到。
+       */
       if (this.txDaily.length === 0) {
-        this.txDailyFailed = true;
+        if (infos.length > 0) {
+          this.txDailyFilteredEmpty = true;
+        } else {
+          this.txDailyFailed = true;
+        }
       }
     } catch (e) {
       this.txDailyFailed = true;
@@ -605,9 +623,14 @@ export struct RecommendView {
       this.txRadarSource.setItems(this.txRadar);
       // 成功也留一行：能区分「接口通了但返回空列表」和「请求失败」
       console.info(`tx radar ok: ${this.txRadar.length}`);
-      // 通了但一首都没有：别一直摆骨架（那等于一块空卡），直接标成取不到
+      // 通了但一首都没有：别一直摆骨架（那等于一块空卡），直接标成取不到；
+      // 若接口确实回过歌、只是全被「不感兴趣」过滤了，那是另一回事（见下）
       if (this.txRadar.length === 0) {
-        this.txRadarFailed = true;
+        if (infos.length > 0) {
+          this.txRadarFilteredEmpty = true;
+        } else {
+          this.txRadarFailed = true;
+        }
       }
     } catch (e) {
       this.txRadarFailed = true;
@@ -633,7 +656,11 @@ export struct RecommendView {
       this.txGuessSource.setItems(this.txGuess);
       console.info(`tx guess ok: ${this.txGuess.length}`);
       if (this.txGuess.length === 0) {
-        this.txGuessFailed = true;
+        if (infos.length > 0) {
+          this.txGuessFilteredEmpty = true;
+        } else {
+          this.txGuessFailed = true;
+        }
       }
     } catch (e) {
       this.txGuessFailed = true;
@@ -2674,6 +2701,14 @@ export struct RecommendView {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
+        } else if (this.txRadarFilteredEmpty) {
+          Text('今天私人雷达里的歌都在「不感兴趣」里，去设置里清一下就能看到')
+            .fontSize(CARD_META_SIZE)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
         } else {
           Row({ space: CARD_GAP }) {
             ForEach(boneIndexes(2), () => {
@@ -2727,6 +2762,14 @@ export struct RecommendView {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
             .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
+        } else if (this.txDailyFilteredEmpty) {
+          Text('今天推荐的都已在「不感兴趣」里，去设置里清一下就能看到')
+            .fontSize(CARD_META_SIZE)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
         } else {
           Row({ space: CARD_GAP }) {
             ForEach(boneIndexes(2), () => {
@@ -2773,6 +2816,14 @@ export struct RecommendView {
       if (this.txGuess.length === 0) {
         if (this.txGuessFailed) {
           Text('猜你喜欢暂时取不到（登录可能已过期，去「设置 - 登录音乐」重新登录试试）')
+            .fontSize(CARD_META_SIZE)
+            .fontColor(C_TEXT_WEAK)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .padding({ left: PAGE_PAD, right: PAGE_PAD, bottom: 12 })
+        } else if (this.txGuessFilteredEmpty) {
+          Text('猜你喜欢的歌都在「不感兴趣」里，去设置里清一下就能看到')
             .fontSize(CARD_META_SIZE)
             .fontColor(C_TEXT_WEAK)
             .maxLines(2)

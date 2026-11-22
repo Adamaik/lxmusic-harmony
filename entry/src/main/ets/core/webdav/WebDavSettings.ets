@@ -64,6 +64,15 @@ export class WebDavSettings {
   private lastSyncedAt: string = '';
   /** 上次成功同步时的内容指纹（不含时间），用来判断「内容是否真的变了」 */
   private lastSyncedHash: string = '';
+  /**
+   * 刚「从网盘恢复」过，下一次自动同步不准上传
+   *
+   * 恢复是**合并**（重名歌单加「 (2)」、跳过匹配不上的歌），恢复后本机指纹必然不等于
+   * 网盘那份的指纹；如果只写 lastSyncedAt，下一次运行会判定成「本机改过」→ 直接把
+   * 合并后的副本上传回去，另一台设备的干净配置就被重复歌单覆盖了。这个标记要落盘：
+   * 恢复完可能先退到后台、下次启动才跑自动同步，只放内存会丢。
+   */
+  private restoredPendingSkip: boolean = false;
 
   init(context: common.Context): void {
     if (this.inited) {
@@ -208,8 +217,37 @@ export class WebDavSettings {
     this.password = '';
     this.lastSyncedAt = '';
     this.lastSyncedHash = '';
+    this.restoredPendingSkip = false;
     AppStorage.setOrCreate(K_WEBDAV_URL, '');
     AppStorage.setOrCreate(K_WEBDAV_USER, '');
+    this.write();
+  }
+
+  /** 刚恢复过（合并结果），下一次自动同步只跳过上传、不做别的 */
+  isRestoredPendingSkip(): boolean {
+    return this.restoredPendingSkip;
+  }
+
+  /** 记下「刚恢复过」：落盘，重启后仍然生效（见字段注释） */
+  markRestoredPendingSkip(): void {
+    if (this.restoredPendingSkip) {
+      return;
+    }
+    this.restoredPendingSkip = true;
+    this.write();
+  }
+
+  /**
+   * 消费掉「刚恢复过」
+   *
+   * 只由两处调用：下一轮自动同步真的走到「要不要上传」这一步时（跳过并清掉），
+   * 或用户手动点「上传配置」（明确覆盖，标记作废）。
+   */
+  clearRestoredPendingSkip(): void {
+    if (!this.restoredPendingSkip) {
+      return;
+    }
+    this.restoredPendingSkip = false;
     this.write();
   }
 
@@ -239,6 +277,7 @@ export class WebDavSettings {
       syncAuto: this.syncAuto,
       lastSyncedAt: this.lastSyncedAt,
       lastSyncedHash: this.lastSyncedHash,
+      restoredPendingSkip: this.restoredPendingSkip,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -281,6 +320,9 @@ export class WebDavSettings {
     if (data.lastSyncedHash !== undefined) {
       this.lastSyncedHash = data.lastSyncedHash;
     }
+    if (data.restoredPendingSkip !== undefined) {
+      this.restoredPendingSkip = data.restoredPendingSkip;
+    }
   }
 
   private publish(): void {
@@ -306,6 +348,7 @@ interface WebDavSettingsData {
   syncAuto?: boolean;
   lastSyncedAt?: string;
   lastSyncedHash?: string;
+  restoredPendingSkip?: boolean;
 }
 
 /**

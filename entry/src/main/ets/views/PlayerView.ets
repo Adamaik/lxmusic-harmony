@@ -2176,6 +2176,14 @@ export struct PlayerView {
     }
     // currentIndex / queue 是 PlaySession 的公开只读信息（不修改它，仅用于判边界）
     const index: number = session.currentIndex;
+    /*
+     * 还没开始播（currentIndex === -1）：队列里有歌、只是没有「当前项」。
+     * 这时绝不能按边界提示「已经是第一首了」—— 那两句话是在**已经在播**的前提下才成立的，
+     * 现在说了等于告诉用户一个不存在的位置。直接忽略这一下手势（点播放键才会起播）。
+     */
+    if (index < 0) {
+      return;
+    }
     if (this.playMode === 'order') {
       if (toNext && index >= total - 1) {
         this.toast('已经是最后一首了');
