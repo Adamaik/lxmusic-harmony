@@ -2,7 +2,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
-import { asNumber, asRecord, asString, httpGetJson } from './PlatformHttp';
+import { asNumber, asRecord, asString, httpGetJson, httpPostJson } from './PlatformHttp';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'MusicAccount';
@@ -163,6 +163,25 @@ export function txUinOf(cookie: string): string {
   return /^\d+$/.test(uin) ? uin : '';
 }
 
+/** QQ 音乐账号信息（musicu）：comm 里必须带 authst，否则服务端回 code=1000 */
+interface TxLoginComm {
+  ct: number;
+  cv: number;
+  uin: string;
+  authst: string;
+}
+
+interface TxLoginInfoReq {
+  module: string;
+  method: string;
+  param: Record<string, Object>;
+}
+
+interface TxLoginInfoBody {
+  comm: TxLoginComm;
+  req_0: TxLoginInfoReq;
+}
+
 /** QQ 音乐票据：`qm_keyst` 优先，退旧名 `qqmusic_key` */
 export function txMusicKeyOf(cookie: string): string {
   const key: string = cookieValue(cookie, 'qm_keyst');
@@ -220,6 +239,22 @@ class MusicAccountStore {
       }
     }
     this.publish();
+    /**
+     * 启动时补拉一次账号信息：上一次登录可能只抓到了 Cookie、没拿到昵称
+     * （2026-11-23 之前老接口对新登录态返回空 body，存档里 nickname 就是空串）。
+     * 不补的话界面会一直停在「没取到昵称 · 会员档未知」。
+     * 失败不弹提示、不改变登录态，下次启动再试。
+     */
+    if (hasTxSession(this.txCookie) && this.txNick.length === 0) {
+      this.refreshTxProfile().catch((e: Error) => {
+        hilog.warn(DOMAIN, TAG, 'refresh tx profile on init failed: %{public}s', e.message);
+      });
+    }
+    if (this.wyCookie.length > 0 && this.wyNick.length === 0) {
+      this.refreshWyProfile().catch((e: Error) => {
+        hilog.warn(DOMAIN, TAG, 'refresh wy profile on init failed: %{public}s', e.message);
+      });
+    }
   }
 
   private apply(data: LoginFile): void {
@@ -394,22 +429,31 @@ class MusicAccountStore {
       return { nickname: '', vip: '' };
     }
     const uin: string = txUinOf(this.txCookie);
-    const url: string = 'https://c.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg'
-      + `?ct=24&cv=4747474&format=json&inCharset=utf-8&outCharset=utf-8&notice=0`
-      + `&platform=yqq.json&needNewCode=0&uin=${encodeURIComponent(uin)}&hostUin=0&g_tk=5381`;
+    /**
+     * 2026-11-23 真机实测：老接口 `fcg_get_profile_homepage` 对新登录态返回 200 + **空 body**，
+     * 昵称拉不到，界面于是显示「账号信息没拉到」。改用 musicu 的 GetLoginUserInfo：
+     * comm 里除了 uin 还必须带 authst（= `qm_keyst` / `qqmusic_key`），否则服务端回 code=1000。
+     */
+    const authst: string = txMusicKeyOf(this.txCookie);
     const headers: Record<string, string> = {
       'User-Agent': TX_UA,
       'Referer': 'https://y.qq.com/',
       'Cookie': this.txCookie,
+      'Content-Type': 'application/json',
     };
     try {
-      const body: Record<string, Object> = await httpGetJson(url, headers, 'QQ音乐账号');
-      const creator: Record<string, Object> = asRecord(asRecord(body['data'])['creator']);
-      const nickname: string = asString(creator['nick']).length > 0
-        ? asString(creator['nick']) : asString(creator['hostname']);
-      const hasVip: boolean = creator['vipType'] !== undefined || creator['vipFlag'] !== undefined;
-      const vipType: number = creator['vipType'] !== undefined
-        ? asNumber(creator['vipType']) : asNumber(creator['vipFlag']);
+      const reqBody: TxLoginInfoBody = {
+        comm: { ct: 24, cv: 0, uin: uin, authst: authst },
+        req_0: { module: 'music.UserInfo.userInfoServer', method: 'GetLoginUserInfo', param: {} },
+      };
+      const body: Record<string, Object> = await httpPostJson('https://u.y.qq.com/cgi-bin/musicu.fcg',
+        reqBody, headers, 'QQ音乐账号');
+      const info: Record<string, Object> = asRecord(asRecord(asRecord(body['req_0'])['data'])['info']);
+      const nickname: string = asString(info['nick']).length > 0
+        ? asString(info['nick']) : asString(info['hostname']);
+      const hasVip: boolean = info['vipType'] !== undefined || info['vipFlag'] !== undefined;
+      const vipType: number = info['vipType'] !== undefined
+        ? asNumber(info['vipType']) : asNumber(info['vipFlag']);
       if (nickname.length > 0) {
         this.txNick = nickname;
         this.txVip = txVipLabelOf(vipType, hasVip);

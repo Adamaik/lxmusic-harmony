@@ -4,7 +4,7 @@ import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURR
   K_PLAYER_STATUS, K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
 import { LyricLine, activeLyricIndex } from '../core/music/Lyric';
 import { K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN,
-  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LIGHT,
+  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, K_SWIPE_SWITCH_SONG, PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LIGHT,
   PLAYER_MOTION_OFF } from '../core/settings/PlaySettings';
 import { I_CAST, I_CHECK_CIRCLE, I_CHEVRON_DOWN, I_COMMENT, I_DOWNLOAD, I_MORE_CIRCLE,
   I_NEXT, I_ORDER_PLAY, I_PAUSE, I_PLAY, I_PREV, I_QUEUE, I_REPEAT, I_REPEAT_ONE, I_SHARE, I_SHUFFLE,
@@ -74,6 +74,37 @@ const COVER_SIZE_MAX: number = 300;
 const COVER_BLOCK_CHROME: number = 84;
 /** 封面左右的留白（coverBlock 的 padding，宽屏算半栏能放多宽时要用） */
 const COVER_SIDE_PADDING: number = 60;
+
+/**
+ * 顶栏内容区高度（vp，不含状态栏留白）
+ *
+ * 顶栏实际高度是它 + topInset（见 build 里顶栏的 height）。
+ * 「上下滑动切歌」要按拖动**起点**分区域，边界就是这条线，所以抽成常量，
+ * 免得以后改了顶栏高度、手势的命中区域却没跟着动。
+ */
+const TOP_BAR_HEIGHT: number = 56;
+
+/**
+ * 上下滑动切歌：位移阈值（vp）
+ *
+ * 72 是「明确的一划」而不是「手指蹭了一下」：播放页上单手滑动的常见幅度在 100vp 上下，
+ * 而误触（点按钮时手指带出的一点纵向位移）一般不超过 30vp。低于它时再看速度。
+ */
+const SWIPE_SONG_DISTANCE: number = 72;
+/**
+ * 上下滑动切歌：速度阈值（vp/s）
+ *
+ * 位移不够但甩得够快也算 —— 快速轻扫是这类手势最常见的用法（与位移阈值取「或」关系）。
+ * 800vp/s 大概是「一划而过」的下限：正常慢速拖动通常只有两三百。
+ */
+const SWIPE_SONG_VELOCITY: number = 800;
+/**
+ * 纵向拖动被判定为切歌时，纵向位移至少要是横向的多少倍
+ *
+ * PanGesture 已经限定 Vertical 了，这一道是**第二层保险**：斜着划、或者某个版本把
+ * 横向手势也带进来时，不至于把一次左右滑动（比如在 Swiper 上翻页）认成切歌。
+ */
+const SWIPE_SONG_DIRECTION_RATIO: number = 1.5;
 
 /**
  * 全屏播放器
@@ -195,6 +226,13 @@ export struct PlayerView {
    * 封面主色的**氛围底在三档里都留着**：它是静态渐变，画一次就不再变，不产生持续功耗。
    */
   @StorageLink(K_PLAYER_MOTION) @Watch('syncPlayerMotion') playerMotion: string = PLAYER_MOTION_LIGHT;
+  /**
+   * 上下滑动切歌（设置 - 播放设置，默认关，见 PlaySettings.K_SWIPE_SWITCH_SONG）
+   *
+   * 这里只订阅、不缓存到别处：手势每次松手时现读，所以设置页一拨立刻生效，
+   * 不用重进播放页；关着时手势分支与加这一项之前逐字一致（见 onVerticalPanEnd）。
+   */
+  @StorageLink(K_SWIPE_SWITCH_SONG) swipeSwitchSong: boolean = false;
   /**
    * 应用是否在前台（EntryAbility 的 onForeground / onBackground 维护，见 DownloadManager）
    *
@@ -2034,6 +2072,127 @@ export struct PlayerView {
     .padding({ left: 24, right: 24 })
   }
 
+  // ------------------------------------------------------------ 纵向拖动：切歌 / 收起播放页
+
+  /**
+   * 纵向拖动松手：先看「上下滑动切歌」，剩下的才走原来的「下滑收起播放页」
+   *
+   * **为什么两件事共用同一条 PanGesture，而不各挂一条**：
+   * 播放页根节点本来就有一条纵向 Pan（下滑收起）。如果再给主体区挂第二条纵向 Pan，
+   * 两条手势就在同一条命中链上抢同一次拖动 —— 谁先攒够 distance、谁被取消，
+   * 取决于框架对「同方向父子手势」的仲裁细节（不同版本行为并不一致）。
+   * 这里没有上真机的条件替它兜底，所以统一收进一个回调：用**同一次拖动**的
+   * 位移、速度、起点位置自己分流，结果完全可预测，也不必改动既有手势的门槛。
+   *
+   * 分流规则：
+   *   1. 四个自绘面板（更多 / 音质 / 匹配歌词 / 评论）任一个开着 → 什么都不做：
+   *      在面板上拖动既不该切歌（会看不见地换歌），也不该收起播放页（与返回键同一条规则）。
+   *   2. 开关关着（默认）→ 与加这个功能之前**逐字一致**：下滑超过 70vp 收起播放页，
+   *      没有额外的方向判定、也没有速度判定 —— 绝不能让没开这个功能的人感到任何变化。
+   *   3. 开关打开：
+   *        - 纵向位移不够明显大于横向 → 不处理（斜划 / 横划不切歌）；
+   *        - 下滑且起点在顶栏那一条里 → 仍然是「收起播放页」（阈值沿用原来的 70vp），
+   *          这样「下拉关掉播放器」这个大家已经养成的手感还在；
+   *        - 上滑 → 下一首；下滑（起点在正文区）→ 上一首；
+   *          **以切歌为准**：正文区里下拉不再收起播放页，收起请点左上角箭头，
+   *          或在顶栏上向下拖。为什么这样选：开关是用户主动打开的，打开它就是为了
+   *          用手势切歌；如果正文区下拉还是关页面，那「下滑上一首」永远不可能触发，
+   *          这个功能等于只有一半。留一条顶栏的关闭路径，比两个动作互相打断更清楚。
+   *        - 位移与速度都没到阈值 → 什么都不做（蹭一下不切歌）。
+   */
+  private onVerticalPanEnd(event: GestureEvent): void {
+    // 1. 面板开着：两件事都不做（见上面第 1 条）
+    if (this.hasOverlay()) {
+      return;
+    }
+    // 2. 开关关着：保持原样（下滑 70vp 收起播放页）
+    if (!this.swipeSwitchSong) {
+      if (event.offsetY > 70) {
+        this.onClose();
+      }
+      return;
+    }
+
+    const offsetY: number = event.offsetY;
+    const offsetX: number = event.offsetX;
+    // 3a. 方向：纵向要明显大于横向（PanGesture 已限定 Vertical，这是第二道保险）
+    if (Math.abs(offsetY) <= Math.abs(offsetX) * SWIPE_SONG_DIRECTION_RATIO) {
+      return;
+    }
+    // 3b. 下滑且从顶栏开始：仍然是「收起播放页」，阈值与原来一致
+    if (offsetY > 0 && this.panStartsInTopBar(event)) {
+      if (offsetY > 70) {
+        this.onClose();
+      }
+      return;
+    }
+    // 3c. 阈值：位移够 或 甩得够快（两者取或）
+    const farEnough: boolean = Math.abs(offsetY) >= SWIPE_SONG_DISTANCE;
+    const fastEnough: boolean = Math.abs(event.velocityY) >= SWIPE_SONG_VELOCITY;
+    if (!farEnough && !fastEnough) {
+      return;
+    }
+    // 3d. 上滑下一首、下滑上一首
+    this.switchSongBySwipe(offsetY < 0);
+  }
+
+  /**
+   * 这次拖动的**起点**是不是落在顶栏里
+   *
+   * 用 `globalY`（相对**应用窗口**左上角）而不是 `localY`：`topInset` 也是相对窗口顶边的
+   * 状态栏留白，两者同一个坐标系，直接可比。窗口化（平板自由窗口）时也不会因为窗口
+   * 不在屏幕顶上而错判。
+   *
+   * 松手时拿到的是**终点**，起点 = 终点 - 本次总位移（`offsetY` 是相对起点的累计量）。
+   *
+   * 拿不到手指信息时（鼠标、触控板，或框架没给 fingerList）返回 false，也就是按「正文区」处理：
+   * 宁可把这一下当成切歌，也不要把正在听的播放页莫名收掉 —— 切错了还能再滑回来，关掉了得重新打开。
+   */
+  private panStartsInTopBar(event: GestureEvent): boolean {
+    if (event.fingerList.length === 0) {
+      return false;
+    }
+    const startY: number = event.fingerList[0].globalY - event.offsetY;
+    return startY < TOP_BAR_HEIGHT + this.topInset;
+  }
+
+  /**
+   * 上下滑动切歌：走 PlaySession 的 next / prev
+   *
+   * **不自己动队列**：播放模式（顺序 / 列表 / 单曲 / 随机）、随机播放「一轮不重复」的袋子、
+   * 预取的那一签、换源、歌词刷新、播控中心的状态回推全在会话里；绕过去就会和队列逻辑打架
+   * （最典型的是随机模式下自己 +1 会让同一首在一轮里放两次）。
+   *
+   * 队首 / 队尾：`next()` / `prev()` 在顺序播放（order）下到边界是**静默返回**的
+   * （见 PlaySession.next 的注释），所以这里先判一次并给轻提示，别让用户以为手势失灵。
+   * 其余三种模式（列表循环 / 单曲循环 / 随机）本来就会绕回去，不存在「到头了」。
+   */
+  private switchSongBySwipe(toNext: boolean): void {
+    const session: PlaySession = PlaySession.getInstance();
+    const total: number = session.queue.length;
+    if (total === 0) {
+      this.toast('播放列表是空的，先去添加歌曲');
+      return;
+    }
+    // currentIndex / queue 是 PlaySession 的公开只读信息（不修改它，仅用于判边界）
+    const index: number = session.currentIndex;
+    if (this.playMode === 'order') {
+      if (toNext && index >= total - 1) {
+        this.toast('已经是最后一首了');
+        return;
+      }
+      if (!toNext && index <= 0) {
+        this.toast('已经是第一首了');
+        return;
+      }
+    }
+    if (toNext) {
+      void session.next();
+      return;
+    }
+    void session.prev();
+  }
+
   build() {
     Stack({ alignContent: Alignment.Top }) {
       // ---------------------------------------------------- 背景（封面高斯模糊 + 压暗）
@@ -2112,7 +2271,7 @@ export struct PlayerView {
         }
         .width('100%')
         // 高度要把状态栏的留白算进去，否则 padding 会把这 56vp 的内容区吃掉一截
-        .height(56 + this.topInset)
+        .height(TOP_BAR_HEIGHT + this.topInset)
         .padding({ left: 18, right: 18, top: this.topInset })
 
         /**
@@ -2224,12 +2383,7 @@ export struct PlayerView {
     .gesture(
       PanGesture({ direction: PanDirection.Vertical, distance: 12 })
         .onActionEnd((event: GestureEvent) => {
-          // 「更多」/「音质」/「匹配歌词」/「评论」面板开着时不下滑关闭：在面板上往下拖
-          // 不该把整个播放器收掉（与返回键同一条规则，见 onBackRequested）
-          if (!this.moreOpen && !this.qualityOpen && !this.matchOpen && !this.commentOpen
-            && event.offsetY > 70) {
-            this.onClose();
-          }
+          this.onVerticalPanEnd(event);
         })
     )
   }

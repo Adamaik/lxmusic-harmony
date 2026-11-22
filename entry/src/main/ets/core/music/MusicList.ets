@@ -486,25 +486,30 @@ const LIST_LINK_PATTERNS: Record<string, RegExp[]> = {
 };
 
 /**
- * 把调用方给的「歌单标识」收敛成平台侧**裸 id**
+ * 平台自己给歌单 id 加的**编码前缀**（不是垃圾，是接口口径的一部分）
  *
- * 为什么必须有这一层（群反馈 2026-11-21 02:11，Rote Sonne 截图「更新失败：网易歌单详情接口返回异常」）：
- * `PlaylistDetailView.updateFromSource` 回源时传的是本地歌单里存的 `sourceListId`，
- * 而它的形态是**洛雪列表标识** `${平台}__${歌单id}`（`LocalLibrary.sourceListIdOf`），
- * 老数据里还可能是 `${平台}__https://…?id=…`（整条分享链接，见 normalizeSourceListId）。
- * 这些字符串直接拼进接口 URL 就是 `id=wy__2102211118` —— 实测网易回
- * `{"code":400,"message":"请求参数错误"}`（HTTP 200、接口 code 非 200），
- * 于是用户只看到一句「接口返回异常」。首次导入走的是解析出来的 `link.id`（裸数字），
- * 所以这个坑只在「从原歌单更新」上炸。
+ * 目前只有酷狗有：歌单广场（kgPlaylists）把精选集 id 写成 `id_${specialid}`，
+ * 而详情接口只认 `id_` 后面那串数字。
  *
- * 这里只在**入口**收敛一次，各平台解析函数拿到的永远是裸 id：
- *   `wy__2102211118`                    -> `2102211118`
- *   `wy__https://music.163.com/playlist?id=2102211118&uct2=…` -> `2102211118`
- *   `wy__https://music.163.com/#/playlist?id=2102211118`      -> `2102211118`
- * 平台自己的内部编码（酷狗的 `id_` / `gcid_`、酷我的 `digest-`）不动 —— 那些由各自的
- * 解析函数处理，这里剥掉反而会坏。
+ * 刻意**不动**的两种：
+ *   - 酷狗的 `gcid_xxx`：那是用户歌单（global_collection_id）的**真实 id 形态**，
+ *     剥掉就没有 id 了，由 kgPlaylistDetail 拿它去换 specialid；
+ *   - 酷我的 `digest-<digest>__<pid>`：`digest` 决定要不要先查 sourceid（digest 5 那条路），
+ *     剥掉会少一次解析，由 kwPlaylistDetail 自己拆。
+ *
+ * 放在入口做，是为了让「从歌单广场导入 / 从收藏打开 / 从原歌单更新」三条路
+ * 拿到的 id 形态完全一致 —— 此前只有广场那条路会剥 `id_`，另外两条会把
+ * `id_123` 原样拼进详情 URL。
  */
-function bareListIdOf(source: string, raw: string): string {
+function platformIdOf(source: string, id: string): string {
+  if (source === 'kg' && id.startsWith('id_')) {
+    return id.substring('id_'.length);
+  }
+  return id;
+}
+
+/** 只做「剥平台前缀 + 从分享链接抠 id」这两步，平台内编码交给 platformIdOf */
+function rawListIdOf(source: string, raw: string): string {
   let id: string = raw.trim();
   if (id.length === 0) {
     return id;
@@ -532,10 +537,37 @@ function bareListIdOf(source: string, raw: string): string {
   return id;
 }
 
+/**
+ * 把调用方给的「歌单标识」收敛成平台侧**裸 id**（各平台详情函数的唯一入口口径）
+ *
+ * 为什么必须有这一层（群反馈 2026-11-21 02:11，Rote Sonne 截图「更新失败：网易歌单详情接口返回异常」）：
+ * `PlaylistDetailView.updateFromSource` 回源时传的是本地歌单里存的 `sourceListId`，
+ * 而它的形态是**洛雪列表标识** `${平台}__${歌单id}`（`LocalLibrary.sourceListIdOf`），
+ * 老数据里还可能是 `${平台}__https://…?id=…`（整条分享链接，见 normalizeSourceListId）。
+ * 这些字符串直接拼进接口 URL 就是 `id=wy__2102211118` —— 实测 2026-11-23 逐平台复核：
+ *   wy `{"code":400,"message":"请求参数错误"}`
+ *   kw `{"result":"ok","total":0}`（**不报错**，只是回一张空歌单 —— 最隐蔽的一家）
+ *   kg 错误页（无 `global.data`）
+ *   mg `{"code":"299999"}`
+ *   tx `{"code":-1}`
+ * 也就是说「带前缀就当裸 id 用」在**五个平台全都会坏**，只是网易先被用户撞上。
+ * 首次导入走的是解析出来的 `link.id`（已经是裸 id），所以这个坑只在「从原歌单更新」上炸。
+ *
+ * 这里只在**入口**收敛一次，各平台解析函数拿到的永远是裸 id：
+ *   `wy__2102211118`                    -> `2102211118`
+ *   `wy__https://music.163.com/playlist?id=2102211118&uct2=…` -> `2102211118`
+ *   `kg__id_3339907`                    -> `3339907`
+ *   `kg__gcid_3z18r5q99zaz0b6`          -> `gcid_3z18r5q99zaz0b6`（酷狗用户歌单的真实 id）
+ *   `kw__digest-5__3676839501`          -> `digest-5__3676839501`（酷我要靠 digest 判断口径）
+ */
+function bareListIdOf(source: string, raw: string): string {
+  return platformIdOf(source, rawListIdOf(source, raw));
+}
+
 /** 歌单里的歌曲 */
 export async function getPlaylistDetail(source: string, id: string, page: number,
   ): Promise<LxListDetail> {
-  // 入口统一收敛成裸 id：调用方可能给 `wy__123` / 整条分享链接（见 bareListIdOf）
+  // 入口统一收敛成裸 id：调用方可能给 `wy__123` / 整条分享链接 / `id_123`（见 bareListIdOf）
   const listId: string = bareListIdOf(source, id);
   if (source === 'kw') {
     return await kwPlaylistDetail(listId, page);
@@ -649,15 +681,37 @@ export async function getPlaylistDetailAll(source: string, id: string,
 }
 
 /**
+ * 少几首以内算「平台自己就少了这几首」，不算没拉全
+ *
+ * 为什么需要（2026-11-23 实测）：QQ 那张 1919 首的歌单，`total_song_num=1919`，
+ * 但接口三页合计只回 1915 首 —— 差的 4 首已下架 / 无版权，**无论怎么翻都拿不到**。
+ * 网易同理：`trackIds` 5317 条里有下架曲目时 `/api/song/detail` 也补不回来。
+ * 旧口径 `list.length < total` 会把这种 0.2% 的差额判成「没拉全」，
+ * 于是这张歌单**每次**「从原歌单更新」都被静默放弃（用户只看到「已保留本地内容」，
+ * 永远更新不了），而且永远修不好。
+ *
+ * 容忍额度取「绝对 5 首」与「总数的 2%」里较大的那个：
+ *   - 小歌单（20 首）少 1~5 首不拦，少 6 首才拦；
+ *   - 大歌单（1919 首）少 38 首以内不拦，少 39 首以上才拦。
+ * 真正的「接口只回半张」（酷狗曾被砍到 999/1919、网易 tracks 只回 1000/5317）
+ * 差额都是几十个百分点，仍然会被拦下。
+ */
+const TRUNCATE_MIN_SHORTFALL: number = 5;
+const TRUNCATE_SHORTFALL_RATE: number = 0.02;
+
+/**
  * 这份「全量歌单」看起来是不是**没拉全**（接口被限流 / 翻页中途被截断）
  *
  * 给「跟随源歌单自动同步」当删除闸门用：拿半份源歌单去对齐，等于把用户歌单删掉一大半。
  * 判定口径：
  *   - `total` 是平台声明的曲目数（去重口径，各平台一致），`list.length` 是我们收到的条目数
  *     （可能大于 total：同一首歌在源歌单里出现两次是合法的，见 getPlaylistDetailAll）；
- *   - 只有 `total > 0`（平台确实给了数）**且** `list.length < total` 才算没拉全 ——
- *     total 为 0 表示平台没给这个数，不猜；
+ *   - 只有 `total > 0`（平台确实给了数）**且**少掉的条数超过容忍额度才算没拉全 ——
+ *     total 为 0 表示平台没给这个数（咪咕翻过最后一页时 `totalCount` 就没了），不猜；
  *   - 反过来 `list.length > total` 是正常的重复条目，不算截断。
+ *
+ * 容忍额度见 TRUNCATE_MIN_SHORTFALL / TRUNCATE_SHORTFALL_RATE：平台把下架曲目
+ * 从 total 里算、却给不出歌，这属于「本来就拉不到」，不该让整次同步作废。
  *
  * 宁可漏判（某平台 total 报得不准）也不能误判：误判只会让这次同步不做，误删却是不可逆的。
  */
@@ -665,7 +719,16 @@ export function playlistDetailTruncated(detail: LxListDetail): boolean {
   if (detail === null || detail === undefined) {
     return true;
   }
-  return detail.total > 0 && detail.list.length < detail.total;
+  if (detail.total <= 0) {
+    return false;
+  }
+  const shortfall: number = detail.total - detail.list.length;
+  if (shortfall <= 0) {
+    return false;
+  }
+  const tolerance: number = Math.max(TRUNCATE_MIN_SHORTFALL,
+    Math.ceil(detail.total * TRUNCATE_SHORTFALL_RATE));
+  return shortfall > tolerance;
 }
 
 /** 排行榜列表 */
@@ -1047,8 +1110,32 @@ async function kwPlaylistDetail(id: string, page: number): Promise<LxListDetail>
     `&pid=${encodeURIComponent(pid)}&pn=${page - 1}&rn=1000&encode=utf8&keyset=pl2012&identity=kuwo` +
     '&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1';
   const body: Record<string, Object> = await fetchRecord(url, undefined, '酷我歌单详情');
-  if (asString(body['result']) !== 'ok') {
-    throw new Error('酷我歌单详情接口返回异常');
+  const result: string = asString(body['result']);
+  if (result !== 'ok') {
+    throw detailErrorOf('kw', result, asString(body['info']), pid);
+  }
+  /**
+   * 酷我对**不存在**的 pid 不报错：`result` 仍是 `ok`、`total=0`、`musiclist` 为空，
+   * 只是把响应里的 `id` 换成另一张默认歌单。2026-11-23 实测：
+   *   pid=999999999999 -> 回 `id=3567587327`「我喜欢听」
+   *   pid=1            -> 回 `id=1`「默认列表」（这条是**真实存在的空歌单**）
+   * 所以判别口径是「回显的 id 与请求的 pid 是否一致」，而不是「列表是不是空的」：
+   * 正常歌单（包含合法的空歌单）两者一定相同。
+   *
+   * 不认这一步的话，用户点「从原歌单更新」只会看到
+   * 「原歌单现在是空的，已保留本地内容」，完全不知道这张歌单已经没了。
+   */
+  const echoId: string = asString(body['id']);
+  // 数字 id 按数值比：接口可能把前导 0 吃掉（`000123` -> `123`），字面比会误报
+  const sameId: boolean = echoId === pid
+    || (/^\d+$/.test(echoId) && /^\d+$/.test(pid) && asNumber(echoId) === asNumber(pid));
+  if (page <= 1 && echoId.length > 0 && !sameId
+    && asObjectArray(body['musiclist']).length === 0) {
+    const echoTitle: string = asString(body['title']);
+    const echoHint: string = echoTitle.length > 0
+      ? `（接口回了另一张歌单「${echoTitle}」）` : '';
+    throw new Error(`酷我找不到歌单 id「${pid}」${echoHint}：`
+      + '原歌单可能已删除或设为私密；也可以重新从分享链接导入一次');
   }
   const info: LxListInfo = {
     name: asString(body['title']),
@@ -1348,6 +1435,8 @@ function kgPageOutput(html: string): Record<string, Object> | null {
 
 async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   let id: string = rawId;
+  // `id_` 前缀在入口（platformIdOf）已经剥过一次，这里留着是为了让直接调用本函数
+  // 的路径（例如测试）也拿得到同样的口径
   if (id.startsWith('id_')) {
     id = id.substring('id_'.length);
   }
@@ -1356,7 +1445,7 @@ async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   if (id.startsWith('gcid_')) {
     gcid = await kgGcidInfo(id);
     if (gcid.specialId.length === 0) {
-      throw new Error('酷狗用户歌单解析失败：可能是私密歌单，或歌单页结构已变');
+      throw new Error(`酷狗用户歌单「${id}」解析失败：可能是私密歌单，或歌单页结构已变`);
     }
     id = gcid.specialId;
   }
@@ -1365,7 +1454,19 @@ async function kgPlaylistDetail(rawId: string): Promise<LxListDetail> {
   const html: string = resultText(result, '酷狗歌单详情');
   const dataMatch: RegExpMatchArray | null = html.match(KG_SPECIAL_LIST);
   if (dataMatch === null) {
-    throw new Error('酷狗歌单详情解析失败（页面结构可能已变）');
+    /**
+     * 没有 `global.data` 有**两种**完全不同的原因，必须分开说：
+     *   1. 歌单不存在 / 已删除 / 私密：酷狗回一个几百字节的错误页，
+     *      body 里就一个 `<div class="error">` + `/yueku/v9/static/images/error.jpg`
+     *      （2026-11-23 实测 id=999999999999 的页面 3548 字节）；
+     *   2. 页面结构真的变了：正常页面一百多 KB、带 `global.data`。
+     * 旧实现一律报「页面结构可能已变」，用户会当成 App 坏了反复重试。
+     */
+    if (html.indexOf('error.jpg') >= 0 || html.indexOf('class="error"') >= 0) {
+      throw new Error(`酷狗歌单详情接口返回异常：歌单「${rawId}」不存在、已删除或已设为私密`);
+    }
+    throw new Error('酷狗歌单详情解析失败（页面结构可能已变），请稍后重试；'
+      + '如果一直这样，请在「关于」里反馈');
   }
   const hashes: Object[] = JSON.parse(dataMatch[1]) as Object[];
   const songs: LxMusicInfo[] = await kgSongsByHash(hashes);
@@ -1666,8 +1767,15 @@ async function mgPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   const infoUrl: string = `https://c.musicapp.migu.cn/MIGUM3.0/resource/playlist/v2.0` +
     `?playlistId=${encodeURIComponent(id)}`;
   const body: Record<string, Object> = await fetchRecord(listUrl, { headers: MG_HEADERS }, '咪咕歌单详情');
-  if (asString(body['code']) !== MG_SUCCESS) {
-    throw new Error('咪咕歌单详情接口返回异常');
+  const code: string = asString(body['code']);
+  if (code !== MG_SUCCESS) {
+    // 咪咕会明确说原因（实测不存在的歌单：code=200002、info=「歌单不存在」），
+    // 别把这两条信息丢成一句「接口返回异常」
+    let message: string = asString(body['info']);
+    if (message.length === 0) {
+      message = asString(body['msg']);
+    }
+    throw detailErrorOf('mg', code, message, id);
   }
   const data: Record<string, Object> = asRecord(body['data']);
   let info: LxListInfo = emptyListInfo('');
@@ -2002,10 +2110,23 @@ async function txPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   if (page > 1) {
     return await txPlaylistDetailMusicu(id, page);
   }
+  let primary: Error | null = null;
   try {
     return await txPlaylistDetailMusicu(id, page);
   } catch (e) {
+    primary = e as Error;
+  }
+  try {
     return await txPlaylistDetailLegacy(id);
+  } catch (legacyFailure) {
+    /**
+     * 两条路都失败：抛**新版**那个错误。它带 data.code / msg（例如
+     * `data.code=-100006, msg=get diss info from tmem error` 就是「歌单不存在」），
+     * 而老接口永远只有一句「接口返回异常」—— 让兜底把它盖掉的话，
+     * 用户看到的还是那句毫无信息量的话。
+     */
+    const legacy: Error = legacyFailure as Error;
+    throw (primary !== null ? primary : legacy);
   }
 }
 
@@ -2045,16 +2166,26 @@ async function txPlaylistDetailMusicu(id: string, page: number): Promise<LxListD
     await fetchRecord(TX_MUSICU_BARE, { method: 'post', headers: headers, body: payload },
       'QQ 歌单详情');
   if (asNumber(body['code']) !== 0) {
-    throw new Error(`QQ 歌单详情接口返回异常（code=${asString(body['code'])}）`);
+    throw detailErrorOf('tx', asString(body['code']), '', id);
   }
   const req: Record<string, Object> = asRecord(body['req_1']);
   const data: Record<string, Object> = asRecord(req['data']);
   const songs: Object[] = asObjectArray(data['songlist']);
   if (asNumber(req['code']) !== 0) {
-    throw new Error('QQ 歌单详情接口没取到歌曲');
+    throw detailErrorOf('tx', asString(req['code']), asString(req['msg']), id);
+  }
+  /**
+   * 歌单不存在时 QQ 不回非 0 的 code，而是 `code=0` + `data.code=-100006`
+   * + `msg="get diss info from tmem error"`（2026-11-23 实测 disstid=999999999999）。
+   * 之前这里只按「songlist 为空」判失败，用户只看到「没取到歌曲」，
+   * 既不知道歌单没了、也不知道是不是接口抽风。
+   */
+  const dataCode: string = asString(data['code']);
+  if (dataCode.length > 0 && dataCode !== '0' && songs.length === 0) {
+    throw detailErrorOf('tx', dataCode, asString(data['msg']), id);
   }
   if (songs.length === 0 && page <= 1) {
-    throw new Error('QQ 歌单详情接口没取到歌曲');
+    throw new Error(`QQ 歌单详情接口没取到歌曲（disstid=${id}）`);
   }
   // 翻到最后一页之后（歌单被改短、或 total 与页数对不齐时）接口仍回 code=0、songlist 为空：
   // 这是「没有下一页」，不是失败 —— 交给 getPlaylistDetailAll 的「没有新歌」判定收尾
@@ -2083,7 +2214,7 @@ async function txPlaylistDetailLegacy(id: string): Promise<LxListDetail> {
   const body: Record<string, Object> = await fetchRecord(url, { headers: headers }, 'QQ 歌单详情');
   const cdlist: Object[] = asObjectArray(body['cdlist']);
   if (asNumber(body['code']) !== 0 || cdlist.length === 0) {
-    throw new Error('QQ 歌单详情接口返回异常');
+    throw detailErrorOf('tx', asString(body['code']), '', id);
   }
   const cd: Record<string, Object> = asRecord(cdlist[0]);
   const songs: Object[] = asObjectArray(cd['songlist']);
@@ -2383,32 +2514,78 @@ async function wyPlaylistDetail(id: string, page: number, name: string,
 }
 
 /**
- * 网易歌单详情失败时的可读错误
+ * 歌单详情失败时的**可读**错误（五个平台共用）
  *
  * 群反馈要的是「具体为什么失败」，而不是笼统一句「接口返回异常」
  * （2026-11-21 02:11 Rote Sonne 的截图就是这句话，用户完全无从下手）。
- * 实测三类：
- *   - `code=400`「请求参数错误」：id 不是裸数字（带了 `wy__` 前缀或整条分享链接），
- *     或 id 根本不存在 —— 2026-11-23 用 `id=wy__2102211118` 实测就是这条；
- *   - `code=404`：歌单被删除 / 设为私密；
- *   - `code=301 / 403 / 250`：需要登录，或登录态过期。
- * 文案直接给「怎么办」，因为它会原样出现在 Toast 里（`更新失败：${message}`）。
+ * 2026-11-23 逐平台实测到的真实返回（都是 HTTP 200、错在 body 里的 code）：
+ *   - wy：`code=400`「请求参数错误」（id 不是裸数字 / 歌单不存在）、`404`（已删除或私密）、
+ *     `301 / 403 / 250`（未登录或登录过期）；
+ *   - mg：`code=200002`「歌单不存在」；
+ *   - tx：`code=0` + `data.code=-100006`「get diss info from tmem error」（歌单不存在）、
+ *     老接口 `code=-1`（已下线）；
+ *   - kw：`result=ok` 但回显的 id 换了另一张歌单（见 kwPlaylistDetail 的 echo 判定），
+ *     真正的 `result` 非 ok 时把原值带出来；
+ *   - kg：没有 code，只有「错误页」这一种信号（见 kgPlaylistDetail）。
+ *
+ * 文案里都带「怎么办」，因为它会原样出现在 Toast 里（`更新失败：${message}`）。
+ *
+ * @param source 平台（wy / mg / tx / kw / kg）
+ * @param code 平台原样给的 code / result（字符串形式，不做类型假设）
+ * @param message 平台给的附加说明（可为空）
+ * @param id 这次请求的歌单 id（写进文案方便用户核对 / 反馈）
  */
-function wyDetailError(code: number, message: string, id: string): Error {
+function detailErrorOf(source: string, code: string, message: string, id: string): Error {
+  const name: string = platformName(source);
   const tail: string = message.length > 0 ? `，${message}` : '';
-  if (code === 400) {
-    return new Error(`网易歌单详情接口返回异常（code=400${tail}）：`
-      + `歌单 id「${id}」不被接口接受，可能不是纯数字 id 或歌单已不存在`);
+  if (source === 'wy') {
+    if (code === '400') {
+      return new Error(`网易歌单详情接口返回异常（code=400${tail}）：`
+        + `歌单 id「${id}」不被接口接受，可能不是纯数字 id 或歌单已不存在`);
+    }
+    if (code === '404') {
+      return new Error(`网易歌单详情接口返回异常（code=404${tail}）：`
+        + `歌单「${id}」不存在、已删除或已设为私密`);
+    }
+    if (code === '301' || code === '403' || code === '250') {
+      return new Error(`网易歌单详情接口返回异常（code=${code}${tail}）：`
+        + '需要登录或登录已过期，请到「设置 - 登录音乐」重新登录网易云后再试');
+    }
   }
-  if (code === 404) {
-    return new Error(`网易歌单详情接口返回异常（code=404${tail}）：`
-      + `歌单「${id}」不存在、已删除或已设为私密`);
+  if (source === 'mg') {
+    if (code === '200002') {
+      return new Error(`咪咕歌单详情接口返回异常（code=200002${tail}）：`
+        + `歌单「${id}」不存在、已删除或已设为私密`);
+    }
+    return new Error(`咪咕歌单详情接口返回异常（code=${code}${tail}）：`
+      + `没能取到歌单「${id}」，可以稍后重试；一直失败就从分享链接重新导入一次`);
   }
-  if (code === 301 || code === 403 || code === 250) {
-    return new Error(`网易歌单详情接口返回异常（code=${code}${tail}）：`
-      + '需要登录或登录已过期，请到「设置 - 登录音乐」重新登录网易云后再试');
+  if (source === 'tx') {
+    if (code === '-100006') {
+      return new Error(`QQ 歌单详情接口返回异常（code=-100006${tail}）：`
+        + `歌单「${id}」不存在、已删除或已设为私密`);
+    }
+    if (code === '-1') {
+      return new Error(`QQ 歌单详情接口返回异常（code=-1${tail}）：`
+        + `没能取到歌单「${id}」，可能接口已变更，可以稍后重试或换个歌单试试`);
+    }
+    return new Error(`QQ 歌单详情接口返回异常（code=${code}${tail}）：`
+      + `没能取到歌单「${id}」，可以稍后重试`);
   }
-  return new Error(`网易歌单详情接口返回异常（code=${code}${tail}）`);
+  if (source === 'kw') {
+    return new Error(`酷我歌单详情接口返回异常（result=${code}${tail}）：`
+      + `没能取到歌单「${id}」，可以稍后重试；一直失败就从分享链接重新导入一次`);
+  }
+  if (source === 'kg') {
+    return new Error(`酷狗歌单详情接口返回异常（${code}${tail}）：`
+      + `没能取到歌单「${id}」，可以稍后重试；一直失败就从分享链接重新导入一次`);
+  }
+  return new Error(`${name}歌单详情接口返回异常（code=${code}${tail}）`);
+}
+
+/** 网易歌单详情失败时的可读错误（保留这个名字：调用点在 wyPlaylistDetail 里读起来更直白） */
+function wyDetailError(code: number, message: string, id: string): Error {
+  return detailErrorOf('wy', `${code}`, message, id);
 }
 
 /** `trackIds` 是一串 `{id}`，按原顺序取出字符串 id（丢空、去重） */

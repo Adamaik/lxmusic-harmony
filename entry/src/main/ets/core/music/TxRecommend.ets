@@ -18,8 +18,15 @@
  *       每页 10 首，Page 增大时会有重复（首曲常与上一页相同），调用方必须按 mid 去重。
  *   - 猜你喜欢 `music.radioProxy.MbTrackRadioSvr / get_radio_track`
  *       param { Page, vSeed: [] }，data.tracks[] 是**扁平**的 Track（与搜索同形状），一次只有几首。
+ *   - 每日推荐 `music.recommend.RecommendFeed / get_recommend_feed`
+ *       param { direction: 0, page: 1, v_cache: [], v_uniq: [], s_num: 0 }，返回一堆卡片；
+ *       其中 **subtype = 510** 的那张是「每日 30 首」动态歌单（`time` 是当天 unix 秒），
+ *       `id` 是该歌单的 disstid。拿到 id 再走 `music.srfDissInfo.DissInfo / CgiGetDiss`
+ *       读 `data.songlist`（完整 Track，与歌单详情同形状），才是真正的每日 30 首。
  *
  * 解析复用 MusicSearch.parseTxSongs（与搜索同一条映射，字段口径不会分叉）。
+ * 注意：parseTxSongs 要求每首带 `file.media_mid`，所以「只给歌名 + 封面的卡片」
+ * （推荐 feed 里的运营卡）解析不出来 —— 每日推荐必须走上面那条两跳链，不能直接啃卡片。
  */
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -34,6 +41,12 @@ const GATEWAY: string = 'https://u.y.qq.com/cgi-bin/musicu.fcg';
 const TX_UA: string = 'QQMusic 14090508(android 12)';
 /** 雷达最多翻几页（真机实测每页 10 首、Page 到 3 之后基本重复；4 页够凑 30+ 首） */
 const RADAR_MAX_PAGE: number = 4;
+/** 猜你喜欢最多翻几页（一次只回几首，Page 变大后重复变多；4 页凑一行够用） */
+const GUESS_MAX_PAGE: number = 4;
+/** 每日推荐卡片在 feed 里的 subtype 标记（510 = 「每日 30 首」动态歌单） */
+const DAILY_SUBTYPE: number = 510;
+/** 每日推荐歌单一次读多少首（QQ 每日 30 首，留点余量；不要拉整张） */
+const DAILY_SONG_NUM: number = 60;
 
 /** musicu.fcg 的 comm 信封（ArkTS 不允许匿名对象字面量当类型，显式建类） */
 class TxComm {
@@ -107,6 +120,63 @@ class TxGuessBody {
   req_0: TxGuessReq;
 
   constructor(comm: TxComm, req: TxGuessReq) {
+    this.comm = comm;
+    this.req_0 = req;
+  }
+}
+
+/** 每日推荐 feed 参数（字段照 QQ 官网推荐页：direction 0 = 下拉首屏） */
+class TxDailyParam {
+  direction: number = 0;
+  page: number = 1;
+  v_cache: number[] = [];
+  v_uniq: string[] = [];
+  s_num: number = 0;
+}
+
+class TxDailyReq {
+  module: string = 'music.recommend.RecommendFeed';
+  method: string = 'get_recommend_feed';
+  param: TxDailyParam = new TxDailyParam();
+}
+
+class TxDailyBody {
+  comm: TxComm;
+  req_0: TxDailyReq;
+
+  constructor(comm: TxComm, req: TxDailyReq) {
+    this.comm = comm;
+    this.req_0 = req;
+  }
+}
+
+/**
+ * 每日推荐歌单（CgiGetDiss）参数
+ *
+ * `dirid` 用 0（按 disstid 取），`tag` / `userinfo` / `orderlist` 照官网歌单详情带全：
+ * 每日 30 首是**账号私有**的动态歌单，少带一个标记可能只回歌单外壳、`songlist` 为空。
+ */
+class TxDissParam {
+  disstid: number = 0;
+  dirid: number = 0;
+  tag: boolean = true;
+  song_begin: number = 0;
+  song_num: number = DAILY_SONG_NUM;
+  userinfo: boolean = true;
+  orderlist: boolean = true;
+}
+
+class TxDissReq {
+  module: string = 'music.srfDissInfo.DissInfo';
+  method: string = 'CgiGetDiss';
+  param: TxDissParam = new TxDissParam();
+}
+
+class TxDissBody {
+  comm: TxComm;
+  req_0: TxDissReq;
+
+  constructor(comm: TxComm, req: TxDissReq) {
     this.comm = comm;
     this.req_0 = req;
   }
@@ -203,22 +273,200 @@ export async function fetchTxRadar(): Promise<LxMusicInfo[]> {
   return parseTxSongs(tracks);
 }
 
-/** 猜你喜欢（一次只有几首，适合当「换一批」的补充，不单独成页） */
+/**
+ * 猜你喜欢
+ *
+ * 一次只回几首（实测 3 首左右），所以翻 `GUESS_MAX_PAGE` 页按 mid 去重凑成一行：
+ * Page 变大后重复会变多，一整页都是旧歌就提前收工，不再白发请求。
+ */
 export async function fetchTxGuess(): Promise<LxMusicInfo[]> {
-  const req: TxGuessReq = new TxGuessReq();
-  req.param.Page = 1;
-  const body: TxGuessBody = new TxGuessBody(buildComm(), req);
-  try {
-    const resp: Record<string, Object> = await httpPostJson(GATEWAY, body, txHeaders(), 'QQ音乐猜你喜欢');
-    const data: Record<string, Object> | null = blockOf(resp);
-    if (data === null) {
-      return [];
+  const seen: Set<string> = new Set<string>();
+  const tracks: Object[] = [];
+  for (let page = 1; page <= GUESS_MAX_PAGE; page++) {
+    const req: TxGuessReq = new TxGuessReq();
+    req.param.Page = page;
+    const body: TxGuessBody = new TxGuessBody(buildComm(), req);
+    try {
+      const resp: Record<string, Object> = await httpPostJson(GATEWAY, body, txHeaders(),
+        `QQ音乐猜你喜欢(第${page}页)`);
+      const data: Record<string, Object> | null = blockOf(resp);
+      if (data === null) {
+        continue;
+      }
+      const list: Object[] = asObjectArray(data['tracks']);
+      let added: number = 0;
+      for (const raw of list) {
+        // 这一条是**扁平** Track（不是雷达那种 { Track: {...} }）
+        const track: Record<string, Object> = asRecord(raw);
+        const mid: string = asString(track['mid']);
+        if (mid.length === 0 || seen.has(mid)) {
+          continue;
+        }
+        seen.add(mid);
+        tracks.push(track);
+        added += 1;
+      }
+      hilog.info(DOMAIN, TAG, 'guess page %{public}d: %{public}d 首，新增 %{public}d 首',
+        page, list.length, added);
+      if (added === 0) {
+        break;
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'guess page %{public}d failed: %{public}s', page, (e as Error).message);
     }
-    const list: LxMusicInfo[] = parseTxSongs(asObjectArray(data['tracks']));
-    hilog.info(DOMAIN, TAG, 'guess: %{public}d 首', list.length);
-    return list;
-  } catch (e) {
-    hilog.warn(DOMAIN, TAG, 'guess failed: %{public}s', (e as Error).message);
-    return [];
   }
+  const songs: LxMusicInfo[] = parseTxSongs(tracks);
+  hilog.info(DOMAIN, TAG, 'guess: %{public}d 首', songs.length);
+  return songs;
+}
+
+// ------------------------------------------------------------ 每日推荐
+
+/** 上海时区「哪一天」（每日推荐按上海当天算，跨日就要换一批，见 isTodayShanghai） */
+function shanghaiDayOf(ms: number): string {
+  return new Date(ms + 8 * 3600 * 1000).toISOString().substring(0, 10);
+}
+
+/**
+ * 卡片的 `time` 是不是「今天」（上海）
+ *
+ * QQ 的每日推荐是**按天**下发的动态歌单：卡片时间不是今天，说明拿到的是昨天/缓存的
+ * 那一批，不能再当「今日推荐」显示。接口没给时间（0）就不拦 —— 宁可多显示一块，
+ * 也别因为一个可选字段整块消失。
+ */
+function isTodayShanghai(stamp: number): boolean {
+  if (stamp <= 0) {
+    return true;
+  }
+  const ms: number = stamp > 100000000000 ? stamp : stamp * 1000;
+  return shanghaiDayOf(ms) === shanghaiDayOf(Date.now());
+}
+
+/** 卡片上的歌单 id（不同卡片把 id 放在不同字段里，都是纯数字串） */
+function cardIdOf(card: Record<string, Object>): string {
+  const keys: string[] = ['id', 'tid', 'disstid', 'dissid', 'playlist_id'];
+  for (const key of keys) {
+    const digits: string = asString(card[key]).replace(/[^0-9]/g, '');
+    // 动态歌单 id 是长数字；太短的多半是 type / 位置编号，不能当 disstid
+    if (digits.length >= 6) {
+      return digits;
+    }
+  }
+  return '';
+}
+
+/** 把一个容器上的 v_card 收进 cards（容器不存在时 asObjectArray 给空数组，不报错） */
+function pushCards(container: Record<string, Object>, cards: Object[]): void {
+  const list: Object[] = asObjectArray(container['v_card']);
+  for (const card of list) {
+    cards.push(card);
+  }
+}
+
+/**
+ * 推荐 feed 里的卡片摊平
+ *
+ * **实测（2026-11-23 匿名请求 musicu.fcg）**：卡片不在 `data.v_shelf[].v_card` 上，而是在
+ * `data.v_shelf[].v_niche[].v_card[]`（shelf 是「板块」，niche 是板块里的一格，卡片在格子里）。
+ * 匿名时每个 shelf 的 niche 只有 1 张 `type=500` 的歌单卡（`id` 就是 disstid、`time` 是歌单
+ * 创建时间），每日推荐那张 `subtype=510` 的卡只有登录后才会出现。
+ * 老版本 / 其它入口也见过 `v_card` 直接挂在 shelf 或 data 上，所以这几层都收一遍。
+ */
+function dailyCardsOf(data: Record<string, Object>): Object[] {
+  const cards: Object[] = [];
+  pushCards(data, cards);
+  const shelves: Object[] = asObjectArray(data['v_shelf']);
+  for (const shelf of shelves) {
+    const record: Record<string, Object> = asRecord(shelf);
+    pushCards(record, cards);
+    const niches: Object[] = asObjectArray(record['v_niche']);
+    for (const niche of niches) {
+      pushCards(asRecord(niche), cards);
+    }
+  }
+  const list: Object[] = asObjectArray(data['list']);
+  for (const item of list) {
+    pushCards(asRecord(item), cards);
+  }
+  return cards;
+}
+
+/**
+ * 从推荐 feed 里挑出「每日推荐」那张卡片（找不到给 null）
+ *
+ * 只认 `subtype / type = 510` 的卡片：其它卡片是普通歌单（`type=500`，`id` 是歌单 id、
+ * `title` 是运营取的歌单名），按标题找「每日」会挑错成别人的歌单，所以不做标题兜底。
+ * `time` 是今天（上海）的优先；时间对不上的 510 卡留着兜底 —— 字段口径若变，
+ * 至少还能把日推显示出来，而不是整块消失。
+ */
+function findDailyCard(data: Record<string, Object>): Record<string, Object> | null {
+  const cards: Object[] = dailyCardsOf(data);
+  let fallback: Record<string, Object> | null = null;
+  for (const raw of cards) {
+    const card: Record<string, Object> = asRecord(raw);
+    if (asNumber(card['subtype']) !== DAILY_SUBTYPE && asNumber(card['type']) !== DAILY_SUBTYPE) {
+      continue;
+    }
+    if (cardIdOf(card).length === 0) {
+      continue;
+    }
+    if (isTodayShanghai(asNumber(card['time']))) {
+      return card;
+    }
+    if (fallback === null) {
+      fallback = card;
+    }
+  }
+  return fallback;
+}
+
+/**
+ * 每日推荐（每日 30 首）
+ *
+ * 两跳：推荐 feed 拿当天动态歌单 id → `CgiGetDiss` 读那 30 首完整曲目。
+ * **必须登录**：未登录时 feed 只回普通歌单卡（没有 subtype 510），
+ * 所以找不到卡片时直接抛错，让界面把这一块标成「取不到」，不静默显示空块。
+ * 歌单详情取不到时还有一层兜底：卡片自带的 `card_extra_info.SongList / Tracks`
+ * 若本来就是完整 Track（带 file.media_mid），照样能播，不至于整块空掉。
+ */
+export async function fetchTxDaily(): Promise<LxMusicInfo[]> {
+  const feedReq: TxDailyReq = new TxDailyReq();
+  const feedBody: TxDailyBody = new TxDailyBody(buildComm(), feedReq);
+  const feedResp: Record<string, Object> =
+    await httpPostJson(GATEWAY, feedBody, txHeaders(), 'QQ音乐每日推荐');
+  const feedData: Record<string, Object> | null = blockOf(feedResp);
+  if (feedData === null) {
+    throw new Error('QQ 音乐每日推荐接口返回异常');
+  }
+  const card: Record<string, Object> | null = findDailyCard(feedData);
+  if (card === null) {
+    throw new Error('QQ 音乐每日推荐里没找到今日歌单（登录可能已过期）');
+  }
+  const dissId: string = cardIdOf(card);
+  const dissReq: TxDissReq = new TxDissReq();
+  dissReq.param.disstid = asNumber(dissId);
+  const dissBody: TxDissBody = new TxDissBody(buildComm(), dissReq);
+  const resp: Record<string, Object> =
+    await httpPostJson(GATEWAY, dissBody, txHeaders(), 'QQ音乐每日推荐歌单');
+  const data: Record<string, Object> | null = blockOf(resp);
+  if (data !== null) {
+    const songs: LxMusicInfo[] = parseTxSongs(asObjectArray(data['songlist']));
+    if (songs.length > 0) {
+      hilog.info(DOMAIN, TAG, 'daily: disstid=%{public}s, %{public}d 首', dissId, songs.length);
+      return songs;
+    }
+  }
+  // 兜底：卡片自己带的曲目（有的版本 510 卡直接把 30 首塞在 card_extra_info 里）
+  const extra: Record<string, Object> = asRecord(card['card_extra_info']);
+  const inline: Object[] = [];
+  for (const raw of asObjectArray(extra['SongList'])) {
+    inline.push(raw);
+  }
+  for (const raw of asObjectArray(extra['Tracks'])) {
+    inline.push(raw);
+  }
+  const fallbackSongs: LxMusicInfo[] = parseTxSongs(inline);
+  hilog.info(DOMAIN, TAG, 'daily fallback: disstid=%{public}s, %{public}d 首',
+    dissId, fallbackSongs.length);
+  return fallbackSongs;
 }

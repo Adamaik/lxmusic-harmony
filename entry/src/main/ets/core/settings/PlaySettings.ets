@@ -17,8 +17,11 @@ const FILE_NAME: string = 'play_settings.json';
  * v5：「播放页动效」由布尔改成三档字符串（off / light / immersive，见 K_PLAYER_MOTION）。
  * v4 及更早的存档里它是 `true` / `false`，apply 里按 `true -> light`、`false -> off` 迁移，
  * 迁移完立刻按 v5 结构回写一次（用户不必等到下次改设置才落成新格式）。
+ * v6：新增「上下滑动切歌」（见 K_SWIPE_SWITCH_SONG）。老存档里没有这一项、
+ * 新装也是同一个默认值（关），所以**不需要迁移**；版本号照旧递增，
+ * 只是为了让「比本版更新的存档整份按默认处理」这条规则认得它。
  */
-const SETTINGS_VERSION: number = 5;
+const SETTINGS_VERSION: number = 6;
 
 /**
  * 播放设置（设置 - 播放设置）
@@ -29,7 +32,8 @@ const SETTINGS_VERSION: number = 5;
  *   被打断结束后自动重新播放
  *   播放页显示小歌词 / 歌词页模糊效果 / 歌词居中显示 / 歌词字号 / 歌词页不熄屏 /
  *   桌面歌词 / 车载蓝牙歌词 / 本地与云端自动匹配歌词 /
- *   播放页动效（三档：关闭 / 轻量 = 封面呼吸 + 主色氛围底 + 边缘光带 / 沉浸 = 再加 3D 倾斜 + 波纹 + 浮光 + 流动背景）
+ *   播放页动效（三档：关闭 / 轻量 = 封面呼吸 + 主色氛围底 + 边缘光带 / 沉浸 = 再加 3D 倾斜 + 波纹 + 浮光 + 流动背景）/
+ *   上下滑动切歌（默认关，见 K_SWIPE_SWITCH_SONG）
  *
  * 存法：一份 JSON 落在应用沙箱（filesDir/play_settings.json），同时把每个值写进
  * AppStorage——界面用 @StorageLink 订阅即可实时响应，播放器侧直接读本单例。
@@ -158,6 +162,20 @@ export const PLAYER_MOTION_LABELS: string[] = ['关闭', '轻量', '沉浸'];
 export const PLAYER_MOTION_DEFAULT: string = PLAYER_MOTION_LIGHT;
 
 /**
+ * 上下滑动切歌（设置 - 播放设置）
+ *
+ * 群反馈（2026-11-18 16:31，曹华）：「这个界面能设置，上下滑动切歌不」。
+ * 当时群里对「要不要这种交互」有分歧（有人直接说没用），而它确实会和播放页
+ * 既有的「下滑收起播放页」抢同一个方向的拖动。所以：功能做，但**默认关**，
+ * 愿意用的人自己去设置里打开 —— 不替所有人改掉他们习惯的手势。
+ *
+ * 打开之后播放页正文区：上滑 = 下一首、下滑 = 上一首；顶栏那一段的下滑
+ * 仍然是「收起播放页」（靠拖动起点所在的区域区分，见 PlayerView 的 onVerticalPanEnd）。
+ * 关着时播放页的手势与加这一项之前逐字一致。
+ */
+export const K_SWIPE_SWITCH_SONG: string = 'cfg_swipe_switch_song';
+
+/**
  * 默认渠道（默认平台）
  *
  * 有些页面没有「选渠道」的入口，只能替用户猜一个平台：
@@ -223,6 +241,8 @@ interface PlaySettingsData {
   defaultSource?: string;
   /** 多音源自动切换，见 K_AUTO_SOURCE_SWITCH */
   autoSourceSwitch?: boolean;
+  /** 上下滑动切歌，见 K_SWIPE_SWITCH_SONG（默认关） */
+  swipeSwitchSong?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -318,6 +338,14 @@ export class PlaySettings {
   private defaultSource: string = '';
   /** 多音源自动切换默认开，见 K_AUTO_SOURCE_SWITCH 的说明 */
   private autoSourceSwitch: boolean = true;
+  /**
+   * 上下滑动切歌，默认**关**
+   *
+   * 见 K_SWIPE_SWITCH_SONG：它会和播放页既有的「下滑收起播放页」抢同一个方向的拖动，
+   * 属于「有人很想要、有人觉得多余」的交互，所以默认关、让用户自己开。
+   * 关着时播放页的手势与加这一项之前完全一致。
+   */
+  private swipeSwitchSong: boolean = false;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -384,6 +412,7 @@ export class PlaySettings {
       playerMotion: this.playerMotion,
       defaultSource: this.defaultSource,
       autoSourceSwitch: this.autoSourceSwitch,
+      swipeSwitchSong: this.swipeSwitchSong,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -484,6 +513,10 @@ export class PlaySettings {
     if (data.autoSourceSwitch !== undefined) {
       this.autoSourceSwitch = data.autoSourceSwitch;
     }
+    // 上下滑动切歌：老存档（v5 及更早）里没有这一项，保持默认（关）—— 与加这一项之前一致
+    if (data.swipeSwitchSong !== undefined) {
+      this.swipeSwitchSong = data.swipeSwitchSong;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -510,6 +543,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_PLAYER_MOTION, this.playerMotion);
       AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
       AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, this.autoSourceSwitch);
+      AppStorage.setOrCreate(K_SWIPE_SWITCH_SONG, this.swipeSwitchSong);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -809,6 +843,25 @@ export class PlaySettings {
     }
     this.playerMotion = value;
     AppStorage.setOrCreate(K_PLAYER_MOTION, value);
+    this.write();
+  }
+
+  /**
+   * 上下滑动切歌（见 K_SWIPE_SWITCH_SONG）
+   *
+   * 播放页在每次纵向拖动松手时现读这一项（AppStorage + 本单例），
+   * 所以开关一拨立刻生效，不必重进播放页 —— 与「播放页动效」同一套做法。
+   */
+  isSwipeSwitchSong(): boolean {
+    return this.swipeSwitchSong;
+  }
+
+  setSwipeSwitchSong(value: boolean): void {
+    if (value === this.swipeSwitchSong) {
+      return;
+    }
+    this.swipeSwitchSong = value;
+    AppStorage.setOrCreate(K_SWIPE_SWITCH_SONG, value);
     this.write();
   }
 }

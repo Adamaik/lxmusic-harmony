@@ -11,7 +11,8 @@ import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
-  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, LYRIC_FONT_MAX, LYRIC_FONT_MIN, MAIN_QUALITYS, MAIN_QUALITY_LABELS,
+  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, K_SWIPE_SWITCH_SONG, LYRIC_FONT_MAX, LYRIC_FONT_MIN,
+  MAIN_QUALITYS, MAIN_QUALITY_LABELS,
   PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LABELS, PLAYER_MOTION_LEVELS, PLAYER_MOTION_LIGHT,
   PlaySettings } from '../core/settings/PlaySettings';
 import { isFileQuality, K_ACTUAL_QUALITY, qualityFallbackNote, qualityLabel, targetQuality } from '../core/music/Quality';
@@ -78,7 +79,8 @@ struct ExtendQualitySetting {
  *   二、歌词：播放页显示小歌词、歌词页模糊效果、歌词居中显示、歌词字号、歌词页不熄屏、
  *       桌面歌词、车载蓝牙歌词
  *   三、播放页：播放页动效（三档：关闭 / 轻量 = 封面呼吸 + 主色光晕 + 边缘光带 /
- *       沉浸 = 再加 3D 倾斜 + 扩散波纹 + 上浮光点 + 背景流动；默认轻量）
+ *       沉浸 = 再加 3D 倾斜 + 扩散波纹 + 上浮光点 + 背景流动；默认轻量）、
+ *       上下滑动切歌（默认关：打开后播放页上滑下一首、下滑上一首）
  *
  * 参考图里还有一项「歌词帧率」，这里没做：歌词本身不是逐帧渲染的（靠 AVPlayer 的
  * timeUpdate 一秒一推、行间是 240ms 的补间），给一个帧率选项只是摆设。
@@ -138,6 +140,12 @@ export struct PlaySettingsView {
    * 因为「轻量 / 沉浸」不是「开与关」的关系，开关表达不了。
    */
   @StorageLink(K_PLAYER_MOTION) playerMotion: string = PLAYER_MOTION_LIGHT;
+  /**
+   * 上下滑动切歌（默认关，见 PlaySettings.K_SWIPE_SWITCH_SONG）
+   *
+   * 播放页在每次纵向拖动松手时现读这一项，拨完立刻生效，不用重进播放页。
+   */
+  @StorageLink(K_SWIPE_SWITCH_SONG) swipeSwitchSong: boolean = false;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
@@ -234,6 +242,18 @@ export struct PlaySettingsView {
     }
     return '最省电：播放页一点动画都不跑。封面主色的氛围底是静态渐变（画一次就不变），'
       + '不产生持续功耗，所以它仍然保留。';
+  }
+
+  /**
+   * 上下滑动切歌的说明
+   *
+   * 必须讲清三件事：手势方向、**默认关闭**（不是坏了），以及它和「下滑收起播放页」
+   * 的关系 —— 这一项会占掉播放页正文区的下拉手势，用户要能预期到「下滑不再收起」。
+   */
+  private swipeSwitchSongHint(): string {
+    return '在播放页上滑切下一首、下滑切上一首（位移超过约 72vp，或快速甩动时才触发，'
+      + '轻轻一划不会误切）。打开后正文区的下滑不再收起播放页 —— 收起请点左上角的箭头，'
+      + '或在顶栏那一条上向下拖动。顺序播放到队首/队尾时会提示，不会静默失败。';
   }
 
   /** 桌面歌词这一项的说明：不支持的设备上明说，免得用户以为开关坏了 */
@@ -514,6 +534,24 @@ export struct PlaySettingsView {
                   PlaySettings.getInstance().setPlayerMotionLevel(PLAYER_MOTION_LEVELS[index]);
                 },
               })
+
+              /**
+               * 上下滑动切歌：默认关（见 PlaySettings.K_SWIPE_SWITCH_SONG）
+               *
+               * 放在「播放页」这一张卡里，因为它与上面那项一样只管播放页的交互。
+               * 它和「播放页动效」互不影响：关掉动效也照样能滑。
+               */
+              ToggleSetting({
+                label: '上下滑动切歌',
+                value: this.swipeSwitchSong,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setSwipeSwitchSong(next);
+                  if (next) {
+                    this.toast('已开启上下滑动切歌：播放页上滑下一首、下滑上一首');
+                  }
+                },
+              })
+              HintText({ text: this.swipeSwitchSongHint() })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: 8, bottom: 8 })
