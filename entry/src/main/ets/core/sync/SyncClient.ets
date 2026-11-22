@@ -10,16 +10,15 @@ import { defaultDeviceName, SyncStore } from './SyncStore';
 import { FEATURE_VERSION, LxListData, LxSyncAction, SyncKeyInfo, SyncStatus, SyncUrlInfo,
   SYNC_AUTH_MSG, SYNC_CLIENT_TYPE, SYNC_CLOSE_FAILED, SYNC_CLOSE_NORMAL, SYNC_CODE_AUTH_FAILED,
   SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_FAILED, SYNC_CODE_CONNECT_SERVICE_FAILED,
-  SYNC_CODE_GET_SERVICE_ID_FAILED,
-  SYNC_CODE_HIGH_SERVICE_VERSION, SYNC_CODE_LOW_SERVICE_VERSION, SYNC_CODE_MISSING_AUTH_CODE,
+  SYNC_CODE_CONNECT_TIMEOUT, SYNC_CODE_GET_SERVICE_ID_FAILED,
+  SYNC_CODE_HIGH_SERVICE_VERSION, SYNC_CODE_HTTP_ERROR, SYNC_CODE_LOW_SERVICE_VERSION,
+  SYNC_CODE_MISSING_AUTH_CODE,
   SYNC_HELLO_MSG, SYNC_ID_PREFIX, SYNC_KNOWN_CODES, SYNC_MSG_AUTH_FAILED, SYNC_MSG_BLOCKED_IP,
   SYNC_MSG_CONNECT } from './SyncTypes';
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'SyncClient';
 
-/** /hello 与 /ah 的请求超时（洛雪是 10s） */
-const HTTP_TIMEOUT_MS: number = 10000;
 /**
  * 服务端每 30s 发一次文本 ping，超过这个时间没收到就当作断线
  *
@@ -28,8 +27,22 @@ const HTTP_TIMEOUT_MS: number = 10000;
  * 放宽到 3 个 ping 周期：真断了有 WebSocket 的 close 事件兜底，不会漏。
  */
 const PING_TIMEOUT_MS: number = 90 * 1000;
-/** 建连超时（洛雪是 2 分钟） */
-const CONNECT_TIMEOUT_MS: number = 2 * 60 * 1000;
+/**
+ * 握手总超时：/hello -> /id -> /ah 三步合计 15s
+ *
+ * 这三步全走完才会去开 WebSocket。以前每一步各自 10s，最坏 30s，中间还没有任何进度
+ * 反馈（一直停在 2%），用户只能看着进度条发呆。现在把总时限压到 15s，超时立刻落到
+ * 「连接超时」分支并把进度清掉，界面就能给重试按钮。
+ */
+const HANDSHAKE_TIMEOUT_MS: number = 15000;
+/**
+ * 长连接建立后等「服务端开始驱动同步」的超时
+ *
+ * 洛雪官方是 2 分钟：那是为了照顾从公网连进来、上行列表很大的情况。但握手成功后
+ * 服务端一句话都不说（典型现象：把另一个手机 / 普通网页服务当成了同步服务端），
+ * 界面会永远停在 16%「等待同步」。45s 足够覆盖慢速局域网，也不至于让用户干等。
+ */
+const CONNECT_TIMEOUT_MS: number = 45 * 1000;
 
 /** getEnabledFeatures 的返回项（与洛雪 EnabledFeatures 一致） */
 interface SyncFeatureOptions {
@@ -153,6 +166,9 @@ export class SyncClient {
       // 看着像应用坏了，其实下一轮重连就接上了。原文只进 hilog。
       const raw: string = (e as Error).message;
       const message: string = SYNC_KNOWN_CODES.includes(raw) ? raw : SYNC_CODE_CONNECT_FAILED;
+      // 关键：失败时把进度清回 0，否则界面会永远停在「正在连接服务器… 2%」——
+      // 阶段文案是上一次成功回调留下的，没有任何地方会去覆盖它。
+      this.reportProgress(0, '');
       this.setStatus(false, message);
       hilog.error(DOMAIN, TAG, 'connect failed: %{public}s', raw);
       throw e as Error;
@@ -164,25 +180,40 @@ export class SyncClient {
     if (id !== this.connectId) {
       return;
     }
+    // 握手三步共用这一个截止时间：每一步的 HTTP 超时取「剩余时间」，
+    // 这样总时长有上界，也不需要在超时后留下一个还在后台跑的 doConnect。
+    const deadline: number = Date.now() + HANDSHAKE_TIMEOUT_MS;
     const urlInfo: SyncUrlInfo = parseUrl(host);
     this.urlInfo = urlInfo;
 
-    await this.checkHello(urlInfo);
+    this.reportProgress(5, '正在校验服务器…');
+    await this.checkHello(urlInfo, deadline);
     if (id !== this.connectId) {
       return;
     }
-    const serverId: string = await this.getServerId(urlInfo);
+    this.reportProgress(8, '正在获取服务端信息…');
+    const serverId: string = await this.getServerId(urlInfo, deadline);
     if (id !== this.connectId) {
       return;
     }
+    this.reportProgress(10, '正在认证…');
     const keyInfo: SyncKeyInfo =
-      await this.auth(urlInfo, serverId, deviceName, authCode.length > 0 ? authCode : null);
+      await this.auth(urlInfo, serverId, deviceName, authCode.length > 0 ? authCode : null, deadline);
     if (id !== this.connectId) {
       return;
     }
     this.keyInfo = keyInfo;
     this.reportProgress(12, '正在建立长连接…');
     this.openSocket(urlInfo, keyInfo, id);
+  }
+
+  /** 握手剩余时间；已经超时就抛「连接超时」（由 connect 的 catch 翻成状态） */
+  private remainingMs(deadline: number): number {
+    const left: number = deadline - Date.now();
+    if (left <= 0) {
+      throw new Error(SYNC_CODE_CONNECT_TIMEOUT);
+    }
+    return left;
   }
 
   /** 断开连接（isReset 为 false 时用于重连前的清理，不改状态文案） */
@@ -221,9 +252,16 @@ export class SyncClient {
 
   // ------------------------------------------------------------ 握手 / 认证
 
-  private async checkHello(urlInfo: SyncUrlInfo): Promise<void> {
+  private async checkHello(urlInfo: SyncUrlInfo, deadline: number): Promise<void> {
     const result: HttpTextResult =
-      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/hello`, {}, HTTP_TIMEOUT_MS);
+      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/hello`, {},
+        this.remainingMs(deadline));
+    // 先把「HTTP 层就不是同步服务」摘出来：把另一台手机 / 某个网页服务当服务端时，
+    // /hello 多半是 404 或 502，以前一律报成「连接失败」，用户会一直去查 IP。
+    if (result.code !== 200) {
+      hilog.warn(DOMAIN, TAG, 'hello http %{public}d', result.code);
+      throw new Error(SYNC_CODE_HTTP_ERROR);
+    }
     if (result.text === SYNC_HELLO_MSG) {
       return;
     }
@@ -240,9 +278,14 @@ export class SyncClient {
     throw new Error(SYNC_CODE_CONNECT_SERVICE_FAILED);
   }
 
-  private async getServerId(urlInfo: SyncUrlInfo): Promise<string> {
+  private async getServerId(urlInfo: SyncUrlInfo, deadline: number): Promise<string> {
     const result: HttpTextResult =
-      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/id`, {}, HTTP_TIMEOUT_MS);
+      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/id`, {},
+        this.remainingMs(deadline));
+    if (result.code !== 200) {
+      hilog.warn(DOMAIN, TAG, 'id http %{public}d', result.code);
+      throw new Error(SYNC_CODE_HTTP_ERROR);
+    }
     if (!result.text.startsWith(SYNC_ID_PREFIX)) {
       throw new Error(SYNC_CODE_GET_SERVICE_ID_FAILED);
     }
@@ -250,21 +293,21 @@ export class SyncClient {
   }
 
   private async auth(urlInfo: SyncUrlInfo, serverId: string, deviceName: string,
-    authCode: string | null): Promise<SyncKeyInfo> {
+    authCode: string | null, deadline: number): Promise<SyncKeyInfo> {
     if (authCode !== null) {
-      return await this.authByCode(urlInfo, serverId, deviceName, authCode);
+      return await this.authByCode(urlInfo, serverId, deviceName, authCode, deadline);
     }
     const saved: SyncKeyInfo | null = this.store.loadKey(serverId);
     if (saved === null) {
       throw new Error(SYNC_CODE_MISSING_AUTH_CODE);
     }
-    await this.authByKey(urlInfo, deviceName, saved);
+    await this.authByKey(urlInfo, deviceName, saved, deadline);
     return saved;
   }
 
   /** 认证码方式：用认证码派生的 AES 密钥把「RSA 公钥 + 设备名」交给服务端，换回身份信息 */
   private async authByCode(urlInfo: SyncUrlInfo, serverId: string, deviceName: string,
-    authCode: string): Promise<SyncKeyInfo> {
+    authCode: string, deadline: number): Promise<SyncKeyInfo> {
     const b64Key: string = deriveKeyB64(authCode);
     const pair = await generateRsaKey();
     const payload: string =
@@ -272,7 +315,8 @@ export class SyncClient {
     const msg: string = aesEncryptBase64(payload, b64Key);
     const headers: Record<string, string> = { 'm': msg };
     const result: HttpTextResult =
-      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/ah`, headers, HTTP_TIMEOUT_MS);
+      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/ah`, headers,
+        this.remainingMs(deadline));
     if (result.text === SYNC_MSG_BLOCKED_IP) {
       throw new Error(SYNC_MSG_BLOCKED_IP);
     }
@@ -304,11 +348,13 @@ export class SyncClient {
   }
 
   /** 已保存密钥方式：用 clientId + AES 密钥验证身份 */
-  private async authByKey(urlInfo: SyncUrlInfo, deviceName: string, keyInfo: SyncKeyInfo): Promise<void> {
+  private async authByKey(urlInfo: SyncUrlInfo, deviceName: string, keyInfo: SyncKeyInfo,
+    deadline: number): Promise<void> {
     const msg: string = aesEncryptBase64(SYNC_AUTH_MSG + deviceName, keyInfo.key);
     const headers: Record<string, string> = { 'i': keyInfo.clientId, 'm': msg };
     const result: HttpTextResult =
-      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/ah`, headers, HTTP_TIMEOUT_MS);
+      await this.httpGet(`${urlInfo.httpProtocol}//${urlInfo.hostPath}/ah`, headers,
+        this.remainingMs(deadline));
     if (result.code !== 200) {
       throw new Error(SYNC_CODE_AUTH_FAILED);
     }
@@ -337,6 +383,17 @@ export class SyncClient {
       const raw: string | Object | ArrayBuffer = response.result;
       const text: string = typeof raw === 'string' ? raw as string : JSON.stringify(raw);
       return { code: response.responseCode, text: text };
+    } catch (e) {
+      // 系统抛出的是英文原文（`Operation timeout` 之类）。超时要归到自己的
+      // 「连接超时」分支，否则会被 connect 的兜底翻成「连不上服务器」，
+      // 用户就分不清是地址不通还是服务器太慢。
+      const raw: string = (e as Error).message;
+      const text: string = typeof raw === 'string' ? raw : '';
+      if (text.toLowerCase().includes('timeout')) {
+        hilog.warn(DOMAIN, TAG, 'http timeout: %{public}s', url);
+        throw new Error(SYNC_CODE_CONNECT_TIMEOUT);
+      }
+      throw e as Error;
     } finally {
       request.destroy();
     }
@@ -413,6 +470,8 @@ export class SyncClient {
       hilog.error(DOMAIN, TAG, 'socket error: %{public}s', JSON.stringify(err));
       // 以前这里把 err.message 原样当状态，message 缺省时兜底成英文 'connect error' ——
       // 两种都会以裸英文弹提示条（用户反馈过「connect error 报错」）。一律走统一码。
+      // 进度也要清掉：否则界面停在上一次的「正在建立长连接… 12%」。
+      this.reportProgress(0, '');
       this.setStatus(false, SYNC_CODE_CONNECT_FAILED);
     });
 
@@ -421,6 +480,7 @@ export class SyncClient {
         return;
       }
       hilog.error(DOMAIN, TAG, 'connect socket failed: %{public}s', JSON.stringify(err));
+      this.reportProgress(0, '');
       this.setStatus(false, SYNC_CODE_CONNECT_FAILED);
     });
   }
@@ -527,6 +587,11 @@ export class SyncClient {
     this.connectTimer = setTimeout(() => {
       this.connectTimer = 0;
       hilog.warn(DOMAIN, TAG, 'connect timeout');
+      // 握手已经成功、socket 也开了，但服务端一直不下发同步任务：这多半是
+      // 「地址指向的不是真正的洛雪同步服务端」（连上了 WebSocket 却没有协议）。
+      // 先给出和「连不上」不同的状态，再关掉走重连，别让界面停在 16%。
+      this.reportProgress(0, '');
+      this.setStatus(false, SYNC_CODE_CONNECT_TIMEOUT);
       socket.close({ code: SYNC_CLOSE_FAILED, reason: '' }).catch(() => {
       });
     }, CONNECT_TIMEOUT_MS);

@@ -205,6 +205,15 @@ export const SYNC_CODE_AUTH_FAILED: string = 'Auth failed';
 export const SYNC_CODE_MISSING_AUTH_CODE: string = 'Missing auth code';
 export const SYNC_CODE_GET_SERVICE_ID_FAILED: string = 'Get service id failed';
 export const SYNC_CODE_CONNECT_SERVICE_FAILED: string = 'Connect service failed';
+/**
+ * 握手整体超时：15s 内没有走完 /hello -> /id -> /ah
+ *
+ * 单独一个码是为了和「连上了但是服务端不对」区分开：前者要用户查 IP / 端口 / 局域网，
+ * 后者要用户换地址。以前两种情况都落到 CONNECT_FAILED，界面只能说「连接失败」。
+ */
+export const SYNC_CODE_CONNECT_TIMEOUT: string = 'Connect timeout';
+/** 服务端 HTTP 返回非 200（多数是把另一台手机 / 别的网页服务当成了同步服务端） */
+export const SYNC_CODE_HTTP_ERROR: string = 'Http error';
 export const SYNC_CODE_CONNECTING: string = 'Connecting...';
 export const SYNC_CODE_LOW_SERVICE_VERSION: string =
   'Sync server version too low, please upgrade server to latest';
@@ -222,6 +231,7 @@ export const SYNC_CODE_CONNECT_FAILED: string = 'Connect failed';
 export const SYNC_KNOWN_CODES: string[] = [
   SYNC_CODE_AUTH_FAILED, SYNC_CODE_MISSING_AUTH_CODE, SYNC_CODE_GET_SERVICE_ID_FAILED,
   SYNC_CODE_CONNECT_SERVICE_FAILED, SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_FAILED,
+  SYNC_CODE_CONNECT_TIMEOUT, SYNC_CODE_HTTP_ERROR,
   SYNC_CODE_LOW_SERVICE_VERSION, SYNC_CODE_HIGH_SERVICE_VERSION,
 ];
 

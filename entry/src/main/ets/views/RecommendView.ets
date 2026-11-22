@@ -6,12 +6,12 @@ import { PlaySession, SongItem, songFromSearch } from '../core/player/PlaySessio
 import { BottomBar } from '../ui/BottomBar';
 import {
   C_BG, C_CARD, C_CHEVRON, C_FILL_SOFT, C_FILL_SOFT_STRONG, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB,
-  C_TEXT_WEAK, F_SECTION,
+  C_TEXT_WEAK, C_TOP_FADE, C_TOP_FADE_END, F_SECTION,
 } from '../ui/Theme';
 import {
   I_CHEVRON_RIGHT, I_PERSON, I_PLAYLIST, I_PLAY, I_STAR, I_TROPHY, IconGlyph,
 } from '../ui/Icons';
-import { CoverArt, FavoriteHeart, TopFade } from '../ui/Widgets';
+import { CoverArt, FavoriteHeart } from '../ui/Widgets';
 import { CoverStore, K_COVER_VERSION } from '../core/music/CoverStore';
 import { LxArtist, resolveArtistByName, splitSingerNames } from '../core/music/MusicArtist';
 import { ArtistNav } from '../ui/ArtistNav';
@@ -46,10 +46,15 @@ import { DismissedSongs } from '../core/music/DismissedSongs';
  * **卡片形态与配色**（2026-10-21 重做）：歌手分类 / 歌单分类 / 精选榜原先按数组下标循环取
  * 6 组高饱和纯色渐变（红 / 蓝 / 紫 / 橙 / 粉 / 绿），一屏七八张彩虹块，和本应用
  * 「浅灰底 + 白卡 + 洛雪红 + 玻璃层」的主题完全不是一个语言（用户反馈「纯色和软件主题不搭」）。
- * 现在三处都改用共用组件 `ui/TileCard.ets`，只有两种形态：
+ * 现在歌手分类 / 精选榜仍走共用组件 `ui/TileCard.ets`，只有两种形态：
  *   - **有真实封面**（榜单榜首封面）→ 封面铺满 + 底部压暗 + 白字，跟推荐歌曲大卡同一观感；
  *   - **没有封面**（平台歌单分类这种纯文字档位）→ 主题玻璃卡：白卡 + 极淡红晕染 + 深色字。
  * 选中态一律用强调红描边，颜色只剩「选中」一个语义，不再靠换配色区分。
+ *
+ * **歌单分类这一排是本页自绘的**（2026-11-20，`catCard`）：它压在真实封面上，
+ * `TileCard` 那条「66% 高、0 → 65% 黑」的压暗太浅（文字背后只有 ~40% 黑），
+ * 亮封面上白字会糊；本页把压暗加厚并给标题加阴影，形态与 TileCard 保持一致。
+ * 详见 catCard / catCardWidth 的说明。
  *
  * **懒加载与主线程纪律**（2026-10-13 实机反馈「切平台卡好久、甚至闪退」之后定的）：
  *   - 开页只取首屏要用的（推荐歌曲那一张榜），其余滚进可视区才发请求
@@ -64,6 +69,14 @@ import { DismissedSongs } from '../core/music/DismissedSongs';
 
 /** 页面左右留白（与壳层标题栏、迷你栏同一口径） */
 const PAGE_PAD: number = 16;
+/**
+ * 顶栏遮罩下沿的收口高度（vp）
+ *
+ * 标题带（状态栏 + 标题栏 = `topInset`）那一段必须**铺实**，内容滚到那里就该看不见；
+ * 这 10vp 只是把「实色 → 透明」的硬边收成一段极短的渐隐，免得卡片像被刀切。
+ * 首块内容要排在它下面（见 heroTopSpacer），否则标题文字会被这层压暗。
+ */
+const TOP_FADE_TAIL: number = 10;
 /** 同一行里两张卡之间的间距 */
 const CARD_GAP: number = 10;
 /** 行与行之间的间距（外层 List 的 space） */
@@ -1210,6 +1223,37 @@ export struct RecommendView {
     return Math.max(120, usable / cols);
   }
 
+  /**
+   * 歌单分类一屏摆几张（手机 3 张 = 酷狗/QQ 的「推荐 / 最热 / 最新」，平板上放宽）
+   *
+   * 与「歌单广场」的网格同一个思路：宽屏多摆几张，别让三张方卡孤零零地挂在左边。
+   */
+  private catCols(): number {
+    if (this.windowWidth >= 840) {
+      return 5;
+    }
+    if (this.windowWidth >= 600) {
+      return 4;
+    }
+    return 3;
+  }
+
+  /**
+   * 歌单分类卡的宽度：把屏宽按「一屏 `catCols()` 张 + 卡间距 + 两侧留白」分掉
+   *
+   * 原来是写死 112vp：在 362vp 宽的手机上三张卡加间距一共 372vp，比屏宽还宽，
+   * **第三张「最新」被屏幕右边缘切掉一截、圆角都没了**（11-20 14:55 那张反馈图
+   * 里就是这样，用户圈的就是这一排）。按屏宽均分后，三张核心分类一定完整落在
+   * 左右留白里；再往后若有第 4 张（酷狗有「热藏 / 飙升」），只在右边露一条窄边，
+   * 那是「还能右滑」的提示，和顶部大卡「一屏露两张半」是同一个语言。
+   * 上限 200 / 下限 88 只为兜住极端屏宽，正常手机落在 96~120 之间。
+   */
+  private catCardWidth(): number {
+    const n: number = this.catCols();
+    const usable: number = this.contentWidth() - PAGE_PAD * 2 - CARD_GAP * (n - 1);
+    return Math.max(88, Math.min(200, usable / n));
+  }
+
   /** 这一行最后一张卡不给右间距（列间距靠 margin 撑） */
   private laneGap(index: number): number {
     return index % this.gridCols() === this.gridCols() - 1 ? 0 : CARD_GAP;
@@ -1331,9 +1375,14 @@ export struct RecommendView {
    *
    * 减掉 ROW_GAP：List 的 `space` 会在占位行与第一块之间再加一段，不减就比原设计
    * 多出 18vp 的空白（视觉会整体下移）。
+   *
+   * 2026-11-20 补：再加一段 `TOP_FADE_TAIL`。顶部遮罩现在是「标题带铺实 + 10vp 收口」
+   * （见 topScrim），首块内容若仍贴着标题栏底边排，那 10vp 收口就会把「推荐歌曲」
+   * 这几个字的顶部压暗半截 —— 所以把整页内容一起往下让出收口那一段，遮罩与内容
+   * 严格不重叠。净效果只比原来低 10vp（+6 与收口抵消一部分）。
    */
   private heroTopSpacer(): number {
-    const height: number = this.topInset + 6 - ROW_GAP;
+    const height: number = this.topInset + TOP_FADE_TAIL + 6 - ROW_GAP;
     return height > 0 ? height : 0;
   }
 
@@ -2125,7 +2174,7 @@ export struct RecommendView {
   @Builder
   catRow() {
     Column() {
-      this.sectionTitle('歌单分类', 4)
+      this.sectionTitle('歌单分类', 6)
       List({ space: CARD_GAP }) {
         ForEach(this.sorts, (sort: LxSortItem, index: number) => {
           ListItem() {
@@ -2143,32 +2192,107 @@ export struct RecommendView {
       .scrollBar(BarState.Off)
       .listDirection(Axis.Horizontal)
       .width('100%')
-      .height(120)
-      .padding({ left: PAGE_PAD, right: PAGE_PAD })
+      // 高度跟卡片走：卡是正方形，多留 8vp 给选中态那圈 2vp 红边与投影，别让 List 裁掉
+      .height(this.catCardWidth() + 8)
+      // top 2 + sectionTitle 的 bottom 10 = 标题到卡片 12vp（原先只有 10，标题下伸的
+      // 那一截和卡片贴得太近，观感上就是「标题被卡片压住」）
+      .padding({ left: PAGE_PAD, right: PAGE_PAD, top: 2 })
     }
     .width('100%')
   }
 
   /**
-   * 一张歌单分类卡（2026-10-21 重做：纯色渐变块 → 主题玻璃卡，见文件头「卡片形态」）
+   * 一张歌单分类卡（2026-11-20 起本页自绘，不再复用 `TileCard`）
    *
    * 平台的「排序」只是纯文字档位，本身没有封面：取到该档位下第一张歌单的封面铺上，
-   * 还没取到 / 取不到时继续走玻璃卡（`coverUrl: ''`，见 loadCatCovers）。
+   * 还没取到 / 取不到时走玻璃卡（见 loadCatCovers）。
+   *
+   * **为什么不用 `TileCard` 了**：它给封面卡配的底部压暗是「占 66% 高、0 → 65% 黑」，
+   * 白字落在卡底时背后只有约 40% 黑。11-20 那张群反馈图里「最热」正好压在一张很亮的
+   * 浅色封面上，白字和封面糊成一片（对比度不到 2:1）——这就是「文字在封面上看不清 /
+   * 像压字」的来源。这里把压暗加厚成三段（0 → 45% 黑 → 90% 黑，覆盖面 72%），标题
+   * 加粗到 15 再加一层 2vp 阴影，亮封面 / 暗封面都读得清；玻璃卡（没封面）的形态、
+   * 首字水印与选中态配色与 `TileCard` 保持一致，风格不跑偏。
+   *
+   * `ui/TileCard.ets` 是公共组件（本任务只许改本文件），同一处建议已写进报告；
+   * 将来若把 TileCard 的渐变调强，这里可以再换回去。
    */
   @Builder
   catCard(sort: LxSortItem, index: number) {
-    TileCard({
-      title: sort.name,
-      coverUrl: this.catCoverOf(index),
-      cardWidth: 112,
-      cardHeight: 112,
-      radius: 12,
-      selected: this.catIndex === index,
-      showPlay: false,
-      onTap: () => {
-        this.switchCat(index);
-      },
+    Stack({ alignContent: Alignment.BottomStart }) {
+      if (this.catCoverOf(index).length > 0) {
+        CoverArt({
+          url: this.catCoverOf(index),
+          name: sort.name,
+          art: false,
+          boxSize: this.catCardWidth(),
+          radius: 0,
+          fill: true,
+        })
+          .width('100%')
+          .height('100%')
+        // 底部压暗：白字要跳出来（比 TileCard 更厚一档，见上面说明）
+        Column()
+          .width('100%')
+          .height('72%')
+          .linearGradient({
+            angle: 0,
+            colors: [['#00000000', 0.0], ['#73000000', 0.5], ['#E6000000', 1.0]],
+          })
+        Text(sort.name)
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Color.White)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .textAlign(TextAlign.Start)
+          .padding({ left: 11, right: 10, bottom: 9 })
+          .textShadow({ radius: 10, color: '#59000000', offsetX: 0, offsetY: 2 })
+      } else {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(this.catIndex === index ? C_RED_TINT : C_CARD)
+        // 极淡的红色晕染（左上 → 透明），给白卡一点层次，与 TileCard 的玻璃卡同款
+        Column()
+          .width('100%')
+          .height('100%')
+          .linearGradient({ angle: 135, colors: [[C_RED_TINT, 0.0], ['#00000000', 1.0]] })
+        Stack({ alignContent: Alignment.TopEnd }) {
+          Text(sort.name.length > 0 ? sort.name.substring(0, 1) : '')
+            .fontSize(this.catCardWidth() * 0.56)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(C_RED)
+            .opacity(0.10)
+            .maxLines(1)
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ right: 9, top: 2 })
+        Text(sort.name)
+          .fontSize(14)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.catIndex === index ? C_RED : C_TEXT)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .textAlign(TextAlign.Start)
+          .padding({ left: 11, right: 10, bottom: 9 })
+      }
+    }
+    .width(this.catCardWidth())
+    .height(this.catCardWidth())
+    .borderRadius(12)
+    .clip(true)
+    .border({ width: this.catIndex === index ? 2 : 0, color: C_RED })
+    .shadow({ radius: 8, color: '#0F000000', offsetX: 0, offsetY: 3 })
+    .onClick(() => {
+      this.switchCat(index);
     })
+    .accessibilityGroup(true)
+    .accessibilityText(this.catIndex === index ? `${sort.name}，已选中` : sort.name)
+    .accessibilityLevel('yes')
   }
 
   // -------------------------------------------------- ③ 排行榜：官方榜 + 精选榜
@@ -2684,6 +2808,63 @@ export struct RecommendView {
     .width('100%')
   }
 
+  /**
+   * 遮罩里「实色段」在整条渐变上的结束位置（0 ~ 1）
+   *
+   * 遮罩总高 = 标题带 + `TOP_FADE_TAIL`，实色只铺到标题带底边，
+   * 剩下那一小段才渐隐。`topInset` 还没量到时（0）整条都是渐隐，不会留一块死白。
+   */
+  private topFadeSolidEnd(): number {
+    const total: number = this.topInset + TOP_FADE_TAIL;
+    if (total <= 0) {
+      return 1;
+    }
+    return this.topInset / total;
+  }
+
+  /**
+   * 顶栏遮罩：标题带**铺实**，下沿再接 `TOP_FADE_TAIL` 一小段收口
+   *
+   * 原来这里用的是公共的 `TopFade`（`ui/Widgets.ets`）：它是一条从页面底色到全透明的
+   * 渐变，而调用方给的高度是 `topInset + 10` —— 渐变的下边缘正好落在标题栏底边，
+   * 到那条边时已经**完全透明**。于是「推荐」那两个字下面直接就是封面原图。
+   *
+   * 2026-11-20 14:55 群反馈的两张截图就是这个：酷狗来源那次首屏是一张很亮的大卡
+   * （《慌啥子嘛》），往上一滑，卡片封面连同封面美术字一起顶到「推荐」两个大字下面，
+   * 白字压白字、白字压图（见报告里的截图）。渐变在任何中间位置都只是半透明，
+   * 对「亮封面 + 白色标题」这种组合天然挡不住，所以问题不是「渐变不够高」，是
+   * **标题带这一段必须不透明**。
+   *
+   * 现在的结构（高度实算，`topInset` 由壳层异步量出来 = 状态栏 + 标题栏）：
+   *   1) `0 ~ topInset`：铺页面底色（渐变前两个色标同色 = 实色），内容滚到这里就被
+   *      干净地挡住 —— 静止时这层与页面底色同色，完全看不见；滚动时它等效于一条
+   *      不透明标题栏；
+   *   2) `topInset ~ topInset + 10`：同色 → 透明，把硬边收成一小段渐隐，
+   *      卡片不会像被刀切。
+   * 因为收口那 10vp 会压暗落在里面的内容，首块内容整体再往下让了这一段
+   * （见 heroTopSpacer），保证标题 / 副标题不会落在收口带里。
+   *
+   * 刻意保持与 `TopFade` 相同的结构（**单个**节点 + `HitTestMode.Transparent`）：
+   * 它只是一层视觉遮罩，不能拦住下面 List 的滚动与点击，也不能多套一层容器
+   * （容器的子节点仍有自己的命中行为，可能把触摸吃掉）。
+   */
+  @Builder
+  topScrim() {
+    Column()
+      .width('100%')
+      .height((this.topInset > 0 ? this.topInset : 0) + TOP_FADE_TAIL)
+      .linearGradient({
+        // 180 = 从上往下：顶边是页面底色本身，越往下越透
+        angle: 180,
+        colors: [
+          [C_TOP_FADE, 0.0],
+          [C_TOP_FADE, this.topFadeSolidEnd()],
+          [C_TOP_FADE_END, 1.0],
+        ],
+      })
+      .hitTestBehavior(HitTestMode.Transparent)
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
@@ -2776,8 +2957,8 @@ export struct RecommendView {
       .width('100%')
       .height('100%')
 
-      /** 顶栏渐隐：内容从透明标题栏底下穿过时淡出，标题才不被列表文字顶穿 */
-      TopFade({ fadeHeight: this.topInset + 10 })
+      /** 顶栏遮罩：标题带铺实 + 10vp 收口（见 topScrim 的说明） */
+      this.topScrim()
     }
     .width('100%')
     .height('100%')

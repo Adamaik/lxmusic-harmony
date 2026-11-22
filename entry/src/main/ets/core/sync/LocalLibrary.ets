@@ -42,10 +42,30 @@ export interface AddMusicResult {
 }
 
 /**
+ * 一组重复歌曲里的一条（一条 = 歌单里的一行，不是「一首歌」）
+ *
+ * 面板要用它逐条展示、让用户点选「保留哪一条」，所以这里带的是**展示字段的快照**：
+ * 面板不去回查库（那会重新读一遍整张歌单），也不额外请求任何网络数据 ——
+ * 时长 / 平台 / 音质本来就在 SongItem 里。
+ */
+export interface DuplicateEntry {
+  /** 这一行的歌曲 id（同 id 可以在组里出现多行：线上歌单本来就能把同一首加两遍） */
+  id: string;
+  name: string;
+  singer: string;
+  /** mm:ss；没有就是空串 */
+  interval: string;
+  /** 平台 kw/kg/mg/tx/wy，或本地 / 云盘的 source */
+  source: string;
+  /** 音质（如 320k / flac），没有就是空串 */
+  quality: string;
+}
+
+/**
  * 一组重复歌曲（按歌名·歌手聚合，组内 >1）
  *
- * 只用于「检测并清理重复」，不改动任何数据：界面拿 keepId / duplicateIds 自己决定
- * 删不删，删除仍然走 removeMusicFromPlaylist 的上行分支。
+ * 只用于「检测并清理重复」，不改动任何数据：界面拿 keepId / duplicateIds / entries
+ * 自己决定删不删，删除仍然走 removeMusicFromPlaylist 的上行分支。
  */
 export interface DuplicateGroup {
   /** duplicateKeyOf 的结果（空串表示只能按 id 判重的条目，不参与分组） */
@@ -54,12 +74,19 @@ export interface DuplicateGroup {
   name: string;
   /** 展示用歌手（组内第一条） */
   singer: string;
-  /** 组内总条数 */
+  /** 组内总条数（= entries.length） */
   count: number;
-  /** 建议保留的那条 id（列表中位置最靠前的一条） */
+  /** 默认建议保留的那条 id（列表中位置最靠前的一条） */
   keepId: string;
-  /** 建议删除的那几条 id（组内除 keepId 外全部） */
+  /**
+   * 默认建议删除的那几行 id（组内除第一条外全部）
+   *
+   * **可能含重复 id**：组里同一首歌被加了两遍时，两行 id 相同，删一行就得告诉库里
+   * 「这个 id 只删 1 个副本」（见 removeDuplicateSongs 的配额口径）。
+   */
   duplicateIds: string[];
+  /** 组内每一行（列表顺序），面板据此让用户改「保留哪一条」 */
+  entries: DuplicateEntry[];
 }
 
 /**
@@ -792,13 +819,18 @@ export class LocalLibrary implements LibrarySink {
    *
    * 内置收藏歌单也走这里（在它的详情页删歌 = 取消收藏），只是上行方式不同：
    * 收藏列表在协议里是整份覆盖（love），用户歌单是增量动作（list_music_remove）。
+   *
+   * `quota` 只给「检查重复歌曲」用：按 id 的删除天生一删删掉该 id 的所有行，而歌单里
+   * 同一首歌可以被加两遍（导入刻意保留，见 importPlaylist）。传了配额就只删「这个 id
+   * 的 N 个副本」；不传保持原有语义（这个 id 在歌单里有几行就删几行），其它调用点一个字
+   * 都不用改。
    */
-  removeMusicFromPlaylist(id: string, songIds: string[]): void {
+  removeMusicFromPlaylist(id: string, songIds: string[], quota?: Map<string, number>): void {
     if (songIds.length === 0) {
       return;
     }
     if (this.isBuiltinPlaylist(id)) {
-      this.removeMusicFromLove(songIds);
+      this.removeMusicFromLove(songIds, quota);
       return;
     }
     const target = this.findPlaylist(id);
@@ -809,9 +841,21 @@ export class LocalLibrary implements LibrarySink {
     const localRemoved: number = this.removeFromSideTables(id, songIds);
     const remains: LxMusicInfoNew[] = [];
     const removedIds: string[] = [];
+    // 每个 id 已经删掉几行：配额缺省（-1）表示不限，与按 id 全删的旧行为一致
+    const taken: Map<string, number> = new Map<string, number>();
     for (const info of target.list) {
-      if (songIds.includes(info.id)) {
-        removedIds.push(info.id);
+      if (!songIds.includes(info.id)) {
+        remains.push(info);
+        continue;
+      }
+      const limit: number = quota === undefined ? -1 : (quota.get(info.id) ?? 0);
+      const used: number = taken.get(info.id) ?? 0;
+      if (limit < 0 || used < limit) {
+        taken.set(info.id, used + 1);
+        // 上行只报 id：同 id 删两行时不必把 id 在数组里重复两遍
+        if (!removedIds.includes(info.id)) {
+          removedIds.push(info.id);
+        }
         continue;
       }
       remains.push(info);
@@ -832,13 +876,22 @@ export class LocalLibrary implements LibrarySink {
   }
 
   /** 从内置收藏里移除一批歌（协议上是整份 love 列表覆盖，与官方一致） */
-  private removeMusicFromLove(songIds: string[]): void {
+  private removeMusicFromLove(songIds: string[], quota?: Map<string, number>): void {
     const localRemoved: number = this.removeFromSideTables(LIST_ID_LOVE, songIds);
     const remains: LxMusicInfoNew[] = [];
+    const taken: Map<string, number> = new Map<string, number>();
     for (const info of this.data.loveList) {
       if (!songIds.includes(info.id)) {
         remains.push(info);
+        continue;
       }
+      const limit: number = quota === undefined ? -1 : (quota.get(info.id) ?? 0);
+      const used: number = taken.get(info.id) ?? 0;
+      if (limit < 0 || used < limit) {
+        taken.set(info.id, used + 1);
+        continue;
+      }
+      remains.push(info);
     }
     if (remains.length === this.data.loveList.length) {
       if (localRemoved > 0) {
@@ -858,6 +911,11 @@ export class LocalLibrary implements LibrarySink {
    * 口径与加歌时的判重完全一致（duplicateKeyOf）：只有「歌名·歌手」非空的条目才参与，
    * key 为空的条目（连歌名都没有的侧表歌）宁可漏报也不并组 —— 并错了就是误删用户的歌。
    *
+   * **不再跳过同 id 的第二行**：歌单导入刻意保留了「线上歌单把同一首加了两遍」的合法
+   * 重复（见 importPlaylist 的 keepDuplicates），若这里按 id 去重，那种重复就完全报不出来
+   * （群反馈「有些歌曲没重复」的另一半原因）。两行同 id 时它们是组里的两条 entries，
+   * 删除按「副本数」删（removeDuplicateSongs 的配额），不会一删删两行。
+   *
    * 内建收藏歌单也覆盖：它的数据在 loveList 里，playlistSongs → targetMusics 认 'love'，
    * 侧表里属于收藏的那部分也一起被 playlistSongs 合进来，不另造一份数据源。
    */
@@ -865,18 +923,19 @@ export class LocalLibrary implements LibrarySink {
     const songs: SongItem[] = this.playlistSongs(id);
     const order: string[] = [];
     const byKey: Map<string, DuplicateGroup> = new Map<string, DuplicateGroup>();
-    const seenIds: Set<string> = new Set<string>();
     for (const song of songs) {
-      // 老数据（同一条侧表 key 被记了两遍）会把同一首歌列两次：那是「同一行重复」，
-      // 删一次就干净了，不能当成「两首重复的歌」让用户点两次删除
-      if (seenIds.has(song.id)) {
-        continue;
-      }
-      seenIds.add(song.id);
       const key: string = duplicateKeyOf(song.name, song.singer);
       if (key.length === 0) {
         continue;
       }
+      const entry: DuplicateEntry = {
+        id: song.id,
+        name: song.name,
+        singer: song.singer,
+        interval: song.interval,
+        source: song.source,
+        quality: song.quality,
+      };
       const group: DuplicateGroup | undefined = byKey.get(key);
       if (group === undefined) {
         const fresh: DuplicateGroup = {
@@ -886,19 +945,21 @@ export class LocalLibrary implements LibrarySink {
           count: 1,
           keepId: song.id,
           duplicateIds: [],
+          entries: [entry],
         };
         byKey.set(key, fresh);
         order.push(key);
         continue;
       }
-      // 组内顺序就是列表顺序：第一条（最靠前）留着，后面的一律进 duplicateIds
+      // 组内顺序就是列表顺序：第一条（最靠前）默认留着，后面的一律进 duplicateIds
       group.count++;
+      group.entries.push(entry);
       group.duplicateIds.push(song.id);
     }
     const out: DuplicateGroup[] = [];
     for (const key of order) {
       const group: DuplicateGroup | undefined = byKey.get(key);
-      if (group !== undefined && group.count > 1) {
+      if (group !== undefined && group.entries.length > 1) {
         out.push(group);
       }
     }
@@ -911,6 +972,10 @@ export class LocalLibrary implements LibrarySink {
    * 内部走 removeMusicFromPlaylist 同一套分支（内建收藏歌单 = 收藏侧移除 + love 整份覆盖，
    * 用户歌单 = list_music_remove），所以上行、落盘、界面镜像都不必在这里重写一遍。
    * 调用方可能拿着旧快照来删，不在当前歌单里的 id 直接跳过，不报错。
+   *
+   * **ids 里同一个 id 出现几次 = 删几个副本**：歌单里同一首歌被加了两遍时两行同 id，
+   * 面板要能「留一行删一行」。配额先按歌单里实际有几行夹紧，保证返回的删除条数不是假数；
+   * 这样上层不必传「第几行」之类的位置信息，仍然只是一串 id。
    */
   removeDuplicateSongs(id: string, ids: string[]): number {
     if (ids.length === 0) {
@@ -921,20 +986,32 @@ export class LocalLibrary implements LibrarySink {
     if (!this.isBuiltinPlaylist(id) && this.findPlaylist(id) === null) {
       return 0;
     }
-    const present: string[] = [];
-    const seen: Set<string> = new Set<string>();
+    // 歌单里每个 id 实际有几行：配额不能超过它，否则「删了 N 首」与实际不符
+    const stock: Map<string, number> = new Map<string, number>();
     for (const song of this.playlistSongs(id)) {
-      if (seen.has(song.id) || !ids.includes(song.id)) {
+      stock.set(song.id, (stock.get(song.id) ?? 0) + 1);
+    }
+    const quota: Map<string, number> = new Map<string, number>();
+    const ordered: string[] = [];
+    let removed: number = 0;
+    for (const raw of ids) {
+      const left: number = stock.get(raw) ?? 0;
+      if (left <= 0) {
         continue;
       }
-      seen.add(song.id);
-      present.push(song.id);
+      stock.set(raw, left - 1);
+      const want: number = (quota.get(raw) ?? 0) + 1;
+      quota.set(raw, want);
+      removed++;
+      if (want === 1) {
+        ordered.push(raw);
+      }
     }
-    if (present.length === 0) {
+    if (ordered.length === 0) {
       return 0;
     }
-    this.removeMusicFromPlaylist(id, present);
-    return present.length;
+    this.removeMusicFromPlaylist(id, ordered, quota);
+    return removed;
   }
 
   /** 用整份列表覆盖歌单歌曲（界面里的「用当前播放列表替换」） */
@@ -1456,14 +1533,34 @@ function idsOf(musics: LxMusicInfoNew[]): string[] {
 /** 判重键里隔开歌名与歌手的字符（与对外说明的「歌名·歌手」写法一致，只是个分隔符） */
 const DUPLICATE_KEY_SEP: string = '·';
 
-/** 一个收尾括号组：全角/半角圆括号、方括号、方头括号、尖括号都算「附注」（Live / 伴奏 / 重制版） */
-const TRAILING_BRACKET_GROUP: RegExp = /[（(\[【〔<][^）)\]】〕>]*[）)\]】〕>]$/;
-
 /** 标准化歌手拼回去用的分隔符，与 MusicSearch 的 normalizeSingers 一致 */
 const SINGER_JOIN: string = '、';
 
 /**
- * 判重用的标准化键：歌名·歌手（小写、去空白、去尾部括号组，如「晴天 (Live)」→「晴天」）
+ * 全角括号 / 书名号折成半角，只为让**同一种写法**的不同宽度落到同一个键
+ *
+ * 只换符号、不换内容也不删内容：「歌（Live）」与「歌 (Live)」本来就是一回事，
+ * 不折的话会漏报；而「歌」与「歌 (Live)」必须保持不同（见 duplicateKeyOf 的说明）。
+ */
+const BRACKET_FOLD: Record<string, string> = {
+  '（': '(',
+  '）': ')',
+  '【': '(',
+  '】': ')',
+  '〔': '(',
+  '〕': ')',
+  '［': '(',
+  '］': ')',
+  '｛': '{',
+  '｝': '}',
+  '〈': '<',
+  '〉': '>',
+  '《': '<',
+  '》': '>',
+};
+
+/**
+ * 判重用的标准化键：歌名·歌手（小写、去空白、括号全半角统一，**不剥离版本后缀**）
  *
  * 为什么判重落在「歌名 + 歌手」而不是条目 id：同一首歌在酷我 / QQ / 网易各有一条 id，
  * 从不同音源、不同搜索结果加进同一个歌单时 id 全不一样，只按 id 判重必然重复
@@ -1472,11 +1569,14 @@ const SINGER_JOIN: string = '、';
  * 标准化规则：
  *   - 歌名、歌手都去空白并转小写 ——「晴天」「 晴天 」以及带全角空格的写法必须同键
  *     （JS 的 \s 本来就含全角空格 U+3000，不用再单列）；
- *   - 歌名去掉**尾部**括号组且允许连续多组：「晴天 (Live)」「晴天（伴奏）」「晴天(Live)(Remastered)」
- *     都归到「晴天」；括号在歌名中间的保留 —— 那是歌名本身的一部分，砍掉会把
- *     「A (B) C」和「A C」并成一回事，那是误删；
+ *   - 括号只统一全/半角（见 BRACKET_FOLD），**内容原样保留**：
+ *     「晴天 (Live)」「晴天（伴奏）」「晴天 (Acoustic Ver.)」各自是一个键，
+ *     与「晴天」**不是**同一首 —— 版本后缀（Live / 伴奏 / Remix / 重制版）本来就代表
+ *     不同的录音，合并了就是误删（群反馈 2026-11-20 15:11「重复歌曲检测不太对」的根因：
+ *     旧口径把尾部括号组整个剥掉，于是《歌》与《歌 (Live)》《歌 (Remix)》被判成同一组）；
  *   - 歌手按 SINGER_SEPARATORS 拆开、各自标准化、排序后用「、」重拼，于是
- *     「周杰伦、方文山」与「方文山/周杰伦」是同一个键（口径与搜索页去重一致）；
+ *     「周杰伦、方文山」与「方文山/周杰伦」是同一个键（口径与搜索页去重一致）——
+ *     这一半是对的，保持不动；
  *   - 任一边为空就退化为只用非空的那一边；两边都空返回空串，调用方必须把空串视为
  *     **不可判重**、只用 id 判，否则所有缺歌名的条目会被并成一坨。
  *
@@ -1495,28 +1595,21 @@ export function duplicateKeyOf(name: string, singer: string): string {
   return `${song}${DUPLICATE_KEY_SEP}${artist}`;
 }
 
-/** 歌名标准化：去空白 → 小写 → 反复剥掉尾部括号组（剥完可能为空，交给调用方退化） */
+/** 歌名标准化：去空白 → 小写 → 括号全半角统一（只有全空白的歌名会是空串，交给调用方退化） */
 function normalizeDuplicateName(name: string): string {
   if (name === undefined || name === null) {
     return '';
   }
-  return stripTrailingBracketGroups(name.replace(/\s/g, '').toLowerCase());
+  return foldBracketChars(name.replace(/\s/g, '').toLowerCase());
 }
 
-/**
- * 剥掉尾部的括号组，直到尾部不再是括号组
- *
- * 循环而不是一次 replace：`/(…)$/` 去掉的最外层那组，后面可能还挂着一组
- * （「晴天 (Live) (Remastered)」）；一次只去一组会留下「晴天 (Live)」这种半成品键。
- */
-function stripTrailingBracketGroups(text: string): string {
-  let out: string = text;
-  while (out.length > 0) {
-    const next: string = out.replace(TRAILING_BRACKET_GROUP, '');
-    if (next === out) {
-      break;
-    }
-    out = next;
+/** 把全角括号逐个换成半角，其余字符原样保留 */
+function foldBracketChars(text: string): string {
+  let out: string = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch: string = text.charAt(i);
+    const mapped: string | undefined = BRACKET_FOLD[ch];
+    out += mapped === undefined ? ch : mapped;
   }
   return out;
 }

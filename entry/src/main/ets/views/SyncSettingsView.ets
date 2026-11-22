@@ -1,12 +1,11 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ICON_GREEN, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ICON_GREEN, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SECTION, F_SUB, R_CARD } from '../ui/Theme';
 import { I_CLOSE, I_PLUS, I_REFRESH, I_TRASH, IconGlyph } from '../ui/Icons';
 import { RoundIconButton } from '../ui/Widgets';
 import { LibrarySummary } from '../core/sync/LocalLibrary';
 import { K_SYNC_DATA_VERSION, K_SYNC_ENABLE, K_SYNC_MESSAGE, K_SYNC_PROGRESS, K_SYNC_STAGE,
   K_SYNC_STATUS, SyncManager } from '../core/sync/SyncManager';
-import { SYNC_CODE_AUTH_FAILED, SYNC_CODE_MISSING_AUTH_CODE } from '../core/sync/SyncTypes';
-import { describeStatus } from '../core/sync/SyncStatusText';
+import { describeStatus, isSyncFailureMessage } from '../core/sync/SyncStatusText';
 import { dustBus, DustPoint, dustPointOf } from '../ui/Dust';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
@@ -66,6 +65,22 @@ export struct SyncSettingsView {
     this.refresh();
   }
 
+  /** 是否处于「停下来等用户处理」的失败态（据此把进度条变红并给重试 / 断开） */
+  private failed(): boolean {
+    return this.enable && !this.connected && isSyncFailureMessage(this.statusMessage);
+  }
+
+  /** 进度条上方那行字：失败时显示具体原因，别让用户只看到一个百分比 */
+  private progressTitle(): string {
+    if (this.failed()) {
+      return describeStatus(false, this.statusMessage);
+    }
+    if (this.stage.length > 0) {
+      return this.stage;
+    }
+    return this.connected ? '已连接，等待变化' : '未连接';
+  }
+
   private refresh(): void {
     const manager = SyncManager.getInstance();
     const library = manager.getLibrary();
@@ -89,11 +104,9 @@ export struct SyncSettingsView {
         this.statusText = '已关闭同步';
       }
     } catch (e) {
+      // 异常里是协议码（英文），给用户看要走 describeStatus；原文只进日志
       const message: string = (e as Error).message;
-      this.statusText = message.length > 0 ? message : '连接失败';
-      if (message === SYNC_CODE_AUTH_FAILED || message === SYNC_CODE_MISSING_AUTH_CODE) {
-        this.statusText = '认证失败：请在下面填入服务端配置的认证码后点「连接」';
-      }
+      this.statusText = describeStatus(false, message);
     } finally {
       this.busy = false;
     }
@@ -112,7 +125,7 @@ export struct SyncSettingsView {
       await manager.connectWithCode(code);
       this.authCode = '';
     } catch (e) {
-      this.statusText = `认证失败：${(e as Error).message}`;
+      this.statusText = describeStatus(false, (e as Error).message);
     } finally {
       this.busy = false;
     }
@@ -125,7 +138,21 @@ export struct SyncSettingsView {
       manager.updateHost(this.host);
       await manager.reconnect();
     } catch (e) {
-      this.statusText = `连接失败：${(e as Error).message}`;
+      this.statusText = describeStatus(false, (e as Error).message);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 失败态里的「断开同步」：关掉开关并断开，进度与错误一起清掉 */
+  private async disconnectSync(): Promise<void> {
+    const manager = SyncManager.getInstance();
+    this.busy = true;
+    try {
+      await manager.disable();
+      this.statusText = '已关闭同步';
+    } catch (e) {
+      this.statusText = `断开失败：${(e as Error).message}`;
     } finally {
       this.busy = false;
     }
@@ -194,7 +221,7 @@ export struct SyncSettingsView {
             .textAlign(TextAlign.Start)
           Text(this.statusText)
             .fontSize(F_SUB)
-            .fontColor(this.connected ? C_ICON_GREEN : C_TEXT_WEAK)
+            .fontColor(this.failed() ? C_RED : (this.connected ? C_ICON_GREEN : C_TEXT_WEAK))
             .width('100%')
             .textAlign(TextAlign.Start)
         }
@@ -223,7 +250,9 @@ export struct SyncSettingsView {
           .fontSize(14)
           .backgroundColor('#00000000')
           .layoutWeight(1)
-          .enabled(!this.enable && !this.busy)
+          // 失败态下必须能改地址：卡住的常见原因就是 IP / 端口填错了（比如填了另一台手机），
+          // 只能改地址再点「重试」，否则用户被锁在错误地址上只能先关掉同步。
+          .enabled(this.failed() ? !this.busy : (!this.enable && !this.busy))
           .onChange((value: string) => {
             this.host = value;
           })
@@ -286,6 +315,31 @@ export struct SyncSettingsView {
       }
       .width('100%')
       .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+
+      Divider().strokeWidth(0.6).color(C_DIVIDER).margin({ left: 14 })
+
+      /**
+       * 「同步不是手机直连」这条必须写在界面上
+       *
+       * 之前只在群里解释过：用户看到「服务端」输入框，很自然会把另一台手机的 IP 填进来，
+       * 然后卡在 2% 完全不知道错在哪。这句话放在地址输入框这张卡里，开同步前就能看到。
+       */
+      Column({ space: 4 }) {
+        Text('同步需要先在一台电脑（或服务器）上运行「洛雪音乐服务端」或打开「洛雪音乐电脑端」，'
+          + '把它的地址和端口填在上面的「服务端」里。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_SUB)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+        Text('两台手机不能直接互相同步 —— 手机上并没有同步服务端，直连是连不上的。'
+          + '认证码在服务端配置里，没设置就留空。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+      .padding({ left: 14, right: 14, top: 10, bottom: 12 })
     }
     .width('100%')
     .borderRadius(R_CARD)
@@ -293,17 +347,24 @@ export struct SyncSettingsView {
     .clip(true)
   }
 
-  /** 连接 / 同步进度：开着同步就显示，同步完成停在 100% */
+  /** 连接 / 同步进度：失败时整条变红、给出原因和「重试 / 断开同步」 */
   @Builder
   progressCard() {
     Column({ space: 8 }) {
       Row({ space: 8 }) {
-        Text(this.stage.length > 0 ? this.stage : (this.connected ? '已连接，等待变化' : '未连接'))
+        Text(this.progressTitle())
           .fontSize(F_SUB)
-          .fontColor(C_TEXT_SUB)
+          .fontColor(this.failed() ? C_RED : C_TEXT_SUB)
           .layoutWeight(1)
           .textAlign(TextAlign.Start)
-        if (this.progress > 0) {
+        if (this.failed()) {
+          Text('连接失败')
+            .fontSize(F_SUB)
+            .fontColor(C_RED)
+            .backgroundColor(C_RED_TINT)
+            .borderRadius(6)
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+        } else if (this.progress > 0) {
           Text(`${this.progress}%`)
             .fontSize(F_SUB)
             .fontColor(this.progress >= 100 ? C_ICON_GREEN : C_RED)
@@ -311,11 +372,45 @@ export struct SyncSettingsView {
       }
       .width('100%')
 
-      Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
+      // 失败时把条拉满并变红：停在 2% 的一小截红条看起来像「还在慢慢连」，
+      // 满格红条才是「已经停了、要你处理」的视觉信号（百分比此时不显示）
+      Progress({ value: this.failed() ? 100 : this.progress, total: 100, type: ProgressType.Linear })
         .width('100%')
-        .color(this.progress >= 100 ? C_ICON_GREEN : C_RED)
+        .color(this.failed() ? C_RED : (this.progress >= 100 ? C_ICON_GREEN : C_RED))
         .backgroundColor(C_FILL_SOFT)
         .style({ strokeWidth: 6 })
+
+      if (this.failed()) {
+        Row({ space: 10 }) {
+          Button('重试')
+            .fontSize(F_SUB)
+            .height(32)
+            .backgroundColor(C_RED)
+            .enabled(!this.busy)
+            .onClick(() => {
+              void this.reconnect();
+            })
+          Button('断开同步')
+            .fontSize(F_SUB)
+            .height(32)
+            .backgroundColor(C_FILL_SOFT)
+            .fontColor(C_TEXT)
+            .enabled(!this.busy)
+            .onClick(() => {
+              void this.disconnectSync();
+            })
+        }
+        .width('100%')
+      }
+
+      if (this.failed()) {
+        // 失败时再把「不是手机直连」说一遍：用户此刻最可能做的就是把另一台手机的 IP 填进来
+        Text('提示：同步需要洛雪音乐服务端或洛雪音乐电脑端，两台手机不能直连。')
+          .fontSize(F_SUB)
+          .fontColor(C_TEXT_WEAK)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
     }
     .width('100%')
     .padding({ left: 14, right: 14, top: 12, bottom: 12 })

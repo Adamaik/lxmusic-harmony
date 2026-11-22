@@ -1,6 +1,7 @@
 import { SYNC_CODE_AUTH_FAILED, SYNC_CODE_CONNECTING, SYNC_CODE_CONNECT_FAILED,
-  SYNC_CODE_CONNECT_SERVICE_FAILED,
-  SYNC_CODE_GET_SERVICE_ID_FAILED, SYNC_CODE_HIGH_SERVICE_VERSION, SYNC_CODE_LOW_SERVICE_VERSION,
+  SYNC_CODE_CONNECT_SERVICE_FAILED, SYNC_CODE_CONNECT_TIMEOUT,
+  SYNC_CODE_GET_SERVICE_ID_FAILED, SYNC_CODE_HIGH_SERVICE_VERSION, SYNC_CODE_HTTP_ERROR,
+  SYNC_CODE_LOW_SERVICE_VERSION,
   SYNC_CODE_MISSING_AUTH_CODE, SYNC_MSG_BLOCKED_IP } from './SyncTypes';
 
 /**
@@ -30,6 +31,8 @@ const SYNC_NOTIFY_CODES: string[] = [
   SYNC_CODE_MISSING_AUTH_CODE,    // 缺认证码
   SYNC_MSG_BLOCKED_IP,            // IP 被封
   SYNC_CODE_CONNECT_SERVICE_FAILED, // 地址 / 端口不对
+  SYNC_CODE_CONNECT_TIMEOUT,      // 握手超时（15s）
+  SYNC_CODE_HTTP_ERROR,           // 对端 HTTP 返回异常（多半不是洛雪服务端）
   SYNC_CODE_GET_SERVICE_ID_FAILED,  // 对端不是洛雪同步服务
   SYNC_CODE_LOW_SERVICE_VERSION,    // 服务端要升级
   SYNC_CODE_HIGH_SERVICE_VERSION,   // 客户端要升级
@@ -38,6 +41,31 @@ const SYNC_NOTIFY_CODES: string[] = [
 
 export function shouldNotifySyncMessage(message: string): boolean {
   return SYNC_NOTIFY_CODES.includes(message);
+}
+
+/**
+ * 是否是「必须用户处理」的失败状态（界面据此把进度条变红、给重试 / 断开按钮）
+ *
+ * 连接中 / 等待同步 / 自动重连都不算失败：它们要么会自己往前走，要么有进度文案。
+ * 这里只认真正停下来的那几种。与 toast 白名单分开维护：`Connect failed` 不弹 toast
+ * （自动重连时会出现，避免刷屏），但界面必须把它标成失败 —— 那正是「连不上服务器」
+ * 最常见的一种。
+ */
+const SYNC_FAILURE_CODES: string[] = [
+  SYNC_CODE_AUTH_FAILED,
+  SYNC_CODE_MISSING_AUTH_CODE,
+  SYNC_MSG_BLOCKED_IP,
+  SYNC_CODE_CONNECT_FAILED,
+  SYNC_CODE_CONNECT_SERVICE_FAILED,
+  SYNC_CODE_CONNECT_TIMEOUT,
+  SYNC_CODE_HTTP_ERROR,
+  SYNC_CODE_GET_SERVICE_ID_FAILED,
+  SYNC_CODE_LOW_SERVICE_VERSION,
+  SYNC_CODE_HIGH_SERVICE_VERSION,
+];
+
+export function isSyncFailureMessage(message: string): boolean {
+  return SYNC_FAILURE_CODES.includes(message);
 }
 
 /** 把同步状态翻译成人话（服务端的 message 是英文常量） */
@@ -58,13 +86,19 @@ export function describeStatus(connected: boolean, message: string): string {
     return '当前 IP 已被服务端封禁';
   }
   if (message === SYNC_CODE_CONNECT_SERVICE_FAILED) {
-    return '无法连接服务（地址或端口不对）';
+    return '该地址不是洛雪同步服务端（/hello 响应不匹配），请核对地址和端口';
+  }
+  if (message === SYNC_CODE_HTTP_ERROR) {
+    return '该地址不是洛雪同步服务端（HTTP 返回异常），请核对地址和端口';
+  }
+  if (message === SYNC_CODE_CONNECT_TIMEOUT) {
+    return '连接超时：15 秒内服务器没有响应，请检查 IP、端口，以及手机是否和服务器在同一局域网，然后点「重试」';
   }
   if (message === SYNC_CODE_CONNECT_FAILED) {
-    return '连接服务失败（网络不通或超时），稍后会自动重连';
+    return '连不上服务器：请检查 IP 和端口是否正确、手机与服务器是否在同一网络，然后点「重试」';
   }
   if (message === SYNC_CODE_GET_SERVICE_ID_FAILED) {
-    return '服务端未返回 ID，可能不是洛雪同步服务';
+    return '该地址不是洛雪同步服务端（没有返回服务端 ID），请核对地址和端口';
   }
   if (message === SYNC_CODE_LOW_SERVICE_VERSION) {
     return '服务端版本过低，请升级服务端';
