@@ -158,10 +158,12 @@ class TxDailyBody {
  */
 class TxDissParam {
   /**
-   * disstid **必须是字符串**：动态歌单 id 是长数字，超出 2^53 时 JSON 里当 number 走
-   * 会被改写成另一个数，CgiGetDiss 就查不到那个歌单（每日推荐整块显示「取不到」）。
+   * disstid **必须是数字**（2026-11-23 真机抓包实测）：
+   * 传字符串时服务端回 `data.code=-100008 param error`，每日推荐整块变成「取不到」；
+   * 传数字才回完整 `songlist`（实测 30 首、带 `file.media_mid`）。
+   * 动态歌单 id 目前是 10~11 位，离 2^53 还有很大余量。
    */
-  disstid: string = '';
+  disstid: number = 0;
   dirid: number = 0;
   tag: boolean = true;
   song_begin: number = 0;
@@ -458,7 +460,7 @@ export async function fetchTxDaily(): Promise<LxMusicInfo[]> {
   }
   const dissId: string = cardIdOf(card);
   const dissReq: TxDissReq = new TxDissReq();
-  dissReq.param.disstid = dissId;
+  dissReq.param.disstid = asNumber(dissId);
   const dissBody: TxDissBody = new TxDissBody(buildComm(), dissReq);
   const resp: Record<string, Object> =
     await httpPostJson(GATEWAY, dissBody, txHeaders(), 'QQ音乐每日推荐歌单');

@@ -2002,11 +2002,10 @@ const TX_DISS_SONG_NUM: number = 1000;
 /** 新版歌单详情（musicu）的请求体，字段照抄洛雪 tx/songList.js 的 getListDetail2 */
 interface TxDissInfoParam {
   /**
-   * 歌单 id。短 id 用 number（与历史行为一致），超过 15 位时按 string 传：
-   * JS 的 number 只有 2^53 精度，长 disstid 转 number 会被改写成另一个 id，
-   * 接口就会回「没取到歌曲」。
+   * disstid **必须按数字传**（2026-11-23 实测）：传字符串时 musicu 回
+   * `param error`，歌单详情取不到。歌单 id 目前 10~11 位，2^53 精度足够。
    */
-  disstid: number | string;
+  disstid: number;
   userinfo: number;
   tag: number;
   orderlist: number;
@@ -2175,20 +2174,10 @@ async function txPlaylistDetail(id: string, page: number): Promise<LxListDetail>
   }
 }
 
-/**
- * 歌单 id 的传输形态：短 id 用 number（保持历史行为），超过 15 位按 string 传。
- *
- * JS 的 number 只有 2^53（≈9.0e15）精度，16 位以上的 disstid 转 number 会被改写成
- * **另一个 id**，接口于是回「没取到歌曲」——而且错误码与「歌单不存在」长得一样，很难查。
- */
-function txDissIdOf(id: string): number | string {
-  return /^\d{1,15}$/.test(id) ? asNumber(id) : id;
-}
-
 /** 新版：music.srfDissInfo.aiDissInfo / uniform_get_Dissinfo（洛雪 tx/songList.js 的 getListDetail2） */
 async function txPlaylistDetailMusicu(id: string, page: number): Promise<LxListDetail> {
   const param: TxDissInfoParam = {
-    disstid: txDissIdOf(id),
+    disstid: asNumber(id),
     userinfo: 1,
     tag: 1,
     orderlist: 1,
