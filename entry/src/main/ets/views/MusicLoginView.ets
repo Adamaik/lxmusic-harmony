@@ -5,7 +5,7 @@ import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT_STRONG, C_ON_ACCENT, C_RED, C_TEXT
   C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD, platformColor, platformTint } from '../ui/Theme';
 import { cardWidthOf, cardColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 import { IconGlyph, I_PERSON } from '../ui/Icons';
-import { BookLoginWeb } from '../components/BookLoginWeb';
+import { BookLoginWeb, DESKTOP_UA } from '../components/BookLoginWeb';
 import { K_MUSIC_LOGGED_TX, K_MUSIC_LOGGED_WY, K_MUSIC_NICK_TX, K_MUSIC_NICK_WY,
   K_MUSIC_VIP_TX, K_MUSIC_VIP_WY, MusicProfile, musicAccount } from '../core/music/MusicAccount';
 
@@ -29,7 +29,8 @@ const TX_SITE_URL: string = 'https://y.qq.com';
  * 登录态不另存一份：页面用 @StorageLink 订阅 MusicAccount 写进 AppStorage 的三个 key，
  * 登录 / 退出后立刻刷新，重进页面也是真实状态。
  *
- * 只接网易（`wy`）；QQ / 酷狗先占位，等核心层按同一形状加平台键再接。
+ * 接了两个平台：网易（`wy`）走网页登录抓 `MUSIC_U`；QQ 音乐（`tx`）抓 `qm_keyst`。
+ * 酷狗先占位，等核心层按同一形状加平台键再接。
  */
 @Component
 export struct MusicLoginView {
@@ -274,6 +275,13 @@ export struct MusicLoginView {
    *
    * 用 `bindContentCover` 而不是半模态：登录页要占满屏、能滚动、还要弹系统键盘。
    * 关掉时把抓到的 Cookie 串交回来（可能为空串），由 onWebLoginClosed 判断是取消还是登录。
+   *
+   * 两个平台的登录页都用桌面 UA 打开（`DESKTOP_UA`）：WebView 默认带移动 UA，站点会把
+   * 请求判成手机端、302 到手机版页面 —— QQ 音乐那个手机版页面
+   * （`i2.y.qq.com/n3/other/pages/myqq/index.html`）整页只有一个「下载APP」，没有登录入口；
+   * 网易云的移动 UA 页面同样是「打开 App」的引导，扫码 / 短信登录都进不去。
+   * 换桌面 UA 后 y.qq.com 返回的是右上角带「登录」的 PC 版首页（点进去是官方扫码 / 账号登录），
+   * 网易云返回的是带扫码 / 短信登录的 PC 版页面。
    */
   @Builder
   loginWebCover() {
@@ -281,6 +289,8 @@ export struct MusicLoginView {
       title: this.loginSource === 'tx' ? 'QQ 音乐' : '网易云音乐',
       loginUrl: this.loginSource === 'tx' ? TX_LOGIN_URL : WY_LOGIN_URL,
       siteUrl: this.loginSource === 'tx' ? TX_SITE_URL : WY_SITE_URL,
+      // 桌面 UA：不传的话 WebView 用默认移动 UA，站点会把请求判成手机端、跳到没有登录入口的手机版页
+      userAgent: DESKTOP_UA,
       safeTop: this.safeTop,
       safeBottom: this.safeBottom,
       onClose: (cookie: string) => {

@@ -105,6 +105,10 @@ export class LxPlayer {
 
   /** 耳机断连监听是否已经挂过（只能挂一次） */
   private headsetWired: boolean = false;
+  /** 音频路由管理器（拔耳机判定要复核输出设备，拿一次存着） */
+  private routingManager: audio.AudioRoutingManager | null = null;
+  /** 取路由管理器失败过（环境不支持）：不再反复试 */
+  private routingManagerFailed: boolean = false;
 
   /**
    * 摘下耳机 / 断开蓝牙耳机 → 自动暂停
@@ -119,33 +123,89 @@ export class LxPlayer {
     if (this.headsetWired) {
       return;
     }
+    const manager: audio.AudioRoutingManager | null = this.routingManagerOf();
+    if (manager === null) {
+      return;
+    }
     this.headsetWired = true;
+    const onChange: (action: audio.DeviceChangeAction) => void =
+      (action: audio.DeviceChangeAction): void => {
+        if (action.type !== audio.DeviceChangeType.DISCONNECT) {
+          return;
+        }
+        if (!PlaySettings.getInstance().isAutoPauseHeadsetOff()) {
+          return;
+        }
+        if (!isHeadsetOf(action.deviceDescriptors)) {
+          return;
+        }
+        if (this.status !== 'playing') {
+          return;
+        }
+        /*
+         * 事件说的只是「这一批设备断开了」，**不等于**「用户把耳机摘了」。
+         * 灭屏、蓝牙在 A2DP 与 SCO 之间来回切、通话建立、系统重新排一次输出路由，
+         * 都会整批上报一次 DISCONNECT，而事件里带着的恰恰是原来那副耳机 ——
+         * 只按事件列表判断，就会在还戴着耳机、声音根本没跑到外放的时候把音乐停掉。
+         * 所以再问一次系统「当下首选输出设备是谁」：还有一个耳机类设备在输出，就不暂停。
+         */
+        if (this.stillOutputsToHeadset()) {
+          hilog.info(DOMAIN, TAG, 'headset reported disconnected, but it is still the output; keep playing');
+          return;
+        }
+        hilog.info(DOMAIN, TAG, 'headset disconnected, pause playback');
+        this.pause().catch((err: Error) => {
+          hilog.warn(DOMAIN, TAG, 'pause after headset off failed: %{public}s', err.message);
+        });
+      };
     try {
-      const manager: audio.AudioRoutingManager = audio.getAudioManager().getRoutingManager();
-      const onChange: (action: audio.DeviceChangeAction) => void =
-        (action: audio.DeviceChangeAction): void => {
-          if (action.type !== audio.DeviceChangeType.DISCONNECT) {
-            return;
-          }
-          if (!PlaySettings.getInstance().isAutoPauseHeadsetOff()) {
-            return;
-          }
-          if (!isHeadsetOf(action.deviceDescriptors)) {
-            return;
-          }
-          if (this.status !== 'playing') {
-            return;
-          }
-          hilog.info(DOMAIN, TAG, 'headset disconnected, pause playback');
-          this.pause().catch((err: Error) => {
-            hilog.warn(DOMAIN, TAG, 'pause after headset off failed: %{public}s', err.message);
-          });
-        };
-      // AudioRoutingManager 的这个事件是三参形态：on('deviceChange', DeviceFlag, cb)
-      manager.on('deviceChange', audio.DeviceFlag.ALL_DEVICES_FLAG, onChange);
+      // 只订阅**输出**设备：麦克风（输入）的插拔跟「声音跑到外放」没有关系，
+      // 之前用 ALL_DEVICES_FLAG 时，输入侧的变化也会进到这个回调里来
+      manager.on('deviceChange', audio.DeviceFlag.OUTPUT_DEVICES_FLAG, onChange);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'wire headset-off pause failed: %{public}s',
         JSON.stringify(e));
+    }
+  }
+
+  /** 音频路由管理器：拿一次存着；环境不支持时只记一次失败，不反复试 */
+  private routingManagerOf(): audio.AudioRoutingManager | null {
+    if (this.routingManager !== null) {
+      return this.routingManager;
+    }
+    if (this.routingManagerFailed) {
+      return null;
+    }
+    try {
+      this.routingManager = audio.getAudioManager().getRoutingManager();
+    } catch (e) {
+      this.routingManagerFailed = true;
+      hilog.warn(DOMAIN, TAG, 'getRoutingManager failed: %{public}s', JSON.stringify(e));
+      return null;
+    }
+    return this.routingManager;
+  }
+
+  /**
+   * 当下真正在出声的是不是耳机类设备
+   *
+   * 查询失败（老系统 / 偶发系统错误）返回 false，也就是**沿用旧行为**（暂停）：
+   * 宁可偶发多停一次（用户按一下播放就回来），也不要让「摘下耳机自动暂停」这个功能失效。
+   */
+  private stillOutputsToHeadset(): boolean {
+    const manager: audio.AudioRoutingManager | null = this.routingManagerOf();
+    if (manager === null) {
+      return false;
+    }
+    try {
+      const info: audio.AudioRendererInfo = {
+        usage: audio.StreamUsage.STREAM_USAGE_MUSIC,
+        rendererFlags: 0,
+      };
+      return isHeadsetOf(manager.getPreferredOutputDeviceForRendererInfoSync(info));
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'query preferred output device failed: %{public}s', JSON.stringify(e));
+      return false;
     }
   }
 
@@ -196,6 +256,14 @@ export class LxPlayer {
    * 用户主动停的不该在别的声音结束后自己响起来，见 PlaySettings.K_AUTO_RESUME_AFTER_INTERRUPT。
    */
   private focusPaused: boolean = false;
+  /**
+   * 打断引起的这一次暂停已经发出、但播放器还没真进 paused
+   *
+   * 系统的 RESUME 可能比它先到（提示音很短的时候就是这样），见 resumeAfterInterrupt。
+   */
+  private interruptPauseIssued: boolean = false;
+  /** 打断已经结束、但当时暂停还没落地：等播放器真进 paused 再恢复（见 applyPendingResume） */
+  private resumeWhenPaused: boolean = false;
   /** 音频会话管理器：「与其他应用同时播放」靠它激活混音会话（见 applyConcurrency） */
   private sessionManager: audio.AudioSessionManager | null = null;
   /** 取会话管理器失败（例如环境不支持）后不再反复重试 */
@@ -544,6 +612,8 @@ export class LxPlayer {
     this.bufferedEndMs = 0;
     // 打断标记是跟着这一首/这个实例走的，新实例从头开始记
     this.focusPaused = false;
+    this.interruptPauseIssued = false;
+    this.resumeWhenPaused = false;
     this.updateBuffer(false, 0);
 
     const player: media.AVPlayer = await media.createAVPlayer();
@@ -592,7 +662,10 @@ export class LxPlayer {
           this.update('playing', '正在播放');
           break;
         case 'paused':
+          // 这次暂停已经落地：打断期间就先结束了的恢复请求（见 resumeAfterInterrupt）到这里补上
+          this.interruptPauseIssued = false;
           this.update('paused', '已暂停');
+          this.applyPendingResume();
           break;
         case 'completed':
           this.update('stopped', '播放完成');
@@ -707,6 +780,14 @@ export class LxPlayer {
   }
 
   async pause(): Promise<void> {
+    // 用户 / 系统播控中心发来的暂停是**明确意图**：把「等这次暂停落地就接着放」的
+    // 待办清掉，否则打断期间用户自己按了暂停，等播放器进 paused 时又被自动放起来。
+    this.resumeWhenPaused = false;
+    await this.doPause();
+  }
+
+  /** 真正调播放器暂停（打断路径也走它，见 pauseOnInterrupt） */
+  private async doPause(): Promise<void> {
     const player = this.avPlayer;
     if (player !== null && this.status === 'playing') {
       await player.pause();
@@ -841,7 +922,10 @@ export class LxPlayer {
 
   /** 系统已经把声音停了：把我们的状态也对齐（pause 内部只在 playing 态才真的调） */
   private pauseOnInterrupt(): void {
-    this.pause().catch((err: Error) => {
+    if (this.status === 'playing') {
+      this.interruptPauseIssued = true;
+    }
+    this.doPause().catch((err: Error) => {
       hilog.warn(DOMAIN, TAG, 'pause for audio interrupt failed: %{public}s', err.message);
     });
   }
@@ -859,7 +943,44 @@ export class LxPlayer {
       return;
     }
     const player = this.avPlayer;
-    if (player === null || this.status !== 'paused') {
+    if (player === null) {
+      return;
+    }
+    if (this.status === 'paused') {
+      this.playAfterInterrupt(player);
+      return;
+    }
+    /**
+     * 打断短到「RESUME 比那次暂停落地还早」：此刻还停在 playing，而我们发出的
+     * pause 正在路上。不把这次恢复记下来，等暂停落地后就再没人叫它播了 ——
+     * 表现就是被一声很普通的提示音**永久**停住（群反馈「放着放着就暂停」）。
+     * 所以记一笔，等播放器真进 paused 时再补（见 applyPendingResume）。
+     */
+    if (this.status === 'playing' && this.interruptPauseIssued) {
+      this.resumeWhenPaused = true;
+    }
+  }
+
+  /** 播放器已经进 paused，而打断那时就先结束了：在这里把播放补回来 */
+  private applyPendingResume(): void {
+    if (!this.resumeWhenPaused) {
+      return;
+    }
+    this.resumeWhenPaused = false;
+    const player = this.avPlayer;
+    if (player === null) {
+      return;
+    }
+    if (this.status !== 'playing' && this.status !== 'paused') {
+      // loading / error / stopped：不是「被打断停下的」那一种，不擅自出声
+      return;
+    }
+    this.playAfterInterrupt(player);
+  }
+
+  /** 打断结束后的那一次 play：失败只记日志（下一次用户操作会重新走完整链路） */
+  private playAfterInterrupt(player: media.AVPlayer): void {
+    if (!PlaySettings.getInstance().isAutoResumeAfterInterrupt()) {
       return;
     }
     player.play().catch((err: BusinessError) => {
@@ -908,6 +1029,9 @@ export class LxPlayer {
         player.off('timeUpdate');
         player.off('bufferingUpdate');
         player.off('error');
+        // 音频焦点监听也要解：漏了它，旧实例上的打断回调会一直挂着（虽然有 avPlayer 判等兜住，
+        // 但释放后还留一份闭包没有意义，且真机上打断事件比 stateChange 更频繁）
+        player.off('audioInterrupt');
         await player.release();
       } catch (err) {
         hilog.warn(DOMAIN, TAG, 'release failed: %{public}s', JSON.stringify(err));
@@ -931,6 +1055,10 @@ export class LxPlayer {
     this.loadedEndMs = 0;
     this.loadedProbeAt = 0;
     this.lastProgressAt = 0;
+    // 打断的现场也跟着实例走：旧实例上的「等 paused 就恢复」不能留到新实例上
+    this.focusPaused = false;
+    this.interruptPauseIssued = false;
+    this.resumeWhenPaused = false;
     // 释放不经过 stateChange：在这里把缓冲状态收掉，界面才不会一直转圈
     this.updateBuffer(false, 0);
   }

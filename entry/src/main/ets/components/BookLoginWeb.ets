@@ -8,6 +8,20 @@ const DOMAIN: number = 0x0001;
 const TAG: string = 'BookLoginWeb';
 
 /**
+ * 桌面（Windows Chrome）User-Agent
+ *
+ * 音乐站点的网页登录都必须用桌面 UA：QQ 音乐 / 网易云都会按 UA 把页面分成 PC 版和手机版，
+ * 手机版（如 `i2.y.qq.com/n3/other/pages/myqq/index.html`）只有一个「下载APP」，**没有登录入口**，
+ * 用鸿蒙 Web 组件的默认移动 UA 打开就表现为「点进去跳到手机版、找不到登录的地方」。
+ *
+ * 值与 core/music/MusicAccount.ets 里的 `TX_UA` / `WY_UA` 保持一致：那边是 HTTP 请求头用的，
+ * 这里是 WebView 用的，两处必须是同一个身份，否则「网页拿到的登录态」和「接口认的客户端」会对不上。
+ * 不从 MusicAccount 导出复用，是为了不让这个通用组件反向依赖音乐核心模块（它也给书源登录用）。
+ */
+export const DESKTOP_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/**
  * 书源「网页登录」用的应用内浏览器
  *
  * 需要登录的书源（喜马拉雅、哔哩哔哩这类）大多没法靠一个表单填明白：有的要扫码、
@@ -28,6 +42,13 @@ export struct BookLoginWeb {
   /** 书源站址（登录后跳到主站时也能抓到 Cookie） */
   siteUrl: string = '';
   /**
+   * 自定义 User-Agent（空串 = 用 Web 组件的系统默认 UA）
+   *
+   * 书源登录页大多是移动站（喜马拉雅、哔哩哔哩这类），保持默认 UA 才是它们想要的版式，
+   * 所以这里不设全局默认值，由调用方按需传入：音乐登录页传 {@link DESKTOP_UA}。
+   */
+  userAgent: string = '';
+  /**
    * 状态栏高度（vp）
    *
    * 这一层是 `bindContentCover` 的整屏覆盖层，铺满整个窗口、**不经过标题栏**，
@@ -47,6 +68,26 @@ export struct BookLoginWeb {
   aboutToAppear(): void {
     // 先把要打开的地址显示出来，页面加载完再由 onPageEnd 换成最终地址
     this.currentUrl = this.loginUrl;
+  }
+
+  /**
+   * 把自定义 UA 装到 WebView 上
+   *
+   * 时机按官方 `setCustomUserAgent` 的说明来：`src` 已带 URL 时，**在 `onControllerAttached`
+   * 回调里设置**（此时 controller 刚绑定；换成 onLoadIntercept 里设会概率性失败）。
+   * 设置生效时组件会带着新 UA 重新请求一次首页 —— 这一下重载正是把「移动 UA 打开的手机版
+   * 页面」换成「桌面 UA 打开的 PC 版页面」的关键，否则首屏已经被服务端 302 到手机站了。
+   * `Web` 组件上的 `.userAgent()` 属性从 API 10 起已废弃，官方替代就是本方法。
+   */
+  private applyUserAgent(): void {
+    if (this.userAgent.length === 0) {
+      return;
+    }
+    try {
+      this.controller.setCustomUserAgent(this.userAgent);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'setCustomUserAgent failed: %{public}s', JSON.stringify(e));
+    }
   }
 
   /**
@@ -173,6 +214,9 @@ export struct BookLoginWeb {
         .fileAccess(false)
         .zoomAccess(true)
         .mixedMode(MixedMode.All)
+        .onControllerAttached(() => {
+          this.applyUserAgent();
+        })
         .onProgressChange((event: OnProgressChangeEvent) => {
           this.progress = event.newProgress;
         })

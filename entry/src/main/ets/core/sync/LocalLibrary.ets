@@ -614,7 +614,16 @@ export class LocalLibrary implements LibrarySink {
    */
   importPlaylist(name: string, source: string, sourceListId: string,
     items: SongItem[]): PlaylistSummary | null {
-    const musics: LxMusicInfoNew[] = musicsOf(items);
+    /**
+     * **导入不按 id 去重**（keepDuplicates = true）。
+     *
+     * 群反馈 2026-11-20 15:19（CharlotteZero「歌单导入永远少一首歌」）：线上歌单里
+     * 同一首歌被加了两遍是合法的，按 id 去重会把第二条悄悄吃掉，导入结果就永远比
+     * 线上少一首，而且没有任何提示。洛雪原版这里也是直接 push、不去重。
+     * 重复要不要清理由歌单菜单里的「检查重复歌曲」决定，导入不替用户做决定。
+     * （加歌 `addMusicToPlaylist` 仍然走默认的去重口径，那里「发现重复就不加」是正确的。）
+     */
+    const musics: LxMusicInfoNew[] = musicsOf(items, true);
     if (musics.length === 0) {
       return null;
     }
@@ -1411,7 +1420,7 @@ export class LocalLibrary implements LibrarySink {
 // ------------------------------------------------------------------ 工具
 
 /** 把 SongItem 列表转成同步用歌曲（丢掉不能同步的条目：本地歌 / 云端歌等非平台歌曲） */
-function musicsOf(items: SongItem[]): LxMusicInfoNew[] {
+function musicsOf(items: SongItem[], keepDuplicates: boolean = false): LxMusicInfoNew[] {
   const out: LxMusicInfoNew[] = [];
   const seen: Set<string> = new Set<string>();
   for (const item of items) {
@@ -1419,10 +1428,15 @@ function musicsOf(items: SongItem[]): LxMusicInfoNew[] {
       continue;
     }
     const info: LxMusicInfoNew | null = toLxMusicInfo(item);
-    if (info === null || seen.has(info.id)) {
+    if (info === null) {
       continue;
     }
-    seen.add(info.id);
+    if (!keepDuplicates) {
+      if (seen.has(info.id)) {
+        continue;
+      }
+      seen.add(info.id);
+    }
     out.push(info);
   }
   return out;

@@ -143,6 +143,8 @@ export class PlaybackService {
   // ------------------------------------------------------------ 长时任务
   private taskRunning: boolean = false;
   private taskStarting: boolean = false;
+  /** 申请进行中又来了「还要再对齐一次」的请求（会话刚激活时就是这种时机） */
+  private taskPending: boolean = false;
 
   // ------------------------------------------------------------ 锁屏封面
   /** 已经处理过的封面地址（成功或失败都记下来，避免反复解码） */
@@ -351,11 +353,20 @@ export class PlaybackService {
     if (positionMs >= 0) {
       this.positionMs = positionMs;
     }
+    const prev: avSession.PlaybackState = this.state;
     this.state = next;
     if (next === avSession.PlaybackState.PLAYBACK_STATE_PLAY ||
       next === avSession.PlaybackState.PLAYBACK_STATE_PREPARE) {
-      // 一开始播就要把后台任务立起来（必须在应用还处于前台时申请）
-      this.startBackgroundTask();
+      // 一开始播就要把后台任务立起来（必须在应用还处于前台时申请）。
+      //
+      // 从「暂停 / 停止 / 出错」重新播起来的那一次必须**重新申请**：按官方《长时任务》
+      // 的约束，应用一停止出声，系统就会把 AUDIO_PLAYBACK 长时任务收掉（暂停要主动取消、
+      // 后台被打断时系统直接代收），而 taskRunning 这个本地标记不会跟着变。只信它，就会
+      // 在「暂停过又接着放」之后误以为任务还在 —— 其实进程一退后台就被冻结，AVPlayer
+      // 跟着停，表现就是「灭屏就暂停」「放着放着就暂停」。
+      const restarting: boolean = prev !== avSession.PlaybackState.PLAYBACK_STATE_PLAY
+        && prev !== avSession.PlaybackState.PLAYBACK_STATE_PREPARE;
+      this.startBackgroundTask(restarting);
     } else if (next === avSession.PlaybackState.PLAYBACK_STATE_ERROR) {
       // 出错了就不该继续占着后台任务
       this.stopBackgroundTask();
@@ -429,6 +440,12 @@ export class PlaybackService {
       }).then(() => {
         return session.activate();
       }).then(() => {
+        // 会话激活之后补一次长时任务：官方约束是「AUDIO_PLAYBACK 必须配合 AVSession」，
+        // 起播那一刻的申请可能因为会话还没建好/还没激活而被系统拒掉（见 startBackgroundTask），
+        // 而状态回调只在播放状态**变化**时才来 —— 不在这里补，第一次起播就会一直没有后台任务。
+        if (this.isPlayState()) {
+          this.startBackgroundTask(false);
+        }
         // 会话激活后再声明能力：没激活时播控中心相关的声明可能被会话服务拒掉
         // （声明哪些控制元素、支持哪几种循环模式、开歌词组件）
         this.declareMediaCenterControls(session);
@@ -1060,9 +1077,32 @@ export class PlaybackService {
 
   // ------------------------------------------------------------ 长时任务
 
-  /** 申请 AUDIO_PLAYBACK 长时任务（重复调用无害） */
-  private async startBackgroundTask(): Promise<void> {
-    if (this.taskRunning || this.taskStarting) {
+  /** 当前是不是「应该有声」的状态（长时任务只在这两种状态下才该占着） */
+  private isPlayState(): boolean {
+    return this.state === avSession.PlaybackState.PLAYBACK_STATE_PLAY
+      || this.state === avSession.PlaybackState.PLAYBACK_STATE_PREPARE;
+  }
+
+  /**
+   * 申请 AUDIO_PLAYBACK 长时任务
+   *
+   * 没有它，应用一退到后台（息屏、切走、被别的应用盖住）就会被系统冻结，AVPlayer 跟着停，
+   * 表现就是「一灭屏就暂停」。三条必须遵守的约束（官方《长时任务》）：
+   *   1. 只有 UIAbility 能申请，且**必须在应用还处于前台时**申请 —— 所以起播那一刻就发；
+   *   2. AUDIO_PLAYBACK 必须配合 AVSession —— 会话还没建好/没激活时申请会被系统拒，
+   *      因此会话激活后要再补一次（见 ensureSession）；
+   *   3. 应用一停止出声（暂停 / 被别的应用打断），系统会把任务收掉，重新出声要**重新申请** ——
+   *      本地那个 taskRunning 标记不会跟着变，所以「暂停过再播」必须 refresh 一次。
+   *
+   * @param refresh true = 本地记着「已经在跑」也再申请一次（暂停后恢复、打断后恢复走这条）
+   */
+  private async startBackgroundTask(refresh: boolean = false): Promise<void> {
+    if (this.taskStarting) {
+      // 上一次申请还没回来：记下「回来之后还要再对齐一次」，别把这次请求丢了
+      this.taskPending = true;
+      return;
+    }
+    if (this.taskRunning && !refresh) {
       return;
     }
     const context = this.context;
@@ -1073,6 +1113,8 @@ export class PlaybackService {
     try {
       const agent: WantAgent | null = await this.buildWantAgent();
       if (agent === null) {
+        // 以前这里直接 return：申请根本没发生，日志里却什么都没有，排障时看不见
+        hilog.warn(DOMAIN, TAG, 'no wantAgent, skip background task');
         return;
       }
       await backgroundTaskManager.startBackgroundRunning(
@@ -1080,27 +1122,46 @@ export class PlaybackService {
       this.taskRunning = true;
       hilog.info(DOMAIN, TAG, 'background task (audioPlayback) started');
     } catch (err) {
-      // 起不来也不影响前台播放，只是退到后台会被冻结
-      hilog.error(DOMAIN, TAG, 'startBackgroundRunning failed: %{public}s', JSON.stringify(err));
+      // 起不来（或「已经在跑时又申请一次」被拒）都要把标记清掉：宁可下一次多问一遍系统，
+      // 也不能留一个「以为任务在、其实早被系统收掉」的假标记 —— 那正是灭屏就没声的原因。
+      // 日志要能一眼分辨：refresh（暂停后恢复时再对齐一次）被拒是**预期内**的，
+      // 说明任务本来就还在；非 refresh 的失败才是真问题，错误码 9800005 / 9800004 是
+      // 重复申请或校验未过，201 是权限（KEEP_BACKGROUND_RUNNING / backgroundModes）。
+      this.taskRunning = false;
+      if (refresh) {
+        hilog.info(DOMAIN, TAG, 'refresh background task rejected (it may already be running): %{public}s',
+          JSON.stringify(err));
+      } else {
+        hilog.error(DOMAIN, TAG, 'startBackgroundRunning failed: %{public}s', JSON.stringify(err));
+      }
     } finally {
       this.taskStarting = false;
+      const again: boolean = this.taskPending;
+      this.taskPending = false;
+      // 申请期间又有人要求对齐（典型：会话刚好在这时激活）、而这次没成功：立刻补一次
+      if (again && !this.taskRunning && this.isPlayState()) {
+        this.startBackgroundTask(false);
+      }
     }
   }
 
   private async stopBackgroundTask(): Promise<void> {
-    if (!this.taskRunning) {
-      return;
-    }
     const context = this.context;
+    const wasRunning: boolean = this.taskRunning;
     this.taskRunning = false;
     if (context === null) {
       return;
     }
+    // 不看 taskRunning 决定要不要真去停：这个标记可能因为「重复申请被拒」而与真实状态不一致
+    // （见 startBackgroundTask 的 catch），漏停就会留下一个没人收的长时任务 —— 既多一条
+    // 常驻通知，也一直在后台占着不休眠。停的时候一律真停一次，代价只是一次 IPC。
     try {
       await backgroundTaskManager.stopBackgroundRunning(context);
       hilog.info(DOMAIN, TAG, 'background task stopped');
     } catch (err) {
-      hilog.warn(DOMAIN, TAG, 'stopBackgroundRunning failed: %{public}s', JSON.stringify(err));
+      if (wasRunning) {
+        hilog.warn(DOMAIN, TAG, 'stopBackgroundRunning failed: %{public}s', JSON.stringify(err));
+      }
     }
   }
 

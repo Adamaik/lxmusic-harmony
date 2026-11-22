@@ -471,26 +471,89 @@ export async function getRecommendPlaylists(source: string, sortId: string, page
   throw new Error(`暂不支持该平台的推荐歌单：${source}`);
 }
 
+/**
+ * 从「歌单链接」里抠 id 的规则（与 PlaylistLink 的 listDetailLink 同一口径，这里只做兜底解析）
+ *
+ * 每个平台给一组正则，按顺序试：网易既有 `playlist?id=` 也有 `/playlist/<id>/<x>/` 两种分享形态，
+ * 只写第一种的话，老数据里那种没有查询串的链接就还原不出 id。
+ */
+const LIST_LINK_PATTERNS: Record<string, RegExp[]> = {
+  'wy': [/[?&]id=(\d+)/, /\/playlist\/(\d+)/],
+  'tx': [/\/playlist\/(\d+)/, /[?&](?:disstid|id)=(\d+)/],
+  'kw': [/\/playlist(?:_detail)?\/(\d+)/, /[?&](?:pid|id)=(\d+)/],
+  'mg': [/\/playlist\/(\d+)/, /[?&](?:playlistId|id)=(\d+)/],
+  'kg': [/\/(\d+)\.html/, /[?&](?:specialid|id)=(\d+)/, /\/songlist\/(gcid_[0-9A-Za-z]+)/],
+};
+
+/**
+ * 把调用方给的「歌单标识」收敛成平台侧**裸 id**
+ *
+ * 为什么必须有这一层（群反馈 2026-11-21 02:11，Rote Sonne 截图「更新失败：网易歌单详情接口返回异常」）：
+ * `PlaylistDetailView.updateFromSource` 回源时传的是本地歌单里存的 `sourceListId`，
+ * 而它的形态是**洛雪列表标识** `${平台}__${歌单id}`（`LocalLibrary.sourceListIdOf`），
+ * 老数据里还可能是 `${平台}__https://…?id=…`（整条分享链接，见 normalizeSourceListId）。
+ * 这些字符串直接拼进接口 URL 就是 `id=wy__2102211118` —— 实测网易回
+ * `{"code":400,"message":"请求参数错误"}`（HTTP 200、接口 code 非 200），
+ * 于是用户只看到一句「接口返回异常」。首次导入走的是解析出来的 `link.id`（裸数字），
+ * 所以这个坑只在「从原歌单更新」上炸。
+ *
+ * 这里只在**入口**收敛一次，各平台解析函数拿到的永远是裸 id：
+ *   `wy__2102211118`                    -> `2102211118`
+ *   `wy__https://music.163.com/playlist?id=2102211118&uct2=…` -> `2102211118`
+ *   `wy__https://music.163.com/#/playlist?id=2102211118`      -> `2102211118`
+ * 平台自己的内部编码（酷狗的 `id_` / `gcid_`、酷我的 `digest-`）不动 —— 那些由各自的
+ * 解析函数处理，这里剥掉反而会坏。
+ */
+function bareListIdOf(source: string, raw: string): string {
+  let id: string = raw.trim();
+  if (id.length === 0) {
+    return id;
+  }
+  const prefix: string = `${source}__`;
+  if (id.startsWith(prefix)) {
+    id = id.substring(prefix.length).trim();
+  }
+  if (id.length === 0) {
+    return id;
+  }
+  if (id.startsWith('http://') || id.startsWith('https://')) {
+    const patterns: RegExp[] | undefined = LIST_LINK_PATTERNS[source];
+    if (patterns !== undefined) {
+      for (const pattern of patterns) {
+        const matched: RegExpMatchArray | null = id.match(pattern);
+        if (matched !== null && matched[1] !== undefined && matched[1].length > 0) {
+          return matched[1];
+        }
+      }
+    }
+    // 认不出链接里的 id 就原样往下传：让接口把真实错误报出来，别在这里编一个 id
+    return id;
+  }
+  return id;
+}
+
 /** 歌单里的歌曲 */
 export async function getPlaylistDetail(source: string, id: string, page: number,
   ): Promise<LxListDetail> {
+  // 入口统一收敛成裸 id：调用方可能给 `wy__123` / 整条分享链接（见 bareListIdOf）
+  const listId: string = bareListIdOf(source, id);
   if (source === 'kw') {
-    return await kwPlaylistDetail(id, page);
+    return await kwPlaylistDetail(listId, page);
   }
   if (source === 'kg') {
-    return await kgPlaylistDetail(id);
+    return await kgPlaylistDetail(listId);
   }
   if (source === 'mg') {
-    return await mgPlaylistDetail(id, page);
+    return await mgPlaylistDetail(listId, page);
   }
   if (source === 'tx') {
-    return await txPlaylistDetail(id, page);
+    return await txPlaylistDetail(listId, page);
   }
   if (source === 'wy') {
-    return await wyPlaylistDetail(id, page, '');
+    return await wyPlaylistDetail(listId, page, '');
   }
   if (source === 'qs') {
-    return await qsPlaylistDetail(id, page);
+    return await qsPlaylistDetail(listId, page);
   }
   throw new Error(`暂不支持该平台的歌单：${source}`);
 }
@@ -515,13 +578,23 @@ const MAX_DETAIL_PAGES: number = 40;
  */
 export async function getPlaylistDetailAll(source: string, id: string,
   onProgress?: (progress: PlaylistDetailProgress) => void): Promise<LxListDetail> {
+  const listId: string = bareListIdOf(source, id);
   const merged: LxMusicInfo[] = [];
+  /**
+   * **之前页**里已经出现过的歌曲 id（只用于判断「这一页有没有新内容」）。
+   *
+   * 为什么不是「收进来的所有 id」：一张歌单里同一首歌出现两次是**合法**的，
+   * 而按 id 全量去重会把第二次出现的那条吃掉 —— 群反馈 2026-11-20 15:19
+   * （CharlotteZero「歌单导入永远少一首歌」）就是这种：那张歌单里有一条重复曲目，
+   * 于是每次导入都比线上少一首。现在**同一页内的重复条目原样保留**，
+   * 重复要不要清理由歌单菜单里的「检查重复歌曲」决定，导入不替用户做决定。
+   */
   const seen: Set<string> = new Set<string>();
   let info: LxListInfo = emptyListInfo('');
   let total: number = 0;
   let page: number = 1;
   while (page <= MAX_DETAIL_PAGES) {
-    const detail: LxListDetail = await getPlaylistDetail(source, id, page);
+    const detail: LxListDetail = await getPlaylistDetail(source, listId, page);
     if (detail.info.name.length > 0 && info.name.length === 0) {
       info = detail.info;
     } else if (info.name.length > 0 && info.img.length === 0 && detail.info.img.length > 0) {
@@ -531,15 +604,26 @@ export async function getPlaylistDetailAll(source: string, id: string,
     if (detail.total > total) {
       total = detail.total;
     }
+    /**
+     * added = 这一页带来了几首**前几页没有**的歌（终止条件用）。
+     * 同一页内重复出现的条目仍然收进 merged（`added` 只算一次，避免把
+     * 「整页都是重复」误判成「有新内容」而无限翻页）。
+     */
     let added: number = 0;
+    const pageKeys: string[] = [];
     for (const song of detail.list) {
       const key: string = musicIdOf(song);
       if (seen.has(key)) {
         continue;
       }
-      seen.add(key);
+      if (!pageKeys.includes(key)) {
+        pageKeys.push(key);
+        added++;
+      }
       merged.push(song);
-      added++;
+    }
+    for (const key of pageKeys) {
+      seen.add(key);
     }
     if (onProgress !== undefined) {
       onProgress({ page: page, loaded: merged.length, total: total });
@@ -547,7 +631,12 @@ export async function getPlaylistDetailAll(source: string, id: string,
     if (added === 0 || detail.list.length === 0) {
       break;
     }
-    if (total > 0 && merged.length >= total) {
+    /**
+     * 用 `seen.size`（**去重后**的条数）跟 total 比，不能用 `merged.length`：
+     * merged 现在保留了重复条目，拿它比会在还有下一页时就提前收工 ——
+     * 那正是「少歌」本身。total 各平台都是「歌单有几首（去重口径）」。
+     */
+    if (total > 0 && seen.size >= total) {
       break;
     }
     page++;
@@ -2223,10 +2312,11 @@ const WY_SONG_BATCH: number = 100;
  * 响应里有 playlist.tracks 与顶层 privileges，正好配成一份带音质的歌曲列表。
  *
  * ⚠️ 这里必须按 `trackIds` 取歌，不能只信 `tracks`：网易对「非官方歌单」会把
- * `tracks` 砍成开头若干首（带 `Cookie: os=pc` 之后实测才是全量，见 wyHeaders；
- * 万一 cookie 那条路又被封，缺的那批就在这里按 id 补回来）。完整曲目 id 一直在
- * 同响应的 `playlist.trackIds` 里 —— 原实现只拿它算了 `total`，于是出现
- * 「共 27 首」却只有 10 行、导入只落 10 首这种事。
+ * `tracks` 砍成开头若干首（**2026-11-23 复核：带 `Cookie: os=pc` 也仍然是砍的** ——
+ * 实测 30 首的用户歌单 `tracks` 只回 10 首、`trackIds` 是完整的 30 条；只有官方榜单
+ * 才给全量。所以「带 cookie 就是全量」这句话不成立，补齐这一步才是主力）。
+ * 完整曲目 id 一直在同响应的 `playlist.trackIds` 里 —— 原实现只拿它算了 `total`，
+ * 于是出现「共 27 首」却只有 10 行、导入只落 10 首这种事。
  */
 async function wyPlaylistDetail(id: string, page: number, name: string,
   limit: number = 0): Promise<LxListDetail> {
@@ -2236,8 +2326,10 @@ async function wyPlaylistDetail(id: string, page: number, name: string,
   const url: string =
     `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=${size}&s=8`;
   const body: Record<string, Object> = await fetchRecord(url, { headers: wyHeaders() }, '网易歌单详情');
-  if (asNumber(body['code']) !== 200) {
-    throw new Error('网易歌单详情接口返回异常');
+  const code: number = asNumber(body['code']);
+  if (code !== 200) {
+    throw wyDetailError(code, asString(body['message']).length > 0
+      ? asString(body['message']) : asString(body['msg']), id);
   }
   const playlist: Record<string, Object> = asRecord(body['playlist']);
   const songs: LxMusicInfo[] = wyFilterSongs(asObjectArray(playlist['tracks']),
@@ -2247,7 +2339,8 @@ async function wyPlaylistDetail(id: string, page: number, name: string,
    * 限量取（首页那几行）时**不要按 trackIds 补齐**：榜单的 trackIds 是完整的几百首，
    * 补齐会把整张榜用 `/api/song/detail` 一批批拉回来 —— 越限越慢。
    */
-  const missing: string[] = limit > 0 ? [] : wyMissingTrackIds(trackIds, songs);
+  const missing: string[] = limit > 0 ? []
+    : wyMissingTrackIds(wyTrackIdSequenceOf(playlist['trackIds']), songs);
   if (missing.length > 0) {
     const rest: LxMusicInfo[] = await wySongsByIds(missing);
     for (const song of rest) {
@@ -2269,6 +2362,35 @@ async function wyPlaylistDetail(id: string, page: number, name: string,
   return { list: songs, total: total, info: info };
 }
 
+/**
+ * 网易歌单详情失败时的可读错误
+ *
+ * 群反馈要的是「具体为什么失败」，而不是笼统一句「接口返回异常」
+ * （2026-11-21 02:11 Rote Sonne 的截图就是这句话，用户完全无从下手）。
+ * 实测三类：
+ *   - `code=400`「请求参数错误」：id 不是裸数字（带了 `wy__` 前缀或整条分享链接），
+ *     或 id 根本不存在 —— 2026-11-23 用 `id=wy__2102211118` 实测就是这条；
+ *   - `code=404`：歌单被删除 / 设为私密；
+ *   - `code=301 / 403 / 250`：需要登录，或登录态过期。
+ * 文案直接给「怎么办」，因为它会原样出现在 Toast 里（`更新失败：${message}`）。
+ */
+function wyDetailError(code: number, message: string, id: string): Error {
+  const tail: string = message.length > 0 ? `，${message}` : '';
+  if (code === 400) {
+    return new Error(`网易歌单详情接口返回异常（code=400${tail}）：`
+      + `歌单 id「${id}」不被接口接受，可能不是纯数字 id 或歌单已不存在`);
+  }
+  if (code === 404) {
+    return new Error(`网易歌单详情接口返回异常（code=404${tail}）：`
+      + `歌单「${id}」不存在、已删除或已设为私密`);
+  }
+  if (code === 301 || code === 403 || code === 250) {
+    return new Error(`网易歌单详情接口返回异常（code=${code}${tail}）：`
+      + '需要登录或登录已过期，请到「设置 - 登录音乐」重新登录网易云后再试');
+  }
+  return new Error(`网易歌单详情接口返回异常（code=${code}${tail}）`);
+}
+
 /** `trackIds` 是一串 `{id}`，按原顺序取出字符串 id（丢空、去重） */
 function wyTrackIdsOf(raw: Object | undefined): string[] {
   const out: string[] = [];
@@ -2284,24 +2406,54 @@ function wyTrackIdsOf(raw: Object | undefined): string[] {
 }
 
 /**
+ * `trackIds` 的**完整序列**（保留重复条目）
+ *
+ * 与 `wyTrackIdsOf` 的区别只有一个：这里的长度/重复次数与歌单里实际列出的条目一致。
+ * 补齐缺歌时要用它 —— 同一首歌在歌单里出现两次，`trackIds` 里就是两条，
+ * 按去重后的表去补只会补回一条，导入结果就比线上少一首（群反馈 11-20 15:19）。
+ * 算「共 N 首」时仍用去重后的 `wyTrackIdsOf`（与 `playlist.trackCount` 同口径）。
+ */
+function wyTrackIdSequenceOf(raw: Object | undefined): string[] {
+  const out: string[] = [];
+  for (const item of asObjectArray(raw)) {
+    const id: string = asString(asRecord(item)['id']);
+    if (id.length > 0) {
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/**
  * `trackIds` 里还没出现在 `songs` 里的那些 id —— 接口截断时就是要补的这批。
  *
- * 补回来的歌是接在 `songs` 后面的，顺序正好对：`tracks` 就是 `trackIds` 的前缀
- * （网易按歌单顺序回前若干首），接上剩下的就是完整歌单顺序。
+ * 按**多重集**比：`songs` 里已经有一份的 id 只抵扣一次，歌单里同一首歌出现两次时
+ * 第二次仍然算「缺」，会被补回来（见 `wyTrackIdSequenceOf` 的说明）。
+ * 旧实现在 `trackIds.length <= songs.length` 时直接返回空 —— 那个判断是错的：
+ * `tracks` 里可能混进了不在 `trackIds` 里的条目，长度相等不代表没有缺口。
  */
 function wyMissingTrackIds(trackIds: string[], songs: LxMusicInfo[]): string[] {
-  if (trackIds.length <= songs.length) {
+  if (trackIds.length === 0) {
     return [];
   }
-  const have: Set<string> = new Set<string>();
+  const inSongs: Map<string, number> = new Map<string, number>();
   for (const song of songs) {
-    have.add(song.songmid);
+    const id: string = song.songmid;
+    const count: number | undefined = inSongs.get(id);
+    inSongs.set(id, count === undefined ? 1 : count + 1);
   }
+  const used: Map<string, number> = new Map<string, number>();
   const missing: string[] = [];
   for (const id of trackIds) {
-    if (!have.has(id)) {
-      missing.push(id);
+    const availableCount: number | undefined = inSongs.get(id);
+    const available: number = availableCount === undefined ? 0 : availableCount;
+    const takenCount: number | undefined = used.get(id);
+    const taken: number = takenCount === undefined ? 0 : takenCount;
+    if (taken < available) {
+      used.set(id, taken + 1);
+      continue;
     }
+    missing.push(id);
   }
   return missing;
 }
