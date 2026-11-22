@@ -21,6 +21,59 @@ const TAG: string = 'BookLoginWeb';
 export const DESKTOP_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+/** 自动点「登录」的重试间隔（毫秒）：首屏 onPageEnd 时页面 JS 常常还没绑好点击事件，等一会儿再试 */
+const AUTO_LOGIN_RETRY_MS: number = 800;
+/** 最多重试几次：6 次 × 800ms ≈ 5 秒，够慢网跑完首页脚本，又不至于一直点下去 */
+const AUTO_LOGIN_MAX_TRIES: number = 6;
+
+/**
+ * 自动点开「登录」入口的注入脚本
+ *
+ * QQ 音乐 PC 首页右上角那个「登录」是 `<a class="top_login__link">登录</a>`，**没有 href**，
+ * 点击由页面 JS 接管、去开登录弹窗（走 `window.open` 或内嵌 iframe）。ArkWeb 默认把
+ * `window.open` 拦掉，于是表现为「点了登录完全没反应」。
+ *
+ * 脚本思路（通用，不写死 QQ 音乐的选择器）：
+ * 1. 先找 `a.top_login__link`（QQ 音乐），命中就点；
+ * 2. 否则遍历 `a,button,div,span`，取第一个 `textContent.trim() === '登录'` 且**可见**的元素来点
+ *    （网易云、以及站点改版后都能命中）；
+ * 3. 返回一个字符串给 `runJavaScript` 的 Promise：`clicked:xxx` / `not_found` / `error:xxx`，
+ *    调用方据此决定「成功就停」还是「过 800ms 再试」。
+ *
+ * 整段包在 IIFE 里，避免把函数名丢进页面全局作用域。
+ */
+const AUTO_LOGIN_SCRIPT: string = `(function () {
+  try {
+    function visible(el) {
+      if (!el) { return false; }
+      var rect = el.getBoundingClientRect();
+      if (rect.width < 8 || rect.height < 8) { return false; }
+      var style = window.getComputedStyle(el);
+      if (!style) { return true; }
+      if (style.display === 'none' || style.visibility === 'hidden') { return false; }
+      if (parseFloat(style.opacity || '1') < 0.1) { return false; }
+      return true;
+    }
+    var fast = document.querySelector('a.top_login__link');
+    if (fast && typeof fast.click === 'function' && visible(fast)) {
+      fast.click();
+      return 'clicked:top_login__link';
+    }
+    var all = document.querySelectorAll('a,button,div,span');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if ((el.textContent || '').trim() !== '登录') { continue; }
+      if (!visible(el)) { continue; }
+      if (typeof el.click !== 'function') { continue; }
+      el.click();
+      return 'clicked:' + el.tagName.toLowerCase();
+    }
+    return 'not_found';
+  } catch (e) {
+    return 'error:' + (e && e.message ? e.message : 'unknown');
+  }
+})()`;
+
 /**
  * 书源「网页登录」用的应用内浏览器
  *
@@ -49,6 +102,15 @@ export struct BookLoginWeb {
    */
   userAgent: string = '';
   /**
+   * 是否自动点开页面上的「登录」入口（默认 false）
+   *
+   * 只给音乐站点登录开：QQ 音乐 PC 首页的「登录」没有 href，点击靠页面 JS 走 `window.open`，
+   * ArkWeb 默认拦掉，用户点了没反应。开启后页面加载完会注入脚本替用户点一下，
+   * 并且打开 `multiWindowAccess` + `onWindowNew`，把弹窗地址装回当前 WebView。
+   * 书源登录一律不传，保持「用户自己点」的原样行为。
+   */
+  autoLogin: boolean = false;
+  /**
    * 状态栏高度（vp）
    *
    * 这一层是 `bindContentCover` 的整屏覆盖层，铺满整个窗口、**不经过标题栏**，
@@ -62,12 +124,40 @@ export struct BookLoginWeb {
   };
 
   private controller: webview.WebviewController = new webview.WebviewController();
+  /**
+   * 弹窗的「接住点」
+   *
+   * ArkWeb 的 `onWindowNew` 规定：不给 `setWebController` 一个 controller，渲染进程会一直等，
+   * 主页面看着像卡住。我们的做法是把弹窗地址直接装回当前 WebView（Cookie 才落在同一个罐里），
+   * 所以这里给一个**不挂到界面上**的 controller，让 ArkWeb 认为新窗口已经被处理过，
+   * 真正要显示的 URL 由我们自己 loadUrl 到当前 WebView。
+   */
+  private popupSink: webview.WebviewController = new webview.WebviewController();
+  /** 自动点登录的重试定时器（-1 = 没有在等） */
+  private autoLoginTimer: number = -1;
+  /** 每次 onPageEnd 自增的序号：翻页后把上一页还没跑完的重试作废，避免在新的页面上乱点 */
+  private autoLoginSeq: number = 0;
+  /** 当前这一轮已经试了几次 */
+  private autoLoginTries: number = 0;
+  /**
+   * 整个 WebView 生命周期内是否已经点中过
+   *
+   * 点中之后就不再自动点：登录弹窗自己也有「登录」按钮（账号密码提交），
+   * 在同一个 WebView 里继续注入会拿空账号去提交，比不点更糟。
+   */
+  private autoLoginDone: boolean = false;
   @State progress: number = 0;
   @State currentUrl: string = '';
 
   aboutToAppear(): void {
     // 先把要打开的地址显示出来，页面加载完再由 onPageEnd 换成最终地址
     this.currentUrl = this.loginUrl;
+  }
+
+  aboutToDisappear(): void {
+    // 覆盖层关掉时把还没跑完的重试掐掉，别在已经销毁的 WebView 上注入脚本
+    this.autoLoginSeq++;
+    this.clearAutoLoginTimer();
   }
 
   /**
@@ -87,6 +177,154 @@ export struct BookLoginWeb {
       this.controller.setCustomUserAgent(this.userAgent);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'setCustomUserAgent failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /**
+   * 从 URL 里抠出主机名（小写）
+   *
+   * 不用 `new URL()`：ArkTS 里它的异常路径和 d.ts 版本差异不值得为这点事冒险，
+   * 这里只需要「协议后面到第一个 / 或 : 之前」这一段。
+   */
+  private hostOf(url: string): string {
+    if (url === undefined || url === null) {
+      return '';
+    }
+    const scheme: number = url.indexOf('://');
+    if (scheme < 0) {
+      return '';
+    }
+    let rest: string = url.substring(scheme + 3);
+    const slash: number = rest.indexOf('/');
+    if (slash >= 0) {
+      rest = rest.substring(0, slash);
+    }
+    const colon: number = rest.indexOf(':');
+    if (colon >= 0) {
+      rest = rest.substring(0, colon);
+    }
+    return rest.toLowerCase();
+  }
+
+  /**
+   * 当前页是不是「要点开登录」的那个站点
+   *
+   * 只认 y.qq.com / music.163.com（含子域）。别的一律不注入，免得到登录后跳去的
+   * 其它域上乱点；书源登录更不会走到这里（autoLogin 为 false）。
+   */
+  private isLoginSite(url: string): boolean {
+    const host: string = this.hostOf(url);
+    if (host.length === 0) {
+      return false;
+    }
+    return host === 'y.qq.com' || host.endsWith('.y.qq.com')
+      || host === 'music.163.com' || host.endsWith('.music.163.com');
+  }
+
+  /** 每次页面加载完成都开一轮新的自动点登录（旧的一轮用序号作废） */
+  private startAutoLogin(): void {
+    if (!this.autoLogin || this.autoLoginDone) {
+      return;
+    }
+    this.autoLoginSeq++;
+    this.autoLoginTries = 0;
+    this.attemptAutoLogin(this.autoLoginSeq);
+  }
+
+  /**
+   * 试一次：注入脚本 -> 看返回值决定停还是等一会儿再来
+   *
+   * `runJavaScript` 是异步的（Promise<string>），页面若返回空值就是 null/undefined，
+   * 这里统一当「没点中」处理，继续重试。
+   */
+  private attemptAutoLogin(seq: number): void {
+    if (seq !== this.autoLoginSeq || !this.autoLogin || this.autoLoginDone) {
+      return;
+    }
+    let url: string = this.currentUrl;
+    try {
+      url = this.controller.getUrl();
+      this.currentUrl = url;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'autoLogin getUrl failed, fallback to currentUrl');
+    }
+    if (!this.isLoginSite(url)) {
+      hilog.info(DOMAIN, TAG, 'autoLogin skipped: host not a login site');
+      return;
+    }
+    if (this.autoLoginTries >= AUTO_LOGIN_MAX_TRIES) {
+      hilog.info(DOMAIN, TAG, 'autoLogin gave up after %{public}d tries', this.autoLoginTries);
+      return;
+    }
+    this.autoLoginTries++;
+    this.controller.runJavaScript(AUTO_LOGIN_SCRIPT)
+      .then((result: string) => {
+        const text: string = result === undefined || result === null ? '' : result;
+        hilog.info(DOMAIN, TAG, 'autoLogin try %{public}d -> %{public}s', this.autoLoginTries, text);
+        if (text.indexOf('clicked') === 0) {
+          // 点中了就停：登录弹窗 / 新窗口由 onWindowNew 或页面自己的 iframe 接住
+          this.autoLoginDone = true;
+          this.clearAutoLoginTimer();
+          return;
+        }
+        this.scheduleAutoLoginRetry(seq);
+      })
+      .catch((e: Error) => {
+        hilog.warn(DOMAIN, TAG, 'autoLogin runJavaScript failed: %{public}s', JSON.stringify(e));
+        this.scheduleAutoLoginRetry(seq);
+      });
+  }
+
+  /** 等 AUTO_LOGIN_RETRY_MS 再试一次（页面 JS 可能还没就绪） */
+  private scheduleAutoLoginRetry(seq: number): void {
+    if (seq !== this.autoLoginSeq || this.autoLoginTries >= AUTO_LOGIN_MAX_TRIES) {
+      return;
+    }
+    this.clearAutoLoginTimer();
+    this.autoLoginTimer = setTimeout(() => {
+      this.autoLoginTimer = -1;
+      this.attemptAutoLogin(seq);
+    }, AUTO_LOGIN_RETRY_MS);
+  }
+
+  private clearAutoLoginTimer(): void {
+    if (this.autoLoginTimer >= 0) {
+      clearTimeout(this.autoLoginTimer);
+      this.autoLoginTimer = -1;
+    }
+  }
+
+  /**
+   * 页面用 `window.open` 开登录弹窗时，把目标地址装回当前 WebView
+   *
+   * 不新开界面：登录要在同一个 WebView 里完成，Cookie 才会落在同一个罐里，
+   * 点「完成」时 `harvest()` 才抓得到 `qm_keyst` / `MUSIC_U`。
+   *
+   * 两件事都要 try/catch：
+   * - `setWebController` 是 ArkWeb 的硬性要求（不给的话渲染进程会一直等，页面像卡死）；
+   * - `targetUrl` 可能是空串（页面先 open('about:blank') 再改 location），此时只记日志、不导航。
+   */
+  private handleWindowNew(event: OnWindowNewEvent): void {
+    try {
+      const target: string = event === undefined || event === null ? '' : event.targetUrl;
+      hilog.info(DOMAIN, TAG, 'onWindowNew: %{public}s', target);
+      try {
+        event.handler.setWebController(this.popupSink);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'setWebController failed: %{public}s', JSON.stringify(e));
+      }
+      if (target === undefined || target === null || target.length === 0) {
+        hilog.warn(DOMAIN, TAG, 'onWindowNew with empty targetUrl, nothing to load');
+        return;
+      }
+      if (!/^https?:/i.test(target)) {
+        hilog.warn(DOMAIN, TAG, 'onWindowNew target is not http(s), ignored');
+        return;
+      }
+      this.controller.loadUrl(target);
+      this.currentUrl = target;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'onWindowNew failed: %{public}s', JSON.stringify(e));
     }
   }
 
@@ -214,6 +452,17 @@ export struct BookLoginWeb {
         .fileAccess(false)
         .zoomAccess(true)
         .mixedMode(MixedMode.All)
+        // 多窗口权限：`onWindowNew` 的前置开关，默认 false 时 `window.open` 会被直接丢掉、
+        // 回调根本不触发（这正是「点登录没反应」的另一半原因）。
+        // 只在 autoLogin 时打开，书源登录保持默认，行为与改动前完全一致。
+        .multiWindowAccess(this.autoLogin)
+        .onWindowNew((event: OnWindowNewEvent) => {
+          if (!this.autoLogin) {
+            // 理论上 autoLogin=false 时 multiWindowAccess 也是 false、不会走到这里；多一道闸更稳
+            return;
+          }
+          this.handleWindowNew(event);
+        })
         .onControllerAttached(() => {
           this.applyUserAgent();
         })
@@ -225,6 +474,12 @@ export struct BookLoginWeb {
             this.currentUrl = this.controller.getUrl();
           } catch (e) {
             hilog.warn(DOMAIN, TAG, 'getUrl failed');
+          }
+          // 登录站点的首页加载完就把「登录」替用户点开（书源登录 autoLogin=false，直接返回）
+          try {
+            this.startAutoLogin();
+          } catch (e) {
+            hilog.warn(DOMAIN, TAG, 'startAutoLogin failed: %{public}s', JSON.stringify(e));
           }
         })
         .width('100%')

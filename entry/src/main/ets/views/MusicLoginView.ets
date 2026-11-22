@@ -289,8 +289,11 @@ export struct MusicLoginView {
       title: this.loginSource === 'tx' ? 'QQ 音乐' : '网易云音乐',
       loginUrl: this.loginSource === 'tx' ? TX_LOGIN_URL : WY_LOGIN_URL,
       siteUrl: this.loginSource === 'tx' ? TX_SITE_URL : WY_SITE_URL,
-      // 桌面 UA：不传的话 WebView 用默认移动 UA，站点会把请求判成手机端、跳到没有登录入口的手机版页
+      // 桌面 UA：不传的话 WebView 用默认移动 UA，站点会把请求判成手机端、跳到没有登录入口的手机版页面
       userAgent: DESKTOP_UA,
+      // 自动点开「登录」：y.qq.com 顶部那个「登录」没有 href，点击靠页面 JS 开弹窗，
+      // ArkWeb 默认把 window.open 拦掉 → 点了没反应。开启后由组件注入脚本替用户点，并把弹窗装回本 WebView
+      autoLogin: true,
       safeTop: this.safeTop,
       safeBottom: this.safeBottom,
       onClose: (cookie: string) => {
