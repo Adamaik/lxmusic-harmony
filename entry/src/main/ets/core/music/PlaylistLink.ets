@@ -1,4 +1,7 @@
-import { LxResponse, lxRequest } from '../source/LxHttp';
+import { LxRequestOptions, LxResponse, lxRequest } from '../source/LxHttp';
+// 跟随短链要带**桌面浏览器**的 UA：移动 UA 会被 QQ 音乐的分享链跳到下载页（群里小冰的原话，
+// 2026-11-23 本机复核见 SHORT_LINK_HEADERS 的说明）。UA 常量复用登录页那一份，不再维护第二份。
+import { TX_UA } from './MusicAccount';
 import { platformName } from './MusicList';
 
 /**
@@ -90,6 +93,44 @@ const MAX_REDIRECT_HOP: number = 4;
 
 /** 跟随短链时单个请求的超时（短链服务器不该慢，慢了就当解析不出来） */
 const REDIRECT_TIMEOUT: number = 8000;
+
+/**
+ * 跟随短链时的一组请求头
+ *
+ * **UA 必须是桌面浏览器**：QQ 音乐客户端分享出来的
+ * `https://c6.y.qq.com/base/fcgi-bin/u?__=xxxxxxxx` 会按 UA 分流 —— 移动 UA 有机会被
+ * 跳到「下载客户端」页，桌面 UA 才是歌单页（群里小冰给的现象）。
+ *
+ * 2026-11-23 本机复核（Chrome 120 桌面 UA，带 `--max-redirs 0` 直连）：
+ *   302 → `https://i2.y.qq.com/n3/other/pages/details/playlist.html?ADTAG=cbshare
+ *          &appshare=ohqm&...&id=2480744845&...`
+ * 也就是说**歌单 id 直接躺在 Location 的 `id=` 里**，根本不必等落地页渲染；
+ * 而落地页正文（50KB 的 HTML）里也有 `/playlist/2480744845` 两处 —— 两条路都能抠到 id，
+ * 所以下面「读 Location」与「从正文抠」两条兜底都保留（后者覆盖系统自动跟完 302 的情况）。
+ *
+ * 另外要 Accept: text/html：这些是网页跳转接口，不是 JSON API，声明要 HTML 更接近真实浏览器。
+ */
+const SHORT_LINK_HEADERS: Record<string, string> = {
+  'User-Agent': TX_UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9',
+};
+
+/** 一次短链跟随的收获 */
+interface ShortLinkOutcome {
+  /** 最后一跳的地址（可能仍是短链本身） */
+  url: string;
+  /** 沿途任何一跳认出来的歌单；认不出是 null */
+  link: PlaylistLink | null;
+  /** 是否遇到过网络错误（只用来换一句更好懂的提示，不参与判断） */
+  networkFailed: boolean;
+}
+
+/** 一次响应解释出来的「下一步」：要么有下一跳地址，要么直接认出歌单 */
+interface HopResult {
+  next: string;
+  link: PlaylistLink | null;
+}
 
 // ------------------------------------------------------------------ 取值工具
 
@@ -228,6 +269,58 @@ export function linkOf(source: string, id: string): PlaylistLink {
   return makeLink(source, id, '');
 }
 
+/**
+ * 由「平台 + 歌单 id」拼一条**规范长链接**（不联网、不猜 id）
+ *
+ * 用途：从在线歌单详情页直接导入时（ImportPlaylistSheet 的 presetSource/presetId），
+ * 用户根本没粘贴过链接 —— 但需求要求「通过链接导入的歌单」都记下当时的链接，
+ * 「我的 - 歌单」长按才有「更新导入歌单」。这里按平台拼一条规范地址存进侧表。
+ *
+ * **拼出来的链接必须能被 parseShareText 反解回同一个 id**：更新时会先拿它重新解析
+ * 平台与 id，解析不出来才退回歌单里存的 sourceListId。所以每种形态都对照过
+ * 上面的 ID_REGEXPS 与 KG_GCID_PATH（酷狗的用户歌单 id 是 `gcid_xxx`，走 /songlist/）。
+ */
+export function listUrlOf(source: string, id: string): string {
+  if (id.length === 0) {
+    return '';
+  }
+  if (source === 'tx') {
+    return `https://y.qq.com/n/ryqq/playlist/${id}`;
+  }
+  if (source === 'wy') {
+    return `https://music.163.com/#/playlist?id=${id}`;
+  }
+  if (source === 'kw') {
+    return `https://www.kuwo.cn/playlist_detail/${id}`;
+  }
+  if (source === 'kg') {
+    // 酷狗的用户歌单（gcid_xxx）与精选集（纯数字）是两种链接形态
+    return id.startsWith('gcid_')
+      ? `https://m.kugou.com/songlist/${id}/`
+      : `https://www.kugou.com/yy/special/single/${id}.html`;
+  }
+  if (source === 'mg') {
+    return `https://music.migu.cn/v3/music/playlist/${id}`;
+  }
+  return '';
+}
+
+/**
+ * 一条解析结果该把**哪条链接**存进歌单的导入来源（「更新导入歌单」以后按它回源）
+ *
+ * 平时就存解析时用的那条（用户粘贴的链接 / 短链跟出来的落地页地址），保留「当时的导入链接」
+ * 这个语义。但有一种情况存了也没用：系统自动跟随 302 时我们读不到最终地址，此时
+ * `link.url` 还是短链本身，`parseShareText` 反解不出 id —— 那就换成本平台规范长链接
+ * （listUrlOf），保证侧表里那条链接自己就能反解出平台与 id。
+ */
+export function linkUrlOf(link: PlaylistLink): string {
+  const parsed: PlaylistLink | null = parseShareText(link.url);
+  if (parsed !== null && parsed.listId === link.listId) {
+    return link.url;
+  }
+  return listUrlOf(link.source, link.id);
+}
+
 // ------------------------------------------------------------------ 深链
 
 function parseQuery(query: string): Record<string, string> {
@@ -312,10 +405,29 @@ export function parseShareText(text: string): PlaylistLink | null {
 
 // ------------------------------------------------------------------ 短链
 
-function httpGet(url: string, maxRedirects: number): Promise<LxResponse> {
+/**
+ * 发一次 GET（短链跟随专用）
+ *
+ * @param maxRedirects 0 = 关掉自动重定向、由调用方自己从 Location 里读下一跳；
+ *   不传 = 交给系统自动跟（跟完拿到的是落地页正文）。
+ *
+ * **两种都要能走**：`maxRedirects` 是 HarmonyOS API 23 才有的字段（见官方
+ * HttpRequestOptions 文档：默认 30、取值 [0, 2147483647]、0 即关闭重定向），
+ * 低版本设备上该字段会被忽略、系统自己把 302 跟掉 —— 那时响应里没有 Location，
+ * 只能从落地页正文里抠 id。所以调用方对这两种情况都有兜底，不把成败押在系统版本上。
+ */
+function httpGet(url: string, maxRedirects?: number): Promise<LxResponse> {
   return new Promise<LxResponse>((resolve: (resp: LxResponse) => void,
     reject: (err: Error) => void) => {
-    lxRequest(url, { maxRedirects: maxRedirects, rawText: true, timeout: REDIRECT_TIMEOUT },
+    const options: LxRequestOptions = {
+      rawText: true,
+      timeout: REDIRECT_TIMEOUT,
+      headers: SHORT_LINK_HEADERS,
+    };
+    if (maxRedirects !== undefined) {
+      options.maxRedirects = maxRedirects;
+    }
+    lxRequest(url, options,
       (resp: LxResponse) => {
         resolve(resp);
       },
@@ -323,6 +435,10 @@ function httpGet(url: string, maxRedirects: number): Promise<LxResponse> {
         reject(new Error(message));
       });
   });
+}
+
+function isRedirect(statusCode: number): boolean {
+  return statusCode >= 300 && statusCode < 400;
 }
 
 /** 响应头里的 Location（大小写不定，逐个比） */
@@ -375,37 +491,155 @@ function htmlJumpTarget(resp: LxResponse): string {
 }
 
 /**
- * 跟随短链拿到最终地址（洛雪各平台 handleParseId 的那一步）
+ * 从落地页正文里找「页面自己声明的正规地址」（canonical / og:url / JSON 里的 url）
  *
- * 这里不用系统的自动重定向：跟完了读不到最终地址（响应里的 url 只是请求地址），
- * 所以关掉自动跳转（maxRedirects: 0），自己从 Location / HTML 里取下一跳。
+ * 用途：系统自动跟完 302 后，我们拿不到最终地址（响应里的 url 只是请求地址），
+ * 而落地页可能在正文里声明自己的规范地址 —— 从那里又能读出平台与 id。
+ * 只有前三步都抠不到 id 时才轮到它，所以宁可写得宽一点，也不能让它抢先误判。
+ */
+function canonicalUrlFromBody(body: string): string {
+  if (body.length === 0) {
+    return '';
+  }
+  const patterns: RegExp[] = [
+    /<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i,
+    /<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["']/i,
+    /"url"\s*:\s*"(https?:\\?\/\\?\/[^"]+)"/i,
+  ];
+  for (const pattern of patterns) {
+    const matched: RegExpMatchArray | null = body.match(pattern);
+    if (matched !== null && matched[1] !== undefined && matched[1].length > 0) {
+      // JSON 里的地址是 `https:\/\/y.qq.com\/...` 这种转义形态，还原成正常 URL
+      return matched[1].replace(/\\\//g, '/');
+    }
+  }
+  return '';
+}
+
+/**
+ * 从一次响应（200 的落地页）里认出歌单
+ *
+ * 顺序：正文里的歌单 id → 正文里声明的规范地址。平台优先按落地页域名认，
+ * 落地页域名认不出来时用调用方给的（比如短链本身已经认出了 tx）。
+ */
+function linkFromBody(resp: LxResponse, base: string, fallbackSource: string): PlaylistLink | null {
+  const body: string = typeof resp.body === 'string' ? resp.body as string : '';
+  if (body.length === 0) {
+    return null;
+  }
+  const source: string = platformOfUrl(base).length > 0 ? platformOfUrl(base) : fallbackSource;
+  const id: string = playlistIdFromHtml(body);
+  if (id.length > 0 && source.length > 0) {
+    return makeLink(source, id, base);
+  }
+  const declared: string = canonicalUrlFromBody(body);
+  return declared.length > 0 ? matchUrl(declared) : null;
+}
+
+/**
+ * 解释一次响应：要么给出「下一跳地址」，要么直接给出歌单
+ *
+ * 3xx 时**先看 Location 本身**：QQ 分享链的 Location 里就带 `&id=2480744845`，
+ * 认出来就直接收工，不必再请求落地页（少一次请求、也躲开落地页的 UA 分流）。
+ */
+function hopOf(resp: LxResponse, base: string, fallbackSource: string): HopResult {
+  if (isRedirect(resp.statusCode)) {
+    const location: string = locationOf(resp);
+    if (location.length === 0) {
+      return { next: '', link: null };
+    }
+    const next: string = absoluteUrl(base, location);
+    return { next: next, link: matchUrl(next) };
+  }
+  const jumped: string = htmlJumpTarget(resp);
+  if (jumped.length > 0) {
+    const next: string = absoluteUrl(base, jumped);
+    return { next: next, link: matchUrl(next) };
+  }
+  return { next: '', link: linkFromBody(resp, base, fallbackSource) };
+}
+
+/**
+ * 跟随短链，顺便把歌单认出来（洛雪各平台 handleParseId 的那一步）
+ *
+ * 为什么不用系统自动重定向：跟完读不到最终地址（LxResponse.url 只是请求地址），
+ * 也读不到中间每一跳的 Location —— 而 QQ 的 id 恰好就在第一跳的 Location 里。
+ * 所以默认关掉自动重定向自己跟；万一设备/系统不认 `maxRedirects: 0`
+ * （API 23 以下的字段会被忽略），再退回自动跟随、从落地页正文抠 id。
+ *
+ * @param fallbackSource 短链本身已经认出来的平台（落地页域名认不出时用它兜底）
+ */
+async function followShortLink(url: string, fallbackSource: string): Promise<ShortLinkOutcome> {
+  let current: string = url;
+  let networkFailed: boolean = false;
+  for (let hop = 0; hop < MAX_REDIRECT_HOP; hop++) {
+    // 每一跳的地址本身先认一次：Location 里带 id 的情况走这里
+    const here: PlaylistLink | null = matchUrl(current);
+    if (here !== null) {
+      return { url: current, link: here, networkFailed: networkFailed };
+    }
+    let resp: LxResponse | null = null;
+    try {
+      resp = await httpGet(current, 0);
+    } catch (e) {
+      /**
+       * 手动模式失败：可能是系统不认 maxRedirects（API 23 以下），也可能是短链服务
+       * 只接受自动跟随。换「让系统自己跟」再试一次，落地页正文里照样有 id。
+       */
+      networkFailed = true;
+      try {
+        resp = await httpGet(current);
+      } catch (retryFailure) {
+        return { url: current, link: null, networkFailed: true };
+      }
+    }
+    if (resp === null) {
+      return { url: current, link: null, networkFailed: true };
+    }
+    let step: HopResult = hopOf(resp, current, fallbackSource);
+    if (step.link === null && step.next.length === 0 && isRedirect(resp.statusCode)) {
+      // 3xx 但没给 Location：让系统自己跟一次，再看落地页（QQ 偶尔只回一个空 302）
+      try {
+        const auto: LxResponse = await httpGet(current);
+        step = hopOf(auto, current, fallbackSource);
+      } catch (e) {
+        networkFailed = true;
+      }
+    }
+    if (step.link !== null) {
+      return { url: step.next.length > 0 ? step.next : current, link: step.link, networkFailed: networkFailed };
+    }
+    if (step.next.length === 0) {
+      return { url: current, link: null, networkFailed: networkFailed };
+    }
+    current = step.next;
+  }
+  return { url: current, link: matchUrl(current), networkFailed: networkFailed };
+}
+
+/**
+ * 跟随短链拿到最终地址（老接口，保留给「只想看最终地址」的调用方）
+ *
+ * 解析歌单请直接用 resolveShareText：它走的是 followShortLink，能在**第一跳**就
+ * 从 Location 里认出 id，不必等落地页。
  */
 export async function followRedirect(url: string): Promise<string> {
-  let current: string = url;
-  for (let hop = 0; hop < MAX_REDIRECT_HOP; hop++) {
-    const resp: LxResponse = await httpGet(current, 0);
-    if (resp.statusCode >= 300 && resp.statusCode < 400) {
-      const location: string = locationOf(resp);
-      if (location.length === 0) {
-        return current;
-      }
-      current = absoluteUrl(current, location);
-      continue;
-    }
-    const jumped: string = htmlJumpTarget(resp);
-    if (jumped.length === 0) {
-      return current;
-    }
-    current = absoluteUrl(current, jumped);
-  }
-  return current;
+  const outcome: ShortLinkOutcome = await followShortLink(url, platformOfUrl(url));
+  return outcome.url;
 }
 
 /**
  * 解析分享文本（失败时抛出可直接展示给用户的说明）
  *
- * 本地正则解析不出来、但文本里有链接时，跟一次短链再试 —— 这是洛雪遇到
+ * 本地正则解析不出来、但文本里有链接时，跟随短链再试 —— 这是洛雪遇到
  * 163cn.tv / c.migu.cn / t1.kugou.com 这类分享短链时的做法。
+ *
+ * **QQ 音乐客户端分享出来的短链**（`c6.y.qq.com/base/fcgi-bin/u?__=xxx`）是群反馈里
+ * 最容易失败的一类：2026-11-19 用户截图「没能从QQ链接里找到歌单 id」。现在的口径是：
+ *   1. 带桌面 UA 请求短链，自己跟 302（`maxRedirects: 0`），**每一跳的 Location 都先认 id**；
+ *   2. 认不出就退到「系统自动跟随 + 从落地页正文抠 id / 规范地址」；
+ *   3. 仍然不行时给一句能照着做的提示（换成歌单页长链接，附长链例子），
+ *      不再甩一句「请确认是歌单的分享链接」让用户自己猜。
  */
 export async function resolveShareText(text: string): Promise<PlaylistLink> {
   const raw: string = text.trim();
@@ -425,51 +659,25 @@ export async function resolveShareText(text: string): Promise<PlaylistLink> {
   if (known.length > 0 && looksLikeSongLink(url)) {
     throw new Error(`这是${platformName(known)}的单曲链接，不是歌单链接。请在歌单页面右上角「分享」里复制链接`);
   }
-  let finalUrl: string = '';
-  try {
-    finalUrl = await followRedirect(url);
-  } catch (e) {
-    // 短链服务器不通不该盖住真正的原因，往下按「认不出平台」给提示
-    finalUrl = '';
+  const outcome: ShortLinkOutcome = await followShortLink(url, known);
+  if (outcome.link !== null) {
+    return outcome.link;
   }
-  if (finalUrl.length > 0 && finalUrl !== url) {
-    const retried: PlaylistLink | null = parseShareText(finalUrl);
-    if (retried !== null) {
-      return retried;
-    }
-  }
-  /**
-   * 落地页可能是 JS 渲染的（URL 里没有 id，id 在 HTML/脚本里）。
-   * QQ 音乐的 `c6.y.qq.com/base/fcgi-bin/u?__=xxx` 就是这种：3xx 跳到 /n/ryqq/playlist/...，
-   * 但有时又跳到一个壳页面。这里再从落地页正文里捞一次 id。
-   */
-  if (finalUrl.length > 0) {
-    try {
-      const resp: LxResponse = await httpGet(finalUrl, 0);
-      const body: string = typeof resp.body === 'string' ? resp.body as string : '';
-      const id: string = playlistIdFromHtml(body);
-      const landingSource: string = platformOfUrl(finalUrl);
-      if (id.length > 0 && landingSource.length > 0) {
-        return makeLink(landingSource, id, finalUrl);
-      }
-    } catch (e) {
-      // 捞不到就继续往下给通用提示
-    }
-  }
-  const source: string = platformOfUrl(finalUrl.length > 0 ? finalUrl : url);
+  const finalUrl: string = outcome.url.length > 0 ? outcome.url : url;
+  const finalSource: string = platformOfUrl(finalUrl);
+  const source: string = finalSource.length > 0 ? finalSource : known;
   if (source.length === 0) {
     throw new Error('暂不支持这个平台，目前支持网易云 / QQ / 酷狗 / 酷我 / 咪咕的歌单链接');
   }
-  if (looksLikeSongLink(finalUrl.length > 0 ? finalUrl : url)) {
+  if (looksLikeSongLink(finalUrl)) {
     throw new Error(`这是${platformName(source)}的单曲链接，不是歌单链接。请在歌单页右上角「分享」里复制链接`);
   }
-  // QQ 音乐客户端分享出来的是短链，服务器不给 id 时唯一可靠的办法是换长链（群友实测）
   if (source === 'tx' && isQqShortLink(url)) {
-    throw new Error('这是 QQ 音乐客户端分享出来的短链接，服务器没有给出歌单 id。'
-      + '请用电脑浏览器打开这个歌单、复制地址栏里的长链接；'
-      + '或者把歌单分享到微信，再从微信里复制链接（群友验证过这样拿到的是长链接）。');
+    throw new Error(qqShortLinkMessage(outcome.networkFailed));
   }
-  throw new Error(`没能从${platformName(source)}链接里找到歌单 id，请确认是歌单的分享链接`);
+  throw new Error(`没能从${platformName(source)}链接里找到歌单 id。`
+    + `短链可能已经失效，或者跳到了一个不含歌单 id 的页面；请换成歌单页的长链接再试`
+    + `${longListLinkExample(source)}`);
 }
 
 /** QQ 音乐客户端分享出来的短链（`c6.y.qq.com/base/fcgi-bin/u?__=` 这种） */
@@ -481,18 +689,60 @@ function isQqShortLink(url: string): boolean {
 }
 
 /**
+ * QQ 短链跟完还是没 id 时的提示
+ *
+ * @param networkFailed true = 请求本身就失败了（断网 / 被拒），提示先检查网络；
+ *                      false = 请求成功但落地页里没有 id（多半被跳到了下载页），
+ *                      提示换长链接。两种原因给用户的动作不一样，别混成一句。
+ */
+function qqShortLinkMessage(networkFailed: boolean): string {
+  if (networkFailed) {
+    return '这条 QQ 音乐分享短链没能打开（网络不通或被服务器拒绝）。请检查网络后重试；'
+      + '也可以让朋友在电脑上打开这个链接，把跳转后地址栏里的歌单页地址发给你'
+      + '（形如 https://y.qq.com/n/ryqq/playlist/7525892127）。';
+  }
+  return '这条 QQ 音乐客户端分享的短链跳到了一个不含歌单 id 的页面（常见是被跳到了「下载客户端」页）。'
+    + '请在电脑浏览器里打开这个链接，等它跳到歌单页后把地址栏里的地址复制过来'
+    + '（形如 https://y.qq.com/n/ryqq/playlist/7525892127）；'
+    + '或者把歌单转发到微信，再从微信里复制链接（群友验证过那样拿到的是长链接）。';
+}
+
+/** 给「换成什么长链接」一个能照着抄的例子 */
+function longListLinkExample(source: string): string {
+  switch (source) {
+    case 'tx':
+      return '（QQ 音乐的长链接形如 https://y.qq.com/n/ryqq/playlist/7525892127）';
+    case 'wy':
+      return '（网易云的长链接形如 https://music.163.com/#/playlist?id=2102211118）';
+    case 'kw':
+      return '（酷我的长链接形如 https://www.kuwo.cn/playlist_detail/123456789）';
+    case 'kg':
+      return '（酷狗的长链接形如 https://www.kugou.com/yy/special/single/123456789.html）';
+    case 'mg':
+      return '（咪咕的长链接形如 https://music.migu.cn/v3/music/playlist/123456789）';
+    default:
+      return '';
+  }
+}
+
+/**
  * 从落地页正文里找歌单 id
  *
- * 常见三种写法：`"disstid":123456`、`disstid=123456`、`/playlist/123456`。
+ * 常见写法：`"disstid":123456`、`disstid=123456`、`/playlist/123456`，
+ * 还有 URL 编码过的一份（`%22dissid%22%3A%22123456%22`，分享页把 JSON 塞进参数时会出现）。
  * 只收 5 位以上纯数字：歌单 id 都是这个量级，短数字多半是别的参数（页码、版本号）。
+ *
+ * `id=` / `pid=` / `specialid=` 放在最后：它最宽松，前面几条能认出来就不该轮到它。
  */
 function playlistIdFromHtml(body: string): string {
   if (body.length === 0) {
     return '';
   }
   const patterns: RegExp[] = [
-    /(?:disstid|dissid)["']?\s*[:=]\s*["']?(\d{5,})/i,
+    /(?:disstid|dissid|diss_id)["']?\s*[:=]\s*["']?(\d{5,})/i,
     /playlist\/(\d{5,})/i,
+    /%22(?:dissid|disstid)%22%3A%22(\d{5,})%22/i,
+    /[?&](?:id|pid|specialid)=(\d{5,})/i,
   ];
   for (const pattern of patterns) {
     const matched: RegExpMatchArray | null = body.match(pattern);

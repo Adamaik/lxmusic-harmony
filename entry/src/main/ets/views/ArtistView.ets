@@ -3,9 +3,10 @@ import { LxSearchPage } from '../core/music/MusicSearch';
 import { platformName } from '../core/music/MusicList';
 import { PlaySession, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { K_PLAY_QUALITY } from '../core/settings/PlaySettings';
-import { C_BG, C_DIVIDER, C_FILL_SOFT, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK,
-  F_SUB, platformColor, platformTint } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ON_ACCENT, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK,
+  F_SECTION, F_SUB, platformColor, platformTint } from '../ui/Theme';
 import { CoverArt, EmptyState } from '../ui/Widgets';
+import { I_PLAY, IconGlyph } from '../ui/Icons';
 import { SongListPane } from './SongListPane';
 import { MiniBarHost } from './MiniBarHost';
 import { HDS_BAR_HEIGHT } from '../ui/Hds';
@@ -15,18 +16,52 @@ import { CONTENT_MAX_WIDTH, K_WINDOW_WIDTH, LAYOUT_UNBOUNDED, contentColumnsFor 
 const ARTIST_PAGE_LIMIT: number = 50;
 
 /**
- * 歌手页 —— 「按歌手聚合」的结果页
+ * 歌手头像边长（vp）
+ *
+ * 2026-11-23 照华为音乐的歌手页重排时从 84 放大到 96：华为音乐那一页的头像是「这张脸的
+ * 主体」，比列表行的封面大一整档；84 在 12.5vp 的统计文字旁边还是个「列表头」的比例，
+ * 站不出歌手页的身份。96 = 名字（24vp，最多两行）加统计行的总高，圆头像正好压在左边。
+ */
+const ARTIST_AVATAR: number = 96;
+
+/**
+ * 歌手页 —— 「按歌手聚合」的结果页（2026-11-23 照华为音乐重做）
  *
  * 从一个歌手出发，把他在这个平台上的歌聚到一处：头部是歌手（头像 / 名字 / 单曲与专辑
  * 计数 / 简介），下面就是这个歌手的全部歌曲，滚到底自动接下一页。
  *
- * 对应派音的 `ArtistDetailPage`（`features/setting/src/main/ets/view/ArtistDetailPage.ets`）。
- * 那一版还带专辑列表与「收藏歌手」，这里只保留「按歌手聚合歌曲」这一件事：
- * 本项目里歌单/收藏是同步协议的一部分（见 docs/LX_SYNC.md），而「收藏歌手」在洛雪的
- * 同步结构里没有对应的类型，硬加会多出一种同步不出去的数据。
+ * ## 2026-11-23 这一版为什么改（用户原话「歌手页面也照着华为音乐优化一下，太丑了」）
  *
- * 歌还是 `SongItem`（由 `songFromSearch` 转），所以行上的收藏 / 下载 / 更多菜单、
- * 以及播放链路与搜索结果完全共用 —— 这一页不新增任何播放入口。
+ * 改之前的头部是「小头像 + 名字 + 一行统计 + 一颗灰底红字的胶囊」，问题有三处：
+ *   1. 头像 84 与名字 22 都是列表头的比例，撑不起一个页面；
+ *   2. 「播放全部」是 `C_FILL_SOFT` 的浅灰药丸 + 红字 —— 那套样式在本应用里是**标签**用的
+ *      （平台标签、筛选 chip 都是它），看着像说明文字，不像这个页面的主操作；
+ *   3. 排序「最热 / 最新」是两个各自带浅灰底的独立药丸，和「播放全部」并排时三个灰块
+ *      分量一样，主次全平。
+ *
+ * 现在照华为音乐那一页重排（这是**只改长相、不改逻辑**的一次改动）：
+ *   - 头像 96 正圆 + 名字 24 加粗，左对齐一条边（与下面每一行的左边缘对齐）；
+ *   - 名字下面一行：平台小标签 + 「单曲 N · 专辑 M」的统计行；
+ *   - 简介收到两行（原来三行，头部太高会把列表挤下去）；
+ *   - 「播放全部」改成**红底反白 + 播放图标**的主按钮（`C_RED` + `C_ON_ACCENT`，
+ *     与歌单详情那个「播放全部」同一个强调色，只是这里做成了真正的按钮）；
+ *   - 「最热 / 最新」改成**一个分段控件**（一个浅灰槽里两块，选中那块浮出卡片底色），
+ *     与主按钮拉开主次；不认排序的平台（酷我 / 咪咕）整块不出现，位置留给主按钮；
+ *   - 列表上方补一行「热门歌曲 / 最新歌曲 · 共 N 首」的小标题（华为音乐那一页也有）。
+ *
+ * ## 有意没做的两件事
+ *
+ * 1. **不在页内自绘返回键**：这一页是 `HdsNavDestination`，返回键与标题栏是 HDS 画的
+ *    （见 pages/Index.ets 的 PAGE_ARTIST 分支）。页内再画一颗就是两颗返回键 ——
+ *    用户看到的华为音乐截图里那颗返回键也正是系统标题栏里的那颗。
+ * 2. **不做「收藏歌手」**：洛雪的同步结构里没有「歌手」这个类型（见 docs/LX_SYNC.md），
+ *    硬加会多出一种同步不出去的数据。歌还是 `SongItem`（由 `songFromSearch` 转），
+ *    所以行上的收藏 / 下载 / 更多菜单、以及播放链路与其它列表完全共用。
+ *
+ * ## 数据与回调一个字都没动
+ *
+ * `getArtistDetail` / `getArtistSongs` 的取数、翻页、排序切换、打开播放器 / 播放列表 /
+ * toast 全按原样保留，这次只重排 UI（含那一行分页状态文案）。
  */
 @Component
 export struct ArtistView {
@@ -211,7 +246,13 @@ export struct ArtistView {
     this.getUIContext().getPromptAction().showToast({ message: message });
   }
 
-  /** 计数文案：单曲 N · 专辑 M（哪一项没有就不写哪一项） */
+  /**
+   * 统计文案：单曲 N · 专辑 M
+   *
+   * 哪一项没有就不写哪一项；**两项都没有时返回空串**（原来这里回退成平台名，而平台名
+   * 现在由名字下面那颗小标签单独画 —— 两处并排会出现「酷狗 酷狗」）。
+   * 空串时调用方整段不画，不会留一行空行。
+   */
   private countText(): string {
     const parts: string[] = [];
     if (this.detail.songNum > 0) {
@@ -220,23 +261,51 @@ export struct ArtistView {
     if (this.detail.albumSize > 0) {
       parts.push(`专辑 ${this.detail.albumSize}`);
     }
-    if (parts.length === 0) {
-      parts.push(platformName(this.source));
-    }
     return parts.join(' · ');
+  }
+
+  /**
+   * 列表上方那行小标题
+   *
+   * 照华为音乐：歌手页在歌曲列表前有一行「热门作品」这样的字。这里跟着排序态走
+   * （最近 / 最新），不认排序的平台（酷我 / 咪咕）只有一种顺序，就叫「歌曲」——
+   * 那时写「热门」是假的（接口没按热度排过）。
+   */
+  private sectionLabel(): string {
+    if (!this.sortable()) {
+      return '歌曲';
+    }
+    return this.order === 'hot' ? '热门歌曲' : '最新歌曲';
+  }
+
+  /**
+   * 选中那块分段控件的底色
+   *
+   * 单独抽一个方法而不是在 @Builder 里写三元：三元的两支类型不同（`Resource` 与
+   * `Color`），ArkTS 严格模式下对返回值的推断容易出联合类型告警；这里显式声明
+   * `ResourceColor`，一处收敛。
+   */
+  private chipFill(value: LxArtistOrder): ResourceColor {
+    return this.order === value ? C_CARD : Color.Transparent;
   }
 
   // ------------------------------------------------------------ 头部
 
+  /**
+   * 排序分段控件里的一格
+   *
+   * 选中态：卡片底色浮在浅灰槽上 + 主题红字；未选中：透明底 + 次要文字色。
+   * 这是华为音乐那种分段控件的画法，与「播放全部」那颗红按钮的主次关系一眼可分。
+   */
   @Builder
   sortChip(label: string, value: LxArtistOrder) {
     Text(label)
-      .fontSize(13)
+      .fontSize(12.5)
       .fontWeight(this.order === value ? FontWeight.Medium : FontWeight.Normal)
       .fontColor(this.order === value ? C_RED : C_TEXT_SUB)
-      .padding({ left: 13, right: 13, top: 6, bottom: 6 })
-      .backgroundColor(C_FILL_SOFT)
-      .borderRadius(15)
+      .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+      .backgroundColor(this.chipFill(value))
+      .borderRadius(13)
       .onClick(() => {
         void this.switchOrder(value);
       })
@@ -244,20 +313,75 @@ export struct ArtistView {
       .accessibilityLevel('yes')
   }
 
+  /** 排序：两块装在一个浅灰槽里（不认排序的平台由调用方整块不画） */
+  @Builder
+  sortSegment() {
+    Row() {
+      this.sortChip('最热', 'hot')
+      this.sortChip('最新', 'new')
+    }
+    .padding(2)
+    .backgroundColor(C_FILL_SOFT)
+    .borderRadius(16)
+    .alignItems(VerticalAlign.Center)
+  }
+
+  /**
+   * 主操作：「播放全部」
+   *
+   * 红底 + 反白字 + 播放图标 —— 这一页唯一的主按钮。改之前是浅灰底 + 红字，
+   * 与旁边的排序 chip 同一种长相，用户在群里说的「太丑」有一半来自这个：
+   * 主操作长得像标签，页面就没有落点。反白色走 `C_ON_ACCENT`（主题里那枚
+   * 「压在强调色上的文字色」，深浅模式都保证可读），不写死白色。
+   *
+   * 没有歌时整颗按钮半透明（`opacity`）但**仍可点**：点了走 `playAll()` 的
+   * 空判断什么也不做，比给一颗点不动的死按钮更不容易让人误会是卡住了。
+   */
+  @Builder
+  playAllButton() {
+    Row({ space: 6 }) {
+      IconGlyph({ symbol: I_PLAY, iconSize: 15, color: C_ON_ACCENT })
+        .accessibilityLevel('no')
+      Text('播放全部')
+        .fontSize(14)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(C_ON_ACCENT)
+    }
+    .height(38)
+    .padding({ left: 18, right: 20 })
+    .backgroundColor(C_RED)
+    .borderRadius(19)
+    .opacity(this.songs.length > 0 ? 1 : 0.45)
+    .onClick(() => {
+      this.playAll();
+    })
+    .accessibilityText('播放这个歌手的全部歌曲')
+    .accessibilityLevel('yes')
+  }
+
+  /**
+   * 头部：头像 + 名字 + 平台标签 + 统计 + 简介 + 主操作行
+   *
+   * 「左对齐要一致」这一条是照用户给的那张截图说的：头像、名字、统计、简介、主按钮
+   * 全部压在同一条左边缘上（左右各 16，与下面每一行的内边距同值），页面上只有一条
+   * 竖向对齐线，不会出现头像居中而文字靠左那种错位感。
+   *
+   * 返回键**不在这里**：由 `HdsNavDestination` 的标题栏提供（见 struct 开头第 1 条说明）。
+   */
   @Builder
   header() {
-    Column({ space: 14 }) {
-      Row({ space: 14 }) {
-        // 歌手头像是圆的：CoverArt 的 radius 给一半边长就是圆
+    Column({ space: 12 }) {
+      Row({ space: 16 }) {
+        // 歌手头像是圆的：CoverArt 的 radius 给一半边长就是正圆
         CoverArt({
           url: this.detail.picUrl,
           name: this.detail.name,
-          boxSize: 84,
-          radius: 42,
+          boxSize: ARTIST_AVATAR,
+          radius: ARTIST_AVATAR / 2,
         })
-        Column({ space: 6 }) {
+        Column({ space: 9 }) {
           Text(this.detail.name.length > 0 ? this.detail.name : '歌手')
-            .fontSize(22)
+            .fontSize(24)
             .fontWeight(FontWeight.Bold)
             .fontColor(C_TEXT)
             .maxLines(2)
@@ -274,12 +398,16 @@ export struct ArtistView {
               .borderRadius(6)
               .backgroundColor(platformTint(this.source))
               .flexShrink(0)
-            Text(this.countText())
-              .fontSize(F_SUB)
-              .fontColor(C_TEXT_SUB)
-              .maxLines(1)
-              .layoutWeight(1)
-              .textAlign(TextAlign.Start)
+            // 统计行：单曲 N · 专辑 M（接口没给计数时整段不画，见 countText）
+            if (this.countText().length > 0) {
+              Text(this.countText())
+                .fontSize(F_SUB)
+                .fontColor(C_TEXT_SUB)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .textAlign(TextAlign.Start)
+            }
           }
           .width('100%')
           .alignItems(VerticalAlign.Center)
@@ -288,13 +416,16 @@ export struct ArtistView {
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
+      // 头像与右边那两块竖直居中：头像 96、右边名字最多两行，居中比顶对齐更稳
       .alignItems(VerticalAlign.Center)
 
       if (this.detail.desc.length > 0) {
         Text(this.detail.desc)
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
-          .maxLines(3)
+          // 两行封顶（原来三行）：头像放大之后头部本来就高了，简介再占三行会把
+          // 歌曲列表挤到一屏只剩三四首，反而更难用
+          .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .lineHeight(19)
           .width('100%')
@@ -302,27 +433,10 @@ export struct ArtistView {
       }
 
       Row({ space: 10 }) {
-        // 播放全部：整页入队并从第一首开始（播放列表是全局那一份，与搜索结果共用）
-        Row({ space: 6 }) {
-          Text('播放全部')
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(C_RED)
-        }
-        .height(34)
-        .padding({ left: 16, right: 16 })
-        .backgroundColor(C_FILL_SOFT)
-        .borderRadius(17)
-        .onClick(() => {
-          this.playAll();
-        })
-        .accessibilityText('播放这个歌手的全部歌曲')
-        .accessibilityLevel('yes')
-
+        this.playAllButton()
         if (this.sortable()) {
           Blank()
-          this.sortChip('最热', 'hot')
-          this.sortChip('最新', 'new')
+          this.sortSegment()
         }
       }
       .width('100%')
@@ -335,12 +449,33 @@ export struct ArtistView {
     .padding({ left: 16, right: 16, top: this.topInset + 8, bottom: 8 })
   }
 
+  /** 列表上方那行小标题：热门歌曲 / 最新歌曲 + 共 N 首 */
+  @Builder
+  sectionTitle() {
+    Row({ space: 8 }) {
+      Text(this.sectionLabel())
+        .fontSize(F_SECTION)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(C_TEXT)
+      Blank()
+      Text(`共 ${this.songs.length} 首`)
+        .fontSize(F_SUB)
+        .fontColor(C_TEXT_WEAK)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 12, bottom: 6 })
+    .alignItems(VerticalAlign.Center)
+  }
+
   build() {
     /**
      * 页内挂一条迷你播放条（MiniBarHost）：这一页是压在路由栈上的 NavDestination，
-     * 会把壳层那条带迷你栏的 HdsTabs 整个盖住 —— 之前这里忘了套外壳，进来就没有播放条
+     * 会把壳层那条带迷你栏的 HdsTabs 整个盖住 —— 不自己挂一条，进来就没有播放条
      * （群反馈 2026-11-19 11:33「这个界面有点突兀，看能不能把底部音乐栏加上去」）。
-     * 列表底部同时让出「条高 + 间距」，免得最后几首歌被那条悬浮栏压住。
+     *
+     * 这条外壳与搜索页 / 本地音乐那几页用的 `PanePage` 是同一套实现（单页签 Tabs +
+     * barFloatingStyle 拿系统材质；鸿蒙6 退回自绘玻璃胶囊），栏里那条迷你条本身就是
+     * 全应用共用的 `MiniBarView`，所以几何、材质、点击行为与其它页完全一致。
      */
     MiniBarHost({
       windowWidth: this.windowWidth,
@@ -350,6 +485,10 @@ export struct ArtistView {
     }) {
       Column() {
         this.header()
+
+        if (!this.loading && this.songs.length > 0) {
+          this.sectionTitle()
+        }
 
         if (this.loading) {
           Column() {
@@ -369,14 +508,21 @@ export struct ArtistView {
           .width('100%')
           .layoutWeight(1)
         } else {
-          // SongListPane 自己是可滚动的懒加载列表，别再套 Scroll（嵌套滚动会打架）
+          // SongListPane 自己是可滚动的懒加载列表，别再套 Scroll（嵌套滚动会打架）。
+          // 行上的样式与其它列表页**同一份实现**：歌名 + 歌手两行、右侧爱心 + 更多三点、
+          // 当前播放那行红字。`showPlayingIcon` 是它在 2026-11-23 新加的开关：
+          // 打开后当前播放那一行会多一枚红色小喇叭（华为音乐 / 其它列表页都是这个记号，
+          // 这里不自己另写一套行）。
           SongListPane({
             items: this.songs,
             currentId: this.currentId,
             emptyText: '',
             // 这一页的歌都来自同一个平台，行上不必再标来源（平台已标在头部）
             showSource: false,
-            // 滚到底要停在悬浮迷你条上方：条高 + 与它的间距（与其它页同一口径）
+            showPlayingIcon: true,
+            // 滚到底要停在悬浮迷你条上方：条高 + 与它的间距（与其它页同一口径，
+            // 见 PlaylistDetailView / SearchView 的同一处算法）。少了这一段最后几首
+            // 会被那条悬浮栏压住。
             bottomInset: this.bottomInset + HDS_BAR_HEIGHT + 26,
             footerStatus: this.status,
             onReachEnd: () => {

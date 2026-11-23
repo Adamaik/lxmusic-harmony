@@ -1,4 +1,4 @@
-import { PlaySession, SongItem } from '../core/player/PlaySession';
+import { PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
 import { K_BUFFERED_SECONDS, K_BUFFERING, K_CURRENT_ART, K_CURRENT_COVER, K_CURRENT_ID, K_CURRENT_NAME,
   K_CURRENT_QUALITY, K_CURRENT_SINGER, K_CURRENT_SOURCE, K_DURATION, K_LYRIC_LINES, K_LYRIC_STATUS,
   K_PLAYER_STATUS, K_PLAY_MODE, K_PROGRESS } from '../core/player/PlaySession';
@@ -28,6 +28,9 @@ import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS,
 import { COVER_RADIUS_DEFAULT, K_COVER_RADIUS } from '../core/settings/AppearanceSettings';
 import { LyricMatchSheet } from './LyricMatchSheet';
 import { CommentSheet } from './CommentSheet';
+import { AddToPlaylistSheet } from './AddToPlaylistSheet';
+import { SyncManager } from '../core/sync/SyncManager';
+import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { displayQuality, K_ACTUAL_QUALITY, LOCAL_QUALITY_MARK, isExtendedQuality, isFileQuality,
   qualityFallbackNote, qualityLabel, switchableQualitys, targetQuality } from '../core/music/Quality';
 import { PlaySettings } from '../core/settings/PlaySettings';
@@ -194,6 +197,16 @@ export struct PlayerView {
   @State @Watch('syncOverlayState') qualityOpen: boolean = false;
   /** 评论页是否展开（铺满播放器的自绘覆盖物，见 CommentSheet 开头的说明） */
   @State @Watch('syncOverlayState') commentOpen: boolean = false;
+  /**
+   * 播放页「更多」里点「添加到歌单」后弹的选歌单面板（见 playlistOverlay）
+   *
+   * 群反馈 2026-11-23（用户提供截图）：歌曲菜单里只有「播放 / 添加到播放列表 /
+   * 添加到下一个播放 / 查看评论」，缺「添加到歌单」。歌单详情、在线榜单、播放历史、
+   * 本地音乐那几处的行菜单都有这一项，只有播放页漏了。
+   */
+  @State @Watch('syncOverlayState') playlistOpen: boolean = false;
+  /** 打开面板那一刻重新读到的歌单列表（刚建的歌单马上能选到，与其它页同一做法） */
+  @State playlistCandidates: PlaylistSummary[] = [];
   /** 当前唱到的歌词行；-1 = 没有时间轴/还没开始 */
   @State activeLine: number = -1;
   /**
@@ -330,7 +343,8 @@ export struct PlayerView {
 
   /** 有没有自绘覆盖物开着（有的话返回键先收它，而不是收起整个播放页） */
   private hasOverlay(): boolean {
-    return this.commentOpen || this.matchOpen || this.qualityOpen || this.moreOpen;
+    return this.commentOpen || this.matchOpen || this.qualityOpen || this.moreOpen
+      || this.playlistOpen;
   }
 
   /** 四个 @State 任何一个开合都走这里：把「有没有覆盖物」上报给壳层 */
@@ -356,6 +370,8 @@ export struct PlayerView {
       this.matchOpen = false;
     } else if (this.qualityOpen) {
       this.qualityOpen = false;
+    } else if (this.playlistOpen) {
+      this.playlistOpen = false;
     } else {
       this.moreOpen = false;
     }
@@ -868,6 +884,49 @@ export struct PlayerView {
       : `已加入播放列表：${item.name}`);
   }
 
+  // ------------------------------------------------------------ 添加到歌单
+
+  /**
+   * 打开「添加到歌单」面板
+   *
+   * 候选歌单在**打开这一刻**重新读一次：用户可能刚在别处新建了一个歌单，
+   * 拿旧列表会出现在面板里找不到刚建的歌单。与 views/SongListPane.ets 同一做法。
+   */
+  private openPlaylistPicker(): void {
+    this.playlistCandidates = SyncManager.getInstance().getLibrary().playlistSummaries();
+    this.playlistOpen = true;
+  }
+
+  private addCurrentToPlaylist(playlist: PlaylistSummary): void {
+    const item: SongItem | null = PlaySession.getInstance().current;
+    if (item === null) {
+      this.playlistOpen = false;
+      return;
+    }
+    const result: AddMusicResult = SyncManager.getInstance().getLibrary()
+      .addMusicToPlaylist(playlist.id, [item]);
+    this.playlistOpen = false;
+    // 这里永远只有一首：说「里已经有这首歌了」比「加 0 首」自然
+    this.toast(result.added > 0
+      ? `已添加到「${playlist.name}」`
+      : `「${playlist.name}」里已经有这首歌了`);
+  }
+
+  private createPlaylistAndAddCurrent(name: string): void {
+    const item: SongItem | null = PlaySession.getInstance().current;
+    if (name.length === 0 || item === null) {
+      this.playlistOpen = false;
+      return;
+    }
+    const library = SyncManager.getInstance().getLibrary();
+    const id: string = library.createPlaylist(name);
+    const result: AddMusicResult = library.addMusicToPlaylist(id, [item]);
+    this.playlistOpen = false;
+    this.toast(result.added > 0
+      ? `已新建歌单「${name}」并添加`
+      : `已新建歌单「${name}」，但这首歌没能加进去`);
+  }
+
   /** 投播按钮的外观（系统只负责交互与设备面板，图标自己画） */
   @Builder
   castPickerBuilder() {
@@ -921,6 +980,11 @@ export struct PlayerView {
       })
       this.moreItem('添加到下一个播放', () => {
         this.addCurrentToQueue(true);
+      })
+      // 与其它页的行菜单对齐：歌单详情 / 在线榜单 / 播放历史 / 本地音乐都有「添加到歌单」，
+      // 只有播放页的「更多」漏了这一项（群反馈 2026-11-23，用户附菜单截图）
+      this.moreItem('添加到歌单', () => {
+        this.openPlaylistPicker();
       })
       // 洛雪的评论入口就在播放页的「更多」底部菜单里（Vertical/Player 的 MoreBtn），
       // 底部那排图标上的评论钮是同一条路的快捷入口
@@ -1256,6 +1320,46 @@ export struct PlayerView {
       .height('62%')
       .borderRadius({ topLeft: 20, topRight: 20 })
       // 面板内容用的是浅色主题的配色（与「添加到歌单」那个系统半模态一致）
+      .backgroundColor(C_BG)
+      .clip(true)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#8A000000')
+  }
+
+  /**
+   * 「添加到歌单」面板
+   *
+   * 复用 views/AddToPlaylistSheet.ets（歌单详情 / 在线榜单 / 播放历史共用那一个），
+   * 外面照「匹配歌词」的做法自绘一层遮罩 + 圆角底 —— 播放器本身是系统半模态，
+   * 再叠系统 bindSheet 会和它打架（见本文件开头那段说明）。
+   */
+  @Builder
+  playlistOverlay() {
+    Column() {
+      Column()
+        .width('100%')
+        .layoutWeight(1)
+        .onClick(() => {
+          this.playlistOpen = false;
+        })
+      Column() {
+        AddToPlaylistSheet({
+          songName: this.name,
+          candidates: this.playlistCandidates,
+          bottomInset: this.bottomInset,
+          onPick: (playlist: PlaylistSummary) => {
+            this.addCurrentToPlaylist(playlist);
+          },
+          onCreate: (name: string) => {
+            this.createPlaylistAndAddCurrent(name);
+          },
+        })
+      }
+      .width('100%')
+      .height('62%')
+      .borderRadius({ topLeft: 20, topRight: 20 })
       .backgroundColor(C_BG)
       .clip(true)
     }
@@ -2363,6 +2467,11 @@ export struct PlayerView {
       // 评论页：与上面两层同一套做法（自绘、铺满）
       if (this.commentOpen) {
         this.commentOverlay()
+      }
+
+      // 「添加到歌单」：与「匹配歌词」同一套自绘面板
+      if (this.playlistOpen) {
+        this.playlistOverlay()
       }
     }
     .width('100%')

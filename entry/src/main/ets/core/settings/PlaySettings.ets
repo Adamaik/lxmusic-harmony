@@ -200,6 +200,23 @@ export const K_DEFAULT_SOURCE: string = 'cfg_default_source';
  */
 export const K_AUTO_SOURCE_SWITCH: string = 'cfg_auto_source_switch';
 
+/**
+ * 放不出来时自动换到**别的平台**的同名歌（跨平台换源）
+ *
+ * 和上面那一项不是一回事：
+ *   - `K_AUTO_SOURCE_SWITCH`：同一首歌、同一个平台，换**别的音源脚本**再取一次地址；
+ *   - 本项：当前平台怎么都取不到，去**另一个平台**搜同名同歌手的歌来顶上
+ *     （实现见 `PlaySession.switchSourceAndResolve`，严格匹配歌名 + 歌手）。
+ *
+ * **默认关**。群里反馈（11-23 17:35 / 11-19 14:06 等）：自动换平台之后，
+ * 有些歌「本来能播」反而变成播不出来或播成别的版本，还伴随「已自动换源播放」的提示，
+ * 用户不知道发生了什么。跨平台替歌本身有风险 —— 各平台曲库、版本、时长都不一样，
+ * 同名歌可能是 Live、翻唱、加速版，所以交给用户自己决定，并明确告知风险。
+ *
+ * 关着时：取地址失败就照常报错（与加这一项之前一致），不会悄悄放成别的歌。
+ */
+export const K_SWITCH_PLATFORM_SAME_SONG: string = 'cfg_switch_platform_same_song';
+
 /** 默认渠道的取值（第一项是空串 = 自动 = 不指定），顺序与界面上的胶囊一致 */
 export const DEFAULT_SOURCE_VALUES: string[] = ['', 'kw', 'kg', 'mg', 'tx', 'wy'];
 /**
@@ -243,6 +260,8 @@ interface PlaySettingsData {
   autoSourceSwitch?: boolean;
   /** 上下滑动切歌，见 K_SWIPE_SWITCH_SONG（默认关） */
   swipeSwitchSong?: boolean;
+  /** 放不出来时自动换别的平台的同名歌，见 K_SWITCH_PLATFORM_SAME_SONG（默认关） */
+  switchPlatformSameSong?: boolean;
 }
 
 function clampFontSize(value: number): number {
@@ -346,6 +365,13 @@ export class PlaySettings {
    * 关着时播放页的手势与加这一项之前完全一致。
    */
   private swipeSwitchSong: boolean = false;
+  /**
+   * 放不出来时自动换到别的平台的同名歌，默认**关**
+   *
+   * 见 K_SWITCH_PLATFORM_SAME_SONG：跨平台替歌可能放成别的版本（Live / 翻唱 / 加速版），
+   * 属于「宁可不放也不能放错」的一条线，所以默认关、由用户在设置里显式打开。
+   */
+  private switchPlatformSameSong: boolean = false;
 
   /**
    * 绑定沙箱目录并读回上次的设置。
@@ -413,6 +439,7 @@ export class PlaySettings {
       defaultSource: this.defaultSource,
       autoSourceSwitch: this.autoSourceSwitch,
       swipeSwitchSong: this.swipeSwitchSong,
+      switchPlatformSameSong: this.switchPlatformSameSong,
     };
     try {
       const file = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -517,6 +544,10 @@ export class PlaySettings {
     if (data.swipeSwitchSong !== undefined) {
       this.swipeSwitchSong = data.swipeSwitchSong;
     }
+    // 跨平台同名歌替换：老存档里没有这一项，保持默认（关），不会因为升级就悄悄换歌
+    if (data.switchPlatformSameSong !== undefined) {
+      this.switchPlatformSameSong = data.switchPlatformSameSong;
+    }
     const fontSize: number | undefined = data.lyricFontSize;
     if (fontSize !== undefined) {
       this.lyricFontSize = clampFontSize(fontSize);
@@ -544,6 +575,7 @@ export class PlaySettings {
       AppStorage.setOrCreate(K_DEFAULT_SOURCE, this.defaultSource);
       AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, this.autoSourceSwitch);
       AppStorage.setOrCreate(K_SWIPE_SWITCH_SONG, this.swipeSwitchSong);
+      AppStorage.setOrCreate(K_SWITCH_PLATFORM_SAME_SONG, this.switchPlatformSameSong);
     } catch (e) {
       // AppStorage 在 Ability 生命周期里通常可用；万一环境不支持也不能让启动挂掉，
       // 界面自己会用 @StorageLink 的默认值，设置仍能改、能落盘。
@@ -673,6 +705,24 @@ export class PlaySettings {
     }
     this.autoSourceSwitch = value;
     AppStorage.setOrCreate(K_AUTO_SOURCE_SWITCH, value);
+    this.write();
+  }
+
+  /**
+   * 放不出来时自动换别的平台的同名歌（见 K_SWITCH_PLATFORM_SAME_SONG，默认关）
+   *
+   * 由 PlaySession 取地址失败时现读，改完立刻生效。
+   */
+  isSwitchPlatformSameSong(): boolean {
+    return this.switchPlatformSameSong;
+  }
+
+  setSwitchPlatformSameSong(value: boolean): void {
+    if (value === this.switchPlatformSameSong) {
+      return;
+    }
+    this.switchPlatformSameSong = value;
+    AppStorage.setOrCreate(K_SWITCH_PLATFORM_SAME_SONG, value);
     this.write();
   }
 

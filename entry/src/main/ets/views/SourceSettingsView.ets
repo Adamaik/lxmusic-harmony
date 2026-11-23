@@ -23,6 +23,13 @@ import {
   runSourceCheckup,
 } from '../core/source/SourceCheckup';
 import { SourceHealth, SourceRouter } from '../core/source/SourceRouter';
+import {
+  SUB_RESULT_FAILED,
+  SUB_RESULT_UPDATE,
+  SourceSubscription,
+  SubscriptionRow,
+} from '../core/source/SourceSubscription';
+import { SubscriptionRecord } from '../core/source/SourceStore';
 import { HdsListItemCard, IconSize, PrefixIcon, SuffixArrow, SuffixText } from '@kit.UIDesignKit';
 import { I_DISC } from '../ui/Icons';
 import { SEARCH_PLATFORMS, isSearchSupported } from '../core/music/MusicSearch';
@@ -117,6 +124,23 @@ export struct SourceSettingsView {
   @State checkingUpdates: boolean = false;
   @State updating: boolean = false;
 
+  // ------------------------------------------------------------ 音源订阅
+
+  /**
+   * 订阅记录（来源链接 + 订阅状态）
+   *
+   * 进页面读一次盘、改了就刷，渲染时只查这个数组：卡片是逐条渲染的，如果在 builder 里
+   * 现去读文件，一次滚动就要读几十遍盘（见 SourceSubscription.list 的实现）。
+   */
+  @State subscriptions: SubscriptionRecord[] = [];
+  /** 「检查全部更新 / 单源检查更新」的结果行：有更新 / 已是最新 / 检查失败 */
+  @State subRows: SubscriptionRow[] = [];
+  @State checkingAllUpdates: boolean = false;
+  /** 正在单源检查的那个音源 id（按钮显示「检查中…」） */
+  @State checkingOneId: string = '';
+  /** 正在应用更新的那个订阅 id */
+  @State updatingSubId: string = '';
+
   /**
    * 窗口宽度（vp）：宽屏下这几段并排（0 = 还没量到，按手机一列）
    *
@@ -137,6 +161,9 @@ export struct SourceSettingsView {
     this.refreshSources();
     this.checkResults = loadCheckupResults();
     this.lastCheckAt = lastCheckupAt();
+    // 订阅要自己的存储初始化（只需一个 Context）；自动检查跟着进页面这一次机会走，
+    // 但「最多每进程一次、12 小时内不重复、失败静默」都在 SourceSubscription 里把关
+    this.initSubscription();
     this.logListener = (log: SourceLog) => {
       // 面板这行只留时分秒（保持原来那一行的长度），完整日期在详情页里给
       const time: string = new Date(log.time).toLocaleTimeString();
@@ -445,6 +472,10 @@ export struct SourceSettingsView {
     this.updating = true;
     try {
       const info: SourceInfo = applySourceUpdate(update);
+      // 同一个音源在订阅记录里的结论也要一起翻新：这条路径与「检查全部更新」走的是
+      // 同一个 replaceSourceScript，不翻的话卡片上会一直挂着「上次查到有新版本」
+      SourceSubscription.getInstance().markUpdated(info.id, info.version);
+      this.refreshSubscriptions();
       const remains: SourceUpdateInfo[] = this.updates.filter((item: SourceUpdateInfo) => item.id !== update.id);
       this.updates = remains;
       this.refreshSources();
@@ -469,7 +500,9 @@ export struct SourceSettingsView {
       for (let i = 0; i < pending.length; i++) {
         this.status = `正在更新音源：${i + 1}/${pending.length}…`;
         try {
-          applySourceUpdate(pending[i]);
+          const fresh: SourceInfo = applySourceUpdate(pending[i]);
+          // 订阅记录的结论跟着翻新（见 updateOne 里的同一处说明）
+          SourceSubscription.getInstance().markUpdated(fresh.id, fresh.version);
           ok += 1;
         } catch (e) {
           failed += 1;
@@ -478,10 +511,360 @@ export struct SourceSettingsView {
       }
       this.updates = [];
       this.refreshSources();
+      this.refreshSubscriptions();
       this.status = `更新完成：成功 ${ok} 个${failed > 0 ? `，失败 ${failed} 个（原音源未改动）` : ''}`;
     } finally {
       this.updating = false;
     }
+  }
+
+  // ------------------------------------------------------------ 音源订阅
+
+  /**
+   * 初始化订阅存储，并做「每次启动最多一次」的自动检查
+   *
+   * 自动检查的三个克制点由 SourceSubscription.maybeAutoCheck 把关（每进程一次、
+   * 距上次检查不足 12 小时不发请求、失败静默）；这里只负责把结果接住：
+   *   - 有结果就把它当成这一次的检查结论摆出来（进页面就能看到），
+   *   - **不弹 toast、不改状态行为「失败」**：用户什么都没点，不该被提醒打扰。
+   */
+  private initSubscription(): void {
+    const sub: SourceSubscription = SourceSubscription.getInstance();
+    try {
+      sub.init(this.getContext());
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'init subscription failed: %{public}s', (e as Error).message);
+    }
+    this.refreshSubscriptions();
+    void sub.maybeAutoCheck().then((rows: SubscriptionRow[]) => {
+      if (rows.length === 0) {
+        return;
+      }
+      this.subRows = rows;
+      this.refreshSubscriptions();
+      let fresh: number = 0;
+      for (const row of rows) {
+        if (row.status === SUB_RESULT_UPDATE) {
+          fresh += 1;
+        }
+      }
+      if (fresh > 0) {
+        this.status = `自动检查了 ${rows.length} 个订阅音源，其中 ${fresh} 个有新版本（可在「音源订阅」里更新）`;
+      }
+    }).catch((e: Error) => {
+      hilog.info(DOMAIN, TAG, 'auto subscription check failed: %{public}s', e.message);
+    });
+  }
+
+  private refreshSubscriptions(): void {
+    const sub: SourceSubscription = SourceSubscription.getInstance();
+    // 兜底再初始化一次：aboutToAppear 里如果拿不到 HostContext（组件树还没挂好），
+    // 订阅存储就一直是未就绪状态，整个功能会静悄悄消失。刷新发生在用户真实操作之后，
+    // 这时 Context 一定在，补一次 init 就能救回来（init 本身是幂等的）
+    if (!sub.isReady()) {
+      try {
+        sub.init(this.getContext());
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'retry init subscription failed: %{public}s', (e as Error).message);
+      }
+    }
+    this.subscriptions = sub.list();
+  }
+
+  private subRecordOf(id: string): SubscriptionRecord | null {
+    for (const item of this.subscriptions) {
+      if (item.id === id) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /** 来源链接（空串 = 没有：本地文件导入，或早期版本导入时没记下来） */
+  private sourceUrlOf(id: string): string {
+    const record: SubscriptionRecord | null = this.subRecordOf(id);
+    return record !== null ? record.url : '';
+  }
+
+  private isSubscribed(id: string): boolean {
+    const record: SubscriptionRecord | null = this.subRecordOf(id);
+    return record !== null && record.subscribed && record.url.length > 0;
+  }
+
+  /** 这个源支持订阅吗（= 记下了来源链接） */
+  private canSubscribe(id: string): boolean {
+    return /^https?:\/\//.test(this.sourceUrlOf(id));
+  }
+
+  /** 能不能查更新：脚本自己声明了 updateUrl，或者我们知道它的来源链接 */
+  private hasUpdateAddress(item: SourceInfo): boolean {
+    const declared: string = item.updateUrl !== undefined ? item.updateUrl : '';
+    if (/^https?:\/\//.test(declared)) {
+      return true;
+    }
+    return this.canSubscribe(item.id);
+  }
+
+  /**
+   * 卡片上那行小字：说清「订阅状态 / 为什么不能订阅」
+   *
+   * 「不能用」和「不知道能不能用」是两种完全不同的状态：没有来源链接的源不是坏了，
+   * 只是我们不知道它的发布地址 —— 这一句必须写出来，否则用户只会觉得功能坏了。
+   */
+  private subStateText(item: SourceInfo): string {
+    if (this.canSubscribe(item.id)) {
+      return this.isSubscribed(item.id)
+        ? '已订阅：会跟着来源链接更新'
+        : '未订阅：可以订阅它，以后跟随来源链接更新';
+    }
+    return '没有来源链接（本地文件导入，或早期版本导入时没记），不支持订阅';
+  }
+
+  private subscribedCountOf(): number {
+    let count: number = 0;
+    for (const item of this.subscriptions) {
+      if (item.subscribed && item.url.length > 0) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  /** 上次检查发现「有新版本」但还没更新的订阅数（不联网，只读记录） */
+  private pendingUpdateCountOf(): number {
+    let count: number = 0;
+    for (const item of this.subscriptions) {
+      if (item.subscribed && item.lastResult === SUB_RESULT_UPDATE) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  /** 本次结果里还能点「更新」的行数（有脚本正文才算，光知道有新版本不算） */
+  private subRowUpdateCount(): number {
+    let count: number = 0;
+    for (const row of this.subRows) {
+      if (row.update !== null) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private lastSubCheckAt(): number {
+    let newest: number = 0;
+    for (const item of this.subscriptions) {
+      if (item.lastCheckedAt > newest) {
+        newest = item.lastCheckedAt;
+      }
+    }
+    return newest;
+  }
+
+  private subSummaryText(): string {
+    if (this.subscriptions.length === 0) {
+      return '还没有记录到来源链接';
+    }
+    const parts: string[] = [`${this.subscribedCountOf()} 个已订阅`];
+    const pending: number = this.pendingUpdateCountOf();
+    if (pending > 0) {
+      parts.push(`${pending} 个上次查到有新版本`);
+    }
+    return parts.join(' / ');
+  }
+
+  /** 没有来源链接的源有几个（音源订阅卡片底部那句提示用） */
+  private linklessCount(): number {
+    let count: number = 0;
+    for (const item of this.sources) {
+      if (!this.canSubscribe(item.id)) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private toggleSubscribe(item: SourceInfo): void {
+    if (!this.canSubscribe(item.id)) {
+      // 老数据 / 本地文件导入：这里只能给出「怎么办」，不能假装订上了
+      this.toast('这个源没有来源链接，无法订阅；把原链接重新导入一次即可补上');
+      return;
+    }
+    const sub: SourceSubscription = SourceSubscription.getInstance();
+    if (this.isSubscribed(item.id)) {
+      sub.unsubscribe(item.id);
+      this.status = `已取消订阅「${item.name}」（来源链接保留，随时可以订回来）`;
+    } else if (sub.subscribe(item.id)) {
+      this.status = `已订阅「${item.name}」：以后点「检查全部更新」会去来源链接拉最新脚本`;
+    } else {
+      this.toast('订阅失败，请把原链接重新导入一次');
+    }
+    this.refreshSubscriptions();
+  }
+
+  /**
+   * 检查全部订阅的更新
+   *
+   * 与上面那个「检查更新」的分工：那个只查**脚本声明了 updateUrl** 的源（洛雪官方口径），
+   * 这个查**用户订阅过**的源，并且在没有 updateUrl 时退回「导入时的那条链接」——
+   * 这正是群里那些「源又不行了」的源能自己变新的关键。
+   */
+  private async checkAllSubscribed(): Promise<void> {
+    if (this.checkingAllUpdates || this.checkingUpdates || this.checking || this.busy) {
+      return;
+    }
+    const sub: SourceSubscription = SourceSubscription.getInstance();
+    if (!sub.isReady()) {
+      this.toast('订阅记录读写不可用，暂时无法检查订阅更新');
+      return;
+    }
+    const count: number = sub.subscribedCount();
+    if (count === 0) {
+      this.toast('还没有订阅任何音源：先在下面某个音源那一行点「订阅」');
+      return;
+    }
+    this.checkingAllUpdates = true;
+    this.subRows = [];
+    this.status = `正在检查 ${count} 个订阅音源的更新…`;
+    try {
+      const rows: SubscriptionRow[] = await sub.checkSubscribed((done: number, total: number) => {
+        this.status = `正在检查订阅更新：${done}/${total}…`;
+      }, () => false);
+      this.subRows = rows;
+      let hasUpdate: number = 0;
+      let latest: number = 0;
+      let failed: number = 0;
+      for (const row of rows) {
+        if (row.status === SUB_RESULT_UPDATE) {
+          hasUpdate += 1;
+        } else if (row.status === SUB_RESULT_FAILED) {
+          failed += 1;
+        } else {
+          latest += 1;
+        }
+      }
+      const parts: string[] = [];
+      if (hasUpdate > 0) {
+        parts.push(`${hasUpdate} 个有更新`);
+      }
+      if (latest > 0) {
+        parts.push(`${latest} 个已是最新`);
+      }
+      if (failed > 0) {
+        parts.push(`${failed} 个检查失败`);
+      }
+      this.status = `订阅更新检查完成：${parts.length > 0 ? parts.join(' / ') : '没有取到结果'}`;
+      this.refreshSubscriptions();
+    } catch (e) {
+      this.status = `检查订阅更新失败: ${(e as Error).message}`;
+    } finally {
+      this.checkingAllUpdates = false;
+    }
+  }
+
+  /** 单源检查更新（音源卡片上的「检查更新」；没订阅但知道链接的源也能查） */
+  private async checkSourceUpdateOf(item: SourceInfo): Promise<void> {
+    if (this.checkingOneId.length > 0 || this.checkingAllUpdates || this.checking || this.busy) {
+      this.toast('正在检查其它更新，等这一下结束');
+      return;
+    }
+    this.checkingOneId = item.id;
+    this.status = `正在检查「${item.name}」有没有新版本…`;
+    try {
+      const row: SubscriptionRow = await SourceSubscription.getInstance().checkOne(item.id);
+      // 单源结论并进订阅区那张结果表：有更新时用户就地能点「更新」，不用再跑一遍全量检查
+      const rows: SubscriptionRow[] = this.subRows.filter((one: SubscriptionRow) => one.id !== row.id);
+      rows.unshift(row);
+      this.subRows = rows;
+      this.status = `「${item.name}」${row.note}`;
+      this.refreshSubscriptions();
+    } catch (e) {
+      this.status = `检查「${item.name}」的更新失败: ${(e as Error).message}`;
+    } finally {
+      this.checkingOneId = '';
+    }
+  }
+
+  /**
+   * 应用一条订阅更新
+   *
+   * 走 SourceSubscription.applyRow -> SourceEngine.replaceSourceScript：**id 不变**，
+   * 播放列表里的引用、当前加载着的音源都还在（删了重导会让它们全部失效）。
+   * 失败抛错就什么都不写，原音源保持不动。
+   */
+  private applySubRow(row: SubscriptionRow): void {
+    if (row.update === null || this.updatingSubId.length > 0) {
+      return;
+    }
+    this.updatingSubId = row.id;
+    try {
+      const info: SourceInfo | null = SourceSubscription.getInstance().applyRow(row);
+      if (info === null) {
+        this.status = `「${row.name}」这次没有可用的新脚本，未做改动`;
+        return;
+      }
+      this.status = `已把「${info.name}」更新到 ${this.versionText(info.version)}（点「加载」后新脚本才生效）`;
+      this.toast(`已更新「${info.name}」`);
+      this.subRows = this.subRows.filter((one: SubscriptionRow) => one.id !== row.id);
+      this.refreshSources();
+      this.refreshSubscriptions();
+    } catch (e) {
+      this.status = `更新「${row.name}」失败: ${(e as Error).message}（原音源未改动）`;
+    } finally {
+      this.updatingSubId = '';
+    }
+  }
+
+  /** 把本次结果里所有「有更新」的订阅一次更新掉（同样走原地替换） */
+  private updateAllSubRows(): void {
+    if (this.updatingSubId.length > 0) {
+      return;
+    }
+    const pending: SubscriptionRow[] = this.subRows.filter((row: SubscriptionRow) => row.update !== null);
+    if (pending.length === 0) {
+      return;
+    }
+    const sub: SourceSubscription = SourceSubscription.getInstance();
+    const done: Set<string> = new Set<string>();
+    let ok: number = 0;
+    let failed: number = 0;
+    for (const row of pending) {
+      try {
+        sub.applyRow(row);
+        done.add(row.id);
+        ok += 1;
+      } catch (e) {
+        failed += 1;
+        hilog.warn(DOMAIN, TAG, 'update subscription source failed: %{public}s', (e as Error).message);
+      }
+    }
+    // 只摘掉真的更新成功的那几条：失败的行要留在表里，用户才能看见原因并重试
+    this.subRows = this.subRows.filter((row: SubscriptionRow) => !done.has(row.id));
+    this.refreshSources();
+    this.refreshSubscriptions();
+    this.status = `更新完成：成功 ${ok} 个${failed > 0 ? `，失败 ${failed} 个（原音源未改动）` : ''}`;
+  }
+
+  /** 结果行的一句话：新版本号 → / 已是最新 / 检查失败的原因 */
+  private subRowStatusText(row: SubscriptionRow): string {
+    if (row.status === SUB_RESULT_FAILED) {
+      return row.note;
+    }
+    if (row.status === SUB_RESULT_UPDATE) {
+      return `${this.versionText(row.localVersion)} → ${this.versionText(row.remoteVersion)}　${row.note}`;
+    }
+    return row.note.length > 0 ? row.note : '已是最新';
+  }
+
+  private subRowColor(row: SubscriptionRow): Resource {
+    if (row.status === SUB_RESULT_UPDATE) {
+      return C_ICON_ORANGE;
+    }
+    if (row.status === SUB_RESULT_FAILED) {
+      return C_RED;
+    }
+    return C_TEXT_WEAK;
   }
 
   private platformName(id: string): string {
@@ -518,6 +901,17 @@ export struct SourceSettingsView {
       let info: SourceInfo;
       if (/^https?:\/\//.test(input)) {
         info = await engine.importFromUrl(input);
+        /**
+         * 记下这次导入用的链接，并默认订阅
+         *
+         * 这是「音源订阅」唯一的信息来源：引擎只认脚本内容，不知道 URL（洛雪的口径里
+         * 音源就是一段脚本）；而用户手上真正有的、能拿来说「以后照着这个更新」的，
+         * 恰恰只有这条链接。放在这里而不是引擎里，也因为导入成功才该记：
+         * 下载失败时列表里根本没这条源，记了就是孤儿记录。
+         */
+        if (SourceSubscription.getInstance().rememberImportedUrl(info.id, input)) {
+          this.refreshSubscriptions();
+        }
       } else {
         info = engine.importSource(input);
       }
@@ -588,6 +982,10 @@ export struct SourceSettingsView {
       }
     }
     this.checkResults = remains;
+    // 删源时 SourceStore.remove 会顺手清掉它的订阅记录（见那边的 pruneSubscriptions），
+    // 这里只需要把界面这一份刷新过来；订阅结果表里也把那一条摘掉
+    this.subRows = this.subRows.filter((row: SubscriptionRow) => row.id !== id);
+    this.refreshSubscriptions();
     this.status = '已删除该音源';
     this.refreshSources();
   }
@@ -772,7 +1170,26 @@ export struct SourceSettingsView {
   }
 
   build() {
-    Column() {
+    /**
+     * 根容器从 `Column` 换成 `Stack` —— 多出来的那一层就是「标题栏自己的不透明底色」
+     *
+     * 原来这里是 `Column { Scroll }`，页面里没有任何东西给顶部那条标题栏铺底：壳层
+     * （pages/Index.ets 的 subTitleBarStyle）把 HDS 标题栏刷成了**纯透明**
+     * （backgroundColor: Color.Transparent + maskExtraHeight: 0），页面上只靠 WidePane
+     * 那条 TopFade 渐变遮一下。而那条渐变是「页面底色 -> 全透明」，到标题栏下沿时已经
+     * 透掉九成，于是列表一往上滚就把字压到「音源设置」标题和状态栏上（11-17 23:37 的
+     * 那张列表被标题压住、11-18 11:07 那张顶部残留「加载」「删除」字样的截图）。
+     *
+     * 换成 Stack 后：底下那层照旧铺满、照旧从透明标题栏底下穿过去（沉浸式观感不变，
+     * 顶部占位也照旧跟着内容滚走），上面再垫一块与页面底色相同的实心 Column 当标题栏
+     * 底色（见 build 末尾）。HDS 标题栏是独立图层、永远画在页面内容之上，所以标题与
+     * 返回键不会被这块底压住 —— 被它挡住的只有本该被挡住的、穿过去的那部分列表内容。
+     *
+     * 没有改成「给容器加 padding / 把 Scroll 挤到标题栏下面」：那样会把滚动内容裁在
+     * 标题栏下边缘（本文件顶部占位那段注释说的就是这件事），而且内容再也滚不到标题栏
+     * 底下，与项目里其它设置页的观感不一致。
+     */
+    Stack({ alignContent: Alignment.TopStart }) {
       // 标题栏与返回键由 HdsNavDestination 提供，这里不再自绘头部
       Scroll() {
         /**
@@ -791,7 +1208,9 @@ export struct SourceSettingsView {
           space: { main: LengthMetrics.vp(16), cross: LengthMetrics.vp(16) },
         }) {
           // 顶部占位：第一行落在透明标题栏下方，但它跟着内容一起滚走 —— 用容器内边距会把
-          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）
+          // 这一段内容裁在标题栏下边缘，看起来就"像被顶栏挡住"（首页就是这么做的）。
+          // 多出来的那 6vp 是留给标题栏底部那块实心底的缝（见 build 末尾）：不滚动的时候
+          // 第一行正好落在实心底下方 6vp 处、不会被它切掉，滚起来才会从它底下穿过去。
           Column().height(this.topInset + 6).width('100%')
           Text(this.status)
             .fontSize(F_SUB)
@@ -919,10 +1338,100 @@ export struct SourceSettingsView {
                 }
                 .width('100%')
 
-                // 没有更新地址时说明清楚：这不是按钮坏了，是脚本没提供地址
-                if (this.sources.length > 0 && this.sourcesWithUpdateUrl().length === 0) {
-                  Text('「检查更新」需要脚本声明更新地址（头部 @updateUrl，或运行时 showUpdateAlert）；'
-                    + '当前这些源都没有，拿到新版链接后重新导入即可覆盖旧版。')
+                /**
+                 * 检查全部更新（订阅入口，页面顶部）
+                 *
+                 * 与上面「检查更新」的分工写清在这里，免得用户以为两个按钮是重复的：
+                 *   - 「检查更新」只查**脚本自己声明了 updateUrl** 的源（洛雪官方口径，老入口）；
+                 *   - 「检查全部更新」查**用户订阅过**的源，并在脚本没声明地址时退回
+                 *     「导入时的那条链接」—— 群里那些「源又不行了、只能满群找新链接」的源，
+                 *     绝大多数根本没写 updateUrl，能自己变新靠的就是这一条链接。
+                 *
+                 * 为什么单独占一行而不挤进上面那两个按钮里：三个按钮并排时手机上每个只剩
+                 * 八十来 vp，「检查全部更新」六个字会被挤成一团；而且这是本次新增的主入口，
+                 * 值得让人一眼看见。
+                 */
+                Button(this.checkingAllUpdates ? '正在检查订阅更新…' : '检查全部更新')
+                  .fontSize(13)
+                  .height(36)
+                  .width('100%')
+                  .backgroundColor(C_FILL_SOFT_STRONG)
+                  .fontColor(C_TEXT)
+                  .enabled(!this.checkingAllUpdates && !this.checking && !this.busy)
+                  .onClick(() => {
+                    this.checkAllSubscribed();
+                  })
+
+                /**
+                 * 订阅检查的结果表：有更新 / 已是最新 / 检查失败，逐条列出来
+                 *
+                 * 「已是最新」和失败的也要列：用户点了一次「检查全部更新」，想看的是每一个
+                 * 订阅的去向；只列有更新的那几个，失败与没查的会被误当成也是最新。
+                 */
+                if (this.subRows.length > 0) {
+                  Column({ space: 6 }) {
+                    Row() {
+                      Text('本次检查结果')
+                        .fontSize(F_TAB)
+                        .fontColor(C_TEXT_WEAK)
+                        .layoutWeight(1)
+                        .textAlign(TextAlign.Start)
+                      // 只在这一轮真拿到了新脚本时才给「全部更新」：上次会话残留的
+                      // 「有新版本」是没有脚本正文的，点了也写不了（见 subRowUpdateCount）
+                      if (this.subRowUpdateCount() > 0) {
+                        Text(this.updatingSubId.length > 0 ? '更新中…' : `全部更新（${this.subRowUpdateCount()}）`)
+                          .fontSize(F_TAB)
+                          .fontColor(C_RED)
+                          .padding({ left: 8, right: 2, top: 2, bottom: 2 })
+                          .onClick(() => {
+                            this.updateAllSubRows();
+                          })
+                      }
+                    }
+                    .width('100%')
+                    ForEach(this.subRows, (row: SubscriptionRow) => {
+                      Row({ space: 8 }) {
+                        Column({ space: 2 }) {
+                          Text(row.name)
+                            .fontSize(13)
+                            .fontColor(C_TEXT)
+                            .width('100%')
+                            .textAlign(TextAlign.Start)
+                          Text(`${this.subRowStatusText(row)}${row.fromSourceUrl ? '　· 按来源链接' : ''}`)
+                            .fontSize(11)
+                            .fontColor(this.subRowColor(row))
+                            .width('100%')
+                            .textAlign(TextAlign.Start)
+                        }
+                        .layoutWeight(1)
+                        .alignItems(HorizontalAlign.Start)
+                        if (row.update !== null) {
+                          Text(this.updatingSubId === row.id ? '更新中…' : '更新')
+                            .fontSize(12.5)
+                            .fontColor(this.updatingSubId === row.id ? C_TEXT_WEAK : C_RED)
+                            .padding({ left: 8, right: 4, top: 4, bottom: 4 })
+                            .onClick(() => {
+                              this.applySubRow(row);
+                            })
+                        }
+                      }
+                      .width('100%')
+                    }, (row: SubscriptionRow) => `${row.id}_${row.status}_${row.remoteVersion}`)
+                  }
+                  .width('100%')
+                  .padding(10)
+                  .borderRadius(10)
+                  .backgroundColor(C_FILL_SOFT)
+                }
+
+                // 一个地址都没有时说明清楚：这不是按钮坏了，是脚本没给地址、我们也不知道来源链接。
+                // 条件里带上「一个来源链接都没有」：只要订过任何一个源，「检查全部更新」就还能用，
+                // 这时再说「无法自动检查」就是假话。
+                if (this.sources.length > 0 && this.sourcesWithUpdateUrl().length === 0
+                  && this.linklessCount() === this.sources.length) {
+                  Text('这些音源既没有声明更新地址（头部 @updateUrl / 运行时 showUpdateAlert），'
+                    + '也没有记下来源链接（本地文件导入，或早期版本导入时没记），无法自动检查更新：'
+                    + '把音源链接重新导入一次就能补上来源链接，之后就能订阅并跟着更新。')
                     .fontSize(F_TAB)
                     .fontColor(C_TEXT_WEAK)
                     .width('100%')
@@ -1050,6 +1559,48 @@ export struct SourceSettingsView {
                   .width('100%')
                   .alignItems(VerticalAlign.Center)
 
+                  /**
+                   * 订阅 / 检查更新（只有「知道更新地址」的源才出现这一行）
+                   *
+                   * 为什么做成小字而不是第四个按钮：这一行说的是「以后怎么自己变新」，
+                   * 不是「现在怎么用」，跟上面三个按钮不是一个层级；一行小字刚好装下
+                   * 状态 + 两个动作，也不会把卡片撑高。
+                   *
+                   * 没有来源链接的源这里什么都不显示（老数据里这是多数），
+                   * 统一在下面「音源订阅」卡片里解释一句「为什么不能订阅、怎么补」，
+                   * 否则每张卡片下面都挂一行「不支持订阅」会把页面变成一张抱怨清单。
+                   */
+                  if (this.canSubscribe(item.id) || this.hasUpdateAddress(item)) {
+                    Row({ space: 10 }) {
+                      Text(this.subStateText(item))
+                        .fontSize(11)
+                        .fontColor(C_TEXT_WEAK)
+                        .layoutWeight(1)
+                        .maxLines(2)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      if (this.canSubscribe(item.id)) {
+                        Text(this.isSubscribed(item.id) ? '取消订阅' : '订阅')
+                          .fontSize(11.5)
+                          .fontColor(C_RED)
+                          .padding({ left: 8, right: 2, top: 2, bottom: 2 })
+                          .onClick(() => {
+                            this.toggleSubscribe(item);
+                          })
+                      }
+                      if (this.hasUpdateAddress(item)) {
+                        Text(this.checkingOneId === item.id ? '检查中…' : '检查更新')
+                          .fontSize(11.5)
+                          .fontColor(this.checkingOneId === item.id ? C_TEXT_WEAK : C_TEXT)
+                          .padding({ left: 8, right: 2, top: 2, bottom: 2 })
+                          .onClick(() => {
+                            this.checkSourceUpdateOf(item);
+                          })
+                      }
+                    }
+                    .width('100%')
+                    .alignItems(VerticalAlign.Center)
+                  }
+
                   Row({ space: 10 }) {
                     Button(item.disabled === true ? '启用并加载' : '加载')
                       .fontSize(13)
@@ -1084,9 +1635,76 @@ export struct SourceSettingsView {
                 .width('100%')
                 // 失效 / 停用的源整体压暗：一眼能分出「哪些别指望了」
                 .opacity(item.disabled === true || this.verdictOf(item) === VERDICT_DEAD ? 0.6 : 1)
-              }, (item: SourceInfo) => `${item.id}_${item.disabled === true ? 'off' : 'on'}_${this.verdictOf(item)}`)
+              }, (item: SourceInfo) => `${item.id}_${item.disabled === true ? 'off' : 'on'}_${this.verdictOf(item)}`
+                + `_${this.isSubscribed(item.id) ? 'sub' : 'nosub'}`)
             }
             .width('100%')
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 音源订阅
+          /**
+           * 订阅：把「导入时的那条链接」变成「以后能一键跟新的地址」
+           *
+           * 群里的原话（11-17 aries「导过来的原来歌单全是人机验证失败」、11-23
+           * CharlotteZero「现在音源全用不了」、🐉「说维护」）背后是同一件事：音源脚本
+           * 被厂商封了，作者发了新版，但版本只在群里流通 —— 用户既不知道该去哪找，
+           * 也不知道手上这份是不是旧的。上面「一键自检」只回答「现在还能不能用」，
+           * 这一段回答的是「它过期了怎么自己变新」。
+           *
+           * 这一段只讲「哪些源订了、为什么有的源订不了」；动作与结果表都放在上面
+           * 「已导入音源」卡片里（页面顶部一进来就能看到，点完立刻看到结论）。
+           * 逐源卡片本来就挤了加载/停用/删除三个按钮，订阅这种事再往每张卡上堆入口
+           * 就彻底没法看了，所以独立成段、只留状态与解释。
+           *
+           * 一个音源都没有时这一段仍然显示：新用户恰恰最需要知道「导入的链接会被记住、
+           * 以后能跟着更新」，而这段里已经写清「还没有记录到来源链接」，不会造成误解。
+           */
+          Column({ space: 10 }) {
+            this.sectionCard('音源订阅')
+            Column({ space: 8 }) {
+              Row() {
+                Text(this.subSummaryText())
+                  .fontSize(F_SUB)
+                  .fontColor(C_TEXT_SUB)
+                  .layoutWeight(1)
+                  .textAlign(TextAlign.Start)
+                if (this.lastSubCheckAt() > 0 && !this.checkingAllUpdates) {
+                  Text(`上次检查 ${this.shortTime(this.lastSubCheckAt())}`)
+                    .fontSize(F_TAB)
+                    .fontColor(C_TEXT_WEAK)
+                }
+              }
+              .width('100%')
+
+              // 入口放在页面顶部（「已导入音源」卡片里，紧挨「一键自检」）：这一段只解释
+              // 「订阅是什么、为什么订阅值得点」，动作统一在上面那一个按钮上，不在这里
+              // 再放一个同名按钮 —— 一页两个「检查全部更新」只会让人不知道该点哪个
+              Text('订阅记下的就是导入时用的那条链接。订了之后，上方「检查全部更新」会去脚本声明的'
+                + '更新地址拉新版，脚本没声明就退回这条链接；确认是新版后由你点「更新」——'
+                + '原地替换，音源 id 不变，播放列表和正在用的音源都不会失效。'
+                + '自动检查最多每次启动一次、12 小时内不重复，失败不打扰。')
+                .fontSize(F_TAB)
+                .fontColor(C_TEXT_WEAK)
+                .width('100%')
+                .textAlign(TextAlign.Start)
+
+              // 老数据普遍没有来源链接（早期版本导入时根本没记）：这里不能只显示「不支持订阅」，
+              // 得给出下一步动作，否则用户会以为功能坏了
+              if (this.sources.length > 0 && this.linklessCount() > 0) {
+                Text(`${this.linklessCount()} 个音源没有来源链接（本地文件导入，或早期版本导入时没记下来），`
+                  + '所以无法订阅：把那条音源链接重新粘贴到上面「导入音源」再导一次就能补上'
+                  + '（脚本版本没变会原地更新，不会多出一条；作者已发新版时会多出一条，删掉旧的那条即可）。')
+                  .fontSize(F_TAB)
+                  .fontColor(C_TEXT_WEAK)
+                  .width('100%')
+                  .textAlign(TextAlign.Start)
+              }
+            }
+            .width('100%')
+            .padding(12)
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
           }
           .width(cardWidthOf(this.windowWidth))
 
@@ -1222,8 +1840,34 @@ export struct SourceSettingsView {
         .padding({ left: 16, right: 16, bottom: this.bottomInset + 20 })
       }
       .scrollBar(BarState.Off)
-      .layoutWeight(1)
+      // Stack 里没有「主轴」可分，layoutWeight 不起作用：这里直接铺满整页高度，
+      // 内容照样能滚到标题栏底下（只是会被上面那块实心底挡住，见下面）
+      .width('100%')
+      .height('100%')
       .align(Alignment.Top)
+
+      /**
+       * 标题栏（状态栏 + 标题栏）自己的不透明底色
+       *
+       * 高度就取壳层传进来的 `topInset`：Index.ets 里给这一页传的是
+       * `HDS_TITLE_BAR_HEIGHT + this.topInset`，即「状态栏高度 + 标题栏高度」，
+       * 所以这块底正好盖满顶部那一条，一点不差。它挡的是两样东西：
+       *   1. 滚动内容穿到标题 / 状态栏上（截图 B 里那一截「加载」「删除」残留文字）；
+       *   2. 页面刚进来、上一页还没退干净时从透明标题栏透出来的旧内容
+       *      （截图 A 里透在标题背后的「音源」字样与图标）。
+       *
+       * 取色用 `C_BG` 而不是写死色值：`c_bg` 在 resources/base 与 resources/dark 各有一份，
+       * 深浅模式自动换（写死的话深色下就是一块白）。它和 TopFade 的起色 `c_top_fade`
+       * 本来就是同一个值（见 element/color.json），所以这块底与外面那条渐隐蒙版之间
+       * 不会出现色差接缝。
+       *
+       * 不设 hitTestBehavior（保持默认拦截触摸）：这就是一条不透明的标题栏，点在它上面
+       * 不该落到被它挡住、根本看不见的列表行上（否则会出现「点了个寂寞，某个按钮却响应了」）。
+       */
+      Column()
+        .width('100%')
+        .height(this.topInset)
+        .backgroundColor(C_BG)
     }
     .width('100%')
     .height('100%')

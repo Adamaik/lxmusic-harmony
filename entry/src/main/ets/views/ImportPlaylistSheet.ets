@@ -1,4 +1,4 @@
-import { PlaylistLink, linkOf, resolveShareText } from '../core/music/PlaylistLink';
+import { PlaylistLink, linkOf, linkUrlOf, resolveShareText } from '../core/music/PlaylistLink';
 import {
   LxListDetail,
   LxListInfo,
@@ -165,8 +165,17 @@ export struct ImportPlaylistSheet {
         return;
       }
       const updated: boolean = this.existing !== null;
+      /**
+       * 「当时的导入链接」要跟着歌单存进库里（core/sync/LocalLibrary 的导入链接侧表），
+       * 「我的 - 歌单」长按才有「更新导入歌单」，到时候按这条链接回源重拉。
+       *
+       * 存哪一条由 PlaylistLink.linkUrlOf 定：一般是这次真正用的链接（粘贴的 / 短链跟出来的
+       * 落地页地址）；只有「系统自动跟随短链、我们看不到最终地址」时换成规范长链接，
+       * 保证侧表里那条链接自己就能反解出平台与 id。
+       */
+      const importUrl: string = linkUrlOf(link);
       const summary: PlaylistSummary | null = SyncManager.getInstance().getLibrary()
-        .importPlaylist(name, link.source, link.listId, items);
+        .importPlaylist(name, link.source, link.listId, items, importUrl);
       if (summary === null) {
         this.toastable('这些歌曲没法导入（缺少歌曲信息）');
         return;

@@ -23,6 +23,40 @@ const NEXT_TIMEOUT_MS: number = 5000;
 const SINGLE_TIMEOUT_MS: number = 25000;
 const BUDGET_MS: number = 15000;
 
+/**
+ * 「最后兜底」那一次请求的预算（毫秒）
+ *
+ * 为什么要单独给一个：关掉「自动切换音源」时走的是 `single()` 那条路，
+ * 它用的是引擎自己的上限（几十秒），慢一点的代理型音源最终是能出地址的；
+ * 开着自动切换时，每个源只给 5~7 秒，慢源会被当成坏源杀掉。
+ * 于是出现群里反馈的那句 ——「点了自动切换，反而放不了了」（2026-11-19 14:06）、
+ * 「能用的源他也要转一会，是不是自动切源认为它不能播放，直接换源了」（同日 14:10）。
+ *
+ * 兜底这一次的语义是：**保证「开着自动切换」的成功率不低于「关着」**。
+ * 所以给它和 `SINGLE_TIMEOUT_MS` 同量级的时间，且只跑一次、只在所有候选都失败后跑。
+ */
+const LAST_CHANCE_TIMEOUT_MS: number = 25000;
+
+/**
+ * 这个错算不算「慢」，而不是「坏」
+ *
+ * 我们自己是按预算中断请求的（超时），音源脚本内部的网络请求也会抛 timeout / abort。
+ * 这类错误只能说明「这次没赶上」，不能说明「这个源不能用」—— 所以：
+ *   - **不记** PlatformHealth 的冷却（那条记下去是 5 分钟，会把一个只是慢的源
+ *     在整张歌单上晾五分钟，正是「开着自动切换反而全放不了」的成因之一）；
+ *   - 仍然记 SourceRouter 的降级（让它在**本次**平台内排到后面去）。
+ */
+function isSlowFailure(message: string): boolean {
+  const lower: string = message.toLowerCase();
+  const words: string[] = ['timeout', 'timed out', '超时', 'abort', 'aborted', 'cancel', '取消'];
+  for (const word of words) {
+    if (lower.includes(word)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** 换源过程中的回调（播放链路要更新状态行与耗时日志，下载链路只要日志） */
 export interface FailoverHooks {
   /** 用户切歌/取消：返回 true 就停止换源（已失败的源不记账） */
@@ -200,12 +234,69 @@ export async function resolveUrlWithSourceFailover(
       if (hooks.onAttemptFailed !== undefined) {
         hooks.onAttemptFailed(id, i, lastError.message);
       }
-      health.markFailure(id, platform, lastError.message);
+      // 「慢」和「坏」要分开记账，见 isSlowFailure 的说明：
+      // 超时只让它在本次平台内排到后面，不该吃 5 分钟的平台冷却。
+      if (!isSlowFailure(lastError.message)) {
+        health.markFailure(id, platform, lastError.message);
+      } else {
+        hilog.info(DOMAIN, TAG, 'source %{public}s timed out on %{public}s (slow, not broken)',
+          id, platform);
+      }
       router.markFailure(id, platform, lastError.message);
     }
   }
+  // 所有候选都失败了 —— 但这不等于这首歌放不出来，见 lastChance 的注释。
+  const last: FailoverOutcome | null =
+    await lastChance(previousId, musicInfoJson, platform, quality);
+  if (last !== null) {
+    router.markSuccess(last.sourceId, platform);
+    health.markSuccess(last.sourceId, platform);
+    return last;
+  }
   await restoreLoadedSource(previousId);
   throw lastError;
+}
+
+/**
+ * 最后兜底：用**原来加载的那个源 + 长预算**再试一次
+ *
+ * 这一条是为了让「开着自动切换」不比「关着」更差。关着的时候走 `single()`，
+ * 拿当前源、给足时间、直接请求 —— 很多"慢但能用"的源在那条路上是成功的；
+ * 开着的时候每个源只有 5~7 秒，慢源被逐个判死，最后反而放不出来。
+ *
+ * 三个刻意的选择：
+ *   1. **忽略冷却**（不查 health.isCooling）：这是最后一次机会，宁可再撞一次墙；
+ *   2. **不换源**：只用 previousId（进来时已经加载着的那个），因为换源要重新注入脚本，
+ *      而这会儿用户已经等了一段时间，再折腾一次注入只会更慢；
+ *   3. **失败就返回 null**，不抛错 —— 调用方照旧抛原来那个错，报错口径不变。
+ */
+async function lastChance(previousId: string, musicInfoJson: string, platform: string,
+  quality: string): Promise<FailoverOutcome | null> {
+  const engine: SourceEngine = SourceEngine.getInstance();
+  if (previousId.length === 0) {
+    return null;
+  }
+  try {
+    if (engine.getLoadedSourceId() !== previousId || !engine.isInited()) {
+      await engine.loadSource(previousId);
+    }
+    if (!engine.supportsAction(platform, 'musicUrl')) {
+      return null;
+    }
+    const picked: string = pickQuality(musicInfoJson, platform, quality);
+    const url: string = await engine.getMusicUrl(musicInfoJson, picked as LxQuality, platform,
+      LAST_CHANCE_TIMEOUT_MS);
+    if (url.length === 0) {
+      return null;
+    }
+    hilog.info(DOMAIN, TAG, 'last chance resolved on %{public}s (%{public}s)',
+      previousId, platform);
+    return { url: url, sourceId: engine.getLoadedSourceId(), quality: picked };
+  } catch (e) {
+    hilog.warn(DOMAIN, TAG, 'last chance failed on %{public}s: %{public}s',
+      previousId, (e as Error).message);
+    return null;
+  }
 }
 
 /**

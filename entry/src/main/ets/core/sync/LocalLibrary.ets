@@ -110,6 +110,35 @@ const SNAPSHOT_DIR: string = 'lx_sync';
 const SNAPSHOT_FILE: string = 'source-snapshot.json';
 
 /**
+ * 「从链接导入」的歌单存导入链接的文件（与源侧快照同一个目录，同样**不进**同步数据）
+ *
+ * 为什么不把链接写进歌单本体（list.json / LxUserListInfoFull）：
+ *   1. 那份数据要算 md5 与服务端、官方客户端对齐（`listDataMd5`），多一个字段就多一份
+ *      协议风险 —— 别人算出来的 md5 和我们不一样，下次连同步就会弹「选择同步方式」；
+ *   2. `SyncStore.normalizeUserList` 读回时只重建已知字段，未知字段会被丢掉，
+ *      写进去也留不住。
+ * 所以按本文件已有的先例（source-snapshot.json）走侧表：
+ *   - 老数据没有这个文件 = 没有导入链接 = 普通歌单（界面上不显示「更新导入歌单」），
+ *     天然向后兼容，不需要版本号迁移；
+ *   - 记录只按歌单 id 存，歌单删掉时跟着清（见 saveImportLinks），id 复用时不会串。
+ */
+const IMPORT_LINK_FILE: string = 'import-link.json';
+
+/**
+ * 一张歌单的导入来源信息（只给「我的 - 歌单」长按菜单里的「更新导入歌单」用）
+ *
+ * 存在这里而不是歌单本体里的原因见 {@link IMPORT_LINK_FILE} 的说明。
+ */
+export interface ImportLink {
+  /** 导入当时的链接（跟随短链后是最终地址；从在线歌单页直接导入时是按平台拼出来的长链接） */
+  url: string;
+  /** 平台 kw / kg / mg / tx / wy（与歌单的 source 一致） */
+  platform: string;
+  /** 记录时间（毫秒），仅用于排查 */
+  importedAt: number;
+}
+
+/**
  * 某张歌单**上次同步时**源侧有哪些条目（键的多重集）
  *
  * 这是「能不能删」的**唯一依据**：本地某条同平台歌在当前源里找不到，只有当它出现在
@@ -264,6 +293,14 @@ export class LocalLibrary implements LibrarySink {
   /** 每张歌单上次同步时的源侧键快照，懒加载（见 ensureSnapshots） */
   private snapshots: Map<string, SourceSnapshot> = new Map<string, SourceSnapshot>();
   private snapshotsLoaded: boolean = false;
+  /**
+   * 每张歌单「从链接导入」时的链接（懒加载，见 ensureImportLinks）
+   *
+   * 只有「导入过的歌单」有记录；自建歌单、老版本导入的歌单都没有 —— 界面据此决定
+   * 长按菜单里要不要显示「更新导入歌单」。
+   */
+  private importLinks: Map<string, ImportLink> = new Map<string, ImportLink>();
+  private importLinksLoaded: boolean = false;
   /** 手动同步里「等用户确认才删」的计划（同一张歌单同时只留一份） */
   private pendingRemovals: Map<string, PendingRemoval> = new Map<string, PendingRemoval>();
 
@@ -277,6 +314,9 @@ export class LocalLibrary implements LibrarySink {
     this.data = this.store.loadListData();
     this.dislike = normalizeDislikeRules(this.store.loadDislikeRules());
     this.initialized = this.store.hasListData();
+    // 导入链接侧表在启动时读一次：长按菜单要按它决定显示哪几项，
+    // 放到界面构建时再读就成了一次主线程文件 IO（文件很小，但没必要）
+    this.ensureImportLinks();
   }
 
   isInitialized(): boolean {
@@ -631,6 +671,133 @@ export class LocalLibrary implements LibrarySink {
     return item.sourceListId;
   }
 
+  /**
+   * 这张歌单「从链接导入」时存下的链接；自建歌单 / 老版本导入的歌单返回 null
+   *
+   * 「我的 - 歌单」的长按菜单靠它决定要不要多出「更新导入歌单」：**只有这里有记录才显示**。
+   * 老数据（升级前导入的歌单）在侧表里没有记录，按需求当普通歌单处理 ——
+   * 不去猜「有 sourceListId 就算导入过」，因为猜错了会给手建歌单凭空长出一个用不了的入口。
+   */
+  importLinkOf(id: string): ImportLink | null {
+    this.ensureImportLinks();
+    const link: ImportLink | undefined = this.importLinks.get(id);
+    if (link === undefined) {
+      return null;
+    }
+    // 返回副本：调用方拿去展示 / 重新解析，改不到库里这份
+    return { url: link.url, platform: link.platform, importedAt: link.importedAt };
+  }
+
+  /**
+   * 记录（或覆盖）一张歌单的导入链接
+   *
+   * 同一个线上歌单再导一次时 id 不变，直接覆盖成这次用的链接：用户换了分享方式
+   * （短链 / 长链）重导，侧表里留的就该是最近一次真正用过的那个。
+   */
+  private recordImportLink(id: string, url: string, platform: string): void {
+    const clean: string = url.trim();
+    if (clean.length === 0 || platform.length === 0) {
+      return;
+    }
+    this.ensureImportLinks();
+    // 对象字面量先落到显式类型的变量上：ArkTS 不允许字面量直接从参数位置推断类型
+    const entry: ImportLink = { url: clean, platform: platform, importedAt: Date.now() };
+    this.importLinks.set(id, entry);
+    this.saveImportLinks();
+  }
+
+  // ------------------------------------------------------------ 导入链接（落盘）
+
+  /**
+   * 懒加载导入链接侧表
+   *
+   * 与源侧快照同一套做法：读不出来 / 读坏了都只是「没有导入链接」，绝不抛错 ——
+   * 侧表坏了不该让歌单本身打不开。
+   */
+  private ensureImportLinks(): void {
+    if (this.importLinksLoaded) {
+      return;
+    }
+    this.importLinksLoaded = true;
+    const ctx: common.Context | null = this.context;
+    if (ctx === null) {
+      return;
+    }
+    try {
+      const target: string = `${ctx.filesDir}/${SNAPSHOT_DIR}/${IMPORT_LINK_FILE}`;
+      if (!fs.accessSync(target)) {
+        return;
+      }
+      const text: string = fs.readTextSync(target);
+      const raw: Record<string, ImportLink> = JSON.parse(text) as Record<string, ImportLink>;
+      for (const key of Object.keys(raw)) {
+        const entry: ImportLink | undefined = raw[key];
+        if (entry === undefined || entry === null) {
+          continue;
+        }
+        const url: string = typeof entry.url === 'string' ? entry.url.trim() : '';
+        const platform: string = typeof entry.platform === 'string' ? entry.platform.trim() : '';
+        if (url.length === 0 || platform.length === 0) {
+          continue;
+        }
+        const normalized: ImportLink = {
+          url: url,
+          platform: platform,
+          importedAt: typeof entry.importedAt === 'number' ? entry.importedAt : 0,
+        };
+        this.importLinks.set(key, normalized);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'load import link failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /**
+   * 落盘导入链接侧表，顺手清掉**已经不存在**的歌单的记录
+   *
+   * 为什么要清：本地歌单 id 是 `user_list_<时间戳>`，删了再建有可能撞回同一个 id
+   * （同毫秒连点两下时），记录留着就会让新建的自建歌单莫名多出「更新导入歌单」，
+   * 甚至按上一条歌单的链接把歌拉进来 —— 串数据比少一个入口严重得多。
+   */
+  private saveImportLinks(): void {
+    this.ensureImportLinks();
+    const ctx: common.Context | null = this.context;
+    if (ctx === null) {
+      return;
+    }
+    // 只保留还活着的歌单的链接
+    const alive: Map<string, ImportLink> = new Map<string, ImportLink>();
+    for (const item of this.data.userList) {
+      const link: ImportLink | undefined = this.importLinks.get(item.id);
+      if (link !== undefined) {
+        alive.set(item.id, link);
+      }
+    }
+    this.importLinks = alive;
+    try {
+      const dir: string = `${ctx.filesDir}/${SNAPSHOT_DIR}`;
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir);
+      }
+      const out: Record<string, ImportLink> = {};
+      for (const item of this.data.userList) {
+        const link: ImportLink | undefined = alive.get(item.id);
+        if (link !== undefined) {
+          out[item.id] = link;
+        }
+      }
+      const handle = fs.openSync(`${dir}/${IMPORT_LINK_FILE}`,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(handle.fd, JSON.stringify(out));
+      } finally {
+        fs.closeSync(handle);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'save import link failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
   playlistSongs(id: string): SongItem[] {
     // targetMusics 认 default / love / 用户歌单，所以内置收藏歌单也能按 id 取歌
     const musics: LxMusicInfoNew[] | null = this.targetMusics(id);
@@ -761,9 +928,12 @@ export class LocalLibrary implements LibrarySink {
    * sourceListId 迁到规范形态。这样老用户再导一次同一张歌单不会多出一条同名列表，
    * 也不会删掉任何原有数据。
    * @returns 导入后的歌单；没有任何可导入的歌时返回 null
+   * @param importUrl 导入时用的链接（空串 = 没有链接可存，比如以后有别的入口直接给 id）。
+   *   非空时记进导入链接侧表（见 IMPORT_LINK_FILE），「我的 - 歌单」长按菜单据此
+   *   显示「更新导入歌单」。**不进歌单本体**：那份数据参与同步 md5，不能加字段。
    */
   importPlaylist(name: string, source: string, sourceListId: string,
-    items: SongItem[]): PlaylistSummary | null {
+    items: SongItem[], importUrl: string = ''): PlaylistSummary | null {
     /**
      * **导入不按 id 去重**（keepDuplicates = true）。
      *
@@ -799,6 +969,8 @@ export class LocalLibrary implements LibrarySink {
       this.emit({ action: 'list_update', data: [buildUserListInfo(existing)] }, 'list');
       // 刚按源歌单写了一遍，十分钟内不必再回源对齐（打开歌单时的自动同步会看这个时间戳）
       this.sourceSyncAt.set(targetId, Date.now());
+      // 这次导入用的链接覆盖旧的：「更新导入歌单」以后按最近一次真正用过的链接回源
+      this.recordImportLink(targetId, importUrl, source);
       return { id: targetId, name: name, count: musics.length + this.sideCountOf(targetId) };
     }
     const item: LxUserListInfoFull = {
@@ -819,6 +991,7 @@ export class LocalLibrary implements LibrarySink {
     this.emit({ action: 'list_create', data: data }, 'list');
     // 刚导入就是源歌单的完整快照：十分钟内打开它不必立刻再拉一遍
     this.sourceSyncAt.set(id, Date.now());
+    this.recordImportLink(id, importUrl, source);
     return { id: id, name: name, count: musics.length };
   }
 
@@ -1316,6 +1489,8 @@ export class LocalLibrary implements LibrarySink {
     this.data.userList = remains;
     // 歌单没了，它在各张侧表里的引用也一起清掉（留着就是永远读不到的垃圾）
     this.dropSideLists(removable);
+    // 导入链接侧表同理：歌单删了，记录必须跟着走（本地歌单 id 可能被复用，留着会串）
+    this.saveImportLinks();
     this.persist();
     this.mirrorToSession();
     this.emit({ action: 'list_remove', data: removable }, 'list');
@@ -1744,6 +1919,8 @@ export class LocalLibrary implements LibrarySink {
     switch (action.action) {
       case 'list_data_overwrite':
         this.data = normalizeListData(action.data as LxListData);
+        // 整份列表被远端覆盖了：侧表里属于「已经不存在的歌单」的导入链接一并清掉
+        this.saveImportLinks();
         return;
       case 'list_create': {
         const payload = action.data as LxListCreateData;
@@ -1788,6 +1965,8 @@ export class LocalLibrary implements LibrarySink {
           }
         }
         this.data.userList = remains;
+        // 远端删了歌单：它的导入链接记录也一起清掉（同 removePlaylists 的理由）
+        this.saveImportLinks();
         return;
       }
       case 'list_update': {

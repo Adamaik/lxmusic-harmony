@@ -5,8 +5,8 @@ import { SyncManager } from '../core/sync/SyncManager';
 // 加歌的返回值是 { added, skipped }：重复的会被跳过，提示要按真实结果说话
 import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { platformName } from '../core/music/MusicList';
-import { C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, platformColor, platformTint } from '../ui/Theme';
-import { I_CHECK_CIRCLE, I_CIRCLE, I_MORE_CIRCLE, IconGlyph } from '../ui/Icons';
+import { C_CARD, C_DIVIDER, C_RED, C_TEXT, C_TEXT_WEAK, F_ITEM, platformColor, platformTint } from '../ui/Theme';
+import { I_CHECK_CIRCLE, I_CIRCLE, I_MORE_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { CoverArt, EmptyState, FavoriteHeart, SingerLink } from '../ui/Widgets';
 import { SongListSource } from '../ui/SongListSource';
 import { AddToPlaylistSheet } from './AddToPlaylistSheet';
@@ -26,6 +26,18 @@ import { contentColumnsFor, K_WINDOW_WIDTH } from '../ui/Layout';
 export struct SongListPane {
   @Prop @Watch('onItemsChanged') items: SongItem[] = [];
   @Prop currentId: string = '';
+  /**
+   * 「正在播放」那一行要不要在歌名前挂一只红色小喇叭
+   *
+   * 默认**关**：这个组件被歌单详情、在线榜单、播放历史、歌手页等多处共用，
+   * 各处原先的观感（只有红字）要原样保留 —— 加这一项之前谁也没画喇叭，
+   * 不该因为歌手页要它就把所有列表一起改掉。
+   *
+   * 歌手页（`views/ArtistView.ets`）照华为音乐重做时传 true：那边列表的行高、
+   * 字号和华为音乐一致，红字之外还缺一个「正在出声」的标记，
+   * 与 `views/OnlineListView.ets`、`views/PlayQueueSheet.ets` 的行保持同一套语言。
+   */
+  @Prop showPlayingIcon: boolean = false;
   @Prop emptyText: string = '这里是空的';
   /** 行上是否标出来源平台（聚合搜索结果才需要，普通歌单里所有歌都是一个平台） */
   @Prop showSource: boolean = false;
@@ -85,6 +97,13 @@ export struct SongListPane {
    */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
   private source: SongListSource = new SongListSource();
+  /**
+   * 列表滚动器（「回到正在播放那一行」用）
+   *
+   * 群反馈 2026-11-16 07:55（看海）：「没有那个歌单里导航到歌曲那一行的按钮」——
+   * 长歌单（几百上千首）想找回正在听的那一首只能手划。这里补一个能滚到当前项的能力。
+   */
+  private scroller: Scroller = new Scroller();
 
   /** 一屏几列（宽屏多列，窄屏 1 列 = 改之前的样子，见 ui/Layout.ets） */
   private columns(): number {
@@ -285,13 +304,21 @@ export struct SongListPane {
       radius: 13,
     })
     Column({ space: 4 }) {
-      Text(item.name)
-        .fontSize(F_ITEM)
-        .fontColor(this.currentId === item.id ? C_RED : C_TEXT)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-        .textAlign(TextAlign.Start)
+      Row({ space: 4 }) {
+        // 正在播放那一行的红色小喇叭（只有 showPlayingIcon 打开时才画，见该 @Prop 的说明）
+        if (this.showPlayingIcon && this.currentId === item.id) {
+          IconGlyph({ symbol: I_VOLUME, iconSize: 15, color: C_RED })
+        }
+        Text(item.name)
+          .fontSize(F_ITEM)
+          .fontColor(this.currentId === item.id ? C_RED : C_TEXT)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
       if (item.singer.length > 0 || this.showSource) {
         Row({ space: 6 }) {
           if (item.singer.length > 0) {
@@ -356,12 +383,40 @@ export struct SongListPane {
     }
   }
 
+  /** 当前正在播放的那首歌在这个列表里的下标；不在这个列表里返回 -1 */
+  private currentRowIndex(): number {
+    if (this.currentId.length === 0) {
+      return -1;
+    }
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.items[i].id === this.currentId) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 滚到正在播放的那一行
+   *
+   * 找不到就什么都不做（按钮在这种状态下本来也不显示，见 build 里的判断）。
+   * 用 `scrollToIndex` 而不是自己算偏移：列表项高度随封面尺寸变化，算偏移容易滚歪。
+   */
+  private scrollToCurrent(): void {
+    const index: number = this.currentRowIndex();
+    if (index < 0) {
+      return;
+    }
+    this.scroller.scrollToIndex(index, true, ScrollAlign.CENTER);
+  }
+
   build() {
+    Stack({ alignContent: Alignment.BottomEnd }) {
     Column() {
       if (this.items.length === 0) {
         EmptyState({ text: this.emptyText, topPadding: 82 })
       } else {
-        List() {
+        List({ scroller: this.scroller }) {
           /**
            * 整页只有一个 ListItemGroup：组内是歌曲行，组尾是翻页状态行
            *
@@ -433,6 +488,38 @@ export struct SongListPane {
         .onReachEnd(() => {
           this.onReachEnd();
         })
+      }
+    }
+    .width('100%')
+    .height('100%')
+
+      /**
+       * 「定位到正在播放那一行」的悬浮按钮
+       *
+       * 三个刻意的选择：
+       *   1. 只在**当前这首歌就在这个列表里**时显示（`currentRowIndex() >= 0`）——
+       *      不在这个列表里还显示，点了没反应，比不显示更糟；
+       *   2. 多选态不显示（`!this.selecting`）：那时用户在做批量操作，浮动按钮会误触；
+       *   3. 位置放在右下角、并让出底部那条迷你播放栏（bottomInset + 88），
+       *      不压在任何歌曲行上 —— 群反馈里原来那个准星按钮正是压在行上才被吐槽。
+       * 图标用文本 `⌖`（U+2316 POSITION INDICATOR）而不是系统符号资源：
+       * 这个圆准星正是它的语义，且不依赖某个可能不存在的 sys.symbol 名字。
+       */
+      if (this.currentRowIndex() >= 0 && !this.selecting) {
+        Text('⌖')
+          .fontSize(20)
+          .fontColor(C_RED)
+          .textAlign(TextAlign.Center)
+          .width(44)
+          .height(44)
+          .borderRadius(22)
+          .backgroundColor(C_CARD)
+          .shadow({ radius: 12, color: '#33000000', offsetY: 3 })
+          .margin({ right: 16, bottom: this.bottomInset + 88 })
+          .accessibilityText('定位到正在播放的歌曲')
+          .onClick(() => {
+            this.scrollToCurrent();
+          })
       }
     }
     .width('100%')

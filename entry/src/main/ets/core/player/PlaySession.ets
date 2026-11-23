@@ -666,6 +666,16 @@ export class PlaySession {
   private failRetry: number = 0;
   /** 这次解析要排除的音源（已经证明放不出来的那些，可累计多个） */
   private skipSourceIds: string[] = [];
+  /**
+   * 连续「放不出来就自动跳下一首」的次数
+   *
+   * 群反馈 2026-11-23 17:29「播放不了的歌曲不会自动跳过」：一首歌彻底失败时
+   * 以前就停在报错上，用户得自己按下一首。现在自动跳，但必须防「整张歌单全坏时
+   * 无限空转」：跳满一圈（queue.length - 1 首）还没出声，就停手把控制权交回用户。
+   *
+   * 任何一次真的放出声音都会清零（见 playAt 里 playUrl 成功那一段）。
+   */
+  private autoSkipCount: number = 0;
   /** 播放现场落盘 */
   private stateStore: PlayStateStore = new PlayStateStore();
   private stateInited: boolean = false;
@@ -2410,6 +2420,25 @@ export class PlaySession {
               hilog.info(DOMAIN, TAG, 'platform failure recorded: %{public}s (%{public}s): %{public}s',
                 item.source, loadedId, lastError.message);
               health.markFailure(loadedId, item.source, lastError.message);
+              /**
+               * 跨平台换源的闸门
+               *
+               * 默认关（见 PlaySettings.K_SWITCH_PLATFORM_SAME_SONG）：各平台曲库与版本不一致，
+               * 同名歌可能是 Live / 翻唱 / 加速版，自动替上去会「放错歌」。
+               *
+               * 但有一个**例外**：从 QQ 歌单导入的歌曲（`item.source === 'tx'`）。
+               * 群反馈 2026-11-23 17:27（CharlotteZero）：「歌单导入qq，只能用qq的音源播放，
+               * 这样qq音源失效不就听不了吗」—— 这类歌单整张都是 tx 条目，一旦 QQ 取不到流，
+               * 用户面对的是「一张几百首的歌单全不能听」，而且他根本没有别的办法：
+               * 关掉开关时我们只报错，打开开关又得靠用户自己想起来去设置里翻。
+               * 所以对 tx 条目放开这一条兜底（仍然走严格匹配：歌名+歌手完全相等才换，
+               * 换完照旧弹「已自动换源播放」，不会静默换成别的歌）。
+               */
+              const userAllowsSwitch: boolean = PlaySettings.getInstance().isSwitchPlatformSameSong();
+              const txImported: boolean = item.source === 'tx';
+              if (!userAllowsSwitch && !txImported) {
+                throw lastError;
+              }
               const alt: AltPlayback | null =
                 await this.switchSourceAndResolve(item, quality, token, lastError.message);
               if (alt === null) {
@@ -2463,6 +2492,8 @@ export class PlaySession {
       // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
+      // 这一首真的把地址交给播放器了：清掉「连续自动跳过」的计数（见那一段注释）
+      this.autoSkipCount = 0;
       // 地址真的到手、播放器也接下了：negotiate / 换源 / 降档折腾完，这一档才是本次实际生效的档位。
       // 期间用户可能已经切了歌（playAt 会把实际档位清空），旧的那一次不许覆盖新歌的显示。
       if (this.playToken === token) {
@@ -2482,6 +2513,32 @@ export class PlaySession {
       // buffer 有值说明是送进播放器之后才失败的 —— 这两种在排障时完全是两件事
       StartupTiming.getInstance().markFailed('播放失败');
       const message: string = `播放「${item.name}」失败：${friendlyPlayError((e as Error).message)}`;
+      /**
+       * 自动跳到下一首（群反馈 2026-11-23 17:29「播放不了的歌曲不会自动跳过」）
+       *
+       * 判据是**这一轮彻底失败了**才走到这里：降档试过、换源试过、跨平台也试过（若开着），
+       * 仍然没拿到能出声的地址。这时候继续停在这首歌上对用户没有任何用处 ——
+       * 他要么手动按下一首，要么以为软件卡死了。
+       *
+       * 防呆上限用「队列长度 - 1」而不是写死 3 或 5：整张歌单都不行的时候
+       * （音源全挂、断网）应该跳满一圈就停手报错，而不是绕回去继续空转；
+       * 队列只有一首时上限为 0 —— 没得跳，保持原来的报错行为。
+       * 真正放出声音会把这个计数清零（见上面 playUrl 成功那一段）。
+       */
+      const maxSkips: number = Math.max(0, this.queue.length - 1);
+      if (this.autoSkipCount < maxSkips) {
+        this.autoSkipCount += 1;
+        hilog.info(DOMAIN, TAG, 'play failed, auto skip %{public}d/%{public}d: %{public}s',
+          this.autoSkipCount, maxSkips, item.name);
+        this.setStatus('error', message);
+        this.notify(`${message}，已自动跳到下一首`);
+        void this.next();
+        return;
+      }
+      // 跳满一圈：停手，把控制权交回用户，报错口径与加这项之前一致
+      hilog.warn(DOMAIN, TAG, 'play failed, auto skip exhausted (%{public}d): %{public}s',
+        this.autoSkipCount, item.name);
+      this.autoSkipCount = 0;
       this.setStatus('error', message);
       this.notify(message);
     }

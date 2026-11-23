@@ -1,11 +1,16 @@
 import { common } from '@kit.AbilityKit';
-import { K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem } from '../core/player/PlaySession';
+import { K_LIBRARY_VERSION, PlaySession, PlaylistSummary, SongItem, songFromSearch } from '../core/player/PlaySession';
 import { K_ECHO_VERSION, ListenLog } from '../core/history/ListenLog';
 import { BottomBar } from '../ui/BottomBar';
 import { K_FAVORITE_IDS } from '../core/player/FavoriteIndex';
 import { K_SYNC_DATA_VERSION, SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylist, CollectedPlaylists, K_COLLECTED_VERSION, collectedKeyOf } from '../core/sync/CollectedPlaylists';
-import { OnlineRoute, platformName } from '../core/music/MusicList';
+import { getPlaylistDetailAll, LxListDetail, OnlineRoute, platformName,
+  playlistDetailTruncated } from '../core/music/MusicList';
+import { PlaylistLink, parseShareText } from '../core/music/PlaylistLink';
+// ImportLink：歌单存下来的「导入链接」；只有它有记录的歌单，长按菜单才多出「更新导入歌单」
+// PlaylistSyncResult：「跟随源歌单」对齐的结果（+几 / -几，以及要不要用户确认删除）
+import { ImportLink, PlaylistSyncResult } from '../core/sync/LocalLibrary';
 import { LOVE_LIST_NAME } from '../core/sync/SyncTypes';
 import { K_LOCAL_VERSION, LocalMusic } from '../core/local/LocalMusic';
 import { ExportOutcome, ImportFileOutcome, PlaylistPort } from '../core/local/PlaylistPort';
@@ -119,6 +124,13 @@ export struct MineView {
   @State selectedIds: string[] = [];
   /** 正在读写文件：防连点（保存 / 选择对话框同一时间只能有一个） */
   @State transferring: boolean = false;
+  /**
+   * 正在「更新导入歌单」的歌单 id（空串 = 没在更新）
+   *
+   * 更新是一次网络全量拉取 + 对齐，可能十几秒：这段时间里同一张歌单不能再点
+   * （两份旧快照互相覆盖会重复加歌、甚至互相删），菜单项也要显示成「正在更新…」给点反馈。
+   */
+  @State updatingPlaylist: string = '';
   /** 最近一次触摸点：删除歌单时在这里撒一把粒子（普通字段，不引起重绘） */
   private dustX: number = 0;
   private dustY: number = 0;
@@ -254,6 +266,150 @@ export struct MineView {
             // 删除给一点粒子飘散（在触摸点撒，不在支持的系统上自动不做）
             dustBus.spray(this.dustX, this.dustY);
             this.refresh();
+          },
+        },
+      ],
+    });
+  }
+
+  // ------------------------------------------------------------ 歌单：更新导入歌单
+
+  /**
+   * 这张歌单的导入链接（没有 = 自建歌单，或升级前导入、侧表里没记录的老歌单）
+   *
+   * 长按菜单靠它决定要不要显示「更新导入歌单」：需求只要求「从链接导入的歌单」有这一项，
+   * 自建歌单不显示。判断只认侧表，不去猜「有 source 就算导入过」——猜错会给手建歌单
+   * 凭空长出一个用不了的入口。
+   */
+  private importLinkOf(item: PlaylistSummary): ImportLink | null {
+    return SyncManager.getInstance().getLibrary().importLinkOf(item.id);
+  }
+
+  /**
+   * 「更新导入歌单」：拿当初存的导入链接重新拉一遍曲目，把本地歌单对齐成最新
+   *
+   * 这里**不另写一套删除逻辑**，整条链路复用歌单详情页「从原歌单更新」用的那一套：
+   *   - 拉取：getPlaylistDetailAll（真翻页，大歌单也能拉全）；
+   *   - 对齐：LocalLibrary.syncWithSource(manual = true) —— 新增直接补进来，
+   *           「源里删掉的」不会立刻删，而是落成「待确认删除」计划，用户点「删除」才真删
+   *           （manual 路径的语义，见 syncWithSource 的注释）；
+   *   - 防重入：beginSyncToSource / endSyncToSource，与打开歌单时的自动对齐互斥。
+   *
+   * 入口放长按菜单，是为了「不进歌单也能更新」——这也是需求要的那个操作路径。
+   */
+  private async updateImportedPlaylist(item: PlaylistSummary): Promise<void> {
+    if (this.updatingPlaylist.length > 0) {
+      this.toast('正在更新歌单，稍候');
+      return;
+    }
+    const library = SyncManager.getInstance().getLibrary();
+    const link: ImportLink | null = library.importLinkOf(item.id);
+    if (link === null) {
+      return;
+    }
+    /**
+     * 用**当初存的导入链接**重新解析平台与歌单 id：保存的链接通常已经跟成带 id 的地址，
+     * 这里不联网；万一解析不出来（老数据 / 链接格式变了），退回歌单里已存的 sourceListId ——
+     * 它本来就是同一个线上歌单的标识，口径见 LocalLibrary.normalizeSourceListId。
+     */
+    const parsed: PlaylistLink | null = parseShareText(link.url);
+    const source: string = parsed !== null ? parsed.source : link.platform;
+    const sourceListId: string = parsed !== null ? parsed.listId : library.sourceListIdOf(item.id);
+    if (source.length === 0 || sourceListId.length === 0) {
+      this.toast('这个歌单缺少导入来源，没法更新');
+      return;
+    }
+    if (!library.beginSyncToSource(item.id)) {
+      this.toast('这张歌单正在同步，稍候');
+      return;
+    }
+    this.updatingPlaylist = item.id;
+    try {
+      this.toast('正在从导入链接拉取最新内容…');
+      const detail: LxListDetail = await getPlaylistDetailAll(source, sourceListId);
+      // 只拿到一部分时整体放弃：拿半份源歌单去对齐，会把「没拉到的」当成「源里删了」
+      if (playlistDetailTruncated(detail, source)) {
+        this.toast('源歌单没拉全（可能被接口限流），已保留本地内容');
+        return;
+      }
+      const quality: string = PlaySession.getInstance().quality;
+      const items: SongItem[] = [];
+      for (const music of detail.list) {
+        items.push(songFromSearch(music, quality));
+      }
+      if (items.length === 0) {
+        this.toast('源歌单现在是空的，已保留本地内容');
+        return;
+      }
+      const result: PlaylistSyncResult = library.syncWithSource(item.id, items, true);
+      if (result.aborted) {
+        // 一条都对不上：更像 sourceListId 指错了歌单，按源删本地等于清空歌单，不动
+        this.refresh();
+        this.toast('源歌单变化太大，这次先不同步（可能是接口没返回全）');
+        return;
+      }
+      if (result.pendingRemoval > 0) {
+        // 新增已经落库，删除等用户在弹窗里确认
+        this.refresh();
+        this.confirmImportRemoval(item, result);
+        return;
+      }
+      if (!result.changed) {
+        this.toast('已是最新，和导入链接里的歌单一致');
+        return;
+      }
+      this.refresh();
+      const parts: string[] = [];
+      if (result.added > 0) {
+        parts.push(`+${result.added}`);
+      }
+      if (result.removed > 0) {
+        parts.push(`-${result.removed}`);
+      }
+      this.toast(`已更新「${item.name}」：${parts.join(' / ')}`);
+    } catch (e) {
+      this.toast(`更新失败：${(e as Error).message}`);
+    } finally {
+      library.endSyncToSource(item.id);
+      this.updatingPlaylist = '';
+    }
+  }
+
+  /**
+   * 「导入链接里的歌单少了这些歌」的确认弹窗
+   *
+   * 与歌单详情页那套（PlaylistDetailView.confirmSourceRemoval）同一口径：列出歌名、
+   * 用户点「删除」才真的移除，点「保留」什么都不动（快照不刷，下次更新还会问）。
+   * 那边的方法是页面私有，入口也不同（这里是长按菜单），所以在本页写一份同样口径的。
+   */
+  private confirmImportRemoval(item: PlaylistSummary, result: PlaylistSyncResult): void {
+    const library = SyncManager.getInstance().getLibrary();
+    const lines: string[] = [];
+    for (const name of result.pendingNames) {
+      lines.push(`· ${name}`);
+    }
+    if (result.pendingRemoval > result.pendingNames.length) {
+      lines.push(`· 等共 ${result.pendingRemoval} 首`);
+    }
+    const head: string = result.added > 0 ? `已先补进 ${result.added} 首新歌。` : '';
+    this.getUIContext().showAlertDialog({
+      title: '导入链接里的歌单少了这些歌',
+      message: `${head}源歌单里已经没有这 ${result.pendingRemoval} 首了：\n${lines.join('\n')}\n要从本地歌单里一起删掉吗？（选「保留」不动本地）`,
+      autoCancel: true,
+      buttons: [
+        {
+          value: '保留',
+          action: () => {
+            library.discardPendingSourceRemoval(item.id);
+          },
+        },
+        {
+          value: '删除',
+          fontColor: C_RED,
+          action: () => {
+            const removed: number = library.applyPendingSourceRemoval(item.id);
+            this.refresh();
+            this.toast(`已移除 ${removed} 首`);
           },
         },
       ],
@@ -673,6 +829,16 @@ export struct MineView {
         .onClick(() => {
           this.addPlaylistToFavorites(item);
         })
+      /**
+       * 只有「从链接导入」的歌单才多这一项：拿当初存的导入链接重新拉一遍曲目。
+       * 自建歌单 / 老版本导入（没有记录）没有这一项 —— 见 importLinkOf。
+       */
+      if (this.importLinkOf(item) !== null) {
+        MenuItem({ content: this.updatingPlaylist === item.id ? '正在更新…' : '更新导入歌单' })
+          .onClick(() => {
+            void this.updateImportedPlaylist(item);
+          })
+      }
       MenuItem({ content: '重命名' })
         .onClick(() => {
           this.openRename(item);

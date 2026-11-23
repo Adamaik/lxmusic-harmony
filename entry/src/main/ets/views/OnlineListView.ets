@@ -7,7 +7,7 @@ import { SyncManager } from '../core/sync/SyncManager';
 // 加歌的返回值是 { added, skipped }：重复的会被跳过，提示要按真实结果说话
 import { AddMusicResult } from '../core/sync/LocalLibrary';
 import { CollectedPlaylists, K_COLLECTED_VERSION } from '../core/sync/CollectedPlaylists';
-import { C_BG, C_DIVIDER, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
+import { C_BG, C_CARD, C_DIVIDER, C_RED, C_RED_TINT, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB } from '../ui/Theme';
 import { I_CHECK_CIRCLE, I_CIRCLE, I_DOWNLOAD, I_HEART, I_HEART_FILLED,
   I_MORE_CIRCLE, I_PLAY_CIRCLE, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { CoverArt, FavoriteHeart, SingerLink } from '../ui/Widgets';
@@ -1212,6 +1212,27 @@ export struct OnlineListView {
     })
   }
 
+  /**
+   * 滚到正在播放的那一首（群反馈 2026-11-16 07:55 看海：「没有那个歌单里导航到歌曲那一行的按钮」）
+   *
+   * 这一页是在线歌单/榜单详情，动辄几百首，没有定位入口就只能一路手划。
+   * 与 `PlaylistDetailView` 同一套做法（那边早就有这颗靶心），保持一致观感与交互：
+   * 找得到就居中，找不到就说明「不在这个榜单里」，不要点了没反应。
+   */
+  private scrollToCurrent(): void {
+    if (this.currentId.length === 0) {
+      this.toast('还没有在播放的歌曲');
+      return;
+    }
+    for (let i = 0; i < this.songs.length; i++) {
+      if (this.songs[i].id === this.currentId) {
+        this.scroller.scrollToIndex(i, true, ScrollAlign.CENTER);
+        return;
+      }
+    }
+    this.toast('正在播放的这首歌不在这个榜单里');
+  }
+
   build() {
     // 迷你播放条浮在列表之上（与歌单详情同一套做法：Tabs 自带的悬浮栏，见 miniBarTabBar）
     Stack({ alignContent: Alignment.Bottom }) {
@@ -1262,6 +1283,40 @@ export struct OnlineListView {
         .height('100%')
 
         this.fallbackMiniBar()
+      }
+
+      /**
+       * 「定位到正在播放那一行」的悬浮靶心
+       *
+       * 与 `PlaylistDetailView` 同一个位置口径：右下角、让出底部悬浮迷你栏
+       * （bottomInset + HDS_BAR_HEIGHT + PAGE_BAR_BOTTOM_GAP + 14），绝不压在歌曲行上。
+       * 只在「有歌在放 + 列表非空」时出现。
+       */
+      if (this.currentId.length > 0 && this.songs.length > 0) {
+        Column() {
+          Text('⌖')
+            .fontSize(18)
+            .fontColor(C_RED)
+            .textAlign(TextAlign.Center)
+            .width(42)
+            .height(42)
+            .borderRadius(21)
+            .backgroundColor(C_CARD)
+            .shadow({ radius: 14, color: '#33000000', offsetX: 0, offsetY: 3 })
+            .accessibilityText('定位到正在播放的歌曲')
+            .onClick(() => {
+              this.scrollToCurrent();
+            })
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.End)
+        .alignItems(HorizontalAlign.End)
+        .padding({
+          right: 18,
+          bottom: this.bottomInset + HDS_BAR_HEIGHT + PAGE_BAR_BOTTOM_GAP + 14,
+        })
+        .hitTestBehavior(HitTestMode.Transparent)
       }
     }
     .width('100%')

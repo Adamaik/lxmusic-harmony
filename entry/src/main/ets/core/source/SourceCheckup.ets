@@ -155,6 +155,14 @@ export interface SourceUpdateInfo {
   script: string;
   /** 用的是哪个更新地址 */
   url: string;
+  /**
+   * 这个地址是「来源链接」而不是脚本声明的 updateUrl
+   *
+   * 两种地址的可靠性不一样：updateUrl 是脚本作者显式声明「这里永远是新版」，
+   * 来源链接只是「当初从这导入的」，它可能是某个网盘直链、可能早就换路径了。
+   * 界面据此说明「按来源链接检查」，出问题时用户知道该怀疑哪一边。
+   */
+  fromSourceUrl: boolean;
   checkedAt: number;
 }
 
@@ -809,12 +817,20 @@ function findSource(id: string): SourceInfo | null {
 /**
  * 检查一个源有没有新版本
  *
- * 只在「脚本声明过更新地址」时才有得查：
+ * @param id          音源 id
+ * @param fallbackUrl 「这个源当初是从哪个链接导进来的」（来源链接，见 SourceSubscription）
+ *
+ * 地址优先用脚本自己声明的，两种都收过：
  *   1. 头部 `@updateUrl`（第三方源的扩展写法，见 LxMetadata）；
  *   2. 运行时 `lx.send('showUpdateAlert', { updateUrl })`（引擎已记下，见 handleUpdateAlert）。
- * 两种都没有时返回 error 说明，不弹错、不影响原源。
+ * 声明过就不看来源链接 —— 作者既然写了 updateUrl，那条才是发布新版的正式地址。
+ *
+ * 都没有时才退回 fallbackUrl。这一条是给群里那句「源又不行了、只能满群找新链接」补的：
+ * 大量第三方源根本没写 @updateUrl，但作者就是在同一个固定链接上原地更新脚本，
+ * 只要有来源链接，照样能跟上（见 SourceSubscription 的订阅）。
+ * 两种地址都没有时返回 error 说明，不弹错、不影响原源。
  */
-export async function checkSourceUpdate(id: string): Promise<SourceUpdateInfo> {
+export async function checkSourceUpdate(id: string, fallbackUrl: string = ''): Promise<SourceUpdateInfo> {
   const engine: SourceEngine = SourceEngine.getInstance();
   const info: SourceInfo | null = findSource(id);
   const empty: SourceUpdateInfo = {
@@ -828,15 +844,19 @@ export async function checkSourceUpdate(id: string): Promise<SourceUpdateInfo> {
     note: '',
     script: '',
     url: '',
+    fromSourceUrl: false,
     checkedAt: Date.now(),
   };
   if (info === null) {
     empty.error = '音源不存在';
     return empty;
   }
-  const url: string = info.updateUrl !== undefined ? info.updateUrl : '';
+  const declared: string = info.updateUrl !== undefined ? info.updateUrl : '';
+  const fromSourceUrl: boolean = !/^https?:\/\//.test(declared);
+  const url: string = fromSourceUrl ? fallbackUrl : declared;
+  empty.fromSourceUrl = fromSourceUrl;
   if (!/^https?:\/\//.test(url)) {
-    empty.error = '该音源没有声明更新地址';
+    empty.error = fromSourceUrl ? '该音源既没有声明更新地址，也没有来源链接' : '该音源没有声明更新地址';
     return empty;
   }
   empty.url = url;
@@ -874,6 +894,7 @@ export async function checkSourceUpdate(id: string): Promise<SourceUpdateInfo> {
     note: '',
     script: script,
     url: url,
+    fromSourceUrl: fromSourceUrl,
     checkedAt: Date.now(),
   };
   if (versionCmp > 0) {
@@ -896,10 +917,14 @@ export async function checkSourceUpdate(id: string): Promise<SourceUpdateInfo> {
  *
  * 与自检不同，这里**没有沙箱参与**（只是下载 + 解析头部 + 比版本），所以可以真并发。
  * 三个并发足够把常见 3~5 个源的等待压到一轮，又不会让手机网络排队太长。
+ *
+ * @param urlOf 可选的「来源链接」解析器：某个源没有声明 updateUrl 时用它兜底
+ *              （音源订阅就是这么用的，见 SourceSubscription）。不给就只查声明过地址的源。
  */
 export async function checkSourceUpdates(ids: string[],
   onProgress?: (done: number, total: number) => void,
-  isCancelled?: () => boolean): Promise<SourceUpdateInfo[]> {
+  isCancelled?: () => boolean,
+  urlOf?: (id: string) => string): Promise<SourceUpdateInfo[]> {
   const results: SourceUpdateInfo[] = [];
   const total: number = ids.length;
   let nextIndex: number = 0;
@@ -911,7 +936,8 @@ export async function checkSourceUpdates(ids: string[],
       }
       const index: number = nextIndex;
       nextIndex += 1;
-      const outcome: SourceUpdateInfo = await checkSourceUpdate(ids[index]);
+      const fallback: string = urlOf !== undefined ? urlOf(ids[index]) : '';
+      const outcome: SourceUpdateInfo = await checkSourceUpdate(ids[index], fallback);
       results.push(outcome);
       done += 1;
       if (onProgress !== undefined) {

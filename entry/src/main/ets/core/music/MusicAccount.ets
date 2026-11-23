@@ -95,7 +95,14 @@ function hasWySession(cookie: string): boolean {
 
 // ------------------------------------------------------------------ QQ 音乐
 
-const TX_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+/**
+ * 桌面 Chrome UA（导出给别处复用：歌单分享短链的跟随也要它）
+ *
+ * 为什么这里要导出一份而不是各处再写一遍：QQ 音乐的分享短链按 UA 分流，
+ * 移动 UA 有机会被跳到「下载客户端」页，桌面 UA 才 302 到歌单页。歌单导入
+ * （core/music/PlaylistLink）跟短链时用的就是这一个值，以后改版本号只改这里。
+ */
+export const TX_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 /**

@@ -11,7 +11,8 @@ import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   K_EXTEND_QUALITY,
   K_EXTEND_QUALITY_TYPE,
   K_LYRIC_BLUR, K_LYRIC_CENTERED, K_LYRIC_FONT_SIZE, K_LYRIC_KEEP_SCREEN, K_PLAY_QUALITY, K_PLAY_WITH_OTHERS,
-  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, K_SWIPE_SWITCH_SONG, LYRIC_FONT_MAX, LYRIC_FONT_MIN,
+  K_PLAYER_MOTION, K_SHOW_MINI_LYRIC, K_SWIPE_SWITCH_SONG, K_SWITCH_PLATFORM_SAME_SONG,
+  LYRIC_FONT_MAX, LYRIC_FONT_MIN,
   MAIN_QUALITYS, MAIN_QUALITY_LABELS,
   PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LABELS, PLAYER_MOTION_LEVELS, PLAYER_MOTION_LIGHT,
   PlaySettings } from '../core/settings/PlaySettings';
@@ -146,6 +147,12 @@ export struct PlaySettingsView {
    * 播放页在每次纵向拖动松手时现读这一项，拨完立刻生效，不用重进播放页。
    */
   @StorageLink(K_SWIPE_SWITCH_SONG) swipeSwitchSong: boolean = false;
+  /**
+   * 放不出来时自动换别的平台的同名歌（默认关，见 PlaySettings.K_SWITCH_PLATFORM_SAME_SONG）
+   *
+   * PlaySession 取地址最终失败时现读这一项，拨完立刻生效。
+   */
+  @StorageLink(K_SWITCH_PLATFORM_SAME_SONG) switchPlatformSameSong: boolean = false;
   /** 系统是否支持桌面歌词：问过系统之前不下结论（见 desktopLyricHint） */
   @State lyricSupportKnown: boolean = false;
   @State lyricSupported: boolean = false;
@@ -254,6 +261,20 @@ export struct PlaySettingsView {
     return '在播放页上滑切下一首、下滑切上一首（位移超过约 72vp，或快速甩动时才触发，'
       + '轻轻一划不会误切）。打开后正文区的下滑不再收起播放页 —— 收起请点左上角的箭头，'
       + '或在顶栏那一条上向下拖动。顺序播放到队首/队尾时会提示，不会静默失败。';
+  }
+
+  /**
+   * 跨平台同名歌替换的说明
+   *
+   * 这一项的风险必须写在用户看得见的地方：不同平台的曲库、版本、时长都不一样，
+   * 同名歌可能是 Live、翻唱、加速版，换过去的「不是没歌可放」而是「可能放错歌」。
+   * 所以讲清默认关闭、以及关着时是直接报错而不是干等。
+   */
+  private switchPlatformSameSongHint(): string {
+    return '由于不同平台的曲库与版本存在差异，可能会播放成同名但不同版本的歌曲'
+      + '（Live、翻唱、加速版等）或错误的音乐，请自行确认。默认关闭：关着时当前平台取不到'
+      + '播放地址会直接报错，不会替你换成别的平台的歌。它和「音源设置 - 自动切换音源」'
+      + '不是一回事，那一项换的是同一平台下的不同音源。';
   }
 
   /** 桌面歌词这一项的说明：不支持的设备上明说，免得用户以为开关坏了 */
@@ -423,6 +444,24 @@ export struct PlaySettingsView {
                 },
               })
               HintText({ text: this.autoPauseHeadsetOffHint() })
+
+              /**
+               * 放不出来时自动换别的平台的同名歌（默认关，见 PlaySettings.K_SWITCH_PLATFORM_SAME_SONG）
+               *
+               * 放在这张卡里是因为它和上面几项一样都管「真放不出来时怎么办」。
+               * 与「音源设置 - 自动切换音源」分工不同：那一项换的是同一平台的不同音源脚本。
+               */
+              ToggleSetting({
+                label: '放不出来时自动切换其他平台的同名音乐',
+                value: this.switchPlatformSameSong,
+                onPick: (next: boolean) => {
+                  PlaySettings.getInstance().setSwitchPlatformSameSong(next);
+                  if (next) {
+                    this.toast('已开启：取不到播放地址时会去其他平台搜同名同歌手的歌');
+                  }
+                },
+              })
+              HintText({ text: this.switchPlatformSameSongHint() })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: 8, bottom: 8 })

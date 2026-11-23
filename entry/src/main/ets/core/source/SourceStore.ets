@@ -14,12 +14,62 @@ const ACTIVE_FILE: string = 'active_source.json';
 const ROUTER_FILE: string = 'source_router.json';
 /** 上一次「一键自检」的结论（见 SourceCheckup） */
 const EXTRAS_FILE: string = 'source_checkup.json';
+/**
+ * 音源订阅：来源链接 + 订阅状态（见 SourceSubscription）
+ *
+ * 为什么不把「来源链接」塞进 sources.json 的 SourceInfo 里：SourceInfo 是**洛雪脚本头部
+ * 字段的镜像**（name / version / author / updateUrl 都是脚本自己声明的），而「这个源是从
+ * 哪个链接导进来的」是导入那一刻发生的事实，脚本本身并不知道。放进旁挂的一份记录里，
+ * 好处有三：
+ *   1. 老数据天然兼容 —— 没有这份文件就等于「所有源都没记下来源链接」，
+ *      不需要写任何迁移代码（读不到就是空列表，界面显示「不支持订阅」）；
+ *   2. 删源 / 覆盖更新都不丢订阅：记录按 id 索引，而 importSource 覆盖更新、
+ *      replaceSourceScript 原地更新都保持 id 不变（见 SourceEngine）；
+ *   3. 订阅的附带状态（上次检查时间、上次结论）有地方放，不必污染脚本元信息。
+ */
+const SUBS_FILE: string = 'source_subscriptions.json';
+/** 订阅记录的格式版本：将来加减字段时按这个号做迁移；读的时候不校验版本，缺字段按默认值补 */
+const SUBS_SCHEMA_VERSION: number = 1;
 
 export interface ActiveSource {
   id: string;
   /** 加载时用的沙箱环境（mobile / desktop），恢复时要按同一个来 */
   env: string;
   loadedAt: number;
+}
+
+/**
+ * 一个音源「从哪来 / 有没有订阅」的记录
+ *
+ * `url` 与 `subscribed` 必须是两件事，不能合并成一个开关：
+ *   - `url` 是**来源链接**，导入那一刻就该记下来（用户取消订阅也不该忘），
+ *     忘了它这个源就永远失去「重新拉一次最新脚本」的线索；
+ *   - `subscribed` 只是「以后检查更新 / 自动检查要不要算上它」。
+ * 两者分开还有个直接用处：界面上「没订阅但知道链接」的源仍然可以点单次的「检查更新」。
+ */
+export interface SubscriptionRecord {
+  /** 音源 id（与 sources.json 里的 id 一致，覆盖更新也不变） */
+  id: string;
+  /** 来源链接：导入时填的那个 URL；本地文件导入、或早期版本导入的老数据，是空串 */
+  url: string;
+  /** 已订阅：检查全部更新、启动后的自动检查都只算上这些 */
+  subscribed: boolean;
+  /** 订阅（或最近一次重新导入该链接）的时刻 */
+  subscribedAt: number;
+  /** 上次检查更新的时刻（0 = 从没查过） */
+  lastCheckedAt: number;
+  /** 上次检查的结论：'update' / 'latest' / 'failed' / ''（没查过） */
+  lastResult: string;
+  /** 上次远端版本号（检查失败时为空串） */
+  lastRemoteVersion: string;
+  /** 上次结论的一句话说明（进页面就能看到，不必重新联网） */
+  lastNote: string;
+}
+
+/** 订阅记录文件（source_subscriptions.json）的内容 */
+export interface SubscriptionFile {
+  version: number;
+  items: SubscriptionRecord[];
 }
 
 /**
@@ -228,6 +278,11 @@ export class SourceStore {
       }
     }
     this.saveIndex(remains);
+    // 脚本和索引都清掉之后，订阅记录也得跟着清：否则音源设置页会留下一行指向
+    // 已经不存在的音源的订阅（「检查全部更新」每次都要为它白跑一遍网络请求）。
+    // 放在 remove 里而不是让每个调用方记得调：删源有两条路径（设置页删除、
+    // 启动时清理历史重复音源），漏一条就会攒出这种孤儿记录。
+    this.pruneSubscriptions(ids);
     return remains;
   }
 
@@ -372,6 +427,97 @@ export class SourceStore {
       }
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'failed to save checkup state: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  // ------------------------------------------------------------ 订阅与来源链接
+
+  private subsPath(): string {
+    return `${this.dir}/${SUBS_FILE}`;
+  }
+
+  /**
+   * 读订阅记录（读不到 / 解析失败一律返回空数组）
+   *
+   * 和路由记忆、自检结论同一个口径：这份数据坏了只该退化成「所有源都显示没订阅」，
+   * 绝不能把音源设置页带崩。老文件 / 手改过的文件都可能缺字段，这里逐条补齐默认值，
+   * 上层拿到的永远是填满的 SubscriptionRecord，不用到处判 undefined。
+   *
+   * 注意这里**不校验 version**：订阅只是「记住链接、记下上次结论」，不像自检结论那样
+   * 有严格的字段语义，加减字段时按缺省值补就够了，为它写一套迁移代码不值当。
+   */
+  loadSubscriptions(): SubscriptionRecord[] {
+    if (!this.ready) {
+      return [];
+    }
+    try {
+      const path: string = this.subsPath();
+      if (!fs.accessSync(path)) {
+        return [];
+      }
+      const parsed: SubscriptionFile = JSON.parse(fs.readTextSync(path)) as SubscriptionFile;
+      if (parsed === null || parsed === undefined || parsed.items === undefined) {
+        return [];
+      }
+      const list: SubscriptionRecord[] = [];
+      for (const raw of parsed.items) {
+        if (raw === null || raw === undefined || raw.id === undefined || raw.id.length === 0) {
+          continue;
+        }
+        list.push({
+          id: raw.id,
+          url: raw.url !== undefined ? raw.url : '',
+          subscribed: raw.subscribed === true,
+          subscribedAt: raw.subscribedAt !== undefined ? raw.subscribedAt : 0,
+          lastCheckedAt: raw.lastCheckedAt !== undefined ? raw.lastCheckedAt : 0,
+          lastResult: raw.lastResult !== undefined ? raw.lastResult : '',
+          lastRemoteVersion: raw.lastRemoteVersion !== undefined ? raw.lastRemoteVersion : '',
+          lastNote: raw.lastNote !== undefined ? raw.lastNote : '',
+        });
+      }
+      return list;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to read subscriptions: %{public}s', JSON.stringify(e));
+      return [];
+    }
+  }
+
+  /** 写订阅记录；写失败只记日志（下次检查还会再写一次） */
+  saveSubscriptions(list: SubscriptionRecord[]): void {
+    if (!this.ready) {
+      return;
+    }
+    const content: SubscriptionFile = { version: SUBS_SCHEMA_VERSION, items: list };
+    try {
+      const file = fs.openSync(this.subsPath(), fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, JSON.stringify(content));
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to save subscriptions: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /** 删掉若干个音源的订阅记录（音源被删除时调用，见 remove） */
+  private pruneSubscriptions(ids: string[]): void {
+    if (ids.length === 0) {
+      return;
+    }
+    const list: SubscriptionRecord[] = this.loadSubscriptions();
+    const remains: SubscriptionRecord[] = [];
+    let removed: number = 0;
+    for (const item of list) {
+      if (ids.includes(item.id)) {
+        removed += 1;
+      } else {
+        remains.push(item);
+      }
+    }
+    // 没有命中就不重写文件：remove 在「删重复音源」时也走这里，别为它多写一次盘
+    if (removed > 0) {
+      this.saveSubscriptions(remains);
     }
   }
 }
