@@ -982,17 +982,45 @@ export function buildFolderUrl(base: string, dir: string): string {
   }
   const lower: string = trimmedDir.toLowerCase();
   if (lower.startsWith('http://') || lower.startsWith('https://')) {
-    return stripTrailingSlashes(trimmedDir);
+    return collapseSlashes(stripTrailingSlashes(trimmedDir));
   }
-  if (trimmedDir.startsWith('/')) {
-    return `${trimmedBase}${encodePath(trimmedDir)}`;
-  }
-  return `${trimmedBase}/${encodePath(trimmedDir)}`;
+  // encodePath 一定返回以 / 开头的路径（输入有没有前导 / 都一样），
+  // 所以这里只能拼一次。写成 `${base}/${encodePath(dir)}` 会得到 /dav//listen-config，
+  // 坚果云不会替你折叠 //：目录建在 /dav/listen-config，PUT 却打到 /dav//listen-config，
+  // 服务端回 409，而测试连接因为建目录走的是去掉空段的路径，还显示成功。
+  return collapseSlashes(`${trimmedBase}${encodePath(trimmedDir)}`);
 }
 
 /** 目录 + 固定文件名 -> 文件 URL */
 export function configFileUrl(folderUrl: string): string {
-  return `${stripTrailingSlashes(folderUrl)}/${CONFIG_SYNC_FILE_NAME}`;
+  return collapseSlashes(`${stripTrailingSlashes(folderUrl)}/${CONFIG_SYNC_FILE_NAME}`);
+}
+
+/**
+ * 折叠 URL 路径里重复的 /（保留 scheme 的 ://）
+ *
+ * 用户可能从别处拷贝带 // 的整条目录 URL，历史配置里也可能已经存了这种写法。
+ * 这里统一收口，保证建目录和写文件走的是同一个路径。
+ */
+function collapseSlashes(url: string): string {
+  const schemeEnd: number = url.indexOf('://');
+  const head: string = schemeEnd >= 0 ? url.substring(0, schemeEnd + 3) : '';
+  const path: string = schemeEnd >= 0 ? url.substring(schemeEnd + 3) : url;
+  const out: string[] = [];
+  let lastWasSlash: boolean = false;
+  for (let i: number = 0; i < path.length; i++) {
+    const ch: string = path.charAt(i);
+    if (ch === '/') {
+      if (lastWasSlash) {
+        continue;
+      }
+      lastWasSlash = true;
+    } else {
+      lastWasSlash = false;
+    }
+    out.push(ch);
+  }
+  return `${head}${out.join('')}`;
 }
 
 function stripTrailingSlashes(value: string): string {
