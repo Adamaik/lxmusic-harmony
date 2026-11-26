@@ -341,6 +341,30 @@ export class LxPlayer {
   /** 换源后要落到的位置（-1 表示不跳）：从流式播放切回文件播放时用 */
   private pendingSeekMs: number = -1;
   /**
+   * 「下一次起播」要落到的位置（-1 = 从头）
+   *
+   * 音效改动后的重播用它：整首重新烘一遍要几秒，而顺序数据源不能定位，
+   * 所以要么等 WAV 落全再起播（保住用户的位置），要么退回从头流式起播。
+   * 由 PlaySession 在重播前置好（见 replayForEq），一次性消费 —— 绝不泄漏到下一首。
+   */
+  private startSeekMs: number = -1;
+  /**
+   * startSeekMs 的设置时刻
+   *
+   * 兜底：万一设置之后这一趟起播根本没走到 playXxx（解析失败、用户立刻切走），
+   * 这个值不能被下一个人（用户后来点的其它歌）消费掉 —— 否则会莫名其妙跳到中间。
+   * 超过 30 秒就当它作废。
+   */
+  private startSeekAt: number = 0;
+  /**
+   * 这一趟起播是否已经用 pendingSeekMs **精确**落过位置
+   *
+   * EQ 续播走的正是这条路（等整首落全 → 普通 fd 播放 → prepared 态 seek）。
+   * 而 PlaySession 的 applyResumeSeek 还会按秒级位置再跳一次，那会把已经落好的
+   * 精确位置往回拉最多 1 秒（听得出来的一次小回跳）。用它去重。
+   */
+  private startSeekApplied: boolean = false;
+  /**
    * 「处理中拖动」的守候定时器。
    *
    * 边处理边播用的是「总长未知」的数据源，播放器不接受 seek。用户此时拖进度条不能当没看见：
@@ -495,6 +519,30 @@ export class LxPlayer {
 
   getCurrentMs(): number {
     return this.currentMs;
+  }
+
+  /**
+   * 指定「下一次起播」落到的位置（ms，<=0 表示从头）
+   *
+   * 只给音效改动后的重播用（见 PlaySession.replayForEq）：在 playAt 之前调用，
+   * 由接下来那次 playXxx 消费掉。消费即清空，不会带到后面的歌。
+   */
+  setStartSeekMs(ms: number): void {
+    this.startSeekMs = ms > 0 ? ms : -1;
+    this.startSeekAt = Date.now();
+  }
+
+  /** 取走一次性落点（消费后清空；超过 30 秒视为过期，见 startSeekAt） */
+  private takeStartSeekMs(): number {
+    const ms: number = this.startSeekMs;
+    const fresh: boolean = ms > 0 && Date.now() - this.startSeekAt < 30000;
+    this.startSeekMs = -1;
+    return fresh ? ms : -1;
+  }
+
+  /** 这一趟起播是否已经精确落过位置（见 startSeekApplied） */
+  wasStartSeekApplied(): boolean {
+    return this.startSeekApplied;
   }
 
   isPlaying(): boolean {
@@ -772,12 +820,16 @@ export class LxPlayer {
    * 返回 null 表示这次不走 EQ（没开 / 增益全 0 / 失败），调用方照旧用原始 URL 播。
    * 注意这里**不等整首处理完**：processor 攒够约 3 秒数据就返回，之后边播边处理 ——
    * 这是把「等整首下载+处理」压到「等几秒」的关键。
+   *
+   * @param resumeMs >0 时把落点交给 processor：它会额外等整首落全（有上限），
+   *   这样返回的会话一定是 done 的，调用方可以用普通 fd 播放直接定位过去。
    */
-  private async eqSessionOf(url: string, headers: Record<string, string>): Promise<EqStreamSession | null> {
+  private async eqSessionOf(url: string, headers: Record<string, string>,
+    resumeMs: number = 0): Promise<EqStreamSession | null> {
     const gen: number = this.eqGeneration;
     try {
       const session: EqStreamSession | null =
-        await AudioEffectProcessor.getInstance().startStream(url, headers);
+        await AudioEffectProcessor.getInstance().startStream(url, headers, resumeMs);
       if (this.eqGeneration !== gen) {
         // 切歌了：这次处理的结果不要了（processor 内部也会 cancel 掉 Native 任务）
         return null;
@@ -933,7 +985,9 @@ export class LxPlayer {
     this.eqRawUrl = url;
     this.eqRawHeaders = {};
     this.pendingSeekMs = -1;
-    const session: EqStreamSession | null = await this.eqSessionOf(url, {});
+    // 音效改动后的重播会带一个落点（见 setStartSeekMs）：消费掉，只影响这一趟
+    const startMs: number = this.takeStartSeekMs();
+    const session: EqStreamSession | null = await this.eqSessionOf(url, {}, Math.max(0, startMs));
     if (this.eqWasSuperseded(gen)) {
       return;
     }
@@ -942,6 +996,9 @@ export class LxPlayer {
         if (session.isDone()) {
           // 整首已就绪：走普通 fd 播放，进度条拖动可用。这里播的是 EQ 产物本身，
           // 必须传 false，否则会拿 WAV 再去编码一次。
+          if (startMs > 0) {
+            this.pendingSeekMs = startMs;
+          }
           await this.playLocal(session.wavPath, false);
           return;
         }
@@ -974,13 +1031,17 @@ export class LxPlayer {
     this.eqRawUrl = url;
     this.eqRawHeaders = headers;
     this.pendingSeekMs = -1;
-    const session: EqStreamSession | null = await this.eqSessionOf(url, headers);
+    const startMs: number = this.takeStartSeekMs();
+    const session: EqStreamSession | null = await this.eqSessionOf(url, headers, Math.max(0, startMs));
     if (this.eqWasSuperseded(gen)) {
       return;
     }
     if (session !== null) {
       try {
         if (session.isDone()) {
+          if (startMs > 0) {
+            this.pendingSeekMs = startMs;
+          }
           await this.playLocal(session.wavPath, false);
           return;
         }
@@ -1014,12 +1075,22 @@ export class LxPlayer {
       this.eqRawUrl = '';
       this.eqRawHeaders = {};
       this.pendingSeekMs = -1;
-      const session: EqStreamSession | null = await this.eqSessionOfFile(path);
+      const startMs: number = this.takeStartSeekMs();
+      const session: EqStreamSession | null =
+        await this.eqSessionOfFile(path, Math.max(0, startMs));
       if (this.eqWasSuperseded(gen)) {
         return;
       }
       if (session !== null) {
         try {
+          if (session.isDone()) {
+            // 整首已就绪（含「续播」等完的那一趟）：普通 fd 播放，可定位
+            if (startMs > 0) {
+              this.pendingSeekMs = startMs;
+            }
+            await this.playLocalFile(session.wavPath);
+            return;
+          }
           await this.playEqStream(session);
           return;
         } catch (e) {
@@ -1080,9 +1151,9 @@ export class LxPlayer {
   }
 
   /** 本地文件走一次 EQ（失败返回 null，调用方回退原文件） */
-  private async eqSessionOfFile(path: string): Promise<EqStreamSession | null> {
+  private async eqSessionOfFile(path: string, resumeMs: number = 0): Promise<EqStreamSession | null> {
     try {
-      return await AudioEffectProcessor.getInstance().startStreamForFile(path);
+      return await AudioEffectProcessor.getInstance().startStreamForFile(path, resumeMs);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'eq on local file failed: %{public}s', JSON.stringify(e));
       this.noteEqSkipped(`本地文件音效处理失败：${(e as Error).message}`);
@@ -1119,6 +1190,8 @@ export class LxPlayer {
     this.update('loading', '正在加载音频…');
     this.durationMs = 0;
     this.currentMs = 0;
+    // 新实例：位置还没落过（见 startSeekApplied）
+    this.startSeekApplied = false;
     // 换了实例：缓冲水位从零开始（上一次的转圈状态也要收掉、灰段也要从头长）
     this.bufferedEndMs = 0;
     // 打断标记是跟着这一首/这个实例走的，新实例从头开始记
@@ -1167,6 +1240,7 @@ export class LxPlayer {
             try {
               hilog.info(DOMAIN, TAG, 'pending seek applied: %{public}dms', targetMs);
               player.seek(targetMs);
+              this.startSeekApplied = true;
             } catch (err) {
               hilog.warn(DOMAIN, TAG, 'pending seek failed: %{public}s', JSON.stringify(err));
             }

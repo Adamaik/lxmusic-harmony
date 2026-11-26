@@ -4,6 +4,15 @@ import { http } from '@kit.NetworkKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { cancel, processAudio, processAudioFd, processAudioUrl, version, ProcessAudioResult } from 'libaudioeffect.so';
 import { AudioEffectSettings } from '../settings/AudioEffectSettings';
+import { LocalStreamProxy } from './LocalStreamProxy';
+
+/**
+ * 排查用开关：把本来可以直连的 URL 也强行绕一遍本地代理。
+ *
+ * 正常逻辑只有「需要请求头」的源才走代理（见 processByProxy），而这类源（WebDAV）
+ * 不好随手造，所以留一个开关来验证回环链路本身通不通。**发版保持 false。**
+ */
+const FORCE_PROXY_FOR_TEST: boolean = false;
 
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AudioEffectProcessor';
@@ -18,9 +27,21 @@ const EQ_CHUNK_READ_MS: number = 30000;
 const EQ_CHUNK_RETRY: number = 3;
 
 /** 起播前至少要有这么多 WAV 数据（约 3 秒 44.1k/16bit 立体声） */
-const PREBUFFER_BYTES: number = 512 * 1024;
+const PREBUFFER_SECONDS: number = 3;
+/** 预缓冲下限：极低采样率 / 单声道也不至于一有数据就起播 */
+const PREBUFFER_MIN_BYTES: number = 256 * 1024;
 /** 等预缓冲的上限；超时就先起播（反正后面还在继续产出） */
 const PREBUFFER_TIMEOUT_MS: number = 20000;
+
+/**
+ * 「续播」时等整首处理完的上限
+ *
+ * 边处理边播的数据源是**顺序读、不能定位**的（见 LxPlayer.playEqStream），所以想让
+ * 起播就落在原来的位置，只能等 WAV 落全再走普通文件播放。真机实测处理速度约 32 倍速
+ * （4 分钟的曲子约 7 秒），这个上限够覆盖绝大多数歌曲；超出就放弃等待、退回从头流式
+ * 起播 —— 宁可回到老行为，也不能让用户对着转圈等到天荒地老。
+ */
+const RESUME_WAIT_MS: number = 9000;
 
 /** 等上一趟 Native 处理真正退出的上限。超时就不再等，硬着头皮开始新的一趟 */
 const SETTLE_TIMEOUT_MS: number = 3000;
@@ -73,8 +94,9 @@ export class EqStreamSession {
  * 三条输入路径（产物都写到同一个临时 WAV）：
  * - **URL 直连**（默认）：Native 用系统解封装器直接拉网络流，边下边解码边写 WAV。
  *   没有「先整份下载」的等待，也不需要额外的磁盘中转。
- * - **先下载再处理**（仅当需要请求头，比如 WebDAV 认证）：Headers 没法传给 AVSource，
- *   只能自己分块下到本地再处理。
+ * - **需要请求头的源**（WebDAV 认证、防盗链 Referer 等）：起一个本机回环代理把请求头代加上，
+ *   Native 依旧走 URL 直连拉流（见 LocalStreamProxy）—— 起播只等几秒数据。
+ *   代理起不来或链路不通时回退到「整份下载再处理」（老行为，慢但不丢功能）。
  * - **本地文件**（AudioCache 已缓存的整首 / 沙箱里的音频）：Native 只读打开，输出到临时 WAV。
  *
  * 关键约束：
@@ -98,6 +120,8 @@ export class AudioEffectProcessor {
   /** 正在处理的 taskId（同一时刻只服务当前播放这一首） */
   private activeTaskId: number = 0;
   private activeRequest: http.HttpRequest | null = null;
+  /** 当前这次处理在用的回环代理（只有需要请求头的源才有）；切歌时立刻关掉 */
+  private activeProxy: LocalStreamProxy | null = null;
   /** 当前这次处理的状态；切歌时置 null 让在途任务作废 */
   private current: EqRunState | null = null;
   /**
@@ -144,11 +168,14 @@ export class AudioEffectProcessor {
    * 返回时机不是「整首处理完」，而是 WAV 已经有约 3 秒数据（或处理已结束/超时）。
    * 之后播放器一边播、Native 一边继续往后写，用户不用等整首。
    *
+   * @param resumeMs 这次起播想落到的位置（0 = 从头）。>0 时会**额外等整首处理完**
+   *   （有上限，见 RESUME_WAIT_MS）：只有落全的 WAV 才能用普通 fd 播放定位。
    * @returns null 表示不该走 EQ（未开启 / 未初始化 / 全 0 增益）
    * @throws 处理失败或已被切歌时抛出，调用方回退原始音源
    */
-  async startStream(url: string, headers: Record<string, string>): Promise<EqStreamSession | null> {
-    return this.startTask('', url, headers);
+  async startStream(url: string, headers: Record<string, string>,
+    resumeMs: number = 0): Promise<EqStreamSession | null> {
+    return this.startTask('', url, headers, resumeMs);
   }
 
   /**
@@ -160,13 +187,14 @@ export class AudioEffectProcessor {
    * @param path 沙箱绝对路径，或 Picker 给的 `file://docs/...` URI。两种都由本侧用
    *   `fs.openSync` 打开、把 fd 交给 Native —— URI 的读权限挂在 ArkTS 的持久化授权上
    *   （见 LocalAccess），原生按字符串是打不开的，传 fd 才是同一条读取通道。
+   * @param resumeMs 同 startStream：>0 时额外等整首落全，保证返回的会话可定位
    */
-  async startStreamForFile(filePath: string): Promise<EqStreamSession | null> {
-    return this.startTask(filePath, '', {});
+  async startStreamForFile(filePath: string, resumeMs: number = 0): Promise<EqStreamSession | null> {
+    return this.startTask(filePath, '', {}, resumeMs);
   }
 
   private async startTask(filePath: string, url: string,
-    headers: Record<string, string>): Promise<EqStreamSession | null> {
+    headers: Record<string, string>, resumeMs: number): Promise<EqStreamSession | null> {
     const settings: AudioEffectSettings = AudioEffectSettings.getInstance();
     if (!settings.shouldProcess() || !this.ready) {
       return null;
@@ -210,7 +238,36 @@ export class AudioEffectProcessor {
     if (run.failed) {
       throw new Error(run.error);
     }
+    // 要续播：顺序数据源不能定位，必须等整首落全（有上限，超时就用流式从头起）
+    if (resumeMs > 0 && !run.done) {
+      await this.waitProcessed(run, resumeMs);
+      if (this.current !== run) {
+        throw new Error('eq cancelled');
+      }
+      if (run.failed) {
+        throw new Error(run.error);
+      }
+    }
     return new EqStreamSession(wavPath, run);
+  }
+
+  /**
+   * 等整首处理完（给「续播」用，有硬上限）
+   *
+   * 只等 done/failed，不关心进度：Native 侧一旦开始写就基本能跑完，
+   * 中途卡住的情况由它的 20s 无数据超时兜底。
+   */
+  private async waitProcessed(run: EqRunState, resumeMs: number): Promise<void> {
+    const start: number = Date.now();
+    while (Date.now() - start < RESUME_WAIT_MS) {
+      if (this.current !== run || run.failed || run.done) {
+        return;
+      }
+      await this.sleep(100);
+    }
+    hilog.warn(DOMAIN, TAG,
+      'eq resume wait timeout (%{public}dms) for %{public}dms position, stream from head instead',
+      RESUME_WAIT_MS, resumeMs);
   }
 
   /**
@@ -269,6 +326,12 @@ export class AudioEffectProcessor {
         // 已结束的请求 destroy 会报错，忽略
       }
     }
+    // 关掉代理：Native 正卡在读它的时候会立刻拿到 EOF，从而快速退出
+    const proxy: LocalStreamProxy | null = this.activeProxy;
+    this.activeProxy = null;
+    if (proxy !== null) {
+      void proxy.stop();
+    }
     if (run !== null && !run.done) {
       // 没跑完的产物是半截文件，挪走免得下次被当成缓存命中
       this.unlinkQuietly(run.wavPath);
@@ -301,19 +364,17 @@ export class AudioEffectProcessor {
     }
   }
 
-  /** 真正干活：本地文件直读 / URL 直连 Native，或（需要请求头时）先分块下载再处理 */
+  /** 真正干活：本地文件直读 / URL 直连 Native / 需要请求头时走本机代理（失败才整份下载） */
   private async execute(run: EqRunState, filePath: string, url: string,
     headers: Record<string, string>, gains: number[]): Promise<void> {
-    const needDownload: boolean = Object.keys(headers).length > 0;
+    const needProxy: boolean = Object.keys(headers).length > 0 || FORCE_PROXY_FOR_TEST;
     try {
       let result: ProcessAudioResult;
       if (filePath.length > 0) {
         // 本地音频（含 Picker 给的 file:// URI）：本侧开 fd 交给 Native，原文件只读
         result = await this.processLocal(filePath, run, gains);
-      } else if (needDownload) {
-        await this.download(url, headers, run.rawPath, run.taskId);
-        if (this.current !== run) return;
-        result = await processAudio(run.rawPath, run.wavPath, gains, run.taskId);
+      } else if (needProxy) {
+        result = await this.processByProxy(url, headers, run, gains);
       } else {
         // URL 直连：系统解封装器自己拉流，省掉整份下载
         result = await processAudioUrl(url, run.wavPath, gains, run.taskId);
@@ -375,16 +436,99 @@ export class AudioEffectProcessor {
     }
   }
 
-  /** 等到 WAV 够播（或处理结束/失败/超时） */
+  /**
+   * 需要请求头的源：走本机回环代理，让 Native 依旧「URL 直连」拉流。
+   *
+   * 为什么不能把头直接交给 Native：`OH_AVSource` 只吃一个 URI，没有任何入口加请求头。
+   * 原来的替代方案是整份下载后再处理，起播时间 = 下载全曲（大文件直接撞上 20s 预缓冲上限、
+   * 回退原声）。代理把这件事变成「Native 拉 127.0.0.1，我们替它带上认证头转发到真源」，
+   * 于是解码可以边下边进行，起播只等几秒数据。
+   *
+   * 回退策略（保证不比改动前差）：
+   * - 端口起不来 / 回环不通 / 上游不支持 Range → 回退「整份下载再处理」。
+   * - 但若**已经产出过数据**（WAV 里已有样本），说明播放器可能正在读这份文件，
+   *   这时不重试、不删文件，直接让这次失败上抛（调用方回退原声并提示）。
+   */
+  private async processByProxy(url: string, headers: Record<string, string>, run: EqRunState,
+    gains: number[]): Promise<ProcessAudioResult> {
+    let proxy: LocalStreamProxy | null = null;
+    try {
+      proxy = new LocalStreamProxy();
+      this.activeProxy = proxy;
+      const localUrl: string = await proxy.start(url, headers);
+      if (this.current !== run) {
+        throw new Error('eq cancelled');
+      }
+      hilog.info(DOMAIN, TAG, 'eq via local proxy: %{public}s', localUrl);
+      const result: ProcessAudioResult =
+        await processAudioUrl(localUrl, run.wavPath, gains, run.taskId);
+      if (result.ok || this.current !== run) {
+        return result;
+      }
+      if (this.hasOutput(run.wavPath)) {
+        return result;
+      }
+      hilog.warn(DOMAIN, TAG,
+        'eq proxy stream failed (code=%{public}d %{public}s), fall back to full download',
+        result.code, result.message);
+    } catch (e) {
+      if (this.current !== run) {
+        throw new Error('eq cancelled');
+      }
+      hilog.warn(DOMAIN, TAG, 'eq proxy unavailable: %{public}s, fall back to full download',
+        JSON.stringify(e));
+    } finally {
+      if (this.activeProxy === proxy) {
+        this.activeProxy = null;
+      }
+      if (proxy !== null) {
+        await proxy.stop();
+      }
+    }
+    // 回退：分块下到本地再处理（改动前的老路径）
+    this.unlinkQuietly(run.wavPath);
+    await this.download(url, headers, run.rawPath, run.taskId);
+    if (this.current !== run) {
+      throw new Error('eq cancelled');
+    }
+    return await processAudio(run.rawPath, run.wavPath, gains, run.taskId);
+  }
+
+  /** 产物里是否已经有真数据（不能只看文件存在：可能只写了 44 字节的 WAV 头） */
+  private hasOutput(path: string): boolean {
+    try {
+      if (!fs.accessSync(path)) {
+        return false;
+      }
+      return fs.statSync(path).size > 44;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 等到 WAV 够播（或处理结束/失败/超时）
+   *
+   * 「够播」的字节数按**实际采样率**折算，不能写死：原来是固定 512KB，
+   * 44.1k 下约 2.9 秒，96k 立体声只剩 1.3 秒 —— 高采样率音源刚起播就容易饿死
+   * （见 LxPlayer.playEqStream 里 starve 那条回退）。采样率从 WAV 头里读，
+   * 头是 Native 第一个写下去的（且在写数据前就 flush 过），读到就说明可以用了。
+   */
   private async waitPrebuffer(run: EqRunState): Promise<void> {
     const start: number = Date.now();
+    let target: number = 0;
     while (Date.now() - start < PREBUFFER_TIMEOUT_MS) {
       if (this.current !== run || run.failed) return;
       if (run.done) return;
       try {
         if (fs.accessSync(run.wavPath)) {
           const st: fs.Stat = fs.statSync(run.wavPath);
-          if (st.size >= PREBUFFER_BYTES) {
+          if (target <= 0) {
+            target = this.prebufferTarget(run.wavPath);
+          }
+          // 头还没写好（target 仍为 0）：先按下限放行，下一轮再探一次
+          const need: number = target > 0 ? target : PREBUFFER_MIN_BYTES;
+          if (st.size >= need) {
             hilog.info(DOMAIN, TAG, 'eq prebuffer ready: %{public}d bytes in %{public}dms',
               st.size, Date.now() - start);
             return;
@@ -396,6 +540,39 @@ export class AudioEffectProcessor {
       await this.sleep(80);
     }
     hilog.warn(DOMAIN, TAG, 'eq prebuffer timeout after %{public}dms, start anyway', PREBUFFER_TIMEOUT_MS);
+  }
+
+  /**
+   * 起播所需字节数 = 采样率 × 声道 × 2 字节 × PREBUFFER_SECONDS
+   *
+   * 读不出头（还没写 / 不是我们的 WAV）返回 0，由调用方按下限处理 ——
+   * 绝不能因为解析失败就让起播卡住。
+   * WAV 头布局：22 = 声道数(2B)，24 = 采样率(4B)，34 = 位深(2B)。
+   */
+  private prebufferTarget(path: string): number {
+    try {
+      const head: ArrayBuffer = new ArrayBuffer(44);
+      const file: fs.File = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      let read: number = 0;
+      try {
+        read = fs.readSync(file.fd, head, { offset: 0, length: 44 });
+      } finally {
+        fs.closeSync(file);
+      }
+      if (read < 44) {
+        return 0;
+      }
+      const view: DataView = new DataView(head);
+      const sampleRate: number = view.getUint32(24, true);
+      const channels: number = view.getUint16(22, true);
+      if (sampleRate < 8000 || sampleRate > 384000 || channels < 1 || channels > 8) {
+        return 0;
+      }
+      const bytes: number = sampleRate * channels * 2 * PREBUFFER_SECONDS;
+      return Math.max(PREBUFFER_MIN_BYTES, bytes);
+    } catch (e) {
+      return 0;
+    }
   }
 
   private sleep(ms: number): Promise<void> {

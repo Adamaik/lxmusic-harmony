@@ -79,6 +79,33 @@ int32_t clampGain(int32_t g) {
 }
 
 /**
+ * 软限幅：EQ 提升之后的防削波
+ *
+ * 内置预设里 31Hz 一段就有 +5~+6dB，母带本来就贴着满刻度，过完 EQ 很容易被推到 1.0 以外。
+ * 原来直接 clamp(-1, 1) 再转 16bit —— 那不是「低音更足」，是硬切顶（破音），
+ * 而且切出来的高次谐波会糊掉整个频谱。
+ *
+ * 这里只在 **|x| > 0.9** 之后介入，把过载段用 s/(1+s) 连续压进 1.0 以内：
+ *   - 0.9 以下完全直通：正常电平（以及安静段落）一个样本都不会变，产物逐字节一致；
+ *   - 转折点斜率仍为 1（一阶连续），没有折点带来的额外谐波；
+ *   - 上界严格小于 1.0（s → ∞ 时趋近 1.0），怎么推都不会再削顶。
+ *
+ * 代价只有过载样本上的一次除法（普通样本只多一次比较），对 EQ 这种只在峰值触发的
+ * 路径可以忽略。NaN 走直通分支，交给调用方的 std::min/std::max 兜底 —— 与改动前一致。
+ */
+inline float softLimit(float x) {
+    constexpr float kKnee = 0.9f;
+    constexpr float kSpan = 1.0f - kKnee;
+    const float a = std::fabs(x);
+    if (!(a > kKnee)) {
+        return x;
+    }
+    const float s = (a - kKnee) / kSpan;
+    const float y = kKnee + kSpan * (s / (1.0f + s));
+    return x < 0.0f ? -y : y;
+}
+
+/**
  * AudioSuite 的 EQ 算法是**进程级单例**（真机日志里每次建/毁管线都是
  * AudioSuiteEqAlgoInterfaceImpl 的 Deinit/Init）。两趟处理并行时，后一趟的 Init 会把
  * 前一趟正在用的算法状态重置掉，前一趟当场报「音频解码失败或超时」，两边的输出也都不对。
@@ -600,15 +627,39 @@ EqResult runPipeline(const std::string &input,
     ctx.channels = static_cast<int32_t>(channels);
     ctx.bitsPerSample = bits;
 
-    // AudioSuite 采样率是离散枚举，非标准值就近映射；WAV 头仍写真实采样率
+    /**
+     * AudioSuite 的采样率是**离散枚举**，必须和实际数据速率精确对上。
+     *
+     * 这里踩过一个安静的错：原来只列了 48k/32k/96k/8k/16k，其余全走 default → 44100。
+     * 而 SDK 的 OH_Audio_SampleRate 其实覆盖 8k~192k 共 14 档，于是 88.2k / 176.4k / 192k
+     * 这类 Hi-Res 音源被按 44.1k 声明：滤波器系数按 44.1k 算，数据却是 2~4 倍速率，
+     * 频段中心频率被整体压缩到 1/2~1/4（16k 段实际作用在 32k~64k，等于完全没开，
+     * 低频段也全部偏移）。系统不会报错，只会让 EQ 变成另一个形状。
+     *
+     * WAV 头仍然写**真实**采样率；这里只决定 AudioSuite 按什么速率处理。
+     */
     OH_Audio_SampleRate suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_44100;
+    bool rateMapped = true;
     switch (sampleRate) {
-        case 48000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_48000; break;
-        case 32000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_32000; break;
-        case 96000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_96000; break;
         case 8000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_8000; break;
+        case 11025: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_11025; break;
+        case 12000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_12000; break;
         case 16000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_16000; break;
-        default: break;  // 44100 及其它：用 44100
+        case 22050: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_22050; break;
+        case 24000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_24000; break;
+        case 32000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_32000; break;
+        case 44100: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_44100; break;
+        case 48000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_48000; break;
+        case 64000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_64000; break;
+        case 88200: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_88200; break;
+        case 96000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_96000; break;
+        case 176400: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_176400; break;
+        case 192000: suiteRate = OH_Audio_SampleRate::SAMPLE_RATE_192000; break;
+        default:
+            // 枚举里没有的怪速率（极少见）：退回 44.1k 并把这件事写进结果消息，
+            // 免得又变成一条「听不出差别」的静默错误
+            rateMapped = false;
+            break;
     }
 
     if (OH_AudioCodec_Start(decoder) != AV_ERR_OK) {
@@ -657,6 +708,13 @@ EqResult runPipeline(const std::string &input,
     bool ok = false;
     /** 管线是否真的 StartPipeline 成功过（收尾时决定要不要 Stop） */
     bool started = false;
+    /**
+     * 落盘是否失败过（磁盘满 / 配额超限 / I/O 错误）
+     *
+     * 原来完全不看 os 的状态：写不进去就静默产出一个半截 WAV，收尾还照常回填头、
+     * 报成功 —— 用户听到的是「放到一半没了」，我们这边日志里一切正常。
+     */
+    bool writeFailed = false;
     uint32_t dataBytes = 0;
     uint32_t flushed = 0;
     SpectrumMeter outMeter;
@@ -776,14 +834,15 @@ EqResult runPipeline(const std::string &input,
             if (got == 0) continue;
             const int32_t n = got / static_cast<int32_t>(sizeof(float));
             /**
-             * 一次遍历同时做：频谱计数 / 夹幅 / 转 16bit（原来是两遍循环）。
+             * 一次遍历同时做：软限幅 / 频谱计数 / 转 16bit。
              *
-             * 夹幅与舍入必须保持原样（std::max + std::min + std::lround），否则产物不再
-             * 逐字节一致：std::min(1.0f, NaN) 返回 1.0f，换成三元判断会把 NaN 放过去；
+             * 这里的 clamp 与舍入必须保持原样（std::max + std::min + std::lround）：
+             * std::min(1.0f, NaN) 返回 1.0f，换成三元判断会把 NaN 放过去；
              * lround 是「四舍五入远离零」，换成截断会整体差 1 LSB。
+             * 软限幅只改 |x| > 0.9 的过载样本（见 softLimit），正常电平产物不变。
              */
             for (int32_t i = 0; i < n; ++i) {
-                const float f = buf[static_cast<size_t>(i)];
+                const float f = softLimit(buf[static_cast<size_t>(i)]);
                 outMeter.feed(f);
                 pcm[static_cast<size_t>(i)] = static_cast<int16_t>(
                     std::lround(std::max(-1.0f, std::min(1.0f, f)) * 32767.0f));
@@ -796,9 +855,17 @@ EqResult runPipeline(const std::string &input,
             if (dataBytes - flushed >= 64u * 1024u) {
                 os.flush();
                 flushed = dataBytes;
+                // 每 64KB 看一次状态位：真写不进去（磁盘满）就立刻收手，别再空转解码
+                if (!os.good()) {
+                    writeFailed = true;
+                    break;
+                }
             }
         }
         os.flush();
+        if (!os.good()) {
+            writeFailed = true;
+        }
     }
 
     // ---------- 4. 收尾：先停消费者（pipeline），再停解码生产者 ----------
@@ -825,7 +892,8 @@ EqResult runPipeline(const std::string &input,
     OH_AVSource_Destroy(source);
 
     if (os.is_open()) {
-        if (ok && !cancelled && !ctxFailed && dataBytes > 0) {
+        // 写失败的产物是半截的：头也不用回填了，交给调用方当失败删掉
+        if (ok && !writeFailed && !cancelled && !ctxFailed && dataBytes > 0) {
             // 回填 WAV 头里的真实 data 长度
             os.seekp(0, std::ios::beg);
             writeWavHeader(os, dataBytes, sampleRate, static_cast<uint16_t>(channels));
@@ -854,6 +922,12 @@ EqResult runPipeline(const std::string &input,
                     (eos ? " 已收到EOS" : " 未收到EOS") + "）";
         return r;
     }
+    if (writeFailed) {
+        // 优先级排在「无输出」之前：有数据但没写全，真实原因是落盘失败
+        r.code = kErrWriteWav;
+        r.message = "写入输出文件失败（磁盘空间不足或存储配额超限）";
+        return r;
+    }
     if (!ok || dataBytes == 0 || outSamples == 0) {
         r.code = ok ? kErrAudioSuite : r.code;
         r.message = ok ? "音效处理失败（无输出）" : r.message;
@@ -876,7 +950,9 @@ EqResult runPipeline(const std::string &input,
     // 输出帧数：交错样本 / 声道数。与 durationUs 一对比就知道「容器时长」可不可信
     r.outFrames = channels > 0 ? outSamples / static_cast<int64_t>(channels) : outSamples;
     r.message = std::string("durFrom=") + durSource + " bitrate=" + std::to_string(srcBitrate) +
-                " inputBytes=" + std::to_string(inputBytes);
+                " inputBytes=" + std::to_string(inputBytes) +
+                " suiteRate=" + std::to_string(static_cast<int32_t>(suiteRate)) +
+                (rateMapped ? "" : "(unmapped!)");
     return r;
 }
 
