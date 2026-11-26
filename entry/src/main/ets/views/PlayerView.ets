@@ -19,7 +19,8 @@ import { DownloadItem, DownloadManager, downloadKeyOf, K_APP_FOREGROUND } from '
 import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
 import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
-import { C_BG, C_RED } from '../ui/Theme';
+import { C_BG, C_ICON_GREEN, C_RED } from '../ui/Theme';
+import { EQ_PRESETS, EqPreset, K_EQ_ENABLED, K_EQ_ACTIVE, K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
 import { HdsEdgeFlowLight } from '../ui/Hds';
 import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS, CoverTint,
   HALO_GLOW_MAX, HALO_GLOW_REST, MOTION_FPS_30, PlayerAtmosphere, PlayerHalo, PlayerLightBand,
@@ -176,6 +177,21 @@ export struct PlayerView {
    * 以免「设置里选了母带、其实在放 FLAC」。空串 = 还没解析出来。
    */
   @StorageLink(K_ACTUAL_QUALITY) actualQuality: string = '';
+  /**
+   * 音效状态（顶栏那颗「EQ · 预设名」的标识用）
+   *
+   * 只读订阅 AudioEffectSettings 写进 AppStorage 的那两份值：开着才显示标识，
+   * 名字就是当前这套预设（手动拖过滑块会变成「自定义」）。
+   */
+  @StorageLink(K_EQ_ENABLED) eqEnabled: boolean = false;
+  @StorageLink(K_EQ_PRESET) eqPreset: string = 'off';
+  /**
+   * 这一趟播放是否**真的**过了音效（播放器写的，见 LxPlayer.markEqApplied）
+   *
+   * 开关开着不代表这一首就带音效：格式不被解码器支持、带请求头的长音频没在预缓冲
+   * 窗口内下完，都会回退原声。标识必须能分辨，否则用户听不出差别时只会以为音效坏了。
+   */
+  @StorageLink(K_EQ_ACTIVE) eqActive: boolean = false;
   @StorageLink(K_PLAYER_STATUS) @Watch('onStatusChanged') status: string = 'idle';
   /** 播放页封面圆角（外观设置里可调，默认 12） */
   @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
@@ -1527,9 +1543,70 @@ export struct PlayerView {
     })
   }
 
+  /**
+   * 音效标识：顶栏右下的「● EQ · 预设名」
+   *
+   * 为什么要有它：EQ 是**起播前**烘焙进音频的，播放页上看不出这首歌到底过没过音效；
+   * 换到别的设备 / 关了开关之后，用户只能凭听感猜。这颗小标给一个确定答案，
+   * 也顺带把当前用的哪套预设写在脸上。
+   *
+   * 只是状态，不接点击：点开它要跳「设置 - 音效控制台」，而播放页是盖在导航栈上的
+   * 全屏层，从这里压一个子页会钻到它下面去（用户会以为没反应）。
+   */
+  @Builder
+  eqBadge() {
+    Row({ space: 5 }) {
+      // 亮着的绿点 = 正在生效；灰点 = 开关开着但这一首回退了原声
+      Column()
+        .width(5)
+        .height(5)
+        .borderRadius(2.5)
+        .backgroundColor(this.eqInEffect() ? C_ICON_GREEN : '#66FFFFFF')
+      Text('EQ')
+        .fontSize(9.5)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#E6FFFFFF')
+        .letterSpacing(0.4)
+      Text(this.eqBadgeLabel())
+        .fontSize(10.5)
+        .fontColor('#CCFFFFFF')
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .constraintSize({ maxWidth: 96 })
+    }
+    .padding({ left: 8, right: 9, top: 3.5, bottom: 3.5 })
+    .borderRadius(11)
+    .backgroundColor('#26FFFFFF')
+    .accessibilityGroup(true)
+    .accessibilityText(this.eqInEffect()
+      ? `音效已开启，${this.eqBadgeLabel()}`
+      : `音效已开启，但这一首未生效`)
+  }
+
+  /**
+   * 这一首到底有没有带上音效。
+   *
+   * 「原声」预设（增益全 0）本来就不做任何处理，它不算「未生效」—— 那是用户选的结果，
+   * 标识写「原声」才对。其余预设只要没真正过一遍，就按未生效显示。
+   */
+  private eqInEffect(): boolean {
+    return this.eqPreset === 'off' || this.eqActive;
+  }
+
+  /** 标识上那个名字：预设名；手动拖过滑块就是「自定义」；没生效就说清楚没生效 */
+  private eqBadgeLabel(): string {
+    if (this.eqPreset !== 'off' && !this.eqActive) {
+      return '未生效';
+    }
+    if (this.eqPreset === 'custom') {
+      return '自定义';
+    }
+    const preset: EqPreset | undefined = EQ_PRESETS.find((p: EqPreset) => p.key === this.eqPreset);
+    return preset === undefined ? '原声' : preset.label;
+  }
+
   /** 当前唱到的那句歌词；还没有时间轴（activeLine = -1）就退到第一句 */
-  private currentLyric(): LyricLine | null {
-    if (this.lyricLines.length === 0) {
+  private currentLyric(): LyricLine | null {    if (this.lyricLines.length === 0) {
       return null;
     }
     const index: number = this.activeLine;
@@ -2351,40 +2428,50 @@ export struct PlayerView {
 
       // ---------------------------------------------------- 页面主体
       Column() {
-        // 顶栏
-        Row() {
-          IconGlyph({
-              symbol: I_CHEVRON_DOWN,
-              iconSize: 26,
-              color: '#E6FFFFFF',
-            })
-            .onClick(() => {
-              this.onClose();
-            })
-          Blank()
-          // 页码指示只在窄屏有意义：宽屏是左右并排，没有"第几页"这回事
-          if (!this.wide()) {
-            this.pageIndicator()
-          }
-          Blank()
-          Stack({ alignContent: Alignment.Center }) {
-            Circle().width(36).height(36).fill('#26FFFFFF')
+        /**
+         * 顶栏
+         *
+         * EQ 标识不挂在这里：顶栏高度是定死的（56vp + 状态栏），标识要飘到分享钮**下方**、
+         * 压在封面上，挂进来就会被这层高度裁掉。它改挂在根 Stack（见 build 末尾），
+         * 那里是全屏的，能自由飘，也不参与 Column 排版 —— 有它没它封面尺寸都一样。
+         */
+        Stack({ alignContent: Alignment.TopEnd }) {
+          Row() {
             IconGlyph({
-              symbol: I_SHARE,
-              iconSize: 20,
-              color: '#E6FFFFFF',
+                symbol: I_CHEVRON_DOWN,
+                iconSize: 26,
+                color: '#E6FFFFFF',
+              })
+              .onClick(() => {
+                this.onClose();
+              })
+            Blank()
+            // 页码指示只在窄屏有意义：宽屏是左右并排，没有"第几页"这回事
+            if (!this.wide()) {
+              this.pageIndicator()
+            }
+            Blank()
+            Stack({ alignContent: Alignment.Center }) {
+              Circle().width(36).height(36).fill('#26FFFFFF')
+              IconGlyph({
+                symbol: I_SHARE,
+                iconSize: 20,
+                color: '#E6FFFFFF',
+              })
+            }
+            .width(36)
+            .height(36)
+            .onClick(() => {
+              void this.share();
             })
           }
-          .width(36)
-          .height(36)
-          .onClick(() => {
-            void this.share();
-          })
+          .width('100%')
+          // 高度要把状态栏的留白算进去，否则 padding 会把这 56vp 的内容区吃掉一截
+          .height(TOP_BAR_HEIGHT + this.topInset)
+          .padding({ left: 18, right: 18, top: this.topInset })
         }
         .width('100%')
-        // 高度要把状态栏的留白算进去，否则 padding 会把这 56vp 的内容区吃掉一截
         .height(TOP_BAR_HEIGHT + this.topInset)
-        .padding({ left: 18, right: 18, top: this.topInset })
 
         /**
          * 封面 / 歌词
@@ -2448,6 +2535,24 @@ export struct PlayerView {
       .width('100%')
       .height('100%')
       .padding({ bottom: this.bottomInset + 12 })
+
+      /**
+       * 音效标识：只在开着的时候出现，名字就是当前这套预设
+       *
+       * 挂在根 Stack 上（不是顶栏里）才能飘到分享钮下方还不被裁：全屏 Stack 子节点按
+       * 上边距落位，不参与 Column 排版，所以封面/控件的尺寸不受影响。
+       * 整条 Row 不接触摸：它是状态不是按钮，压住封面上的手势就本末倒置了。
+       */
+      if (this.eqEnabled) {
+        Row() {
+          this.eqBadge()
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.End)
+        .padding({ right: 18 })
+        .margin({ top: TOP_BAR_HEIGHT + this.topInset + 4 })
+        .hitTestBehavior(HitTestMode.None)
+      }
 
       // 右下角「更多」：盖在播放器内容之上的自绘底部面板
       if (this.moreOpen) {

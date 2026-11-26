@@ -1,6 +1,9 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_CHEVRON, C_RED, C_TEXT, C_TEXT_WEAK, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { AudioEffectSettings, EQ_PRESETS, EqPreset,
+  K_EQ_ENABLED, K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
+import { I_CHEVRON_RIGHT, IconGlyph } from '../ui/Icons';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
@@ -17,6 +20,75 @@ import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   PLAYER_MOTION_IMMERSIVE, PLAYER_MOTION_LABELS, PLAYER_MOTION_LEVELS, PLAYER_MOTION_LIGHT,
   PlaySettings } from '../core/settings/PlaySettings';
 import { isFileQuality, K_ACTUAL_QUALITY, qualityFallbackNote, qualityLabel, targetQuality } from '../core/music/Quality';
+
+/**
+ * 音效入口卡：总开关 + 一行「进音效控制台」
+ *
+ * 十段推子以前就摊在这张卡里 —— 卡片内容宽只有三百来 vp，预设胶囊一行要塞十枚、
+ * 推子十行紧挨在一起，怎么排都局促（用户原话「挤在一起」）。现在调音面整体挪到
+ * 单独一页（views/EqSettingsView.ets），这里只留两行：
+ *   1. 开关：日常想快速开关音效，不用进二级页；
+ *   2. 入口：右边带当前预设名 + 箭头，进去才是曲线、预设与十段推子。
+ *
+ * 开关关着时入口照旧能进（进去调好再把开关打开也行），右侧写「未开启」。
+ */
+@Component
+struct SoundEffectSetting {
+  /** 打开音效控制台（函数不能用 @Prop，普通成员由父组件一次性初始化即可） */
+  onOpen: () => void = () => {
+  };
+  @StorageLink(K_EQ_ENABLED) eqEnabled: boolean = false;
+  @StorageLink(K_EQ_PRESET) eqPreset: string = 'off';
+
+  /** 当前这套增益对应哪个预设（manual 改过就是「自定义」） */
+  private presetText(): string {
+    if (!this.eqEnabled) {
+      return '未开启';
+    }
+    if (this.eqPreset === 'custom') {
+      return '自定义';
+    }
+    const preset: EqPreset | undefined = EQ_PRESETS.find((p: EqPreset) => p.key === this.eqPreset);
+    return preset === undefined ? '原声' : preset.label;
+  }
+
+  build() {
+    Column({ space: 2 }) {
+      ToggleSetting({
+        label: '音效（EQ）',
+        value: this.eqEnabled,
+        onPick: (next: boolean) => {
+          AudioEffectSettings.getInstance().setEnabled(next);
+        },
+      })
+
+      Row({ space: 8 }) {
+        Text('音效控制台')
+          .fontSize(15)
+          .fontColor(C_TEXT)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Start)
+        Text(this.presetText())
+          .fontSize(12.5)
+          .fontColor(C_TEXT_WEAK)
+        IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 18, color: C_CHEVRON })
+      }
+      .width('100%')
+      .height(44)
+      .onClick(() => {
+        this.onOpen();
+      })
+      // 整行当一个节点：读屏读「音效控制台，爵士」，而不是把文字与箭头各念一遍
+      .accessibilityGroup(true)
+      .accessibilityText(`音效控制台，${this.presetText()}`)
+      .accessibilityLevel('yes')
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .borderRadius(R_CARD)
+    .backgroundColor(C_CARD)
+  }
+}
 
 /** 拓展音质：开关 +（开着时）档位 + 说明 */
 @Component
@@ -106,6 +178,14 @@ export struct PlaySettingsView {
   /** 内容让出标题栏那一段（壳层传来的「状态栏 + 标题栏」）：见滚动内容里的顶部占位 */
   @Prop topInset: number = 0;
   @Prop bottomInset: number = 0;
+  /**
+   * 子页面跳转（音效控制台）
+   *
+   * 页面自己不认识 PAGE_* 常量，路由统一在壳层（同 SettingsView 的 onNavigate）：
+   * 这里只把「用户点了音效控制台」这件事交上去。
+   */
+  onNavigate: (action: string) => void = () => {
+  };
   @StorageLink(K_PLAY_QUALITY) quality: string = '128k';
   /** 默认渠道（'' = 自动 / 不指定，见 PlaySettings.K_DEFAULT_SOURCE） */
   @StorageLink(K_DEFAULT_SOURCE) defaultSource: string = '';
@@ -469,6 +549,20 @@ export struct PlaySettingsView {
             .backgroundColor(C_CARD)
 
             HintText({ text: '播放音质是首选档：这首没有该档时会自动往下退，不会因为选高了就放不出来。' })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 音效（开关 + 进控制台；卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            SoundEffectSetting({
+              onOpen: () => {
+                this.onNavigate('eq');
+              },
+            })
+            HintText({
+              text: '音效与音质是两回事：音质选的是音频文件的档位（128K / FLAC / 母带），'
+                + '音效是对声音做 10 段频率调节。开着音效时会重新处理音频，可能覆盖音质档位带来的差异。',
+            })
           }
           .width(cardWidthOf(this.windowWidth))
 

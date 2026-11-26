@@ -1,0 +1,10 @@
+{
+  "name": "libaudioeffect.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "音效控制台 Native 桥接：解码->EQ->WAV",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {}
+}
