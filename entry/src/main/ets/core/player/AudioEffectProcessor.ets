@@ -6,14 +6,6 @@ import { cancel, processAudio, processAudioFd, processAudioUrl, version, Process
 import { AudioEffectSettings } from '../settings/AudioEffectSettings';
 import { LocalStreamProxy } from './LocalStreamProxy';
 
-/**
- * 排查用开关：把本来可以直连的 URL 也强行绕一遍本地代理。
- *
- * 正常逻辑只有「需要请求头」的源才走代理（见 processByProxy），而这类源（WebDAV）
- * 不好随手造，所以留一个开关来验证回环链路本身通不通。**发版保持 false。**
- */
-const FORCE_PROXY_FOR_TEST: boolean = false;
-
 const DOMAIN: number = 0x0001;
 const TAG: string = 'AudioEffectProcessor';
 const EQ_DIR: string = 'eq_cache';
@@ -367,7 +359,7 @@ export class AudioEffectProcessor {
   /** 真正干活：本地文件直读 / URL 直连 Native / 需要请求头时走本机代理（失败才整份下载） */
   private async execute(run: EqRunState, filePath: string, url: string,
     headers: Record<string, string>, gains: number[]): Promise<void> {
-    const needProxy: boolean = Object.keys(headers).length > 0 || FORCE_PROXY_FOR_TEST;
+    const needProxy: boolean = Object.keys(headers).length > 0;
     try {
       let result: ProcessAudioResult;
       if (filePath.length > 0) {
