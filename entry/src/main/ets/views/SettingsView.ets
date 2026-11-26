@@ -1,6 +1,6 @@
 import { LengthMetrics } from '@kit.ArkUI';
 import { C_BG, C_CARD, C_CHEVRON, C_DIVIDER, C_FILL_SOFT_STRONG, C_ICON_CIRCLE, C_PRESSED, C_RED, C_TEXT, C_TEXT_SUB, C_TEXT_WEAK, F_ITEM, F_SUB, R_CARD } from '../ui/Theme';
-import { I_BOOK, I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_INFO, I_PERSON, I_REFRESH,
+import { I_BOOK, I_BRUSH, I_CACHE, I_CHEVRON_RIGHT, I_DISC, I_DOWNLOAD, I_EQ, I_INFO, I_PERSON, I_REFRESH,
   I_STAR, I_VOLUME, IconGlyph } from '../ui/Icons';
 import { TopFade } from '../ui/Widgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
@@ -22,9 +22,17 @@ const GROUP_SYNC: SettingRowDef[] = [
   { icon: I_REFRESH, title: '同步设置', action: 'sync' },
 ];
 
-/** 播放设置 / 缓存 / 下载 / 云端音乐 */
+/**
+ * 播放设置 / 音效 / 缓存 / 下载 / 云端音乐
+ *
+ * 音效原来是「播放设置」里的一张卡（开关 + 进控制台）。挪出来单独一行：
+ * 它和播放设置里的项不是一类东西 —— 音质/歌词/动效改的是「播什么、怎么显示」，
+ * 音效改的是声音本身的频响，而且它自己还有一整页控制台。放在「播放设置」下面、
+ * 「缓存」上面，跟「改声音」的邻居关系也更清楚。
+ */
 const GROUP_PLAY: SettingRowDef[] = [
   { icon: I_VOLUME, title: '播放设置', action: 'play' },
+  { icon: I_EQ, title: '音效设置', action: 'eq' },
   { icon: I_CACHE, title: '缓存', action: 'cache' },
   { icon: I_DOWNLOAD, title: '下载设置', action: 'download' },
   // WebDAV 云端音乐：服务器地址 / 账号密码 / 曲库管理都在这一页

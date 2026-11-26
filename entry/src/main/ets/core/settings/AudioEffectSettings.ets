@@ -7,7 +7,7 @@ const TAG: string = 'AudioEffectSettings';
 const FILE_NAME: string = 'audio_effect_settings.json';
 
 /**
- * 音效控制台设置（播放设置 - 音效）
+ * 音效设置（设置页独立一行「音效设置」，页面见 views/EqSettingsView.ets）
  *
  * 走的是「解码 -> AudioSuite 10 段 EQ -> 重新封装 WAV -> 交给 AVPlayer」这条链路，
  * 所以默认关闭：开着的时候每首要多一次解码+EQ，起播会多等 0.3~0.5 秒。

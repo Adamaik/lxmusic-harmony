@@ -84,7 +84,7 @@ const PAGE_PLAYLIST: string = 'playlist';
 const PAGE_CACHE: string = 'cache';
 /** 播放设置 */
 const PAGE_PLAY: string = 'play';
-/** 音效控制台（播放设置 - 音效控制台：预设 + 响应曲线 + 10 段推子） */
+/** 音效设置（设置页独立一行：预设 + 响应曲线 + 10 段推子） */
 const PAGE_EQ: string = 'eq';
 /** 下载设置 */
 const PAGE_DOWNLOAD: string = 'download';
@@ -1602,21 +1602,18 @@ struct Index {
           PlaySettingsView({
             bottomInset: this.bottomInset,
             topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
-            onNavigate: (action: string) => {
-              this.onSettingAction(action);
-            },
           })
         }
       }
       .titleBar(this.titleBarOptions('播放设置'))
     } else if (name === PAGE_EQ) {
-      // 音效控制台：十段推子要的是整屏，所以在播放设置里只是个入口（见 SoundEffectSetting）
+      // 音效设置：设置页里单独一行（「播放设置」下面、「缓存」上面），十段推子要整屏
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
           EqSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
         }
       }
-      .titleBar(this.titleBarOptions('音效控制台'))
+      .titleBar(this.titleBarOptions('音效设置'))
     } else if (name === PAGE_DOWNLOAD) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {

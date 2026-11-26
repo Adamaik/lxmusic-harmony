@@ -7,7 +7,7 @@ import { AudioEffectSettings, EQ_BAND_LABELS, EQ_GAIN_MAX, EQ_GAIN_MIN, EQ_PRESE
 import { cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 
 /**
- * 音效控制台（设置 - 播放设置 - 音效控制台）
+ * 音效设置（设置 - 音效设置）
  *
  * 为什么单独开一页，而不是塞在播放设置那张卡里：10 段 EQ 要的是**一屏放得下的操作面**
  * —— 一条能看出形状的响应曲线 + 十段能精确拖动的推子 + 九枚预设。挤在设置页的卡片里
@@ -15,7 +15,9 @@ import { cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
  * 怎么排都局促。单独成页之后，曲线能画到 118 高、每段推子 40 高、预设可以换行，
  * 才像一台均衡器而不是一堆控件。
  *
- * 播放设置里只留「开关 + 跳转这一页」两行（见 PlaySettingsView 的 SoundEffectSetting）。
+ * 入口在设置页顶部那张「播放设置 / 音效设置 / 缓存 …」的列表里，单独一行
+ * （排在「播放设置」下面、「缓存」上面，见 SettingsView 的 GROUP_PLAY）；开关也搬到了本页，
+ * 不再在设置列表上给快捷开关 —— 音效改的是声音本身，进去调才是完整的操作。
  *
  * 页面本身不改播放逻辑：所有值都写进 AudioEffectSettings（AppStorage + 落盘），
  * 播放侧订阅变更后从头重播当前曲目（见 PlaySession.requestEqReplay）。
