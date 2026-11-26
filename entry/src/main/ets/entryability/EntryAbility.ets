@@ -18,6 +18,8 @@ import { ListenTracker } from '../core/history/ListenTracker';
 import { SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
 import { PlaySettings } from '../core/settings/PlaySettings';
+import { AudioEffectSettings } from '../core/settings/AudioEffectSettings';
+import { AudioEffectProcessor } from '../core/player/AudioEffectProcessor';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
 import { RecommendSettings } from '../core/settings/RecommendSettings';
 import { ListenSettings } from '../core/settings/ListenSettings';
@@ -65,6 +67,11 @@ export default class EntryAbility extends UIAbility {
     // 播放设置（音质 / 歌词 / 音频焦点）要读回上次的选择，而且必须早于界面创建：
     // 界面用 @StorageLink 订阅它发布的值，晚了第一帧会拿到默认值。
     PlaySettings.getInstance().init(this.context);
+    // 音效控制台（EQ 预设 / 10 段增益）：播放入口要读它决定是否走 EQ 预处理，
+    // 界面也要用 @StorageLink 订阅，所以早于界面创建。
+    AudioEffectSettings.getInstance().init(this.context);
+    // 音效预处理的 WAV 缓存目录（开启音效时才会用到）
+    AudioEffectProcessor.getInstance().init(this.context);
     // 外观设置（材质档位 / 封面圆角 / 深浅模式）：同样要早于界面创建，
     // 界面用 @StorageLink 订阅它发布的值。
     AppearanceSettings.getInstance().init(this.context);

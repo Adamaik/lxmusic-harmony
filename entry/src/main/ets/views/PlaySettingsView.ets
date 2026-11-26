@@ -1,5 +1,5 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, C_TEXT, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
@@ -72,7 +72,11 @@ struct ExtendQualitySetting {
 /**
  * 播放设置
  *
- * 对应设置页里的「播放设置」，参考图上的分区：
+ * 对应设置页里的「播放设置」。**音效不在这里**：它已经挪成设置页的一行独立入口
+ * （「播放设置」下面、「缓存」上面），页面是 views/EqSettingsView.ets ——
+ * 音效改的是声音本身的频响，与这里「播什么 / 怎么显示」的项不是一类。
+ *
+ * 参考图上的分区：
  *   〇、渠道：默认渠道（自动 / 酷我 / 酷狗 / 咪咕 / QQ / 网易）——
  *       歌手页、本地与云端自动匹配歌词这类没有渠道选择项的地方，先从这个平台取数
  *   一、音质：播放音质（128K/320K/FLAC/24Bit）、拓展音质（开关 + Hi-Res/全景声/全景声+/母带）、

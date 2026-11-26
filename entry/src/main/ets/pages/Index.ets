@@ -68,6 +68,7 @@ import { SyncModeContent } from '../views/SyncModeSheet';
 import { SyncSettingsView } from '../views/SyncSettingsView';
 import { CacheSettingsView } from '../views/CacheSettingsView';
 import { PlaySettingsView } from '../views/PlaySettingsView';
+import { EqSettingsView } from '../views/EqSettingsView';
 import { DownloadSettingsView } from '../views/DownloadSettingsView';
 import { PlaylistSummary } from '../core/player/PlaySession';
 import { K_SELECT_ACTIVE, K_SELECT_ALL, K_SELECT_COUNT, SelectSession } from '../ui/Selection';
@@ -83,6 +84,8 @@ const PAGE_PLAYLIST: string = 'playlist';
 const PAGE_CACHE: string = 'cache';
 /** 播放设置 */
 const PAGE_PLAY: string = 'play';
+/** 音效设置（设置页独立一行：预设 + 响应曲线 + 10 段推子） */
+const PAGE_EQ: string = 'eq';
 /** 下载设置 */
 const PAGE_DOWNLOAD: string = 'download';
 /** 外观设置（材质档位 / 光效 / 深浅模式） */
@@ -1259,6 +1262,10 @@ struct Index {
       this.go(PAGE_PLAY);
       return;
     }
+    if (action === 'eq') {
+      this.go(PAGE_EQ);
+      return;
+    }
     if (action === 'download') {
       this.go(PAGE_DOWNLOAD);
       return;
@@ -1592,10 +1599,21 @@ struct Index {
     } else if (name === PAGE_PLAY) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
-          PlaySettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+          PlaySettingsView({
+            bottomInset: this.bottomInset,
+            topInset: HDS_TITLE_BAR_HEIGHT + this.topInset,
+          })
         }
       }
       .titleBar(this.titleBarOptions('播放设置'))
+    } else if (name === PAGE_EQ) {
+      // 音效设置：设置页里单独一行（「播放设置」下面、「缓存」上面），十段推子要整屏
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          EqSettingsView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+        }
+      }
+      .titleBar(this.titleBarOptions('音效设置'))
     } else if (name === PAGE_DOWNLOAD) {
       HdsNavDestination() {
         WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {

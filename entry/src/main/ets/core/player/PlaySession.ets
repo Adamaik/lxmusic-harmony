@@ -18,6 +18,7 @@ import { ShuffleBag } from './ShuffleBag';
 import { StartupTiming } from './StartupTiming';
 import { PlatformHealth } from './PlatformHealth';
 import { PlaySettings } from '../settings/PlaySettings';
+import { AudioEffectSettings } from '../settings/AudioEffectSettings';
 import { fallbackQuality, isExtendedQuality, K_ACTUAL_QUALITY,
   lowerQuality, pickQuality, qualityLabel } from '../music/Quality';
 import { AutoDownloadSong, downloadedFile, removeDownloadedFile,
@@ -43,6 +44,24 @@ const TAG: string = 'PlaySession';
 
 /** 后台预取的单次预算：比前台宽一点，但同样不许它一直占着沙箱（换源/超时规则见 SourceFailover） */
 const SOURCE_PREFETCH_TIMEOUT_MS: number = 8000;
+
+/**
+ * 音效改完到真正重播之间的等待（毫秒）
+ *
+ * 音效是烘进 WAV 的，改了就得重播一遍才听得到（见 AudioEffectSettings.onChanged）。
+ * 但用户调音时是连着操作的：点完预设可能又拖滑块，一个动作一个动作地重播会变成
+ * 「一直在从头起播、什么都听不到」。攒一小会儿再动，只放最后一次的结果。
+ */
+const EQ_REPLAY_DEBOUNCE_MS: number = 500;
+
+/**
+ * 改音效后「值得续播」的位置门槛（毫秒）
+ *
+ * 续播的代价和位置无关：EQ 是整首重烘，顺序数据源又不能定位，必须等 WAV 落全才起播
+ * （4 分钟的曲子约 7 秒）。所以只有已经听了一段（超过这个门槛）才值得为它等；
+ * 刚开头的十几秒，从头播用户几乎察觉不到，还省掉一次等待。
+ */
+const EQ_RESUME_MIN_MS: number = 10000;
 
 /**
  * 听书「跳过片头」的判定窗口（毫秒）
@@ -727,6 +746,14 @@ export class PlaySession {
   private bookPlayingId: string = '';
 
   /**
+   * 音效改动后的重播定时器（-1 = 没有排着的）
+   * 见 EQ_REPLAY_DEBOUNCE_MS 与 requestEqReplay。
+   */
+  private eqReplayTimer: number = -1;
+  /** 已经因为音效改动重播过的那次「音效配置指纹」，避免同一套配置反复重播 */
+  private eqReplaySignature: string = '';
+
+  /**
    * 绑定沙箱目录（播放现场落盘用）。
    * EntryAbility.onCreate 里调一次，必须早于 bootstrap()（它末尾会读现场）。
    */
@@ -736,6 +763,106 @@ export class PlaySession {
     }
     this.stateInited = true;
     this.stateStore.init(context);
+    // 音效改了要能「切完就听到」：EQ 烘在 WAV 里，只能重新起播一次（见 requestEqReplay）
+    AudioEffectSettings.getInstance().onChanged((reason: string) => {
+      this.requestEqReplay(reason);
+    });
+    /**
+     * 音效没能生效（回退原声）时告诉用户一句
+     *
+     * 音效是所有渠道共用的同一条链路（在线流 / 沙箱缓存 / 已下载 / 本地导入 / WebDAV / 听书），
+     * 但**不是每个文件都能过**：系统解码器不认这个编码、或者带请求头的长音频（听书、云端大文件）
+     * 没能在一趟预缓冲里下完，都会静默回退成原声。以前这种回退只有日志，用户只看到
+     * 「EQ · 流行」却听不出差别，会以为音效坏了。这里每次起播最多提醒一次
+     * （去重与「是否真的开着音效」都由 LxPlayer.noteEqSkipped 负责）。
+     */
+    LxPlayer.getInstance().onEqSkipped = (reason: string) => {
+      hilog.warn(DOMAIN, TAG, 'eq not applied: %{public}s', reason);
+      this.notify('这首暂时没能应用音效，已按原声播放');
+    };
+  }
+
+  /**
+   * 音效配置改了：安排一次「重新处理当前曲目并从原位置接着放」
+   *
+   * 为什么非要重播：AVPlayer 不收 PCM，10 段 EQ 是先把音频处理成 WAV 再交给它播的
+   * （见 AudioEffectProcessor 类注释）。改增益对**已经在响的那份 WAV** 没有任何作用，
+   * 想立刻听到差别，只能拿新增益重新生成一份再播。
+   *
+   * 位置要保住：以前的实现是从 0 重播，用户「听着觉得低音不够、拉一下再听」的典型场景
+   * 每次都被打回开头，非常打断。现在的做法是把当前位置交给播放器（见 LxPlayer.setStartSeekMs）：
+   * EQ 是顺序数据源、不能定位，所以先等整首重新烘完（真机约 32 倍速，4 分钟的曲子约 7 秒，
+   * 有 9 秒上限），再从原位置起播 —— 代价是这几秒的「加载中」，换来的是不丢进度。
+   * 超过上限就退回原来的「从头流式起播」，不会让人一直对着转圈。
+   *
+   * 只在「正在放东西」时才做；暂停/空闲时只是记下配置，下次起播自然生效。
+   */
+  private requestEqReplay(reason: string): void {
+    const settings: AudioEffectSettings = AudioEffectSettings.getInstance();
+    const signature: string = `${settings.isEnabled() ? 1 : 0}|${settings.getGains().join(',')}`;
+    if (signature === this.eqReplaySignature) {
+      return;   // 同一套配置（比如点了和当前一样的那一档），不必重播
+    }
+    this.eqReplaySignature = signature;
+
+    const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
+    if (status !== 'playing' && status !== 'buffering' && status !== 'paused' && status !== 'loading') {
+      return;   // 没在放：不用打断谁
+    }
+    if (this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
+      return;
+    }
+    if (this.eqReplayTimer >= 0) {
+      clearTimeout(this.eqReplayTimer);
+    }
+    this.eqReplayTimer = setTimeout(() => {
+      this.eqReplayTimer = -1;
+      void this.replayForEq(reason);
+    }, EQ_REPLAY_DEBOUNCE_MS);
+  }
+
+  /** 真正重播（见 requestEqReplay）：音效改完调一次，按新配置重新处理并回到原位置 */
+  private async replayForEq(reason: string): Promise<void> {
+    const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
+    if (status !== 'playing' && status !== 'buffering' && status !== 'paused') {
+      return;   // 这一小会儿里用户停了 / 切走了
+    }
+    const index: number = this.currentIndex;
+    if (index < 0 || index >= this.queue.length) {
+      return;
+    }
+    // 听书不重播：一集动辄几十分钟，为了调音效把这一集打回 0 分是不合理的
+    // （下次起播自然按新配置处理）
+    if (this.queue[index].source === BOOK_SOURCE) {
+      hilog.info(DOMAIN, TAG, 'eq changed while playing a book, apply on next start only');
+      return;
+    }
+    const wasPaused: boolean = status === 'paused';
+    /**
+     * 续播位置
+     *
+     * 只有「已经听了一段」才值得续：重新烘一遍要等整首落全（约 7 秒，与位置无关），
+     * 位置在 10 秒以内时为它静默 7 秒明显不划算 —— 直接从头上播，用户几乎察觉不到损失。
+     *
+     * 位置从播放器取（毫秒），同时兜一份秒级的 resumePosition：万一这趟 EQ 失败回退
+     * 原声，applyResumeSeek 还能把位置补回来。
+     */
+    const positionMs: number = Math.max(0, LxPlayer.getInstance().getCurrentMs());
+    const resumeMs: number = positionMs > EQ_RESUME_MIN_MS ? positionMs : 0;
+    hilog.info(DOMAIN, TAG, 'eq changed (%{public}s), replay at %{public}dms: %{public}s',
+      reason, resumeMs, this.queue[index].name);
+    // 预设/开关这类「一下一档」的操作给个提示，滑块拖动不提示（否则一直弹）
+    if (reason !== 'band') {
+      this.notify(resumeMs > 0 ? '音效已切换，回到原位置继续' : '音效已切换，从头播放');
+    }
+    // 交给播放器：下一次起播落到这个位置（一次性，消费即清）
+    LxPlayer.getInstance().setStartSeekMs(resumeMs);
+    this.resumePosition = resumeMs > 0 ? Math.floor(resumeMs / 1000) : 0;
+    this.resumeIndex = index;
+    // 原本是暂停态的话，用切音质那套 resumePaused 机制在真正出声时按回暂停
+    // （见 applyResumePaused）—— 别因为改了个音效就自己响起来。
+    this.resumePaused = wasPaused;
+    await this.playAt(index);
   }
 
   /**
@@ -898,6 +1025,11 @@ export class PlaySession {
     const position: number = this.resumePosition;
     this.resumePosition = 0;
     this.resumeIndex = -1;
+    // 这趟起播已经用毫秒级的 pendingSeekMs 精确落过位置了（EQ 续播），别再按秒级跳一次
+    if (LxPlayer.getInstance().wasStartSeekApplied()) {
+      hilog.info(DOMAIN, TAG, 'resume seek already applied precisely, skip second seek');
+      return;
+    }
     hilog.info(DOMAIN, TAG, 'resume playback at %{public}d s', position);
     LxPlayer.getInstance().seek(position * 1000);
   }

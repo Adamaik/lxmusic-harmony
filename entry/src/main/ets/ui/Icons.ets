@@ -46,6 +46,13 @@ export const I_PLUS: Resource = $r('sys.symbol.plus');
 export const I_TRASH: Resource = $r('sys.symbol.trash');
 /** 音量（播放中指示） */
 export const I_VOLUME: Resource = $r('sys.symbol.speaker_wave_3');
+/**
+ * 音效 / EQ（设置页那一行）
+ *
+ * 用三根竖推子，正好对上这一页的主体（10 段频率推子）；音量那支喇叭留给「播放设置」，
+ * 两项挨在一起，图标必须能一眼分开。
+ */
+export const I_EQ: Resource = $r('sys.symbol.slider_vertical_3');
 /** 下载 */
 export const I_DOWNLOAD: Resource = $r('sys.symbol.download');
 /** 导入（歌单导入：往托盘里落的那支箭头） */
