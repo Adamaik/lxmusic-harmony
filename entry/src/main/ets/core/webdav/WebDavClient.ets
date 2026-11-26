@@ -261,25 +261,42 @@ export class WebDavClient {
    * 「目录不存在」是用户第一次同步时最常见的一步，不该让他先去网盘网页上手动建文件夹。
    * MKCOL 在目录已存在时按 RFC 4918 返回 405 / 409，这里都当成「已经有了」；
    * 真失败（401 / 403 / 507）翻译成人话抛给界面。
+   *
+   * 起点必须是 config.url —— 它是用户填的 WebDAV 入口，调用前已经过 probe（PROPFIND）
+   * 验证存在。不能从 URL 的 origin 开始把整条路径逐段重建：坚果云的入口是
+   * `https://dav.jianguoyun.com/dav`，那是服务器的保留挂载点，对它再发 MKCOL 会回 403；
+   * 旧实现把这声 403 误译成「账号没有创建文件夹的权限」，真正要建的
+   * `/dav/listen-config` 反而一次都没试过。
    */
   async ensureFolder(config: WebDavConfig, folderUrl: string): Promise<void> {
-    const origin: string = originOf(folderUrl);
-    if (origin.length === 0) {
+    const plan: FoldersToCreate = foldersToCreate(config.url, folderUrl);
+    if (plan.start.length === 0) {
       throw new Error('服务器地址不是一个完整的 http(s) 地址');
     }
-    let current: string = origin;
-    for (const segment of pathSegmentsOf(folderUrl)) {
+
+    let current: string = plan.start;
+    for (const segment of plan.segments) {
       current = `${current}/${segment}`;
       const code: number = await this.mkcol(config, current);
+      hilog.info(DOMAIN, TAG, 'MKCOL %{public}s -> %{public}d', describeUrlForMessage(current), code);
       if (code >= 200 && code < 300) {
         continue;
       }
-      // 405 Method Not Allowed / 409 Conflict：目录已经在了（各家实现不一致，都认）。
+      // 405 / 409 / 403 / 304 在不少服务器上都表示「目录已经在了」，但**不能盲信**：
+      // 坚果云对「少了尾斜杠」「父路径不对」的 MKCOL 也会回 405/409，目录其实没建出来；
+      // 后面 PUT 就会落到一个不存在的父目录上，收到 409，用户只看到「上传失败」。
+      // 因此统一用一次 Depth:0 的 PROPFIND 验证目录是否真的存在，在才继续。
       // 301/302 不在这里：它不是「已存在」，而是「这个地址不是真正入口」——
-      // 在 mkcol 里已经按 Location 重试过一次，还重定向就是地址写错了，必须报出来，
-      // 否则后面的 PUT 会写到一个不存在的目录上（409），用户看到的却是「上传失败」。
-      if (code === 405 || code === 409 || code === 304) {
-        continue;
+      // 在 mkcol 里已经按 Location 重试过一次，还重定向就是地址写错了，必须报出来。
+      if (code === 405 || code === 409 || code === 403 || code === 304) {
+        if (await this.folderExists(config, current)) {
+          continue;
+        }
+        if (code === 403) {
+          throw new Error(`这个账号没有在该目录下创建文件夹的权限：${describeUrlForMessage(current)}`);
+        }
+        throw new Error(`网盘上没建出目录 ${describeUrlForMessage(current)}（HTTP ${code}），`
+          + '把「同步目录」换成简单一点的英文目录名再试');
       }
       if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
         throw new Error(`服务器把建目录请求重定向到了别处（HTTP ${code}），`
@@ -287,9 +304,6 @@ export class WebDavClient {
       }
       if (code === 401) {
         throw new Error('用户名或密码不对，建不了目录');
-      }
-      if (code === 403) {
-        throw new Error('这个账号没有在该目录下创建文件夹的权限');
       }
       if (code === 423) {
         throw new Error('目录被服务器锁住了，稍后再试');
@@ -299,6 +313,36 @@ export class WebDavClient {
       }
       // 地址里可能带 user:pass@（Basic 认证的另一种写法），错误文案只给 host + 相对路径
       throw new Error(`在网盘上创建目录失败（HTTP ${code}）：${describeUrlForMessage(current)}`);
+    }
+  }
+
+  /**
+   * 目录是不是真的在（MKCOL 收到 403 时用来区分「已存在」和「真没权限」）
+   *
+   * 只发一次 Depth:0 的 PROPFIND，不解析 XML：2xx 就算存在。PROPFIND 本身失败就返回
+   * false，让调用方走原来的权限报错，不把网络问题伪装成「目录已存在」。
+   */
+  private async folderExists(config: WebDavConfig, url: string): Promise<boolean> {
+    const request = http.createHttp();
+    try {
+      const headers: Record<string, string> = this.authHeaders(config);
+      headers['Depth'] = '0';
+      headers['Content-Type'] = 'application/xml; charset=utf-8';
+      const response: http.HttpResponse = await request.request(withTrailingSlash(url), {
+        method: http.RequestMethod.POST,
+        customMethod: 'PROPFIND',
+        header: headers,
+        extraData: PROPFIND_BODY,
+        connectTimeout: LIST_TIMEOUT_MS,
+        readTimeout: LIST_TIMEOUT_MS,
+      });
+      const code: number = response.responseCode;
+      return code >= 200 && code < 300;
+    } catch (e) {
+      hilog.info(DOMAIN, TAG, 'folder existence probe failed: %{public}s', (e as Error).message);
+      return false;
+    } finally {
+      request.destroy();
     }
   }
 
@@ -328,6 +372,9 @@ export class WebDavClient {
   private async mkcolOnce(config: WebDavConfig, url: string): Promise<MkcolResult> {
     const request = http.createHttp();
     try {
+      // 集合资源按惯例带尾斜杠：坚果云 / Nextcloud 都更认这种写法，
+      // 少了它有的实现会回 409/405，明明能建却被当成「已存在」。
+      const target: string = withTrailingSlash(url);
       const options: http.HttpRequestOptions = {
         method: http.RequestMethod.POST,
         customMethod: 'MKCOL',
@@ -335,7 +382,7 @@ export class WebDavClient {
         connectTimeout: LIST_TIMEOUT_MS,
         readTimeout: LIST_TIMEOUT_MS,
       };
-      const response: http.HttpResponse = await request.request(url, options);
+      const response: http.HttpResponse = await request.request(target, options);
       return {
         code: response.responseCode,
         location: headerValue(response.header, 'location'),
@@ -428,6 +475,42 @@ export class WebDavClient {
 // ------------------------------------------------------------ 工具
 
 /**
+ * 要建哪几层目录（纯函数，便于单测）
+ *
+ * 关键不变量：**绝不对 base 本身发 MKCOL**。base 是用户填的 WebDAV 入口，
+ * probe 已经证明它在；坚果云对 `https://dav.jianguoyun.com/dav` 这种保留入口
+ * 的 MKCOL 会回 403，旧实现把它误报成「账号没有创建文件夹的权限」。
+ *
+ * 目标不在 base 之下时（用户把同步目录填成了整条 URL）退回从 origin 逐段建，
+ * 由服务器裁决能不能建。
+ */
+export interface FoldersToCreate {
+  /** 逐段 MKCOL 的起点（已经存在的目录） */
+  start: string;
+  /** 还需要创建的路径段（保持服务器上的原始转义写法） */
+  segments: string[];
+}
+
+export function foldersToCreate(base: string, target: string): FoldersToCreate {
+  const trimmedBase: string = stripTrailingSlash(base);
+  const trimmedTarget: string = stripTrailingSlash(target);
+  if (trimmedBase.length === 0 || originOf(trimmedBase).length === 0
+    || originOf(trimmedTarget).length === 0) {
+    return { start: '', segments: [] };
+  }
+  if (trimmedTarget === trimmedBase) {
+    return { start: trimmedBase, segments: [] };
+  }
+  if (trimmedTarget.startsWith(`${trimmedBase}/`)) {
+    return {
+      start: trimmedBase,
+      segments: splitPathSegments(trimmedTarget.substring(trimmedBase.length)),
+    };
+  }
+  return { start: originOf(trimmedTarget), segments: pathSegmentsOf(trimmedTarget) };
+}
+
+/**
  * 状态码不是 2xx 就抛一句能看懂的话
  *
  * WebDAV 的失败码挺集中：401 是账号密码，403 是权限，404 是路径写错，
@@ -453,6 +536,9 @@ function assertOk(response: http.HttpResponse, config: WebDavConfig): void {
   }
   if (code === 404) {
     throw new Error('服务器上说这个地址不存在，检查一下路径（注意大小写）');
+  }
+  if (code === 409) {
+    throw new Error('服务器拒绝写入：目标目录不存在或被锁住了，点「测试连接」重建目录后再传');
   }
   if (code === 405 || code === 501) {
     throw new Error(`服务器不支持 WebDAV 的 PROPFIND（HTTP ${code}），确认地址指向的是 WebDAV 服务`);
@@ -575,13 +661,27 @@ function pathSegmentsOf(url: string): string[] {
   if (pathStart < 0) {
     return [];
   }
+  return splitPathSegments(url.substring(pathStart));
+}
+
+/** 把一段路径切成段（保留原始转义写法，空段丢掉） */
+function splitPathSegments(path: string): string[] {
   const segments: string[] = [];
-  for (const segment of url.substring(pathStart).split('/')) {
+  for (const segment of path.split('/')) {
     if (segment.length > 0) {
       segments.push(segment);
     }
   }
   return segments;
+}
+
+/** 去掉末尾斜杠（config.url 经过 normalizeServerUrl 后仍可能被人手补回来） */
+function stripTrailingSlash(value: string): string {
+  let text: string = value.trim();
+  while (text.length > 1 && text.endsWith('/')) {
+    text = text.substring(0, text.length - 1);
+  }
+  return text;
 }
 
 /** UTF-8 解码；出现替换字符（U+FFFD）说明不是 UTF-8，再按 GBK 试一遍（中文 .lrc 常见） */

@@ -1,10 +1,12 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { ParsedResponse, buildEntries, encodeHref, localName, nameOfHref, originOf, parsePropfind,
   pathOfHref, resolveHref, samePath, withTrailingSlash } from '../main/ets/core/webdav/WebDavXml';
+import { FoldersToCreate, foldersToCreate } from '../main/ets/core/webdav/WebDavClient';
 import { WebDavEntry, WEBDAV_ID_PREFIX, WEBDAV_QUALITY, WEBDAV_SOURCE } from '../main/ets/core/webdav/WebDavTypes';
 import { findFolderCover, findSiblingLrc, folderCoverName, groupByFolder, isWebDavSong, shortHash,
   sortByLocation, stableKeyOf, WebDavSong } from '../main/ets/core/webdav/WebDavLibrary';
 import { normalizeServerUrl } from '../main/ets/core/webdav/WebDavSettings';
+import { buildFolderUrl, configFileUrl } from '../main/ets/core/webdav/WebDavConfigData';
 import { mediaKeyOf } from '../main/ets/core/music/MediaCache';
 import { isSyncable } from '../main/ets/core/sync/SyncConvert';
 import { SongItem } from '../main/ets/core/player/PlaySession';
@@ -267,6 +269,82 @@ export default function webDavTest() {
       expect(sorted[0].url).assertEqual('http://host/dav/A/a.mp3');
       expect(sorted[1].url).assertEqual('http://host/dav/A/b.mp3');
       expect(sorted[2].url).assertEqual('http://host/dav/B/b.mp3');
+    });
+  });
+
+  describe('WebDavEnsureFolder', () => {
+    it('never_recreates_the_configured_base', 0, () => {
+      // 坚果云的入口是 https://dav.jianguoyun.com/dav —— 服务器的保留挂载点。
+      // 旧实现从 origin 逐段建，第一步就对它 MKCOL，拿到 403 后误报「没有创建文件夹的权限」，
+      // 真正要建的 listen-config 反而一次都没试。现在只能建 base 以下的部分。
+      const plan: FoldersToCreate = foldersToCreate(
+        'https://dav.jianguoyun.com/dav',
+        'https://dav.jianguoyun.com/dav/listen-config');
+      expect(plan.start).assertEqual('https://dav.jianguoyun.com/dav');
+      expect(plan.segments.length).assertEqual(1);
+      expect(plan.segments[0]).assertEqual('listen-config');
+    });
+
+    it('handles_trailing_slash_and_nested_dir', 0, () => {
+      // 地址被人手补回尾斜杠、目录填了多级时也不能把 base 段算进去
+      const plan: FoldersToCreate = foldersToCreate(
+        'https://cloud.example.com/remote.php/dav/files/me/',
+        'https://cloud.example.com/remote.php/dav/files/me/a/b');
+      expect(plan.start).assertEqual('https://cloud.example.com/remote.php/dav/files/me');
+      expect(plan.segments.length).assertEqual(2);
+      expect(plan.segments[0]).assertEqual('a');
+      expect(plan.segments[1]).assertEqual('b');
+    });
+
+    it('keeps_escaped_segments_and_absolute_dir', 0, () => {
+      // 绝对路径写法 `/dav/同步配置` 拼到 base 下面，转义过的段不能被二次编码
+      const plan: FoldersToCreate = foldersToCreate(
+        'https://dav.jianguoyun.com/dav',
+        'https://dav.jianguoyun.com/dav/%E5%90%8C%E6%AD%A5%E9%85%8D%E7%BD%AE');
+      expect(plan.start).assertEqual('https://dav.jianguoyun.com/dav');
+      expect(plan.segments[0]).assertEqual('%E5%90%8C%E6%AD%A5%E9%85%8D%E7%BD%AE');
+    });
+
+    it('skips_when_target_is_base', 0, () => {
+      const plan: FoldersToCreate = foldersToCreate(
+        'https://dav.jianguoyun.com/dav', 'https://dav.jianguoyun.com/dav/');
+      expect(plan.start).assertEqual('https://dav.jianguoyun.com/dav');
+      expect(plan.segments.length).assertEqual(0);
+    });
+
+    it('falls_back_to_origin_for_unrelated_absolute_dir', 0, () => {
+      // 同步目录填成另一条完整 URL 时，base 不再能当起点
+      const plan: FoldersToCreate = foldersToCreate(
+        'https://dav.jianguoyun.com/dav', 'https://other.example.com/dav/config');
+      expect(plan.start).assertEqual('https://other.example.com');
+      expect(plan.segments.length).assertEqual(2);
+    });
+  });
+
+  describe('WebDavFolderUrl', () => {
+    it('joins_base_and_relative_dir_with_one_slash', 0, () => {
+      // 回归：曾经多拼一个 / 变成 /dav//listen-config，坚果云 PUT 直接 409
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav', 'listen-config'))
+        .assertEqual('https://dav.jianguoyun.com/dav/listen-config');
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav/', 'listen-config'))
+        .assertEqual('https://dav.jianguoyun.com/dav/listen-config');
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav', ''))
+        .assertEqual('https://dav.jianguoyun.com/dav/listen-config');
+    });
+
+    it('handles_absolute_and_full_urls', 0, () => {
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav', '/config/listen'))
+        .assertEqual('https://dav.jianguoyun.com/dav/config/listen');
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav',
+        'https://dav.jianguoyun.com/dav//listen-config'))
+        .assertEqual('https://dav.jianguoyun.com/dav/listen-config');
+    });
+
+    it('escapes_chinese_and_keeps_file_url_clean', 0, () => {
+      expect(buildFolderUrl('https://dav.jianguoyun.com/dav', '同步配置'))
+        .assertEqual('https://dav.jianguoyun.com/dav/%E5%90%8C%E6%AD%A5%E9%85%8D%E7%BD%AE');
+      expect(configFileUrl('https://dav.jianguoyun.com/dav//listen-config'))
+        .assertEqual('https://dav.jianguoyun.com/dav/listen-config/listen-config.json');
     });
   });
 
