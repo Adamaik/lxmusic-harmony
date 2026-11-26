@@ -139,4 +139,19 @@ export class ListenSettings {
     AppStorage.setOrCreate(K_HIDE_LISTEN_TAB, value);
     this.write();
   }
+
+  /**
+   * 同步恢复（WebDAV 配置同步）时写入「是否隐藏听书页签」
+   *
+   * 等价于 setHideTab，区别只在入口与语义：调用方是同步逻辑，不经过设置页 UI。
+   * 只写内存 + 落盘 + publish 到 AppStorage（壳层 @StorageLink 会自己重排页签），
+   * 不弹窗、不打断播放。这里不做「值相同就 return」的短路：同步恢复要求「远端就是
+   * 本机当前状态」，无条件落一次盘最省心（低频操作，代价可忽略）。
+   * 未 init 时只更新内存与 AppStorage，write() 自己会跳过落盘。
+   */
+  applySynced(hideTab: boolean): void {
+    this.hideTab = hideTab;
+    this.write();
+    this.publish();
+  }
 }

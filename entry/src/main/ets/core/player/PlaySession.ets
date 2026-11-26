@@ -29,6 +29,7 @@ import { AutoMatchResult, autoMatchLyric } from '../local/LyricMatch';
 import { WebDavLibrary, isWebDavSong } from '../webdav/WebDavLibrary';
 import { WebDavClient } from '../webdav/WebDavClient';
 import { WebDavSettings } from '../webdav/WebDavSettings';
+import { emitFavoriteEvent } from '../sync/FavoriteEventBus';
 import { WEBDAV_QUALITY } from '../webdav/WebDavTypes';
 import { BookEngine } from '../book/BookEngine';
 import { BookAudio, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE, bookShelfId, parseBookPayload } from '../book/BookTypes';
@@ -53,6 +54,15 @@ const SOURCE_PREFETCH_TIMEOUT_MS: number = 8000;
  * 「一直在从头起播、什么都听不到」。攒一小会儿再动，只放最后一次的结果。
  */
 const EQ_REPLAY_DEBOUNCE_MS: number = 500;
+
+/**
+ * 「正在加载」时重播最多重排几次
+ *
+ * 改音效后若这一首还在 loading（EQ 重烘整首约 7 秒 / 还在取地址），这次改动不能丢：
+ * 每 500ms 再看一次，最多重排这么多次。不做无限重排，是为了防止「一直在加载 → 一直重排」
+ * 把播放链路拖住；超了就放弃，下次起播自然按新配置处理。
+ */
+const EQ_REPLAY_RETRY_MAX: number = 20;
 
 /**
  * 改音效后「值得续播」的位置门槛（毫秒）
@@ -664,6 +674,15 @@ export class PlaySession {
   private currentCacheKey: string = '';
   private currentCacheQuality: string = '';
   private currentUrlFromCache: boolean = false;
+  /** 这一轮真正交给播放器的地址（EQ 说「打不开」时用它按原声兜底） */
+  private currentPlayUrl: string = '';
+  /**
+   * 「EQ 预处理说这条地址打不开」已经为哪首歌触发过一次「丢缓存 + 重解析」。
+   *
+   * 用歌曲 id 记账而不是用重试计数：重解析走的是 playAt（会重置 urlRetried），
+   * 用计数会无限重试；按歌记账就是「同一首歌最多为这件事重解析一次」。
+   */
+  private eqDeadUrlRetriedId: string = '';
   /** 这一轮是读本地缓存文件播的（文件坏了要删掉重来，别一直卡在这首） */
   private currentLocalPath: string = '';
   private urlRetried: boolean = false;
@@ -752,6 +771,8 @@ export class PlaySession {
   private eqReplayTimer: number = -1;
   /** 已经因为音效改动重播过的那次「音效配置指纹」，避免同一套配置反复重播 */
   private eqReplaySignature: string = '';
+  /** 重播在等「loading 结束」时已经重排过几次（见 replayForEq） */
+  private eqReplayRetries: number = 0;
 
   /**
    * 绑定沙箱目录（播放现场落盘用）。
@@ -803,8 +824,14 @@ export class PlaySession {
     if (signature === this.eqReplaySignature) {
       return;   // 同一套配置（比如点了和当前一样的那一档），不必重播
     }
-    this.eqReplaySignature = signature;
-
+    /**
+     * 注意：指纹**不在这里提交**。
+     *
+     * 以前在这里就写 eqReplaySignature，可 500ms 后 replayForEq 遇到 loading
+     * （EQ 重烘整首的那几秒状态就是 loading）会直接返回，指纹却已经消费掉：
+     * 这次改动被静默吞掉，再点同一预设还会被上面的去重挡住 —— 耳朵听到旧预设，
+     * 播放页却已经显示新预设。改成真正开始重播时再提交（见 replayForEq）。
+     */
     const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
     if (status !== 'playing' && status !== 'buffering' && status !== 'paused' && status !== 'loading') {
       return;   // 没在放：不用打断谁
@@ -815,15 +842,28 @@ export class PlaySession {
     if (this.eqReplayTimer >= 0) {
       clearTimeout(this.eqReplayTimer);
     }
+    this.eqReplayRetries = 0;
     this.eqReplayTimer = setTimeout(() => {
       this.eqReplayTimer = -1;
-      void this.replayForEq(reason);
+      void this.replayForEq(reason, signature);
     }, EQ_REPLAY_DEBOUNCE_MS);
   }
 
   /** 真正重播（见 requestEqReplay）：音效改完调一次，按新配置重新处理并回到原位置 */
-  private async replayForEq(reason: string): Promise<void> {
+  private async replayForEq(reason: string, signature: string): Promise<void> {
     const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
+    /**
+     * 这一首正在加载（EQ 重烘 / 取地址）：这次改动不能丢。
+     * 等它落地再重播，最多重排 EQ_REPLAY_RETRY_MAX 次；超了放弃，下次起播自然生效。
+     */
+    if (status === 'loading' && this.eqReplayRetries < EQ_REPLAY_RETRY_MAX) {
+      this.eqReplayRetries++;
+      this.eqReplayTimer = setTimeout(() => {
+        this.eqReplayTimer = -1;
+        void this.replayForEq(reason, signature);
+      }, EQ_REPLAY_DEBOUNCE_MS);
+      return;
+    }
     if (status !== 'playing' && status !== 'buffering' && status !== 'paused') {
       return;   // 这一小会儿里用户停了 / 切走了
     }
@@ -837,6 +877,9 @@ export class PlaySession {
       hilog.info(DOMAIN, TAG, 'eq changed while playing a book, apply on next start only');
       return;
     }
+    // 真正要重播了才提交指纹：被 loading / 状态挡掉的那几次不算「已经播过新配置」
+    this.eqReplayRetries = 0;
+    this.eqReplaySignature = signature;
     const wasPaused: boolean = status === 'paused';
     /**
      * 续播位置
@@ -2261,6 +2304,17 @@ export class PlaySession {
     // 每次切歌领一个号：解析/取链接要几秒，期间用户又点了别的歌的话，
     // 旧的那次必须丢掉，不能等它回来把新歌覆盖掉
     const token: number = ++this.playToken;
+    /**
+     * 切歌了：上一首排着的「音效改动重播」作废。
+     *
+     * 那个定时器是在触发时才读 currentIndex 的，500ms 内切了歌的话，
+     * 它会把刚切过去的这首打断重起（缓存命中时起播很快，状态已经是 playing）。
+     */
+    if (this.eqReplayTimer >= 0) {
+      clearTimeout(this.eqReplayTimer);
+      this.eqReplayTimer = -1;
+    }
+    this.eqReplayRetries = 0;
     // 放的是另一首歌：上次退出时记下的续播位置作废
     if (index !== this.resumeIndex) {
       this.resumePosition = 0;
@@ -2276,6 +2330,8 @@ export class PlaySession {
       this.failSongId = this.queue[index].id;
       this.failRetry = 0;
       this.skipSourceIds = [];
+      // 换歌了：上一首为「EQ 打不开地址」做过的那次重解析记账作废
+      this.eqDeadUrlRetriedId = '';
     }
     this.currentLocalPath = '';
     // 换歌 / 重新解析：上一首的「实际档位」立刻作废，别让音质钮在解析期间显示上一首的档
@@ -2621,6 +2677,8 @@ export class PlaySession {
       // 终点在 LxPlayer 的 stateChange 里（进 playing 才算出声）
       StartupTiming.getInstance().beginBuffer(item.source, quality, fromCache);
       this.setStatus('loading', '正在缓冲…');
+      // 记下这一轮真正要播的地址：EQ 说「打不开」时按原声兜底要用（见 catch 里的 EQ_DEAD_URL）
+      this.currentPlayUrl = url;
       // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
       // 这里不提前改状态，避免没出声界面就先显示播放中
       await LxPlayer.getInstance().playUrl(url);
@@ -2640,6 +2698,39 @@ export class PlaySession {
     } catch (e) {
       if (this.playToken !== token) {
         return;
+      }
+      /**
+       * EQ 预处理报告「这个网络地址打不开」（见 LxPlayer.eqUrlUnopenable）。
+       *
+       * 真机实测（2026-11-27）：地址缓存里的旧链接可能已失效。以前会先回退原声、
+       * 播放器拉同一条旧链又失败，白白绕一圈还误弹「未生效」。现在：
+       *   - 同一首歌第一次遇到：丢掉这条地址缓存、重新解析再播（EQ 会重新处理）；
+       *   - 重解析后还打不开：直接按原声播（与改动前一致），不让用户听不到歌。
+       * 只对这首歌记一次账（eqDeadUrlRetriedId），不会变成无限重试。
+       */
+      if ((e as Error).message === 'EQ_DEAD_URL') {
+        if (this.eqDeadUrlRetriedId !== item.id) {
+          this.eqDeadUrlRetriedId = item.id;
+          if (this.currentCacheKey.length > 0) {
+            MediaCache.getInstance().dropMusicUrl(this.currentCacheKey, this.currentCacheQuality);
+          }
+          hilog.warn(DOMAIN, TAG, 'eq cannot open url, drop cache and resolve again: %{public}s',
+            item.name);
+          this.setStatus('loading', '正在重新获取播放地址…');
+          void this.playAt(this.currentIndex);
+          return;
+        }
+        hilog.warn(DOMAIN, TAG, 'eq still cannot open url after refresh, play raw: %{public}s',
+          item.name);
+        try {
+          await LxPlayer.getInstance().playUrlNoEq(this.currentPlayUrl);
+          // 原声已经交给播放器：清掉自动跳过计数，别把这次当成「这首歌废了」
+          this.autoSkipCount = 0;
+          return;
+        } catch (e2) {
+          hilog.warn(DOMAIN, TAG, 'raw playback after eq url failure failed: %{public}s',
+            (e2 as Error).message);
+        }
       }
       // 起播耗时照打：buffer=未开始 说明地址都没取到（解析失败），
       // buffer 有值说明是送进播放器之后才失败的 —— 这两种在排障时完全是两件事
@@ -3771,6 +3862,8 @@ export class PlaySession {
     this.publishFavorites();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
+    // 平台同步（总开关打开时才会真的发请求；关着时这一句只是空调用）
+    emitFavoriteChange(item, true);
     return true;
   }
 
@@ -3827,15 +3920,22 @@ export class PlaySession {
     this.publishFavorites();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
+    // 批量收藏同样要同步到平台：一次收藏 50 首时，逐首发事件（同步侧自己排队串行）
+    for (const item of fresh) {
+      emitFavoriteChange(item, true);
+    }
     return added;
   }
 
   /** 取消收藏 */
   removeFavorite(id: string): boolean {
     const remains: SongItem[] = [];
+    let removed: SongItem | null = null;
     for (const entry of this.favorites) {
       if (entry.id !== id) {
         remains.push(entry);
+      } else if (removed === null) {
+        removed = entry;
       }
     }
     if (remains.length === this.favorites.length) {
@@ -3845,6 +3945,10 @@ export class PlaySession {
     this.publishFavorites();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
+    // 取消收藏 = 用户的明确意图：平台同步会把平台账号里对应的「喜欢」也删掉
+    if (removed !== null) {
+      emitFavoriteChange(removed as SongItem, false);
+    }
     return true;
   }
 
@@ -3860,9 +3964,12 @@ export class PlaySession {
       return 0;
     }
     const remains: SongItem[] = [];
+    const removedItems: SongItem[] = [];
     for (const entry of this.favorites) {
       if (ids.indexOf(entry.id) < 0) {
         remains.push(entry);
+      } else {
+        removedItems.push(entry);
       }
     }
     const removed: number = this.favorites.length - remains.length;
@@ -3873,6 +3980,10 @@ export class PlaySession {
     this.publishFavorites();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
+    // 批量取消收藏同样按用户的明确意图同步删除平台侧的「喜欢」
+    for (const item of removedItems) {
+      emitFavoriteChange(item, false);
+    }
     return removed;
   }
 
@@ -3880,10 +3991,14 @@ export class PlaySession {
     if (this.favorites.length === 0) {
       return;
     }
+    const removedItems: SongItem[] = this.favorites;
     this.favorites = [];
     this.publishFavorites();
     this.notifyLibrary();
     this.pushFavoriteStateToSystem();
+    for (const item of removedItems) {
+      emitFavoriteChange(item, false);
+    }
   }
 
   isFavorite(id: string): boolean {
@@ -3977,4 +4092,25 @@ export class PlaySession {
   formatDuration(seconds: number): string {
     return formatTime(seconds);
   }
+}
+
+/**
+ * 把一次「收藏 / 取消收藏」发给平台同步（见 core/sync/FavoriteEventBus.ets）
+ *
+ * 为什么不直接在 PlaySession 里调 PlatformPush：那会形成
+ * PlaySession -> PlatformPush -> PlaySession 的循环依赖。事件总线是零依赖的中间层，
+ * 没人订阅时（没开平台同步、或同步模块还没 init）这次调用什么都不会发生。
+ *
+ * 载荷只带同步需要的三样东西：条目 id（本机身份键）、来源平台、musicInfoJson
+ * （平台侧数字 id / songmid / songType 都在 JSON 里）。
+ */
+function emitFavoriteChange(item: SongItem, add: boolean): void {
+  emitFavoriteEvent({
+    itemId: item.id,
+    name: item.name,
+    singer: item.singer,
+    source: item.source,
+    musicInfoJson: item.musicInfoJson,
+    add: add,
+  });
 }

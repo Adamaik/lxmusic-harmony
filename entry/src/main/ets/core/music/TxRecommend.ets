@@ -233,6 +233,122 @@ export function isTxLoggedIn(): boolean {
   return musicAccount().isLoggedIn('tx');
 }
 
+/** 「我喜欢」在 QQ 音乐里的固定目录号（与 TxWrite 的写入口径一致） */
+const TX_LIKE_DIR_ID: number = 201;
+/** 读「我喜欢」每页首数（分页靠 song_begin 偏移，不是页码） */
+const TX_LIKE_PAGE_SIZE: number = 100;
+/** 最多翻多少页：只做预检用途，1 万首封顶足够；取不完时按「读不完整」处理，不静默当空 */
+const TX_LIKE_MAX_PAGES: number = 100;
+
+/**
+ * 「我喜欢」列表的读取结果
+ *
+ * **ok=false 时 ids 不可信**（调用方必须整平台跳过本次推送）：把「读失败」当成
+ * 「远端一首都没收藏」会导致把已经收藏的歌又写一遍，既无效又更容易触发风控。
+ */
+/** 一条「远端已收藏」的歌曲身份要素（只做跨音源去重，不参与播放） */
+export interface TxLikedSong {
+  name: string;
+  singer: string;
+}
+
+export interface TxLikedResult {
+  ok: boolean;
+  ids: Set<number>;
+  /** 远端已收藏曲目的「歌名 + 歌手」列表（跨音源去重用；解析不到名字的曲目会被跳过） */
+  songs: TxLikedSong[];
+  message: string;
+}
+
+/**
+ * 拉一次 QQ 音乐账号的「我喜欢」（dirId = 201）全量歌曲数字 id
+ *
+ * ## 为什么走明文 musicu.fcg
+ * 写「我喜欢」走的是 `musics.fcg?sign=zzcSign&encoding=ag-1`（见 TxWrite），但**读**不需要：
+ * `music.srfDissInfo.DissInfo / CgiGetDiss` 与每日推荐/歌单详情是同一个读 RPC，明文明文即可，
+ * 只有写通道才需要那层签名与 AES-GCM。硬套写通道只会多两层可能出错的加密。
+ *
+ * ## 参数要点（真机实测口径）
+ * - `disstid` 必须是**数字 0**（传字符串会回 `data.code=-100008 param error`）；
+ * - `dirid = 201` 表示「我喜欢」；
+ * - `song_begin` 是**偏移**（0 起），不是页码；`song_num` 是每页条数；
+ * - `tag / userinfo / orderlist` 都要带（少带可能只回歌单外壳、songlist 为空）。
+ *
+ * ## 与写入口径的关系
+ * 响应里的 `songlist[].type` 正是写喜欢时要的 `songType`，`songlist[].id` 正是写喜欢要的
+ * 数字 id —— 两边同源，不会出现「读到的 id 与写进去的 id 不是一套」的问题。
+ *
+ * 只读、不改账号数据。
+ */
+export async function fetchTxLikedIds(): Promise<TxLikedResult> {
+  const ids: Set<number> = new Set<number>();
+  const songs: TxLikedSong[] = [];
+  if (musicAccount().cookieOf('tx').length === 0) {
+    return { ok: false, ids: ids, songs: songs, message: '需要登录 QQ 音乐账号' };
+  }
+  let offset: number = 0;
+  let total: number = -1;
+  for (let page = 0; page < TX_LIKE_MAX_PAGES; page++) {
+    const req: TxDissReq = new TxDissReq();
+    req.param.disstid = 0;
+    req.param.dirid = TX_LIKE_DIR_ID;
+    req.param.song_begin = offset;
+    req.param.song_num = TX_LIKE_PAGE_SIZE;
+    let resp: Record<string, Object>;
+    try {
+      resp = await httpPostJson(GATEWAY, new TxDissBody(buildComm(), req), txHeaders(), 'QQ音乐我喜欢');
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'tx liked request failed at %{public}d: %{public}s',
+        offset, (e as Error).message);
+      return { ok: false, ids: ids, songs: songs, message: `读取失败：${(e as Error).message}` };
+    }
+    const data: Record<string, Object> | null = blockOf(resp);
+    if (data === null) {
+      return { ok: false, ids: ids, songs: songs, message: '平台拒绝读取「我喜欢」（业务码非 0）' };
+    }
+    const tracks: Object[] = asObjectArray(data['songlist']);
+    for (const track of tracks) {
+      const item: Record<string, Object> = asRecord(track);
+      const id: number = asNumber(item['id'], 0);
+      if (id > 0) {
+        ids.add(id);
+      }
+      // 歌名 / 歌手用于「同一首歌、不同音源」的去重。
+      // 这里**不走 parseTxSongs**：它要求每首带 file.media_mid，缺字段的整条会被丢掉，
+      // 去重集合就会少几首（少判 = 多写一次，正是要避免的）。
+      const title: string = asString(item['name']).length > 0
+        ? asString(item['name']) : asString(item['title']);
+      const singerList: Object[] = asObjectArray(item['singer']);
+      const names: string[] = [];
+      for (const singer of singerList) {
+        const singerName: string = asString(asRecord(singer)['name']);
+        if (singerName.length > 0) {
+          names.push(singerName);
+        }
+      }
+      if (title.length > 0 && names.length > 0) {
+        const likedSong: TxLikedSong = { name: title, singer: names.join('、') };
+        songs.push(likedSong);
+      }
+    }
+    if (total < 0) {
+      total = asNumber(data['total_song_num'], -1);
+    }
+    const hasMore: number = asNumber(data['hasmore'], 0);
+    const pageSize: number = tracks.length;
+    offset += pageSize;
+    // 停止条件：没有更多 / 本页空 / 已拿够总数。拿不到 total 时只能靠 hasmore。
+    if (hasMore === 0 || pageSize === 0) {
+      break;
+    }
+    if (total >= 0 && offset >= total) {
+      break;
+    }
+  }
+  hilog.info(DOMAIN, TAG, 'tx liked: %{public}d id(s) (total=%{public}d)', ids.size, total);
+  return { ok: true, ids: ids, songs: songs, message: '' };
+}
+
 /**
  * 私人雷达
  *

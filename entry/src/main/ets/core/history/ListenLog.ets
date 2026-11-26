@@ -108,6 +108,19 @@ export interface ListenRecord {
   durationMs: number;
 }
 
+/**
+ * 听歌流水的导出包（WebDAV 配置同步用）
+ *
+ * 跨设备只搬「歌名+歌手」这个键、开播时刻与实际时长；歌曲元数据按 key 去重后
+ * 单独带一份（同一首歌的封面 / musicInfo 不会在流水里重复 N 份）。
+ * records 新的在前（与落盘同序）；songs 只包含被这些 record 引用到的歌。
+ * 恢复端拿到后交给 {@link ListenLog.mergeRemote} 合并，最近播放与回响都从流水重建。
+ */
+export interface ListenHistoryExport {
+  songs: ListenSong[];
+  records: ListenRecord[];
+}
+
 /** 年月选择器里的一档 */
 export interface MonthKey {
   year: number;
@@ -273,6 +286,216 @@ function compareEchoSongs(left: EchoSong, right: EchoSong): number {
     return right.lastAt - left.lastAt;
   }
   return left.name.localeCompare(right.name);
+}
+
+// ------------------------------------------------ 配置同步（导出 / 合并）
+
+/** songKey 里的分隔符：歌名 + \u0001 + 歌手（与 songKeyOf 同口径，不显示到界面上） */
+const KEY_SEP: string = '\u0001';
+
+/** 数值字段是否合法：必须是**有限非负数**（远端 JSON 里可能有字符串 / NaN / 负数） */
+function isNonNegativeNumber(value: number): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** 导出用的记录副本：同步流程里排序 / 裁剪都改不到流水内部的那条对象 */
+function copyRecord(record: ListenRecord): ListenRecord {
+  return {
+    startedAt: record.startedAt,
+    playedMs: record.playedMs,
+    songKey: record.songKey,
+    durationMs: record.durationMs,
+  };
+}
+
+/** 导出用的歌曲副本：同上，避免调用方改到流水里的元数据 */
+function copySong(song: ListenSong): ListenSong {
+  return {
+    id: song.id,
+    name: song.name,
+    singer: song.singer,
+    coverUrl: song.coverUrl,
+    art: song.art,
+    source: song.source,
+    quality: song.quality,
+    interval: song.interval,
+    musicInfoJson: song.musicInfoJson,
+    albumName: song.albumName,
+    durationMs: song.durationMs,
+  };
+}
+
+/**
+ * 远端歌曲元数据清洗
+ *
+ * 跨设备来的包可能是旧版本写的、也可能被手工改过：只有歌名是硬要求（songKey 靠它），
+ * 其余字段类型不对就给默认值 —— 与 fromSong 的容错口径一致，绝不让 undefined / NaN
+ * 流进统计（回响的完播率对 NaN 很敏感）。
+ */
+function sanitizeRemoteSong(raw: ListenSong): ListenSong | null {
+  const name: string = typeof raw.name === 'string' ? raw.name : '';
+  if (name.length === 0) {
+    return null;
+  }
+  const song: ListenSong = {
+    id: typeof raw.id === 'string' ? raw.id : '',
+    name: name,
+    singer: typeof raw.singer === 'string' ? raw.singer : '',
+    coverUrl: typeof raw.coverUrl === 'string' ? raw.coverUrl : '',
+    art: typeof raw.art === 'boolean' ? raw.art : false,
+    source: typeof raw.source === 'string' ? raw.source : '',
+    quality: typeof raw.quality === 'string' ? raw.quality : '',
+    interval: typeof raw.interval === 'string' ? raw.interval : '',
+    musicInfoJson: typeof raw.musicInfoJson === 'string' ? raw.musicInfoJson : '',
+    albumName: typeof raw.albumName === 'string' ? raw.albumName : '',
+    durationMs: isNonNegativeNumber(raw.durationMs) ? raw.durationMs : 0,
+  };
+  return song;
+}
+
+/**
+ * 把远端歌曲元数据补进本机同 key 的那一份，返回有没有变化
+ *
+ * 判据（任务里「保留更完整/更新的那份」的落地方式）：
+ *   - **逐字段补全，本机非空字段永远保留**：本机这份是当前设备最近一次播放的快照，
+ *     id / musicInfoJson / quality 更能直接续播，而恢复端这些字段常常为空；
+ *   - 只有本机是空串 / 0 时才用远端补（远端也可能为空，那就等于没变）；
+ *   - durationMs 取两边较大的：真实时长只会越记越准，0 表示未知；
+ *   - art 只是「没有封面时用占位图」的派生标记：补到封面就以封面为准清掉。
+ * 不做整份替换，是因为两端可能各缺不同字段，替换会把本机已有的信息丢掉。
+ */
+function mergeSongInto(local: ListenSong, remote: ListenSong): boolean {
+  let changed: boolean = false;
+  if (local.id.length === 0 && remote.id.length > 0) {
+    local.id = remote.id;
+    changed = true;
+  }
+  if (local.singer.length === 0 && remote.singer.length > 0) {
+    local.singer = remote.singer;
+    changed = true;
+  }
+  if (local.coverUrl.length === 0 && remote.coverUrl.length > 0) {
+    local.coverUrl = remote.coverUrl;
+    changed = true;
+  }
+  if (local.source.length === 0 && remote.source.length > 0) {
+    local.source = remote.source;
+    changed = true;
+  }
+  if (local.quality.length === 0 && remote.quality.length > 0) {
+    local.quality = remote.quality;
+    changed = true;
+  }
+  if (local.interval.length === 0 && remote.interval.length > 0) {
+    local.interval = remote.interval;
+    changed = true;
+  }
+  if (local.musicInfoJson.length === 0 && remote.musicInfoJson.length > 0) {
+    local.musicInfoJson = remote.musicInfoJson;
+    changed = true;
+  }
+  if (local.albumName.length === 0 && remote.albumName.length > 0) {
+    local.albumName = remote.albumName;
+    changed = true;
+  }
+  if (remote.durationMs > local.durationMs) {
+    local.durationMs = remote.durationMs;
+    changed = true;
+  }
+  // 有封面了就不该再用占位图（art 只是「没有封面」的兜底标记）
+  if (local.coverUrl.length > 0 && local.art) {
+    local.art = false;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * 解析远端记录的 songKey
+ *
+ * 正常路径：exportHistory 导出的键就是 songKeyOf 的结果，合并完 songs 后字典里必然找得到。
+ * 兼容路径：键里没有分隔符（旧包 / 被截断 / 手写配置）时，把它当歌名按 song.name + singer
+ * 重建一次（重建键与 songKeyOf 同口径）；同名多首时无法确定是哪一首，**宁可丢弃也不猜**。
+ * 两条路都走不通就说明远端只带了 records、没带这首歌的元数据：恢复出来点不开也显示不了，
+ * 只能丢弃。
+ */
+function resolveRecordSongKey(raw: ListenRecord, songs: Map<string, ListenSong>): string {
+  const key: string = typeof raw.songKey === 'string' ? raw.songKey : '';
+  if (key.length === 0) {
+    return '';
+  }
+  if (songs.get(key) !== undefined) {
+    return key;
+  }
+  if (key.indexOf(KEY_SEP) >= 0) {
+    return '';
+  }
+  let rebuilt: string = '';
+  for (const songKey of songs.keys()) {
+    const song: ListenSong | undefined = songs.get(songKey);
+    if (song === undefined || song.name !== key) {
+      continue;
+    }
+    if (rebuilt.length > 0) {
+      // 同名不止一首：歌手对不上就分不清，宁可丢掉
+      return '';
+    }
+    rebuilt = songKey;
+  }
+  return rebuilt;
+}
+
+/**
+ * 远端记录清洗：键要能解析出来，时间 / 时长必须是非负有限数，否则丢弃
+ *
+ * playedMs=0 且 startedAt>0 是对端「进程被杀时还没结清的正在听」快照：按约定它仍是
+ * 合法值（非负），照收；本端下次 loadV2 会按同一口径把它丢掉，不会污染统计。
+ */
+function sanitizeRemoteRecord(raw: ListenRecord, songs: Map<string, ListenSong>): ListenRecord | null {
+  const startedAt: number = raw.startedAt;
+  const playedMs: number = raw.playedMs;
+  const durationMs: number = raw.durationMs;
+  if (!isNonNegativeNumber(startedAt) || !isNonNegativeNumber(playedMs) ||
+    !isNonNegativeNumber(durationMs)) {
+    return null;
+  }
+  const songKey: string = resolveRecordSongKey(raw, songs);
+  if (songKey.length === 0) {
+    return null;
+  }
+  const record: ListenRecord = {
+    startedAt: startedAt,
+    playedMs: playedMs,
+    songKey: songKey,
+    durationMs: durationMs,
+  };
+  return record;
+}
+
+/**
+ * 一条流水的去重键
+ *
+ * startedAt>0：`songKey + 分隔符 + startedAt`（同一首歌同一次开播只算一条）；
+ * startedAt=0：只有歌（v1 迁移来的旧记录没有时间，同一首歌按「有没有」去重）。
+ */
+function recordDedupeKey(songKey: string, startedAt: number): string {
+  if (startedAt <= 0) {
+    return songKey;
+  }
+  return `${songKey}${KEY_SEP}${startedAt}`;
+}
+
+/** 流水排序：开播时刻新的在前；startedAt=0 的旧迁移记录算最旧、排在最后（同刻保持原有先后） */
+function compareListenRecords(left: ListenRecord, right: ListenRecord): number {
+  const leftLegacy: boolean = left.startedAt <= 0;
+  const rightLegacy: boolean = right.startedAt <= 0;
+  if (leftLegacy !== rightLegacy) {
+    return leftLegacy ? 1 : -1;
+  }
+  if (leftLegacy) {
+    return 0;
+  }
+  return right.startedAt - left.startedAt;
 }
 
 /**
@@ -595,6 +818,154 @@ export class ListenLog {
     }
     this.write();
     this.publish();
+  }
+
+  // ------------------------------------------------ 配置同步（导出 / 合并）
+
+  /**
+   * 导出一条条**原始流水**（最多 limit 条，新的在前），只带被这些记录引用到的歌曲元数据
+   *
+   * WebDAV 配置同步把这份包搬到其它设备：最近播放与回响都从流水重建，所以搬的必须是
+   * 原始记录（开播时刻 / 实际时长 / 歌曲键），而不是聚合后的榜单。limit 非法（0 / 负数 /
+   * NaN）时导空包 —— 调用方不想要就别搬。返回的都是**副本**，同步流程里再排序 / 裁剪
+   * 都改不到本机流水。
+   */
+  exportHistory(limit: number): ListenHistoryExport {
+    // ArkTS 对对象字面量里的空数组要求有明确类型：先建好两个空数组再装包
+    const noSongs: ListenSong[] = [];
+    const noRecords: ListenRecord[] = [];
+    const out: ListenHistoryExport = { songs: noSongs, records: noRecords };
+    if (!this.inited) {
+      return out;
+    }
+    const count: number = limit > 0 ? Math.min(Math.floor(limit), this.records.length) : 0;
+    const seen: Set<string> = new Set();
+    for (let i = 0; i < count; i++) {
+      const record: ListenRecord = this.records[i];
+      out.records.push(copyRecord(record));
+      // 歌曲元数据按 key 去重：同一首歌听了很多遍也只在包里带一份
+      if (seen.has(record.songKey)) {
+        continue;
+      }
+      seen.add(record.songKey);
+      const song: ListenSong | undefined = this.songs.get(record.songKey);
+      if (song !== undefined) {
+        out.songs.push(copySong(song));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 合并远端流水（跨设备）：返回**真正新增、且留在最终流水里**的 record 条数
+   *
+   * 语义是「加法」不是「用远端覆盖本机」：远端包里没有的本机记录一条都不删。
+   * 步骤：
+   *   1) 远端歌曲元数据**先**并进 songs 字典：记录校验要靠它认歌（不能依赖设备侧
+   *      id / musicInfoJson，恢复端这些字段常为空）；
+   *   2) 按本机现有流水建去重索引；
+   *   3) 逐条校验 + 去重：startedAt>0 用 `songKey + 分隔符 + startedAt`；startedAt=0 的
+   *      v1 旧迁移记录按 songKey（本机已有同一首歌的任何记录就跳过 —— 它没有新信息）；
+   *   4) 合并后按 startedAt 降序（0 视为最旧、排最后），超过 LISTEN_LOG_MAX 截掉最旧的；
+   *      截断只按时间丢最旧的那几条（容量上限的常规语义，可能是本机最旧的一条），
+   *      「不删本机」指**不因为远端包里没有它就删它**；
+   *   5) 真有变化（新增记录 / 元数据被补全）才 write() + publish()；K_ECHO_VERSION 由
+   *      publish 处理，这里不再多写一次。
+   */
+  mergeRemote(exported: ListenHistoryExport): number {
+    if (!this.inited) {
+      return 0;
+    }
+    if (exported === undefined || exported === null) {
+      return 0;
+    }
+    let changed: boolean = false;
+
+    // 1) 歌曲元数据先合并：先有字典才能校验下面的记录
+    const remoteSongs: ListenSong[] = exported.songs;
+    if (Array.isArray(remoteSongs)) {
+      for (const one of remoteSongs) {
+        const remote: ListenSong | null = sanitizeRemoteSong(one);
+        if (remote === null) {
+          continue;
+        }
+        const key: string = songKeyOf(remote);
+        const local: ListenSong | undefined = this.songs.get(key);
+        if (local === undefined) {
+          // 本机没有这首歌：整份收下（远端可能缺 id / musicInfoJson，点播时会退回按名搜索）
+          this.songs.set(key, remote);
+          changed = true;
+          continue;
+        }
+        if (mergeSongInto(local, remote)) {
+          changed = true;
+        }
+      }
+    }
+
+    // 2) 去重索引：startedAt>0 按「歌 + 时刻」，旧迁移记录只按歌
+    const existingByStart: Set<string> = new Set();
+    const existingSongKeys: Set<string> = new Set();
+    for (const record of this.records) {
+      existingSongKeys.add(record.songKey);
+      if (record.startedAt > 0) {
+        existingByStart.add(recordDedupeKey(record.songKey, record.startedAt));
+      }
+    }
+
+    // 3) 逐条校验 + 去重（远端包里自己重复的记录也一并去掉）
+    const added: ListenRecord[] = [];
+    // 新增记录的去重键：后面判断「哪些新增真的留在最终流水里」用它，不依赖对象引用
+    const addedKeys: Set<string> = new Set();
+    const remoteRecords: ListenRecord[] = exported.records;
+    if (Array.isArray(remoteRecords)) {
+      for (const one of remoteRecords) {
+        const record: ListenRecord | null = sanitizeRemoteRecord(one, this.songs);
+        if (record === null) {
+          continue;
+        }
+        if (record.startedAt <= 0) {
+          if (existingSongKeys.has(record.songKey)) {
+            continue;
+          }
+        } else if (existingByStart.has(recordDedupeKey(record.songKey, record.startedAt))) {
+          continue;
+        }
+        existingSongKeys.add(record.songKey);
+        if (record.startedAt > 0) {
+          existingByStart.add(recordDedupeKey(record.songKey, record.startedAt));
+        }
+        addedKeys.add(recordDedupeKey(record.songKey, record.startedAt));
+        added.push(record);
+      }
+    }
+
+    // 4)+5) 合并、排序、截断；有变化才落盘 + 通知
+    let addedCount: number = 0;
+    if (added.length > 0) {
+      const merged: ListenRecord[] = this.records.slice();
+      for (const one of added) {
+        merged.push(one);
+      }
+      merged.sort(compareListenRecords);
+      const kept: ListenRecord[] = merged.length > LISTEN_LOG_MAX
+        ? merged.slice(0, LISTEN_LOG_MAX)
+        : merged;
+      // 「真正新增」只算进了最终流水的：被容量上限截掉的不能算新增。
+      // 按去重键字符串认（去重后每条键唯一，不会和本机记录撞上），不依赖对象引用。
+      for (const one of kept) {
+        if (addedKeys.has(recordDedupeKey(one.songKey, one.startedAt))) {
+          addedCount += 1;
+        }
+      }
+      this.records = kept;
+      changed = true;
+    }
+    if (changed) {
+      this.write();
+      this.publish();
+    }
+    return addedCount;
   }
 
   // ---------------------------------------------------------------- 播放历史

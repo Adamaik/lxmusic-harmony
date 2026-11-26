@@ -189,6 +189,25 @@ export class DownloadSettings {
     this.write();
   }
 
+  /**
+   * 同步恢复（WebDAV 配置同步）时写入下载音质
+   *
+   * 合法值只有空串（跟随播放音质）与 DOWNLOAD_QUALITY_VALUES 里的档位：
+   * 空串 / 未知档位一律忽略、保持本机原值，免得下载侧按一个不认识的档位去要地址。
+   * 只写内存 + 落盘 + publish 到 AppStorage（设置页 @StorageLink 订阅），不弹窗；
+   * 不动已经在下载的任务 —— 新档位只影响之后开始的下载（见 DownloadManager）。
+   * 未 init 时只更新内存与 AppStorage，write() 自己会跳过落盘。
+   */
+  applySynced(quality: string): void {
+    const next: string = quality.trim();
+    if (next !== '' && !DOWNLOAD_QUALITY_VALUES.includes(next)) {
+      return;
+    }
+    this.quality = next;
+    this.write();
+    this.publish();
+  }
+
   // ---------------------------------------------------------------- 写入
 
   setNameFormat(value: string): void {

@@ -352,8 +352,9 @@ export struct MusicLoginView {
             .borderRadius(R_CARD)
             .backgroundColor(C_CARD)
 
-            Text('只保存网页登录抓回来的 Cookie（相当于本机的一张登录凭证），不保存账号密码，'
-              + '也不会发到别处；不想用了点「退出登录」就清掉。')
+            Text('只保存网页登录抓回来的 Cookie（相当于本机的一张登录凭证），不保存账号密码；'
+              + 'Cookie 只保存在本机，只有你在设置里开启「平台同步」时，才会把你在本机收藏的歌'
+              + '推送到对应平台账号。不想用了点「退出登录」就清掉。')
               .fontSize(11.5)
               .fontColor(C_TEXT_WEAK)
               .width('100%')

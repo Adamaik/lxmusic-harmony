@@ -33,10 +33,15 @@ import {
   buildConfigSnapshot,
   buildFolderUrl,
   configFileUrl,
+  countFavorites,
+  countHistory,
   countSongs,
   describeSettings,
   fingerprintOf,
   isRemoteNewer,
+  mergeDislikes,
+  mergeFavorites,
+  mergeHistory,
   mergePlaylists,
   applySettings,
   parseConfigFile,
@@ -64,6 +69,9 @@ export interface ConfigSyncPreview {
   exportedAt: string;
   playlists: number;
   songs: number;
+  /** v2：收藏首数与听歌流水条数（v1 老文件为 0） */
+  favorites: number;
+  history: number;
   /** 设置项摘要（「音质 320K · 播放页动效 轻量」） */
   settingsText: string;
   /** 网盘那份比本机上次同步的更新（界面可以据此把按钮写成「恢复较新的配置」） */
@@ -79,6 +87,10 @@ export interface ConfigSyncOutcome {
   songs: number;
   skippedSongs: number;
   renamed: number;
+  /** v2：本次并入的收藏 / 流水 / 不感兴趣条数 */
+  favorites: number;
+  history: number;
+  dislikes: number;
 }
 
 /** 读网盘的结果：text 为 null 表示文件不存在；error 非空表示读失败或格式不认识 */
@@ -239,7 +251,8 @@ export class WebDavConfigSync {
       // 用户手动上传 = 明确要覆盖网盘：之前「刚恢复过、别自动上传」的标记作废
       settings.clearRestoredPendingSkip();
       const message: string = this.uploadMessage(snapshot, note);
-      this.publishStatus(`已上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
+      this.publishStatus(`已上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`
+        + `、${snapshot.favorites} 首收藏、${snapshot.history} 条记录`);
       this.publishNotice('');
       return {
         ok: true,
@@ -248,6 +261,9 @@ export class WebDavConfigSync {
         songs: snapshot.songs,
         skippedSongs: snapshot.skippedSongs,
         renamed: 0,
+        favorites: snapshot.favorites,
+        history: snapshot.history,
+        dislikes: 0,
       };
     } catch (e) {
       const message: string = describeError(e as Error);
@@ -267,6 +283,8 @@ export class WebDavConfigSync {
       exportedAt: '',
       playlists: 0,
       songs: 0,
+      favorites: 0,
+      history: 0,
       settingsText: '',
       newer: false,
       file: null,
@@ -306,6 +324,8 @@ export class WebDavConfigSync {
         exportedAt: file.exportedAt,
         playlists: file.playlists.length,
         songs: countSongs(file),
+        favorites: countFavorites(file),
+        history: countHistory(file),
         settingsText: describeSettings(file.settings),
         newer: isRemoteNewer(file, settings.getLastSyncedAt()),
         file: file,
@@ -336,11 +356,16 @@ export class WebDavConfigSync {
     this.publishStatus('正在恢复配置…');
     try {
       const merged: ConfigMergeOutcome = mergePlaylists(file.playlists);
+      // v2：收藏 / 听歌流水 / 不感兴趣同样「合并而非替换」——本机已有的数据一条都不删
+      merged.favorites = mergeFavorites(file.favorites === undefined ? [] : file.favorites);
+      merged.history = mergeHistory(file.history);
+      merged.dislikes = mergeDislikes(file.dislikes === undefined ? [] : file.dislikes);
       let applied: number = 0;
       if (file.settings !== undefined) {
         applied = applySettings(file.settings);
       }
-      const ok: boolean = merged.playlists > 0 || applied > 0;
+      const ok: boolean = merged.playlists > 0 || applied > 0
+        || merged.favorites > 0 || merged.history > 0 || merged.dislikes > 0;
       // 恢复成功 = 本机与网盘对齐了：记下这份的 exportedAt 与指纹，之后自动同步才不会
       // 又把用户刚恢复的这份当成「网盘上更新的」反复提示
       settings.setSyncState(file.exportedAt, fingerprintOf(file));
@@ -354,6 +379,15 @@ export class WebDavConfigSync {
       let message: string = `已恢复 ${merged.playlists} 个歌单、${merged.songs} 首歌曲`;
       if (applied > 0) {
         message += `，并应用了 ${applied} 项设置`;
+      }
+      if (merged.favorites > 0) {
+        message += `，并入 ${merged.favorites} 首收藏`;
+      }
+      if (merged.history > 0) {
+        message += `，合并 ${merged.history} 条听歌记录`;
+      }
+      if (merged.dislikes > 0) {
+        message += `，新增 ${merged.dislikes} 条不感兴趣`;
       }
       if (merged.renamed > 0) {
         message += `\n${merged.renamed} 个同名歌单已加后缀（本机原来的歌单没有动）`;
@@ -379,6 +413,9 @@ export class WebDavConfigSync {
         songs: merged.songs,
         skippedSongs: merged.skippedSongs,
         renamed: merged.renamed,
+        favorites: merged.favorites,
+        history: merged.history,
+        dislikes: merged.dislikes,
       };
     } catch (e) {
       const message: string = describeError(e as Error);
@@ -444,7 +481,8 @@ export class WebDavConfigSync {
       await this.uploadFile(config, snapshot, localHash);
       // 网盘上没有文件就没有「覆盖别人的合并副本」这回事，恢复后的跳过标记到这里失效
       settings.clearRestoredPendingSkip();
-      this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
+      this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`
+        + `、${snapshot.favorites} 首收藏、${snapshot.history} 条记录`);
       this.publishNotice('');
       return;
     }
@@ -480,7 +518,8 @@ export class WebDavConfigSync {
       return;
     }
     await this.uploadFile(config, snapshot, localHash);
-    this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`);
+    this.publishStatus(`已自动上传：${snapshot.playlists} 个歌单、${snapshot.songs} 首歌`
+      + `、${snapshot.favorites} 首收藏、${snapshot.history} 条记录`);
     this.publishNotice('');
     hilog.info(DOMAIN, TAG, 'auto upload done from %{public}s', trigger);
   }
@@ -529,7 +568,8 @@ export class WebDavConfigSync {
   // ------------------------------------------------------------ 状态发布
 
   private uploadMessage(snapshot: ConfigSnapshot, note: string): string {
-    let message: string = `已上传 ${snapshot.playlists} 个歌单、共 ${snapshot.songs} 首歌曲`;
+    let message: string = `已上传 ${snapshot.playlists} 个歌单、共 ${snapshot.songs} 首歌曲`
+      + `、${snapshot.favorites} 首收藏、${snapshot.history} 条听歌记录`;
     if (snapshot.skippedSongs > 0) {
       message += `\n${snapshot.skippedSongs} 首本地/云端歌曲没有上传（换设备后路径不成立）`;
     }
@@ -571,7 +611,17 @@ function deviceNameOf(): string {
 }
 
 function failOutcome(message: string): ConfigSyncOutcome {
-  return { ok: false, message: message, playlists: 0, songs: 0, skippedSongs: 0, renamed: 0 };
+  return {
+    ok: false,
+    message: message,
+    playlists: 0,
+    songs: 0,
+    skippedSongs: 0,
+    renamed: 0,
+    favorites: 0,
+    history: 0,
+    dislikes: 0,
+  };
 }
 
 /**

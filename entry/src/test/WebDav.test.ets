@@ -6,7 +6,8 @@ import { WebDavEntry, WEBDAV_ID_PREFIX, WEBDAV_QUALITY, WEBDAV_SOURCE } from '..
 import { findFolderCover, findSiblingLrc, folderCoverName, groupByFolder, isWebDavSong, shortHash,
   sortByLocation, stableKeyOf, WebDavSong } from '../main/ets/core/webdav/WebDavLibrary';
 import { normalizeServerUrl } from '../main/ets/core/webdav/WebDavSettings';
-import { buildFolderUrl, configFileUrl } from '../main/ets/core/webdav/WebDavConfigData';
+import { buildFolderUrl, configFileUrl, countFavorites, countHistory, fingerprintOf, parseConfigFile }
+  from '../main/ets/core/webdav/WebDavConfigData';
 import { mediaKeyOf } from '../main/ets/core/music/MediaCache';
 import { isSyncable } from '../main/ets/core/sync/SyncConvert';
 import { SongItem } from '../main/ets/core/player/PlaySession';
@@ -332,6 +333,13 @@ export default function webDavTest() {
         .assertEqual('https://dav.jianguoyun.com/dav/listen-config');
     });
 
+    it('collapses_duplicate_slashes_in_default_dir_branch', 0, () => {
+      // 回归：目录留空走默认目录那一支时漏了 collapseSlashes，base 里的 // 会被原样带进
+      // MKCOL 地址（/dav//listen-config），坚果云回 409，测试连接却因为别的路径显示成功
+      expect(buildFolderUrl('https://host//dav', ''))
+        .assertEqual('https://host/dav/listen-config');
+    });
+
     it('handles_absolute_and_full_urls', 0, () => {
       expect(buildFolderUrl('https://dav.jianguoyun.com/dav', '/config/listen'))
         .assertEqual('https://dav.jianguoyun.com/dav/config/listen');
@@ -356,6 +364,131 @@ export default function webDavTest() {
         .assertEqual('https://cloud.example.com/remote.php/dav/files/me/Music');
       expect(normalizeServerUrl('  http://host/dav//  ')).assertEqual('http://host/dav');
       expect(normalizeServerUrl('')).assertEqual('');
+    });
+  describe('WebDavConfigFile', () => {
+    /** v2：收藏 / 听歌流水 / 不感兴趣 / 扩展设置都要能读 */
+    const V2_TEXT: string = JSON.stringify({
+      format: 'listen-config-sync',
+      version: 2,
+      exportedAt: '2026-11-27T00:00:00.000Z',
+      playlists: [],
+      settings: {
+        quality: '320k',
+        eqEnabled: true,
+        eqPreset: 'pop',
+        eqGains: [5, 2, 1, -1, -5, -5, -2, 1, 2, 4],
+        materialLevel: 2,
+        coverRadius: 16,
+        bookSpeed: 1.5,
+        downloadQuality: 'flac',
+        hideListenTab: true,
+      },
+      favorites: [
+        { name: 'A', singer: 'B', source: 'kw', songId: '1' },
+      ],
+      history: {
+        songs: [{ name: 'A', singer: 'B', source: 'kw', songId: '1' }],
+        records: [{ name: 'A', singer: 'B', startedAt: 1700000000000, playedMs: 60000, durationMs: 210000 }],
+      },
+      dislikes: ['x@y'],
+    });
+
+    it('parses_v2_personal_data', 0, () => {
+      const file = parseConfigFile(V2_TEXT).file;
+      expect(file !== null).assertTrue();
+      if (file === null) {
+        return;
+      }
+      expect(countFavorites(file)).assertEqual(1);
+      expect(countHistory(file)).assertEqual(1);
+      expect(file.dislikes !== undefined && file.dislikes.length === 1).assertTrue();
+      const settings = file.settings;
+      expect(settings !== undefined).assertTrue();
+      if (settings !== undefined) {
+        expect(settings.eqEnabled === true).assertTrue();
+        expect(settings.eqPreset).assertEqual('pop');
+        expect(settings.eqGains !== undefined && settings.eqGains.length === 10).assertTrue();
+        expect(settings.bookSpeed).assertEqual(1.5);
+        expect(settings.materialLevel).assertEqual(2);
+      }
+    });
+
+    it('accepts_v1_file_without_new_fields', 0, () => {
+      // v1 老文件（只有歌单 + 播放设置）必须照样能恢复：新字段缺省 = 保持本机值
+      const text: string = JSON.stringify({
+        format: 'listen-config-sync',
+        version: 1,
+        exportedAt: '2026-11-23T00:00:00.000Z',
+        playlists: [{ name: 'P', songs: [{ name: 'A', singer: 'B', source: 'kw', songId: '1' }] }],
+        settings: { quality: '320k' },
+      });
+      const file = parseConfigFile(text).file;
+      expect(file !== null).assertTrue();
+      if (file === null) {
+        return;
+      }
+      expect(file.playlists.length).assertEqual(1);
+      expect(file.favorites === undefined).assertTrue();
+      expect(file.history === undefined).assertTrue();
+      expect(file.dislikes === undefined).assertTrue();
+    });
+
+    it('rejects_file_from_newer_version', 0, () => {
+      const text: string = JSON.stringify({
+        format: 'listen-config-sync',
+        version: 3,
+        exportedAt: '2026-11-27T00:00:00.000Z',
+        playlists: [],
+      });
+      expect(parseConfigFile(text).error.length > 0).assertTrue();
+    });
+
+    it('drops_invalid_history_records', 0, () => {
+      const text: string = JSON.stringify({
+        format: 'listen-config-sync',
+        version: 2,
+        exportedAt: '2026-11-27T00:00:00.000Z',
+        playlists: [],
+        history: {
+          songs: [{ name: 'A', singer: 'B', source: 'kw', songId: '1' }],
+          records: [
+            { name: '', singer: 'B', startedAt: 1, playedMs: 1 },
+            { name: 'A', singer: 'B', startedAt: -5, playedMs: -1, durationMs: 'x' },
+          ],
+        },
+      });
+      const file = parseConfigFile(text).file;
+      expect(file !== null).assertTrue();
+      if (file === null) {
+        return;
+      }
+      // 缺歌名的丢掉；时间/时长非法的归 0 但记录保留（宁可多一条也不丢听过的歌）
+      expect(countHistory(file)).assertEqual(1);
+    });
+
+    it('fingerprint_reflects_favorites_and_history', 0, () => {
+      // 只改收藏时指纹必须变，否则自动同步会判成「没变化」而不上传
+      const base: string = JSON.stringify({
+        format: 'listen-config-sync',
+        version: 2,
+        exportedAt: '2026-11-27T00:00:00.000Z',
+        playlists: [],
+        favorites: [{ name: 'A', singer: 'B', source: 'kw', songId: '1' }],
+      });
+      const changed: string = JSON.stringify({
+        format: 'listen-config-sync',
+        version: 2,
+        exportedAt: '2026-11-27T00:00:00.000Z',
+        playlists: [],
+        favorites: [{ name: 'C', singer: 'D', source: 'kw', songId: '2' }],
+      });
+      const a = parseConfigFile(base).file;
+      const b = parseConfigFile(changed).file;
+      expect(a !== null && b !== null).assertTrue();
+      if (a === null || b === null) {
+        return;
+      }
+      expect(fingerprintOf(a) === fingerprintOf(b)).assertFalse();
     });
   });
 

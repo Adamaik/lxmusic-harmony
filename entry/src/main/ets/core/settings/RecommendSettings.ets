@@ -139,4 +139,21 @@ export class RecommendSettings {
     AppStorage.setOrCreate(K_RECOMMEND_SOURCE, value);
     this.write();
   }
+
+  /**
+   * 同步恢复（WebDAV 配置同步）时写入推荐来源
+   *
+   * 合法值只有 LIST_PLATFORMS 里那几个平台键（见 core/music/MusicList.ets）：
+   * 空串 / 未知来源一律忽略，保持本机原值 —— 推荐页的取数分支只认这些键，
+   * 写进野值只会让首页取不到数据。合法时只写内存 + 落盘 + publish 到 AppStorage，
+   * 不弹窗、不打断播放。未 init 时只更新内存与 AppStorage，write() 自己会跳过落盘。
+   */
+  applySynced(source: string): void {
+    if (!LIST_PLATFORMS.includes(source)) {
+      return;
+    }
+    this.source = source;
+    this.write();
+    this.publish();
+  }
 }

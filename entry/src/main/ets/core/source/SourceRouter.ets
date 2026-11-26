@@ -184,11 +184,25 @@ export class SourceRouter {
       return b.lastOkAt - a.lastOkAt;
     });
     demoted.sort((a: SourceRoute, b: SourceRoute): number => a.lastFailAt - b.lastFailAt);
-    for (const route of trusted) {
-      push(route.id);
-    }
+    /**
+     * 当前**已经加载着**的源永远排第一。
+     *
+     * 为什么把它提到「记忆」前面：换源要重新注入脚本（`loadSource` 会重置引擎、中止在途请求），
+     * 而关闭「自动切换音源」时本来就是「只用当前源」。开着开关的行为不该比关着更差 ——
+     * 先让当前源按它原本的节奏试，真失败了再按记忆换人；一旦换到新源成功，新源就成了
+     * 「当前源」，下一首自然又是第一，路由表「下次不再等坏源」的目标照样成立。
+     *
+     * 以前这里先 push trusted 再 push loadedId：在某平台还没有历史记录时（很常见），
+     * 当前这个本来能用的源会被排到别的源后面，第一个候选只给 7 秒 ——
+     * 于是「能用的源转一会儿就被当成坏源切走」，切过去的新源给条死链，播放失败。
+     * 群反馈 2026-11-19 14:06/14:10：「点了自动切换反而放不了了，他好像自动调到别的源，
+     * 然后播放失败」「就能用的源，他也要转一会，是不是自动切源认为它不能播放，直接换源了」。
+     */
     if (loadedSupports) {
       push(loadedId);
+    }
+    for (const route of trusted) {
+      push(route.id);
     }
     for (const route of demoted) {
       push(route.id);
@@ -264,7 +278,12 @@ export class SourceRouter {
     return false;
   }
 
-  /** 这个源失败几次了（调试/日志用） */
+  /**
+   * 这个源失败几次了（调试/日志用；换源链路也用它决定给当前源多大耐心）
+   *
+   * 连续失败 ≥2 次的源已被路由表降级：换源时它若恰好是「当前加载着的源」，
+   * 不该再占着 25 秒的长预算（见 SourceFailover 的 firstBudget）。
+   */
   failStreakOf(id: string, platform: string): number {
     for (const route of this.routesOf(platform)) {
       if (route.id === id) {

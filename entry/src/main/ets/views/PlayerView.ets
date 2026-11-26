@@ -20,7 +20,8 @@ import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
 import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
 import { C_BG, C_ICON_GREEN, C_RED } from '../ui/Theme';
-import { EQ_PRESETS, EqPreset, K_EQ_ENABLED, K_EQ_ACTIVE, K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
+import { AudioEffectSettings, EQ_PRESETS, EqPreset, K_EQ_ACTIVE, K_EQ_DIRTY, K_EQ_ENABLED,
+  K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
 import { HdsEdgeFlowLight } from '../ui/Hds';
 import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS, CoverTint,
   HALO_GLOW_MAX, HALO_GLOW_REST, MOTION_FPS_30, PlayerAtmosphere, PlayerHalo, PlayerLightBand,
@@ -185,6 +186,8 @@ export struct PlayerView {
    */
   @StorageLink(K_EQ_ENABLED) eqEnabled: boolean = false;
   @StorageLink(K_EQ_PRESET) eqPreset: string = 'off';
+  /** 推子改过但还没点「应用」（见 AudioEffectSettings 的 K_EQ_DIRTY）：标识要写出「未应用」 */
+  @StorageLink(K_EQ_DIRTY) eqDirty: boolean = false;
   /**
    * 这一趟播放是否**真的**过了音效（播放器写的，见 LxPlayer.markEqApplied）
    *
@@ -1552,11 +1555,14 @@ export struct PlayerView {
    *
    * 只是状态，不接点击：点开它要跳「设置 - 音效设置」，而播放页是盖在导航栈上的
    * 全屏层，从这里压一个子页会钻到它下面去（用户会以为没反应）。
+   *
+   * 三种状态要分得开：带着音效（绿点）、还没轮到音效的「待起播」、以及真回退了原声的
+   * 「未生效」；手动调的推子没按「应用」时，名字后面再点明「未应用」。
    */
   @Builder
   eqBadge() {
     Row({ space: 5 }) {
-      // 亮着的绿点 = 正在生效；灰点 = 开关开着但这一首回退了原声
+      // 亮着的绿点 = 这一首带着音效（或用户主动选的平直）；灰点 = 还没轮到 / 回退成原声
       Column()
         .width(5)
         .height(5)
@@ -1580,23 +1586,48 @@ export struct PlayerView {
     .accessibilityGroup(true)
     .accessibilityText(this.eqInEffect()
       ? `音效已开启，${this.eqBadgeLabel()}`
-      : `音效已开启，但这一首未生效`)
+      : `音效已开启，当前状态：${this.eqBadgeLabel()}`)
   }
 
   /**
    * 这一首到底有没有带上音效。
    *
    * 「原声」预设（增益全 0）本来就不做任何处理，它不算「未生效」—— 那是用户选的结果，
-   * 标识写「原声」才对。其余预设只要没真正过一遍，就按未生效显示。
+   * 标识写「原声」才对。自定义但十段全 0 是同一回事：平直曲线就是用户主动要的，
+   * 见 AudioEffectSettings.shouldProcess（开关开着且增益不全为 0 才真的会走 EQ）。
+   * 其余预设只要没真正过一遍，就按未生效显示。
    */
   private eqInEffect(): boolean {
-    return this.eqPreset === 'off' || this.eqActive;
+    if (this.eqPreset === 'off') {
+      return true;
+    }
+    if (this.eqPreset === 'custom' && !AudioEffectSettings.getInstance().shouldProcess()) {
+      // 自定义但十段全 0：本来就不该处理，绿点当「用户主动平直」看
+      return true;
+    }
+    // 手动改过推子（dirty）但还没应用时，当前这首带的仍是上一次应用过的音效：
+    // 绿点由 eqActive 给出，标识只是把「未应用」写在名字后面（见 eqBadgeLabel）
+    return this.eqActive;
+  }
+
+  /** 现在没有歌在响（还没起播 / 已经播完）：这时「没过音效」不是回退，是还没轮到它 */
+  private eqStatusIdle(): boolean {
+    return this.status === 'idle' || this.status === 'stopped';
   }
 
   /** 标识上那个名字：预设名；手动拖过滑块就是「自定义」；没生效就说清楚没生效 */
   private eqBadgeLabel(): string {
-    if (this.eqPreset !== 'off' && !this.eqActive) {
-      return '未生效';
+    // 自定义的十段全 0：本来就不该处理，按「用户主动平直」写「自定义」，别误报未生效
+    const flatCustom: boolean = this.eqPreset === 'custom'
+      && !AudioEffectSettings.getInstance().shouldProcess();
+    if (this.eqPreset !== 'off' && !flatCustom && !this.eqActive) {
+      // 还没起播（idle / 播完 stopped）时还没轮到音效，写「待起播」；
+      // 真正在放 / 暂停（playing / paused / loading）却没有音效，才是回退，写「未生效」
+      return this.eqStatusIdle() ? '待起播' : '未生效';
+    }
+    if (this.eqPreset === 'custom' && this.eqDirty) {
+      // 当前这首响的是上一次应用过的旧音效，新拖的值要按「应用」才生效
+      return '自定义·未应用';
     }
     if (this.eqPreset === 'custom') {
       return '自定义';
@@ -1606,7 +1637,8 @@ export struct PlayerView {
   }
 
   /** 当前唱到的那句歌词；还没有时间轴（activeLine = -1）就退到第一句 */
-  private currentLyric(): LyricLine | null {    if (this.lyricLines.length === 0) {
+  private currentLyric(): LyricLine | null {
+    if (this.lyricLines.length === 0) {
       return null;
     }
     const index: number = this.activeLine;

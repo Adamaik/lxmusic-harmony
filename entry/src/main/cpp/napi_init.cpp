@@ -35,6 +35,13 @@ std::shared_ptr<std::atomic<bool>> acquireTask(int32_t id, bool create) {
     gTasks[id] = flag;
     return flag;
 }
+/**
+ * 注销一次任务。
+ *
+ * taskId 由 ArkTS 侧单调递增分配（AudioEffectProcessor.nextTaskId++），要 2^31 次起播才会在
+ * int32 上回绕，当前调用路径不可达，所以这里按 id 无条件 erase 是安全的。若将来改成复用 id，
+ * 必须按 flag 指针比较后再 erase —— 否则先完成的任务会删掉后来者的取消标志，使 cancel 变成空操作。
+ */
 void releaseTask(int32_t id) {
     std::lock_guard<std::mutex> lock(gTasksMutex);
     gTasks.erase(id);
@@ -122,6 +129,14 @@ napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
     if (napi_create_async_work(env, nullptr, workName,
         [](napi_env e, void *ud) {
             auto *d = static_cast<WorkData *>(ud);
+            /**
+             * 取消标志把 atomic<bool> 的地址当 const volatile bool* 读（见 eq_pipeline.h 的 cancel 形参）。
+             *
+             * 形式上这是对 atomic 对象的非原子访问（C++ 内存模型属 data race / UB），但本机 SDK 的
+             * libc++ 里 atomic<bool> 就是对齐的 1 字节 _Atomic(bool)：arm64 对齐单字节 load 不会撕裂，
+             * volatile 又强制每次重读内存，实际效果等价于 relaxed load；取消语义只需要「尽快可见」。
+             * 彻底消除需要把整条函数签名改成 std::atomic<bool>*（约 12 行 / 3 个文件），收益为零，暂不改。
+             */
             const volatile bool *flag = nullptr;
             if (d->cancelFlag != nullptr) {
                 flag = reinterpret_cast<const volatile bool *>(d->cancelFlag.get());
@@ -161,8 +176,17 @@ napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
             if (status == napi_ok && d->result.ok) {
                 napi_resolve_deferred(e, d->deferred, result);
             } else {
+                // reject 原因必须是**字符串**（不能把 promise 对象或空串当原因，否则 ArkTS
+                // 那边拿到的是个没法读的异常）；message 为空时按状态给一个兜底描述。
+                std::string reason = d->result.message;
+                if (reason.empty()) {
+                    reason = (status == napi_ok)
+                                 ? std::string("音效处理失败（code=") +
+                                       std::to_string(d->result.code) + "）"
+                                 : std::string("音效任务未正常完成");
+                }
                 napi_value err = nullptr;
-                napi_create_string_utf8(e, d->result.message.c_str(), NAPI_AUTO_LENGTH, &err);
+                napi_create_string_utf8(e, reason.c_str(), NAPI_AUTO_LENGTH, &err);
                 napi_reject_deferred(e, d->deferred, err);
             }
             releaseTask(d->taskId);
@@ -171,11 +195,32 @@ napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
         },
         data, &data->work) != napi_ok) {
         releaseTask(data->taskId);
-        napi_reject_deferred(env, deferred, promise);
         delete data;
-        return nullptr;
+        // 创建异步任务都失败了：先 reject 再返回 promise，别让这个 Promise 永远悬着
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, "创建音效异步任务失败", NAPI_AUTO_LENGTH, &err);
+        napi_reject_deferred(env, deferred, err);
+        return promise;
     }
-    napi_queue_async_work(env, data->work);
+    /**
+     * 入队失败必须立刻 reject：napi_async_work 根本没排上，complete 回调永远不会被调用，
+     * 不在这里 reject 的话调用方会一直等下去（Promise 永久悬挂）。
+     *
+     * 已知平台缺陷：OpenHarmony 6.0/6.1 的 napi_queue_async_work 实现丢掉了 Queue() 的返回值、
+     * 恒返回 napi_ok（社区 issue 已确认），所以真入队失败时这个分支抓不到、Promise 仍会悬挂。
+     * 不为此加超时看门狗：processAudio* 本来就要等整首处理完（几分钟也可能是正常的），
+     * ArkTS 侧无法区分「没入队」与「正在处理」；上层预缓冲 / settleActive 都已有超时兜底。
+     * 这段检查留着是为了覆盖 create 失败、参数/多上下文失败，以及将来运行时修好这个缺陷的情形。
+     */
+    if (napi_queue_async_work(env, data->work) != napi_ok) {
+        releaseTask(data->taskId);
+        napi_delete_async_work(env, data->work);
+        delete data;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, "音效异步任务入队失败", NAPI_AUTO_LENGTH, &err);
+        napi_reject_deferred(env, deferred, err);
+        return promise;
+    }
     return promise;
 }
 
@@ -224,6 +269,13 @@ napi_value Init(napi_env env, napi_value exports) {
 }  // namespace
 
 extern "C" __attribute__((constructor)) void RegisterAudioEffectModule() {
+    /**
+     * 栈上 napi_module 是安全的：arkui_napi 的 napi_module_register 会同步把字段逐项拷进
+     * NativeModule（name 还额外 strdup），不保存 napi_module*；register_func 存的是本 TU 的
+     * 静态函数 Init，生命周期等于 so。官方模板用文件作用域 static 只是风格，两者等价。
+     * 唯一注意：NativeModule.fileName 是裸指针拷贝，本模块传 nullptr 所以无风险；
+     * 将来别把栈上缓冲区赋给 nm_filename。
+     */
     napi_module module{};
     module.nm_version = 1;
     module.nm_flags = 0;

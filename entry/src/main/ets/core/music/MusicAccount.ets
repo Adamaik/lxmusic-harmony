@@ -376,7 +376,9 @@ class MusicAccountStore {
   cookieHeader(source: string): string {
     const cookie: string = this.cookieOf(source);
     if (source === 'wy') {
-      return cookie.length > 0 ? `os=pc; ${cookie}` : 'os=pc';
+      // appver 必须带：实测只带 os=pc 时，写接口（红心）会被平台判成风险环境回 -460；
+      // 补上 appver=2.9.7 后同一个请求回 code=200（PC 上直接调接口验证过）。
+      return cookie.length > 0 ? `os=pc; appver=2.9.7; ${cookie}` : 'os=pc; appver=2.9.7';
     }
     return cookie;
   }

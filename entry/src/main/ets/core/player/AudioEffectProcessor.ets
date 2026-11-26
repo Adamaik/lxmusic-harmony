@@ -77,6 +77,24 @@ export class EqStreamSession {
 }
 
 /**
+ * 一次分块请求的结果：状态码必须和数据一起带出来。
+ *
+ * 只看数据长度区分不了「正常一块」「服务器不认 Range 的整份」「区间已到头」：
+ * - 200：上游忽略 Range，这一份就是整个文件，写完即完成（绝不能再当一块接着要）；
+ * - 206：正常分块，不足一块视为文件尾；
+ * - 416：要的区间已在文件尾之外，offset>0 时说明整首都拿到了。
+ */
+class ChunkRead {
+  readonly code: number;
+  readonly data: ArrayBuffer;
+
+  constructor(code: number, data: ArrayBuffer) {
+    this.code = code;
+    this.data = data;
+  }
+}
+
+/**
  * 音效预处理服务：把音频变成「过了 EQ 的 WAV」，交给 AVPlayer 播。
  *
  * 为什么需要这一步：AVPlayer 不接受 PCM 数据流，只认 URL / fd / 自定义数据源；
@@ -589,13 +607,24 @@ export class AudioEffectProcessor {
         if (this.activeTaskId !== taskId) {
           throw new Error('eq cancelled');
         }
-        const chunk: ArrayBuffer = await this.readChunk(request, url, headers, offset, taskId);
-        if (chunk.byteLength === 0) {
+        const chunk: ChunkRead = await this.readChunk(request, url, headers, offset, taskId);
+        if (chunk.code === 416) {
+          // 要的区间已经在文件尾之外（offset>0）：整首都拿到了，收尾
+          hilog.info(DOMAIN, TAG, 'eq raw download reached eof (416) at %{public}d bytes', offset);
+          break;
+        }
+        if (chunk.data.byteLength === 0) {
           throw new Error('eq download failed: empty chunk');
         }
-        fs.writeSync(handle.fd, chunk);
-        offset += chunk.byteLength;
-        if (chunk.byteLength < EQ_CHUNK_BYTES) {
+        fs.writeSync(handle.fd, chunk.data);
+        if (chunk.code === 200) {
+          // 服务器不认 Range：这一份就是整个文件（readChunk 保证只在 offset===0 放行），
+          // 整份落盘即完成 —— 绝不能再当一块接着要，否则下一轮 offset>0 会一直要不到东西
+          offset = chunk.data.byteLength;
+          break;
+        }
+        offset += chunk.data.byteLength;
+        if (chunk.data.byteLength < EQ_CHUNK_BYTES) {
           break;   // 不足一块 = 到文件尾
         }
       }
@@ -618,20 +647,26 @@ export class AudioEffectProcessor {
     hilog.info(DOMAIN, TAG, 'eq raw downloaded: %{public}d bytes', offset);
   }
 
-  /** 读一块；失败重试同一位置（CDN 停顿 / 连接被掐都很常见） */
+  /**
+   * 读一块；失败重试同一位置（CDN 停顿 / 连接被掐都很常见）。
+   *
+   * 返回值带状态码（见 ChunkRead）：200 = 上游不认 Range、这一份就是整个文件；
+   * 416 = 区间已在文件尾之外，offset>0 时由下载循环当成「整首下完了」，不能当失败重试。
+   */
   private async readChunk(request: http.HttpRequest, url: string, headers: Record<string, string>,
-    offset: number, taskId: number): Promise<ArrayBuffer> {
+    offset: number, taskId: number): Promise<ChunkRead> {
     let lastError: string = '';
     for (let attempt = 0; attempt < EQ_CHUNK_RETRY; attempt++) {
       if (this.activeTaskId !== taskId) {
         throw new Error('eq cancelled');
       }
-      const chunkHeaders: Record<string, string> = {
-        'Range': `bytes=${offset}-${offset + EQ_CHUNK_BYTES - 1}`,
-      };
+      // 先摊平调用方的头，最后再压 Range：调用方 headers 里若自带 Range（比如从别处复用的请求头），
+      // 绝不能让它覆盖这里按分块算出来的区间，否则分块会退化成整包或重复块
+      const chunkHeaders: Record<string, string> = {};
       for (const h of Object.keys(headers)) {
         chunkHeaders[h] = headers[h];
       }
+      chunkHeaders['Range'] = `bytes=${offset}-${offset + EQ_CHUNK_BYTES - 1}`;
       try {
         const response: http.HttpResponse = await request.request(url, {
           method: http.RequestMethod.GET,
@@ -642,20 +677,25 @@ export class AudioEffectProcessor {
           readTimeout: EQ_CHUNK_READ_MS,
         });
         const code: number = response.responseCode;
-        if (code !== 206 && code !== 200) {
+        if (code === 416) {
+          if (offset === 0) {
+            // 第一块就要不到：源站/代理行为异常，按错误走重试
+            throw new Error('http 416 at offset 0');
+          }
+          return new ChunkRead(code, new ArrayBuffer(0));
+        }
+        if (code === 200 && offset > 0) {
+          // 中途又回整包：服务器行为不一致，不能把整份接在半截数据后面（AudioCache 同款判定）
+          throw new Error('mixed 200/206 response');
+        }
+        if (code !== 200 && code !== 206) {
           throw new Error(`http ${code}`);
         }
-        if (code === 200) {
-          // 服务器不认 Range：这份就是整个文件，只会出现在第一块
-          if (offset > 0) {
-            throw new Error('mixed 200/206 response');
-          }
-        }
         const chunk: ArrayBuffer = response.result as ArrayBuffer;
-        if (chunk === undefined || chunk.byteLength === 0) {
+        if (chunk === undefined || chunk === null || chunk.byteLength === 0) {
           throw new Error('empty chunk');
         }
-        return chunk;
+        return new ChunkRead(code, chunk);
       } catch (e) {
         lastError = JSON.stringify(e);
         hilog.warn(DOMAIN, TAG, 'eq chunk at %{public}d failed (try %{public}d/%{public}d): %{public}s',

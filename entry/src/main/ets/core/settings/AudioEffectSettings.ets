@@ -126,7 +126,12 @@ export class AudioEffectSettings {
   /** 配置变更订阅者（播放侧注册，用来「切完就重播」） */
   private listeners: EqChangeListener[] = [];
 
-  /** 订阅配置变更；只保留一个订阅者（播放会话），重复注册不会叠加 */
+  /**
+   * 订阅配置变更；注册即 append，**不做去重**。
+   *
+   * 当前只有 PlaySession 在 init() 里注册一次（那里的 stateInited 守卫保证只执行一次），
+   * 所以不会叠加；将来若新增调用方，别在同一生命周期里重复注册（每条通知都会被调用一次）。
+   */
   onChanged(listener: EqChangeListener): void {
     this.listeners.push(listener);
   }
@@ -274,6 +279,36 @@ export class AudioEffectSettings {
   }
 
   /**
+   * 应用一组自定义增益（来自用户保存 / 导入的预设）：**立即生效**
+   *
+   * 与 selectPreset 走同一条路 —— 改完就通知播放侧从头重播当前曲目，用户才听得到差别。
+   * 与 applySynced（同步恢复）的区别：那是「无声」的恢复，不能打断正在播的歌；这里是
+   * 用户主动点的，所以照常 notifyChanged('preset')。
+   *
+   * 校验与规范化：必须正好 10 段（与 EQ_BANDS 对齐），少一段 / 多一段整条忽略（不猜半套曲线）；
+   * 单段按 clampGain 收敛到 [-10, 10] 并取整。preset 名**由增益反推**而不是由调用方给：
+   * 与某套内置预设完全一致就用那套的 key（含全 0 = off「原声」），否则 'custom' —— 保证
+   * 「preset 名与 gains 自洽」这个不变量，播放页标识才不会写「原声」而实际走了 EQ。
+   * enabled 不动：应用一套预设不等于打开音效开关（开关关着时它只生效为设置）。
+   */
+  selectCustomGains(gains: number[]): void {
+    if (!Array.isArray(gains) || gains.length !== EQ_BANDS.length) {
+      hilog.warn(DOMAIN, TAG, 'selectCustomGains ignored: gains must have %{public}d bands',
+        EQ_BANDS.length);
+      return;
+    }
+    const nextGains: number[] = gains.map((g: number) => this.clampGain(g));
+    const matched: EqPreset | undefined =
+      EQ_PRESETS.find((p: EqPreset) => this.gainsEqual(p.gains, nextGains));
+    this.preset = matched !== undefined ? matched.key : 'custom';
+    this.gains = nextGains;
+    this.appliedGains = nextGains.slice();
+    this.write();
+    this.publishGains();
+    this.notifyChanged('preset');
+  }
+
+  /**
    * 手动改某一段增益；改完预设自动变成「自定义」。
    *
    * 注意这里**只落盘、不重播**：拖推子是连续动作，每松一次手就重播一遍会变成
@@ -342,5 +377,63 @@ export class AudioEffectSettings {
     this.write();
     this.publishGains();
     this.notifyChanged('reset');
+  }
+
+  // ---------------------------------------------------------------- 同步恢复（WebDAV 配置同步）
+
+  /**
+   * 同步恢复（WebDAV 配置同步）时一次性写入开关 / 预设 / 十段增益
+   *
+   * 与 selectPreset / setBandGain 建立的不变量保持一致：**preset 名必须与 gains 自洽**。
+   * 所以这里不信远端给的 preset 字符串，而是按规范化后的 gains 反推：
+   *   - 与某套内置预设完全一致 -> 用那套的名字（含全 0 = off「原声」）；
+   *   - 否则 -> 'custom'（远端写 'custom'、写成非法名、或名字与增益对不上，都落在这里）。
+   * 不这么做会写出「preset=off 但增益非零」这种半套状态：播放页标识写「原声」，
+   * 播放器却真的走 EQ（shouldProcess 看的是 gains），比不恢复更糟。
+   *
+   * 副作用约定：同步恢复发生在「没有 UI、没有播放上下文」的地方，所以
+   *   - **不调 notifyChanged**：否则会触发「切音效重播」，把正在播的歌打断；
+   *   - 只写内存（enabled / preset / gains / appliedGains）+ 落盘 + publish 到 AppStorage；
+   *   - appliedGains 与 gains 一致，K_EQ_DIRTY 由 publish() 按 isDirty() 置 false
+   *     （同步来的这一份就是「已经生效的那一份」，本机没有待应用的概念）。
+   *
+   * 非法输入安全：gains 不是正好 10 段（与 EQ_BANDS 对齐）时整条丢弃、不动本机设置
+   * （不半信半疑地只应用一半）；单段 NaN / 越界由 clampGain 收敛到 [-10, 10]；
+   * enabled 非 true 一律按关闭处理；未 init 时只更新内存与 AppStorage，write() 会跳过落盘。
+   */
+  applySynced(enabled: boolean, preset: string, gains: number[]): void {
+    // 增益必须正好 10 段：少一段 / 多一段都不猜，整条恢复丢弃（避免只应用半套曲线）
+    if (!Array.isArray(gains) || gains.length !== EQ_BANDS.length) {
+      hilog.warn(DOMAIN, TAG, 'applySynced ignored: gains must have %{public}d bands',
+        EQ_BANDS.length);
+      return;
+    }
+    const nextGains: number[] = gains.map((g: number) => this.clampGain(g));
+    const matched: EqPreset | undefined =
+      EQ_PRESETS.find((p: EqPreset) => this.gainsEqual(p.gains, nextGains));
+    if (matched === undefined && preset !== 'custom') {
+      // 远端名字与增益对不上：名字按自定义走，打一条日志便于排查（不是错误）
+      hilog.info(DOMAIN, TAG, 'synced preset %{public}s does not match gains, use custom', preset);
+    }
+    this.enabled = enabled === true;
+    this.preset = matched !== undefined ? matched.key : 'custom';
+    this.gains = nextGains;
+    this.appliedGains = nextGains.slice();
+    this.write();
+    this.publish();
+    // 不调 notifyChanged：同步恢复不应触发「切音效重播」打断正在播的歌
+  }
+
+  /** 两组 10 段增益是否完全一致（applySynced 判定 preset 名与增益是否自洽用） */
+  private gainsEqual(a: number[], b: number[]): boolean {
+    if (a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 }

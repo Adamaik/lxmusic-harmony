@@ -19,6 +19,8 @@ import { SyncManager } from '../core/sync/SyncManager';
 import { CollectedPlaylists } from '../core/sync/CollectedPlaylists';
 import { PlaySettings } from '../core/settings/PlaySettings';
 import { AudioEffectSettings } from '../core/settings/AudioEffectSettings';
+import { EqPresetStore } from '../core/settings/EqPresetStore';
+import { PlatformPush } from '../core/sync/PlatformPush';
 import { AudioEffectProcessor } from '../core/player/AudioEffectProcessor';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
 import { RecommendSettings } from '../core/settings/RecommendSettings';
@@ -70,6 +72,11 @@ export default class EntryAbility extends UIAbility {
     // 音效控制台（EQ 预设 / 10 段增益）：播放入口要读它决定是否走 EQ 预处理，
     // 界面也要用 @StorageLink 订阅，所以早于界面创建。
     AudioEffectSettings.getInstance().init(this.context);
+    // 自定义音效预设（用户命名的增益组合 / 导出导入）：音效设置页要订阅它的 AppStorage 值，
+    // 而且必须早于界面创建，否则列表第一帧会空一下。
+    EqPresetStore.getInstance().init(this.context);
+    // 平台同步（实验性，默认关闭）：只读本地开关与账本；真正写平台只在用户点「立即同步」时发生。
+    PlatformPush.getInstance().init(this.context);
     // 音效预处理的 WAV 缓存目录（开启音效时才会用到）
     AudioEffectProcessor.getInstance().init(this.context);
     // 外观设置（材质档位 / 封面圆角 / 深浅模式）：同样要早于界面创建，

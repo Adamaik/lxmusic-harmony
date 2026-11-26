@@ -63,12 +63,14 @@ import { ArtistCandidate, artistCandidatesOf, cachedArtistForOpen, LxArtist,
   resolveArtistByName } from '../core/music/MusicArtist';
 import { SettingsView } from '../views/SettingsView';
 import { MusicLoginView } from '../views/MusicLoginView';
+import { K_PLATFORM_LOGIN_EXPIRED } from '../core/sync/PlatformPush';
 import { SourceSettingsView } from '../views/SourceSettingsView';
 import { SyncModeContent } from '../views/SyncModeSheet';
 import { SyncSettingsView } from '../views/SyncSettingsView';
 import { CacheSettingsView } from '../views/CacheSettingsView';
 import { PlaySettingsView } from '../views/PlaySettingsView';
 import { EqSettingsView } from '../views/EqSettingsView';
+import { PlatformSyncView } from '../views/PlatformSyncView';
 import { DownloadSettingsView } from '../views/DownloadSettingsView';
 import { PlaylistSummary } from '../core/player/PlaySession';
 import { K_SELECT_ACTIVE, K_SELECT_ALL, K_SELECT_COUNT, SelectSession } from '../ui/Selection';
@@ -104,6 +106,8 @@ const PAGE_CHANGELOG: string = 'changelog';
 const PAGE_SETTINGS: string = 'settings';
 /** 登录音乐（设置 - 登录音乐卡）：网易云账号登录，登录后接口才返回母带等权益音质档 */
 const PAGE_LOGIN: string = 'login';
+/** 平台同步（实验性）：把本机收藏写入网易云 / QQ 账号，默认关闭、只在用户点「立即同步」时发送 */
+const PAGE_PLATFORMSYNC: string = 'platformsync';
 /** 播放历史（「我的」页快捷入口里的「最近播放」） */
 const PAGE_HISTORY: string = 'history';
 /** 全部歌单（推荐页分区标题右边「更多」进来的那一页） */
@@ -297,6 +301,13 @@ struct Index {
    */
   @StorageLink(K_RECOMMEND_SOURCE) recommendSource: string = 'kw';
   /**
+   * 平台登录失效信号（见 PlatformPush.handleLoginExpired）
+   *
+   * 值形如 	x:1795719xxxxx：平台 + 时间戳。收到就弹窗告诉用户「已自动登出、请重新登录」，
+   * 并给一个直达「登录音乐」页的按钮 —— 否则用户只会看到同步一直失败，不知道是登录过期。
+   */
+  @StorageLink(K_PLATFORM_LOGIN_EXPIRED) @Watch('onPlatformLoginExpired') platformLoginExpired: string = '';
+  /**
    * 是否隐藏「听书」页签（设置 - 听书）
    *
    * 存法在 core/settings/ListenSettings.ets（沙箱 JSON + AppStorage）。改值的是设置页，
@@ -357,7 +368,14 @@ struct Index {
    * 其余子页面是白底设置页，标题栏直接给系统材质就够，不必绑。
    */
   private onlineScroller: Scroller = new Scroller();
-  private playlistScroller: Scroller = new Scroller();
+  /**
+   * 歌单详情页的列表滚动控制器。
+   *
+   * 必须是 **ListScroller**（Scroller 的子类）：那一页整页只有一个 ListItemGroup，
+   * 「定位到正在播放那一行」靠分组内滚动 `scrollToItemInGroup`，只有 ListScroller 提供。
+   * 父层把它传给 PlaylistDetailView，也照旧传给标题栏渐变与 bindToScrollable（子类可直接当 Scroller 用）。
+   */
+  private playlistScroller: ListScroller = new ListScroller();
   /** HDS 路由栈：搜索页 / 音源设置都作为 HdsNavDestination 压栈，标题栏与返回键由 HDS 提供 */
   private pathStack: NavPathStack = new NavPathStack();
   private mainWindow: window.Window | null = null;
@@ -1245,6 +1263,35 @@ struct Index {
    * 两个页面传进来的都是「去哪」这种字符串，路由统一在壳层实现（`go` 会往
    * HdsNavigation 的栈上压一个 HdsNavDestination），页面自己不认识 PAGE_* 常量。
    */
+  /**
+   * 平台登录失效：弹窗提示 + 引导去重新登录
+   *
+   * 触发时 PlatformPush 已经把该平台**自动登出**了（见 handleLoginExpired），所以弹窗要说清
+   * 「已退出登录」而不是只说「同步失败」；按钮直接跳「登录音乐」页，省得用户自己找。
+   */
+  private onPlatformLoginExpired(): void {
+    const signal: string = this.platformLoginExpired;
+    if (signal.length === 0) {
+      return;
+    }
+    const platform: string = signal.split(':')[0];
+    const name: string = platform === 'wy' ? '网易云音乐' : 'QQ 音乐';
+    this.getUIContext().showAlertDialog({
+      title: `${name}登录已失效`,
+      message: `${name}的登录状态已过期，已自动退出该平台登录。\n\n`
+        + '请重新登录后再同步收藏；重新登录后，之前没推成功的歌会在你下次收藏时继续推送。',
+      autoCancel: true,
+      buttons: [
+        { value: '稍后', action: () => { } },
+        {
+          value: '去登录',
+          action: () => {
+            this.go(PAGE_LOGIN);
+          },
+        },
+      ],
+    });
+  }
   private onSettingAction(action: string): void {
     if (action === 'source') {
       this.go(PAGE_SOURCE);
@@ -1293,6 +1340,11 @@ struct Index {
     if (action === 'login') {
       // 设置页 / 我的页的「登录音乐」：网易云账号登录（登录后母带等权益档才会出现）
       this.go(PAGE_LOGIN);
+      return;
+    }
+    if (action === 'platformpush') {
+      // 设置页「平台同步（实验性）」：登录音乐下面那一行，把收藏写入平台账号（默认关闭）
+      this.go(PAGE_PLATFORMSYNC);
       return;
     }
     // 「我的」页那一排快捷入口：收藏进内置那张收藏歌单的详情，其余四样各自是一页
@@ -1693,6 +1745,15 @@ struct Index {
         }
       }
       .titleBar(this.titleBarOptions('登录音乐'))
+    } else if (name === PAGE_PLATFORMSYNC) {
+      // 平台同步（实验性）：把本机收藏写入网易云 / QQ 账号。
+      // 默认关闭、只在用户点「立即同步收藏」时发送，页面自己把风险与登录态讲清楚。
+      HdsNavDestination() {
+        WidePane({ fadeTop: HDS_TITLE_BAR_HEIGHT + this.topInset + 10 }) {
+          PlatformSyncView({ bottomInset: this.bottomInset, topInset: HDS_TITLE_BAR_HEIGHT + this.topInset })
+        }
+      }
+      .titleBar(this.titleBarOptions('平台同步（实验性）'))
     } else if (name === PAGE_HISTORY) {
       HdsNavDestination() {
         WidePane() {

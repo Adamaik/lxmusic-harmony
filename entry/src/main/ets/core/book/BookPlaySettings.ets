@@ -248,4 +248,22 @@ export class BookPlaySettings {
     AppStorage.setOrCreate(K_BOOK_SKIP_OUTRO, value);
     this.write();
   }
+
+  /**
+   * 同步恢复（WebDAV 配置同步）时一次性写入倍速与跳过片头 / 片尾
+   *
+   * 校验口径与三个 setter 完全一致：倍速夹到最接近的合法档位（AVPlayer 的
+   * PlaybackSpeed 只有枚举里那几档，见 BOOK_SPEED_CHOICES），秒数取整并夹到
+   * [0, BOOK_SKIP_MAX_SEC]。只写内存 + 落盘 + publish 到 AppStorage（听书页用
+   * @StorageLink 订阅），不弹窗、不打断正在播的书；真正作用到播放器仍由调用方
+   * 决定（见 PlaySession 的听书倍速入口），本方法不碰播放现场。
+   * 未 init 时只更新内存与 AppStorage，write() 自己会跳过落盘。
+   */
+  applySynced(speed: number, skipIntroSec: number, skipOutroSec: number): void {
+    this.speed = nearestSpeed(speed);
+    this.skipIntroSec = clampSeconds(skipIntroSec);
+    this.skipOutroSec = clampSeconds(skipOutroSec);
+    this.write();
+    this.publish();
+  }
 }

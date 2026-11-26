@@ -350,31 +350,38 @@ export class WebDavClient {
    * 发一次 MKCOL；被 3xx 重定向时按 Location 重试一次
    *
    * 有的服务器（子路径反代、强制 https）对 MKCOL 先回 301/302。直接当「目录已存在」
-   * 跳过是错的：真实目录可能根本不在这个地址上。优先用 Location 重试；没有 Location
-   * 就补尾斜杠再试一次（部分服务器只在「集合地址」上接受 MKCOL）。
-   * 重试后仍是 3xx 就把状态码交回去，由 ensureFolder 报清楚。
+   * 跳过是错的：真实目录可能根本不在这个地址上。有 Location 就按服务器给的地址
+   * **原样**重试一次（不再补尾斜杠，Location 多半已经是最终入口，补了反而打歪）；
+   * 没有 Location 就直接把首次状态码交回去 —— mkcolOnce 内部本来就补过尾斜杠，
+   * 再拿同一条件发一次是纯白跑一趟。重试后仍是 3xx 也把状态码交回去，由 ensureFolder 报清楚。
    */
   private async mkcol(config: WebDavConfig, url: string): Promise<number> {
-    const first: MkcolResult = await this.mkcolOnce(config, url);
+    const first: MkcolResult = await this.mkcolOnce(config, url, true);
     if (!isRedirect(first.code)) {
       return first.code;
     }
     const fromLocation: string = resolveLocation(first.location, url);
-    const retryUrl: string = fromLocation.length > 0 ? fromLocation : withTrailingSlash(url);
-    if (retryUrl.length === 0 || retryUrl === url) {
+    if (fromLocation.length === 0) {
+      // 没有 Location：首次请求已经按「补尾斜杠」的形式发出过，没有别的地址可试
       return first.code;
     }
-    const second: MkcolResult = await this.mkcolOnce(config, retryUrl);
+    const second: MkcolResult = await this.mkcolOnce(config, fromLocation, false);
     return second.code;
   }
 
-  /** 发一次 MKCOL，回状态码与 Location（调用方按 RFC 语义判断「已存在 / 重定向」） */
-  private async mkcolOnce(config: WebDavConfig, url: string): Promise<MkcolResult> {
+  /**
+   * 发一次 MKCOL，回状态码与 Location（调用方按 RFC 语义判断「已存在 / 重定向」）
+   *
+   * @param addTrailingSlash 请求前是否补集合资源的尾斜杠。重试服务器给的 Location 时传 false：
+   *                        那个地址是服务器自己写的，原样打过去才对。
+   */
+  private async mkcolOnce(config: WebDavConfig, url: string,
+    addTrailingSlash: boolean): Promise<MkcolResult> {
     const request = http.createHttp();
     try {
       // 集合资源按惯例带尾斜杠：坚果云 / Nextcloud 都更认这种写法，
       // 少了它有的实现会回 409/405，明明能建却被当成「已存在」。
-      const target: string = withTrailingSlash(url);
+      const target: string = addTrailingSlash ? withTrailingSlash(url) : url;
       const options: http.HttpRequestOptions = {
         method: http.RequestMethod.POST,
         customMethod: 'MKCOL',

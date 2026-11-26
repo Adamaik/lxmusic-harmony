@@ -530,6 +530,109 @@ export class LocalLibrary implements LibrarySink {
     }
   }
 
+  // ------------------------------------------------------------ 配置同步（收藏导出 / 并入）
+
+  /**
+   * 收藏的合成口径（favoriteSongs() 与 addFavorites() 共用，**只此一份**）
+   *
+   * 收藏里有两种条目：
+   *   - 本地歌 / 云端歌：只存在于各自的侧表（见 sideSongsOf / LIST_ID_LOVE），同步数据里没有；
+   *   - 在线歌：洛雪的 loveList。
+   * 顺序与界面一致：侧表歌在前（本地在前、云端在后），在线歌按 loveList 原顺序。
+   */
+  private favoriteSongsOf(): SongItem[] {
+    const out: SongItem[] = [];
+    for (const song of this.sideSongsOf(LIST_ID_LOVE)) {
+      out.push(song);
+    }
+    for (const info of this.data.loveList) {
+      out.push(fromLxMusicInfo(info));
+    }
+    return out;
+  }
+
+  /**
+   * 导出一份收藏名单（与 mirrorToSession() 里合成 favorites 的口径完全一致）
+   *
+   * 口径必须是同一份，否则「导出 → 换机恢复」会丢歌（实现见 favoriteSongsOf）。
+   * 未加载过本地库（首次安装 / init 之前）时安全返回空数组。
+   */
+  favoriteSongs(): SongItem[] {
+    if (!this.initialized) {
+      return [];
+    }
+    return this.favoriteSongsOf();
+  }
+
+  /**
+   * 把一批在线歌并入收藏（配置同步「恢复收藏」用），返回真正新增的条数
+   *
+   * 判重口径与 onLocalListsChanged() 完全一致：只看同步结构的 id（musicIdOf 算出来的
+   * `${source}_${songmid}`、酷狗是 `${songmid}_${hash}`）。同一首歌从不同平台回来 id 不同，
+   * 协议上本来就是两条，这里也照协议来 —— 不再按歌名·歌手兜底（那是「加歌到歌单」的界面口径）。
+   *
+   * 只收在线歌：本地歌 / 云端歌在同步结构里不存在，musicsOf 会把它们丢掉；收藏里属于
+   * 侧表的那部分由 syncSideFavorites 负责，本方法不碰。也不改动播放队列（刷新时把当前队列
+   * 原样传回 adoptLibraryState，见下）。
+   *
+   * 一条都没新增时不落盘、不刷新：配置同步是周期性的，没变化就不该写文件、抖界面。
+   *
+   * **不 emitOverwrite / 不上行洛雪动作**：这次跨设备搬运由 WebDAV 配置文件负责。
+   * 但本地数据必须落盘（persist）—— 否则重启就丢，等于白搬。
+   *
+   * 刷新刻意**不走 mirrorToSession()**：那个方法会按 defaultList 重建界面播放队列，
+   * 而恢复配置时用户可能正播着一个本地 / 临时队列（不在洛雪同步数据里），一换就把正在听的
+   * 队列顶掉。这里只换收藏：把当前队列原样传回 adoptLibraryState，队列条目一个字都不动。
+   */
+  addFavorites(items: SongItem[]): number {
+    if (items === undefined || items === null || items.length === 0) {
+      return 0;
+    }
+    // 只留能进同步结构的在线歌；本批内部的重复 id 也在这里被吃掉
+    const musics: LxMusicInfoNew[] = musicsOf(items);
+    if (musics.length === 0) {
+      return 0;
+    }
+    if (musics.length < items.length) {
+      hilog.info(DOMAIN, TAG, 'addFavorites: skipped %{public}d non-online/duplicate item(s)',
+        items.length - musics.length);
+    }
+    // 已经在收藏里的（按 id）先占位，判据与 onLocalListsChanged 一致
+    const existed: Set<string> = new Set<string>();
+    for (const info of this.data.loveList) {
+      existed.add(info.id);
+    }
+    const added: LxMusicInfoNew[] = [];
+    for (const info of musics) {
+      if (existed.has(info.id)) {
+        continue;
+      }
+      existed.add(info.id);
+      added.push(info);
+    }
+    if (added.length === 0) {
+      return 0;   // 全都在收藏里了：不写盘、不刷新
+    }
+    // 新加的排最前（保持传入顺序），与「往歌单里加歌」的既有规则一致（ADD_MUSIC_TOP）；
+    // 收藏里原有的条目顺序一个都不动
+    this.data.loveList = added.concat(this.data.loveList);
+    // 落盘：走本文件既有的持久化入口（list.json，与洛雪同步的是同一份数据）
+    this.persist();
+    // 落过库了就不再是「首次安装」，与 load() / onListSynced() 的口径一致
+    this.initialized = true;
+    // 刷新界面：**只换收藏，队列原样传回去**（理由见方法注释，避免顶掉正在播的队列）。
+    // adoptLibraryState 内部有 adoptingLibrary 守卫，不会反过来触发上行。
+    this.applying = true;
+    try {
+      const session: PlaySession = PlaySession.getInstance();
+      session.adoptLibraryState(session.queue, this.favoriteSongsOf());
+    } finally {
+      this.applying = false;
+    }
+    this.bumpLibraryVersion();
+    return added.length;
+  }
+
   /** 界面上的队列 / 收藏变了：转成同步结构，并在需要时上行 */
   onLocalListsChanged(): void {
     if (this.applying) {

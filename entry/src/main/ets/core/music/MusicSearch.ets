@@ -47,6 +47,13 @@ export interface LxMusicInfo {
   hash?: string;
   /** QQ 音乐取流需要 */
   songId?: string;
+  /**
+   * QQ 音乐的歌曲类型（「我喜欢」写入 v_songInfo.songType 要它）
+   *
+   * 搜索结果里通常带 `type`（0 = 普通）。解析不出来的旧数据**不写这个字段**：写入侧
+   * （core/music/TxWrite）会按 songmid 补查详情，不能默认按 0 写。
+   */
+  songType?: number;
   albumMid?: string;
   strMediaMid?: string;
   /** 咪咕用 */
@@ -1523,6 +1530,12 @@ export function parseTxSongs(songList: Object[]): LxMusicInfo[] {
     info.songId = asString(item['id']);
     info.albumMid = albumId;
     info.strMediaMid = mediaMid;
+    // QQ 的歌曲类型：搜索响应里是 item.type；缺就不写（写入侧会按 mid 补查详情，
+    // 不能把「没拿到」当 0 写进「我喜欢」）
+    const songTypeRaw: Object | undefined = item['type'];
+    if (songTypeRaw !== undefined && songTypeRaw !== null) {
+      info.songType = asNumber(songTypeRaw);
+    }
     out.push(info);
   }
   return out;

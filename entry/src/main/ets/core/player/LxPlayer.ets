@@ -292,6 +292,21 @@ export class LxPlayer {
    * 这里用一条 Promise 链把它们排队，保证同一时刻只有一条在换实例。
    */
   private prepareLock: Promise<void> = Promise.resolve();
+  /**
+   * 播放代次：每趟「新的播放意图」（playUrl / playUrlWithHeaders / playLocal / release）自增。
+   *
+   * 与 eqGeneration 分工不同：
+   * - eqGeneration 只在 preparePlayer 建新实例时自增，用来丢弃过期的 EQ 产物；
+   * - playEpoch 在意图发生的那一刻就自增，用来判断「这趟异步播放是否已经被切走」。
+   *   release 不建实例、也不会让 eqGeneration 变化 —— 少了它，快速切歌时旧歌的 playUrl
+   *   在 EQ 预处理被取消后会继续回退原声，把上一首播出来（见 playUrl 里的判断）。
+   */
+  private playEpoch: number = 0;
+  /**
+   * 这一趟建实例只是「为了让拖动生效」（见 seek / deferSeekUntilProcessed），
+   * prepared 之后不要自动出声。由 prepared 回调消费后清掉。
+   */
+  private pauseAfterPrepare: boolean = false;
   /** 播放本地缓存文件时打开的句柄：release 时一定要关掉，否则 fd 会泄漏 */
   private fdHandle: fs.File | null = null;
   /**
@@ -307,9 +322,26 @@ export class LxPlayer {
   private eqStreamFile: fs.File | null = null;
   /** 流式读取位置（fileSize=-1 模式下播放器不传 pos，只能自己顺序记） */
   private eqStreamPos: number = 0;
-  /** 流式播放失败时要退回的原始音源 */
+  /** 流式播放失败时要退回的原始音源（网络地址） */
   private eqRawUrl: string = '';
   private eqRawHeaders: Record<string, string> = {};
+  /**
+   * 流式播放失败时要退回的原始本地文件路径。
+   *
+   * 网络路径靠 eqRawUrl 回退；本地 / 已下载 / 沙箱缓存的歌走 playLocal，没有 URL，
+   * 以前 EQ 流中途失败时这里是空的 —— 明明原文件完全能播，却只会报「播放错误」，
+   * 还会被外层当成缓存坏了去删缓存（见 onError）。
+   */
+  private eqRawPath: string = '';
+  /**
+   * EQ 预处理失败是因为「这个网络地址打不开」（而不是格式不支持 / 取消）。
+   *
+   * 真机实测（2026-11-27）：地址缓存里的旧链接可能已失效，EQ 的 Native 解封装一拉就失败，
+   * 而播放器换原声去拉同一条旧链同样失败，要等上层发现「播放器报错」才丢缓存重新解析 ——
+   * 中间会误弹一次「这首暂时没能应用音效」，且多绕一圈。这里把它单独标出来，交给
+   * PlaySession 立刻丢弃地址缓存、重新解析后再试一次（见 playUrl 与 PlaySession.playAt）。
+   */
+  private eqUrlUnopenable: boolean = false;
   /**
    * 这一趟播放有没有**真的**过上音效。
    *
@@ -367,7 +399,8 @@ export class LxPlayer {
   /**
    * 「处理中拖动」的守候定时器。
    *
-   * 边处理边播用的是「总长未知」的数据源，播放器不接受 seek。用户此时拖进度条不能当没看见：
+   * 边处理边播的数据源**还在变长**（Native 边解码边写 WAV），不能定位：能读到的位置
+   * 随时在变，硬 seek 只会拿到不完整/错位的数据。用户此时拖进度条不能当没看见：
    * 记下目标位置，等整首处理完（WAV 落完）自动切回普通文件播放并跳过去。
    * -1 = 没在等。
    */
@@ -767,7 +800,9 @@ export class LxPlayer {
         return;
       }
       this.clearEqSeekTimer();
-      // 写完了：换成普通 fd 播放，pendingSeekMs 会在 prepared 态落地
+      // 写完了：换成普通 fd 播放，pendingSeekMs 会在 prepared 态落地。
+      // 用户若是暂停着拖的，这次切换只为拿回定位能力，不能顺手出声（见 prepared）
+      this.pauseAfterPrepare = this.status === 'paused';
       hilog.info(DOMAIN, TAG, 'eq done while seek pending: switch to file playback');
       void this.playLocal(session.wavPath, false);
     }, 400);
@@ -836,8 +871,23 @@ export class LxPlayer {
       }
       return session;
     } catch (e) {
+      const msg: string = (e as Error).message;
+      // 切歌取消不是「失败」：不要把它当回退理由，也不要弹「没能应用音效」——
+      // 真正该做的是让调用方看到代次已变、安静退出（见 playUrl 的代次校验）。
+      if (msg.indexOf('cancelled') >= 0 || msg.indexOf('canceled') >= 0) {
+        return null;
+      }
+      /**
+       * 网络地址打不开：多半是地址缓存里的旧链已经失效（网易 CDN 的链接寿命有限）。
+       * 标出来交给调用方「丢缓存 + 重新解析」，这里不提示、也不当作「音效坏了」。
+       */
+      if (msg.indexOf('无法打开网络音频地址') >= 0) {
+        this.eqUrlUnopenable = true;
+        hilog.warn(DOMAIN, TAG, 'eq cannot open this url, ask caller to refresh: %{public}s', msg);
+        return null;
+      }
       hilog.warn(DOMAIN, TAG, 'eq preprocess failed, fallback to raw url: %{public}s', JSON.stringify(e));
-      this.noteEqSkipped(`预处理失败：${(e as Error).message}`);
+      this.noteEqSkipped(`预处理失败：${msg}`);
       return null;
     }
   }
@@ -846,14 +896,20 @@ export class LxPlayer {
    * 用「还在变长的 WAV」起播。
    *
    * AVPlayer 的自定义数据源（AVDataSrcDescriptor）正是为这种场景设计的：
-   * fileSize = -1 表示总长未知，播放器顺序向我们要数据，我们要多少给多少。
-   * 代价是该模式**不能随机定位**，所以只在「边处理边播」这一趟用；
+   * fileSize 给 WAV 头里声明的总长（>0 = 可定位模式，回调会带绝对 pos，见下方注释）；
+   * 传 -1（总长未知）反而会让播放器自己估时长，踩过「186 秒的歌估成 54 秒、播到一半没声」的坑。
+   * 但文件**还在变长**，所以流式期间我们主动不 seek；
    * 整首落盘后（session.isDone()）才切成普通 fd 播放，那时才恢复拖动能力。
    */
   private async playEqStream(session: EqStreamSession): Promise<void> {
     // 换了播放现场：上一轮「等处理完再跳」的守候作废
     this.clearEqSeekTimer();
+    const epoch: number = this.playEpoch;
     const player: media.AVPlayer = await this.preparePlayer(true);
+    // 建实例期间用户切歌了：这趟 EQ 流不要再往新实例上挂
+    if (this.playEpoch !== epoch) {
+      return;
+    }
     StartupTiming.getInstance().armWatchdog();
     // preparePlayer 已经释放了上一个现场，现在登记这一份临时产物（release 时删掉它）
     this.eqTempPath = AudioEffectProcessor.getInstance().isArtifact(session.wavPath) ? session.wavPath : '';
@@ -876,16 +932,27 @@ export class LxPlayer {
     const declaredBytes: number = LxPlayer.declaredWavBytes(fd);
     const descriptor: media.AVDataSrcDescriptor = {
       fileSize: declaredBytes > 0 ? declaredBytes : -1,
-      callback: (buffer: ArrayBuffer, length: number): number => {
+      /**
+       * fileSize >= 0 = **可定位模式**（SDK 原文：fileSize=-1 时 seek / setSpeed / loop / replay
+       * 都不可用）。这个模式下播放器按**绝对流位置**要数据，第三个参数 pos 就是它要的起点
+       * （OpenHarmony 6.1 player_framework 的 media_data_source_callback.cpp：可定位模式传 3 个参数）。
+       *
+       * 所以必须尊重 pos：我们流式期间本来就不主动 seek（见 seek：拖进度先等写完再切普通 fd 播放），
+       * 正常顺序读时 pos 恒等于 eqStreamPos，行为不变；但播放器一旦自己回退/重读（缓冲回退、
+       * 未来的 loop/replay），用自记位置会**静默**返回错位数据（杂音 / 解析异常，还不报错）。
+       */
+      callback: (buffer: ArrayBuffer, length: number, pos?: number): number => {
         const want: number = Math.min(length, buffer.byteLength);
+        // pos 是文件内绝对位置；没传（总长未知那种模式）才退回首记的读取位置
+        const base: number = pos !== undefined && pos >= 0 ? pos : this.eqStreamPos;
         let got: number = 0;
         try {
-          got = fs.readSync(fd, buffer, { offset: this.eqStreamPos, length: want });
+          got = fs.readSync(fd, buffer, { offset: base, length: want });
         } catch (e) {
           got = 0;
         }
         if (got > 0) {
-          this.eqStreamPos += got;
+          this.eqStreamPos = base + got;
           return got;
         }
         if (session.isFailed()) {
@@ -916,6 +983,12 @@ export class LxPlayer {
    *
    * 读不出来就返回 0，调用方退回「总长未知」的老行为（至少不会因为解析失败放不出来）。
    * 偏移 40 是 WAV 规范里 data chunk 的尺寸字段（RIFF/WAVE/fmt(16)/data 的标准布局）。
+   *
+   * 关于 `fs.readSync` 的 offset：它是**文件内绝对偏移**（底层走 pread，filePointer 不动），
+   * 不是「当前 filePointer + offset」。SDK 的 ReadOptions 接口注释里那句 "current filePointer
+   * plus offset" 是文档 bug（那句语义属于 RandomAccessFile.readSync），**不要按它改代码** ——
+   * 改了就真的会跳读。这里先按 offset=0 读头、随后 playEqStream 再按 offset=eqStreamPos 顺序读，
+   * 两者互不影响。
    */
   private static declaredWavBytes(fd: number): number {
     try {
@@ -940,7 +1013,12 @@ export class LxPlayer {
 
   /** 原始音源播放（不走 EQ）；流式播放失败时的回退路径也用它 */
   private async playRawUrl(url: string, headers: Record<string, string>): Promise<void> {
+    const epoch: number = this.playEpoch;
     const player: media.AVPlayer = await this.preparePlayer();
+    // 建实例期间用户切歌了：别再给新实例设旧歌的 url（否则会把新歌顶掉）
+    if (this.playEpoch !== epoch) {
+      return;
+    }
     // 原声路径：这一趟没有 EQ（可能是没开音效，也可能是回退过来的）
     this.markEqApplied(false);
     StartupTiming.getInstance().armWatchdog();
@@ -981,14 +1059,25 @@ export class LxPlayer {
   /** 播放一个网络音频地址（先释放上一个实例） */
   async playUrl(url: string): Promise<void> {
     const gen: number = this.eqGeneration;
+    const epoch: number = ++this.playEpoch;
+    this.eqUrlUnopenable = false;
     this.eqSkipNotified = false;
     this.eqRawUrl = url;
     this.eqRawHeaders = {};
+    this.eqRawPath = '';
     this.pendingSeekMs = -1;
     // 音效改动后的重播会带一个落点（见 setStartSeekMs）：消费掉，只影响这一趟
     const startMs: number = this.takeStartSeekMs();
     const session: EqStreamSession | null = await this.eqSessionOf(url, {}, Math.max(0, startMs));
-    if (this.eqWasSuperseded(gen)) {
+    /**
+     * 预处理期间用户切走了就整个放弃 —— 包括**不要回退原声**。
+     *
+     * eqWasSuperseded 只看「有没有建过新实例」；而切歌的第一步是 release()（不建实例），
+     * 新歌可能还要几百毫秒到几秒解析地址，这段空窗里旧的 playUrl 回来时会误以为没人取代它，
+     * 于是回退 playRawUrl 把上一首播出来（队列显示新歌、耳朵听到旧歌）。
+     * playEpoch 在 release / 新播放意图发生时立刻自增，这里一并校验。
+     */
+    if (this.eqWasSuperseded(gen) || this.playEpoch !== epoch) {
       return;
     }
     if (session !== null) {
@@ -1010,6 +1099,15 @@ export class LxPlayer {
         this.noteEqSkipped(`音效起播失败：${(e as Error).message}`);
       }
     }
+    /**
+     * 这一趟 EQ 预处理失败的原因是「地址打不开」：不要拿同一条地址回退原声
+     * （播放器接下来照样会失败，还会先误弹一次「未生效」）。
+     * 往上抛一个可识别的信号，让 PlaySession 丢地址缓存、重新解析后再来一次。
+     */
+    if (this.eqUrlUnopenable) {
+      this.eqUrlUnopenable = false;
+      throw new Error('EQ_DEAD_URL');
+    }
     await this.playRawUrl(url, {});
   }
 
@@ -1027,13 +1125,17 @@ export class LxPlayer {
    */
   async playUrlWithHeaders(url: string, headers: Record<string, string>): Promise<void> {
     const gen: number = this.eqGeneration;
+    const epoch: number = ++this.playEpoch;
+    this.eqUrlUnopenable = false;
     this.eqSkipNotified = false;
     this.eqRawUrl = url;
     this.eqRawHeaders = headers;
+    this.eqRawPath = '';
     this.pendingSeekMs = -1;
     const startMs: number = this.takeStartSeekMs();
     const session: EqStreamSession | null = await this.eqSessionOf(url, headers, Math.max(0, startMs));
-    if (this.eqWasSuperseded(gen)) {
+    // 与 playUrl 同一道闸：被取代的这趟连回退原声都不做（否则会播出上一首）
+    if (this.eqWasSuperseded(gen) || this.playEpoch !== epoch) {
       return;
     }
     if (session !== null) {
@@ -1053,7 +1155,25 @@ export class LxPlayer {
         this.noteEqSkipped(`音效起播失败：${(e as Error).message}`);
       }
     }
+    if (this.eqUrlUnopenable) {
+      this.eqUrlUnopenable = false;
+      throw new Error('EQ_DEAD_URL');
+    }
     await this.playRawUrl(url, headers);
+  }
+
+  /**
+   * 按原声播放一个网络地址，**完全跳过音效**
+   *
+   * 场景：EQ 预处理打不开这条地址（多半是旧链失效），丢缓存重新解析后仍然打不开。
+   * 这时不能再让 EQ 拦一道 —— 直接交给播放器按原声拉，能出声就行（与改动前一致）。
+   */
+  async playUrlNoEq(url: string): Promise<void> {
+    this.eqSkipNotified = false;
+    this.eqRawUrl = url;
+    this.eqRawHeaders = {};
+    this.eqRawPath = '';
+    await this.playRawUrl(url, {});
   }
 
   /**
@@ -1069,16 +1189,24 @@ export class LxPlayer {
    * （见 AudioEffectProcessor 类注释）。
    */
   async playLocal(path: string, applyEffect: boolean = true): Promise<void> {
+    const epoch: number = ++this.playEpoch;
+    if (applyEffect) {
+      // 新的播放意图：上一次「拖动后保持暂停」的待办作废（见 pauseAfterPrepare）
+      this.pauseAfterPrepare = false;
+    }
     if (applyEffect && LxPlayer.canApplyEffect(path)) {
       const gen: number = this.eqGeneration;
       this.eqSkipNotified = false;
       this.eqRawUrl = '';
       this.eqRawHeaders = {};
+      // 本地路径也要记下来：EQ 流中途失败时要能退回原文件（见 onError）
+      this.eqRawPath = path;
       this.pendingSeekMs = -1;
       const startMs: number = this.takeStartSeekMs();
       const session: EqStreamSession | null =
         await this.eqSessionOfFile(path, Math.max(0, startMs));
-      if (this.eqWasSuperseded(gen)) {
+      // 被取代就放弃，连回退原文件都不做（否则会把切走的那首重新放出来）
+      if (this.eqWasSuperseded(gen) || this.playEpoch !== epoch) {
         return;
       }
       if (session !== null) {
@@ -1155,8 +1283,13 @@ export class LxPlayer {
     try {
       return await AudioEffectProcessor.getInstance().startStreamForFile(path, resumeMs);
     } catch (e) {
+      const msg: string = (e as Error).message;
+      // 同 eqSessionOf：切歌取消不是失败，安静返回
+      if (msg.indexOf('cancelled') >= 0 || msg.indexOf('canceled') >= 0) {
+        return null;
+      }
       hilog.warn(DOMAIN, TAG, 'eq on local file failed: %{public}s', JSON.stringify(e));
-      this.noteEqSkipped(`本地文件音效处理失败：${(e as Error).message}`);
+      this.noteEqSkipped(`本地文件音效处理失败：${msg}`);
       return null;
     }
   }
@@ -1186,7 +1319,9 @@ export class LxPlayer {
     if (!keepEqTask) {
       AudioEffectProcessor.getInstance().cancelActive();
     }
-    await this.release(keepEqTask);
+    // 已经在 prepareLock 里（见 preparePlayer），直接走无锁实现，避免死锁。
+    // 代次沿用当前值：这里不是「新的播放意图」，不能顶掉调用方捕获的代次。
+    await this.releaseUnlocked(keepEqTask, this.playEpoch);
     this.update('loading', '正在加载音频…');
     this.durationMs = 0;
     this.currentMs = 0;
@@ -1245,9 +1380,19 @@ export class LxPlayer {
               hilog.warn(DOMAIN, TAG, 'pending seek failed: %{public}s', JSON.stringify(err));
             }
           }
-          player.play().catch((err: BusinessError) => {
-            this.update('error', `播放失败：${err.message}`);
-          });
+          /**
+           * 这次建实例可能只是「为了让拖动生效」（见 seek / deferSeekUntilProcessed）。
+           * 用户是在暂停态拖的，切完必须还是暂停 —— 无条件 play() 会让音乐自己响起来。
+           */
+          const keepPaused: boolean = this.pauseAfterPrepare;
+          this.pauseAfterPrepare = false;
+          if (keepPaused) {
+            this.update('paused', '已暂停');
+          } else {
+            player.play().catch((err: BusinessError) => {
+              this.update('error', `播放失败：${err.message}`);
+            });
+          }
           break;
         }
         case 'playing':
@@ -1334,19 +1479,26 @@ export class LxPlayer {
       StartupTiming.getInstance().markFailed(`播放错误 ${err.code}`);
       // 边处理边播这一趟失败（数据源跟不上 / 解码报错）：立刻退回原始音源，
       // 用户至少能听到没加音效的声音，而不是看着一条错误提示。
+      // 本地 / 已下载 / 缓存文件没有 URL，退回的是 playLocal 记下的原始路径（eqRawPath）。
       const session = this.eqStreamSession;
-      if (session !== null && this.eqRawUrl !== '') {
+      if (session !== null && (this.eqRawUrl !== '' || this.eqRawPath !== '')) {
         const rawUrl: string = this.eqRawUrl;
         const rawHeaders: Record<string, string> = this.eqRawHeaders;
+        const rawPath: string = this.eqRawPath;
         this.eqStreamSession = null;
-        hilog.warn(DOMAIN, TAG, 'eq stream playback failed, fallback to raw url');
+        hilog.warn(DOMAIN, TAG, 'eq stream playback failed, fallback to raw source');
         // 中途回退：标成「未生效」，别让标识还挂着「已生效」
         this.markEqApplied(false);
         this.noteEqSkipped('音效流播放中断');
         // 放到下一个宏任务再回退：这条链路会一路走到 release()/新建播放器，
         // 此刻我们还在这个播放器自己的 error 回调里（见 release 的 macrotask 注释）。
         setTimeout(() => {
-          void this.playRawUrl(rawUrl, rawHeaders);
+          if (rawPath.length > 0) {
+            // 本地文件：原文件完全可播，直接退回它（不要再报错、也别让外层删缓存）
+            void this.playLocalFile(rawPath);
+          } else {
+            void this.playRawUrl(rawUrl, rawHeaders);
+          }
         }, 0);
         return;
       }
@@ -1695,16 +1847,18 @@ export class LxPlayer {
       return;
     }
     const target: number = ms > 0 ? Math.floor(ms) : 0;
-    // 边处理边播这一趟用的是「总长未知」的数据源，本来就不支持定位。
-    // 整首已经处理完的话，正好借这次拖动切回普通 fd 播放，把定位能力拿回来。
+    // 边处理边播这一趟的数据源**还在变长**，不能定位（不是「总长未知」——fileSize 是知道的，
+    // 见 playEqStream 的注释）。整首已经处理完的话，正好借这次拖动切回普通 fd 播放，把定位能力拿回来。
     const session = this.eqStreamSession;
     if (session !== null) {
       if (session.isDone()) {
         hilog.info(DOMAIN, TAG, 'seek on finished eq stream: switch to file playback');
+        // 暂停着拖进度条：切回文件播放只是为了拿到定位能力，切完必须还是暂停
+        this.pauseAfterPrepare = this.status === 'paused';
         this.pendingSeekMs = target;
         void this.playLocal(session.wavPath, false);
       } else {
-        // 还在处理：这一趟的数据源不支持定位（总长未知），先记下来，写完后自动跳过去
+        // 还在处理：数据源还在变长、不能定位（不是总长未知），先记下来，写完后自动跳过去
         hilog.info(DOMAIN, TAG, 'seek deferred until eq processing done (%{public}dms)', target);
         this.deferSeekUntilProcessed(target);
       }
@@ -1744,12 +1898,48 @@ export class LxPlayer {
   }
 
   async release(keepEqTask: boolean = false): Promise<void> {
+    /**
+     * 与 preparePlayer 共用同一条锁：释放旧现场和建新现场不能互相插队。
+     *
+     * 真机上出现过「旧一次释放的尾巴落到新现场上」：release 里 await 了
+     * macrotask / player.release()，回来时已经有人在建新实例，它却照着旧现场
+     * 清 this.mediaSource / this.fdHandle / status —— MediaSource 的强引用被清后
+     * 被 GC 回收，播放中断甚至野指针崩溃（正是本文件多处在防的那条路）。
+     *
+     * 注意 preparePlayerUnlocked 内部也要释放（它已经在锁里），所以那里直接调
+     * releaseUnlocked，不能再进这个排队入口 —— 否则自己等自己，直接死锁。
+     */
+    // 代次在这里（同步、进锁之前）自增：任何在途的 playXxx 立刻作废。
+    // 内部释放（preparePlayerUnlocked 里）**不能**再自增，否则会把调用方
+    // 自己刚捕获的代次顶掉，它 prepare 之后的校验会误判「已被切歌」而静默不出声。
+    const epoch: number = ++this.playEpoch;
+    const prev: Promise<void> = this.prepareLock;
+    let unlock: () => void = () => {};
+    this.prepareLock = new Promise<void>((resolve: () => void) => {
+      unlock = resolve;
+    });
+    await prev;
+    try {
+      await this.releaseUnlocked(keepEqTask, epoch);
+    } finally {
+      unlock();
+    }
+  }
+
+  /** 真正释放（调用方已在 prepareLock 里：release 入口，或 preparePlayerUnlocked） */
+  private async releaseUnlocked(keepEqTask: boolean, epoch: number): Promise<void> {
     const player = this.avPlayer;
-    // 先摘引用（同步）：后续回调走到判等处直接空转，不会再驱动界面或换实例
-    this.avPlayer = null;
-    // 流式播放现场先收：播放器释放后这个句柄就不能再留着了
+    // 旧现场对象先抓到局部：await 期间新现场可能已经把字段换成自己的，
+    // 清理只能对着「我这一趟抓到的旧对象」做，绝不能回头清 this.xxx。
+    const oldSource = this.mediaSource;
+    const oldFd = this.fdHandle;
     const streamSession = this.eqStreamSession;
     const streamFile = this.eqStreamFile;
+    // 先摘引用（同步）：后续回调走到判等处直接空转，不会再驱动界面或换实例
+    this.avPlayer = null;
+    // 句柄先摘下：新现场若已打开自己的句柄，这里不能把它覆盖/关掉
+    this.fdHandle = null;
+    // 流式播放现场先收：播放器释放后这个句柄就不能再留着了
     this.eqStreamSession = null;
     this.eqStreamFile = null;
     this.eqStreamPos = 0;
@@ -1779,14 +1969,17 @@ export class LxPlayer {
         hilog.warn(DOMAIN, TAG, 'release failed: %{public}s', JSON.stringify(err));
       }
     }
-    // 播放器释放之后才放掉 MediaSource：反过来会让播放器读到一个已析构的源
-    this.mediaSource = null;
-    // 播放器先释放，再关本地文件句柄：反过来可能让播放器读到一个已关闭的 fd
-    const handle = this.fdHandle;
-    this.fdHandle = null;
-    if (handle !== null) {
+    // 播放器释放之后才放掉 MediaSource：反过来会让播放器读到一个已析构的源。
+    // 只在我这一趟的源仍是当前源时才清 —— 新现场换上的源不能碰。
+    // （这里的比较同时保证 oldSource 在 await 期间一直有强引用，不会被提前 GC。）
+    if (this.mediaSource === oldSource) {
+      this.mediaSource = null;
+    }
+    // 播放器先释放，再关本地文件句柄：反过来可能让播放器读到一个已关闭的 fd。
+    // 只关我这一趟抓到的旧句柄；新现场自己的句柄由它自己负责。
+    if (oldFd !== null) {
       try {
-        fs.closeSync(handle);
+        fs.closeSync(oldFd);
       } catch (err) {
         hilog.warn(DOMAIN, TAG, 'close fd failed: %{public}s', JSON.stringify(err));
       }
@@ -1807,6 +2000,16 @@ export class LxPlayer {
       AudioEffectProcessor.getInstance().cancelActive();
     } else if (streamSession !== null && streamSession.isFailed()) {
       hilog.warn(DOMAIN, TAG, 'release with failed eq stream: %{public}s', streamSession.error());
+    }
+    /**
+     * 状态只在「没有更新的播放意图」时收掉。
+     *
+     * 若这趟释放的 await 期间用户已经切歌（新歌已经把状态设成 loading / playing），
+     * 这里再把 status 覆盖成 idle、把进度清零，就会打烂新现场：界面显示空闲、
+     * 进度条归零，甚至新歌正在响却被标成没在播。
+     */
+    if (this.playEpoch !== epoch) {
+      return;
     }
     this.status = 'idle';
     this.message = '';

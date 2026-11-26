@@ -166,8 +166,25 @@ export async function resolveUrlWithSourceFailover(
   let triedDeclaring: number = 0;
 
   const previousId: string = loadedId;
-  const deadline: number = Date.now() + BUDGET_MS;
-  const firstBudget: number = candidates.length > 1 ? FIRST_TIMEOUT_MS : SINGLE_TIMEOUT_MS;
+  /**
+   * 第一个候选若是「当前已加载的源」，按**关闭开关时的同等耐心**给它（SINGLE_TIMEOUT_MS）。
+   *
+   * 慢 ≠ 坏：很多代理型音源本来就要转几秒到十几秒，关着开关时给 25 秒是能成功的；
+   * 开着开关以前多源时第一个也只给 7 秒，于是「能用的源也被判死、切到别的源后放不出来」
+   * （群反馈 2026-11-19 14:06/14:10）。现在第一个永远是当前源（见 SourceRouter.candidates），
+   * 且给它长预算 ——「开着」的成功率不低于「关着」。
+   *
+   * 例外：它在路由表里已连续失败 ≥2 次（真坏了）时仍给短预算，别让坏源每首歌卡 25 秒。
+   */
+  const firstIsLoaded: boolean = candidates[0] === loadedId;
+  const loadedStreak: number = router.failStreakOf(loadedId, platform);
+  const firstBudget: number = firstIsLoaded
+    ? (loadedStreak >= 2 ? FIRST_TIMEOUT_MS : SINGLE_TIMEOUT_MS)
+    : (candidates.length > 1 ? FIRST_TIMEOUT_MS : SINGLE_TIMEOUT_MS);
+  /** 第一发已经用长预算试过当前源了：全部失败后不必再用 lastChance 对同一个源重跑 */
+  const longAttempt: boolean = firstIsLoaded && firstBudget === SINGLE_TIMEOUT_MS;
+  // 第一发可能本身就占 25 秒：总预算要把这一段让出来，否则循环会在第一发之后立刻按「预算耗尽」退出
+  const deadline: number = Date.now() + BUDGET_MS + (longAttempt ? firstBudget : 0);
   let lastError: Error = new Error('没有可用的音源');
   for (let i = 0; i < candidates.length; i++) {
     if (cancelled(hooks)) {
@@ -246,8 +263,10 @@ export async function resolveUrlWithSourceFailover(
     }
   }
   // 所有候选都失败了 —— 但这不等于这首歌放不出来，见 lastChance 的注释。
-  const last: FailoverOutcome | null =
-    await lastChance(previousId, musicInfoJson, platform, quality);
+  // 第一发已经用长预算试过当前源的话，不必再对同一个源重跑一遍（省掉一次 25 秒）。
+  const last: FailoverOutcome | null = longAttempt
+    ? null
+    : await lastChance(previousId, musicInfoJson, platform, quality);
   if (last !== null) {
     router.markSuccess(last.sourceId, platform);
     health.markSuccess(last.sourceId, platform);

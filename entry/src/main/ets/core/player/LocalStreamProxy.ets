@@ -36,6 +36,20 @@ class ByteSpan {
   suffix: string = '';
 }
 
+/** 上游忽略 Range 回整份时，本侧从这份 body 里切出来的区间 */
+class RangeSlice {
+  readonly data: ArrayBuffer;
+  /** 闭区间起止，用来合成 Content-Range */
+  readonly start: number;
+  readonly end: number;
+
+  constructor(data: ArrayBuffer, start: number, end: number) {
+    this.data = data;
+    this.start = start;
+    this.end = end;
+  }
+}
+
 /**
  * 本机回环 HTTP 代理：替 Native 给上游请求加上请求头。
  *
@@ -259,7 +273,11 @@ export class LocalStreamProxy {
         return;
       }
 
-      const span: ByteSpan = parseRange(headerValue(lines, 'range'));
+      // 客户端到底有没有要区间：`bytes=0-` 也算要（ByteSpan 的默认值区分不出来），
+      // 后面「上游忽略 Range 回 200」时要靠它决定是整份直回还是本侧切片
+      const clientRange: string = headerValue(lines, 'range');
+      const hasClientRange: boolean = clientRange.length > 0;
+      const span: ByteSpan = parseRange(clientRange);
       const upHeaders: Record<string, string> = {};
       for (const k of Object.keys(this.extraHeaders)) {
         upHeaders[k] = this.extraHeaders[k];
@@ -293,9 +311,28 @@ export class LocalStreamProxy {
       const code: number = resp.responseCode;
       const total: number = contentRangeTotal(contentRange);
 
+      // 先校验上游状态码，再谈回什么：上游 401/404/500 不能一律给客户端报 200。
+      // 原来 HEAD 分支放在这之前直接回 200，等于把「认证失败 / 文件不存在」伪装成
+      // 「文件长度未知」，客户端会以为拿到了可用流，错得更离谱。
+      if (code !== 200 && code !== 206) {
+        hilog.warn(DOMAIN, TAG, 'upstream replied %{public}d for %{public}s', code, path);
+        if (method === 'HEAD') {
+          // HEAD 的响应不允许带 body：只回状态码和头，长度给 0
+          const headText: string = `HTTP/1.1 ${code} Upstream Error\r\nContent-Type: text/plain\r\n` +
+            `Content-Length: 0\r\nConnection: close\r\n\r\n`;
+          await this.sendBytes(conn, this.encoder.encodeInto(headText));
+          await this.closeQuietly(conn);
+          return;
+        }
+        await this.reply(conn, code, 'Upstream Error', '');
+        return;
+      }
+
       if (method === 'HEAD') {
-        // 长度取上游 Content-Range 里的总数；拿不到就不写 Content-Length（比写 0 诚实）
-        const lengthLine: string = total > 0 ? `Content-Length: ${total}\r\n` : '';
+        // 长度取上游 Content-Range 里的总数；上游忽略 Range 回了整份时 body 长度就是文件总长。
+        // 拿不到就还是不写 Content-Length（比写 0 诚实）
+        const fileTotal: number = total > 0 ? total : (code === 200 ? len : 0);
+        const lengthLine: string = fileTotal > 0 ? `Content-Length: ${fileTotal}\r\n` : '';
         const headText: string = `HTTP/1.1 200 OK\r\n${lengthLine}Content-Type: ${contentType}\r\n` +
           `Accept-Ranges: bytes\r\nConnection: close\r\n\r\n`;
         await this.sendBytes(conn, this.encoder.encodeInto(headText));
@@ -303,17 +340,56 @@ export class LocalStreamProxy {
         return;
       }
 
-      if (code !== 200 && code !== 206) {
-        hilog.warn(DOMAIN, TAG, 'upstream replied %{public}d for %{public}s', code, path);
-        await this.reply(conn, code, 'Upstream Error', '');
+      /**
+       * 客户端要了区间、上游却回 200 整份（服务器不认 Range）：
+       * 本侧按区间切出一段回 206 + 合成 Content-Range。
+       * 原来这里把整份 body 按 200 直接透传 —— 请求的区间被丢掉，
+       * 播放器会把文件头的数据当成它要的位置读，seek/起播全错位。
+       * 要不到（起点越界 / 空 body）按 HTTP 语义回 416 或 502。
+       */
+      if (code === 200 && hasClientRange) {
+        if (len <= 0) {
+          hilog.warn(DOMAIN, TAG, 'upstream 200 with empty body for %{public}s', path);
+          await this.reply(conn, 502, 'Bad Gateway', '');
+          return;
+        }
+        const slice: RangeSlice | null = sliceRange(body, span, len);
+        if (slice === null) {
+          hilog.warn(DOMAIN, TAG, 'client range unsatisfiable: %{public}s / %{public}d bytes',
+            clientRange, len);
+          await this.reply(conn, 416, 'Range Not Satisfiable', `Content-Range: bytes */${len}\r\n`);
+          return;
+        }
+        const sliceLen: number = slice.data.byteLength;
+        const headText: string = `HTTP/1.1 206 Partial Content\r\nContent-Type: ${contentType}\r\n` +
+          `Content-Length: ${sliceLen}\r\n` +
+          `Content-Range: bytes ${slice.start}-${slice.end}/${len}\r\n` +
+          `Accept-Ranges: bytes\r\nConnection: close\r\n\r\n`;
+        await this.sendBytes(conn, this.encoder.encodeInto(headText));
+        if (sliceLen > 0) {
+          await this.sendBody(conn, slice.data);
+        }
+        this.servedBytes += sliceLen;
+        this.servedReqs++;
+        hilog.info(DOMAIN, TAG,
+          'relayed %{public}s %{public}s -> 206 Partial Content, %{public}d bytes (sliced from 200/%{public}d), fetch=%{public}dms total=%{public}dms',
+          method, path, sliceLen, len, fetchMs, Date.now() - t0);
+        await this.closeQuietly(conn);
         return;
       }
 
       /**
-       * 客户端没发 Range 时有两种情况：
-       * - 上游把整份都给了（200，或 206 且总数 ≤ 本片）→ 直接按 200 回去，跟普通服务器一致；
-       * - 文件比本片大 → 只能回 206 分片（Content-Range 如实写），客户端会自己接着要。
-       * 不能对「没要求 Range」的请求谎报 200 + 半个 body，那是让客户端以为文件就这么长。
+       * 其余情况保持原有语义（正常 206 透传路径不动）：
+       * - 客户端没发 Range 时：上游把整份都给了（200，或 206 且总数 ≤ 本片）→ 直接按 200 回去，
+       *   跟普通服务器一致；文件比本片大 → 只能回 206 分片（Content-Range 如实写），
+       *   客户端会自己接着要。不能对「没要求 Range」的请求谎报 200 + 半个 body，
+       *   那是让客户端以为文件就这么长（AVPlayer 的下载器会把 Content-Length 当整份长度，播完一片就 EOS）。
+       * - 客户端要了区间、上游也回了 206 + Content-Range → 原样透传，协议语义不变。
+       *
+       * 事实核对（2026-11 查 OpenHarmony multimedia_av_codec 的 http_curl_client / downloader）：
+       * AVSource 的 HTTP VOD 路径**每个请求都带 Range**（首请求固定 bytes=0-8191），从不发 HEAD，
+       * 所以上面「客户端没带 Range」这条分支对本工程实际不可达；保留 206 + 自洽 Content-Range
+       * 是最不坏的兜底（比 200 + 半个 body 安全得多）。
        */
       const wholeFile: boolean = code === 200 || total > 0 && total <= len;
       let statusLine: string;
@@ -493,6 +569,44 @@ function parseRange(value: string): ByteSpan {
     }
   }
   return span;
+}
+
+/**
+ * 把整份文件按客户端要的区间切一段。
+ *
+ * 只在「客户端带了 Range、上游却回 200 整份」时用（服务器不认 Range）：
+ * 得本侧替它把区间切出来，否则客户端拿到的是文件头那一段而不是它要的位置，
+ * 播放器会读到错位数据。支持 `bytes=a-b` / `bytes=a-` / `bytes=-N`；
+ * 要不到（起点越界、空文件、后缀非法）返回 null，由调用方回 416，跟标准服务器语义一致。
+ */
+function sliceRange(body: ArrayBuffer, span: ByteSpan, len: number): RangeSlice | null {
+  if (len <= 0) {
+    return null;
+  }
+  let start: number = 0;
+  let end: number = len - 1;
+  if (span.suffix.length > 0) {
+    // 后缀区间 `bytes=-N`：只要文件最后 N 字节
+    const n: number = Number(span.suffix.substring(1).trim());
+    if (isNaN(n) || n <= 0) {
+      return null;
+    }
+    start = Math.max(0, len - Math.floor(n));
+  } else {
+    start = span.start;
+    if (start < 0 || start >= len) {
+      // 起点已经越界：文件比客户端以为的短
+      return null;
+    }
+    if (span.end >= 0) {
+      // 右端超出文件尾就收到尾，标准服务器也是这么钳的
+      end = Math.min(span.end, len - 1);
+    }
+    if (end < start) {
+      return null;
+    }
+  }
+  return new RangeSlice(body.slice(start, end + 1), start, end);
 }
 
 /** 从 `bytes 0-4194303/30000000` 里取总数；拿不到（`*` 或空）返回 -1 */

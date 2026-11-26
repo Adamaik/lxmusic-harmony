@@ -2764,7 +2764,7 @@ function wyBitrateOf(song: Record<string, Object>, key: string): number {
  * 这个接口回的是老 schema（见 wyNormalizeSong），且不带 privileges（音质档位自己推）。
  * 单批失败只跳过这一批：能补多少补多少，不因为补歌失败把整张歌单变成错误。
  */
-async function wySongsByIds(ids: string[]): Promise<LxMusicInfo[]> {
+export async function wySongsByIds(ids: string[]): Promise<LxMusicInfo[]> {
   const out: LxMusicInfo[] = [];
   for (let start = 0; start < ids.length; start += WY_SONG_BATCH) {
     const batch: string[] = ids.slice(start, start + WY_SONG_BATCH);

@@ -313,4 +313,29 @@ export class AppearanceSettings {
     AppStorage.setOrCreate(K_NAV_FOLLOW_HAND, value);
     this.write();
   }
+
+  /**
+   * 同步恢复（WebDAV 配置同步）时一次性写入这四项
+   *
+   * 调用方是「没有 UI、也没有播放上下文」的同步逻辑，所以这里只做三件事：
+   * 范围校验 -> 写内存 + 落盘 -> publish 到 AppStorage，界面自己按 @StorageLink 重画。
+   * 刻意不碰系统级副作用：
+   *   - 深浅模式需要 ApplicationContext 才能立刻切换（见 applyColorMode），本方法拿不到
+   *     context，也**不该**在同步恢复的上下文里改系统模式 —— 这里只存值 + publish；
+   *     本次不切系统模式，下次启动由 EntryAbility 的 applyColorMode 按存档生效
+   *     （这是同步的既定口径，不是 bug）。
+   *   - 材质档位 / 圆角 / 跟手都只是界面参数，改 AppStorage 即生效，不会打断播放、不弹窗。
+   *
+   * 非法输入按各字段自己的钳制规则收敛（NaN / 越界都收进合法区间），不会写坏存档。
+   * 未 init 时与 setXxx 一致：只更新内存与 AppStorage，write() 自己会跳过落盘。
+   */
+  applySynced(materialLevel: number, coverRadius: number, colorMode: number,
+    followHand: boolean): void {
+    this.materialLevel = clampMaterialLevel(materialLevel);
+    this.coverRadius = clampCoverRadius(coverRadius);
+    this.colorMode = clampColorMode(colorMode);
+    this.followHand = followHand;
+    this.write();
+    this.publish();
+  }
 }

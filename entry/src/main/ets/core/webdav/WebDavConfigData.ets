@@ -22,11 +22,39 @@ import { PlaylistSummary, SongItem } from '../player/PlaySession';
 import { LxMusicInfo, LxQualityItem, mgImageUrl } from '../music/MusicSearch';
 import { musicIdOf } from '../music/MusicId';
 import { LOCAL_SOURCE } from '../local/LocalMusic';
-import { AddMusicResult, duplicateKeyOf, LocalLibrary } from '../sync/LocalLibrary';
+import {
+  AddMusicResult,
+  duplicateKeyOf,
+  LocalLibrary,
+  normalizeDislikeRules,
+} from '../sync/LocalLibrary';
+import {
+  ListenHistoryExport,
+  ListenLog,
+  ListenRecord,
+  ListenSong,
+  intervalMs,
+  listenItemId,
+} from '../history/ListenLog';
 import { fromLxMusicInfo } from '../sync/SyncConvert';
 import { LxListData, LxMusicInfoNew } from '../sync/SyncTypes';
 import { toMD5 } from '../sync/SyncCrypto';
 import { CONFIG_SYNC_DEFAULT_DIR, WEBDAV_SOURCE } from './WebDavTypes';
+import {
+  AudioEffectSettings,
+  EQ_GAIN_MAX,
+  EQ_GAIN_MIN,
+  EQ_PRESETS,
+} from '../settings/AudioEffectSettings';
+import { AppearanceSettings } from '../settings/AppearanceSettings';
+import { ListenSettings } from '../settings/ListenSettings';
+import { RecommendSettings } from '../settings/RecommendSettings';
+import { BookPlaySettings } from '../book/BookPlaySettings';
+import {
+  DOWNLOAD_QUALITY_VALUES,
+  DownloadSettings,
+  NAME_FORMATS,
+} from '../download/DownloadSettings';
 import {
   DEFAULT_SOURCE_VALUES,
   EXTEND_QUALITYS,
@@ -39,10 +67,25 @@ import {
 
 /** 文件格式标识：只认这个值，避免把别的 JSON 当成聆听的配置 */
 export const CONFIG_SYNC_FORMAT: string = 'listen-config-sync';
-/** 当前写出的格式版本；以后加字段递增，读取端按 <= 本值兼容 */
-export const CONFIG_SYNC_VERSION: number = 1;
+/**
+ * 当前写出的格式版本；以后加字段递增，读取端按 <= 本值兼容。
+ *
+ * v2（2026-11-27）：同步范围从「歌单 + 播放设置」扩到「个性化数据」——
+ * 收藏、听歌流水（播放历史 / 最近播放 / 回响都由它重建）、不感兴趣名单，
+ * 以及外观 / 听书 / 推荐 / 下载 / 音效等设置。新增字段全部可选：
+ * v1 老文件照样能读（缺的字段保持本机值），旧版本 App 读到 v2 会提示先升级，
+ * 这是有意的 —— 旧版本不认识这些字段，恢复后再上传会把它们丢掉。
+ */
+export const CONFIG_SYNC_VERSION: number = 2;
 /** 网盘目录下的固定文件名（两台设备约定同一个名字才能互相找到） */
 export const CONFIG_SYNC_FILE_NAME: string = 'listen-config.json';
+
+/** 收藏最多搬多少首（配置文件要保持「几十 KB 级」，超出的截断） */
+const CONFIG_SYNC_FAVORITES_MAX: number = 2000;
+/** 听歌流水最多搬多少条（一条 ≈ 几十字节；回响只回看最近一年，够用） */
+const CONFIG_SYNC_HISTORY_MAX: number = 300;
+/** 不感兴趣规则最多搬多少条 */
+const CONFIG_SYNC_DISLIKE_MAX: number = 500;
 
 /** 音质由高到低（与 PlaylistPort / SyncConvert 同序） */
 const QUALITY_ORDER: string[] = ['flac24bit', 'flac', '320k', '128k'];
@@ -84,12 +127,17 @@ export interface ConfigSyncPlaylist {
 }
 
 /**
- * 用户设置（音质 / 播放偏好）
+ * 用户设置（音质 / 播放偏好 / 外观 / 听书 / 推荐 / 下载 / 音效）
  *
  * 每一项都可缺省：缺省 = 这一项不参与同步（恢复时保持本机值）。这样以后删掉某一项
- * 也不会让老文件失效。
+ * 也不会让老文件失效；v1 老文件里只有前 17 项，新字段缺省即可。
+ *
+ * 有意不同步的：WebDAV 账号 / 密码（安全）、QQ 音乐登录态（凭据）、下载目录 URI
+ * （本机路径）、深浅模式 colorMode（跟随系统，且应用需要 context）、听歌识曲来源
+ * （设备能力）。这些在 SyncSettingsView 的说明里也写清楚。
  */
 export interface ConfigSyncSettings {
+  // ---- 播放（v1 既有） ----
   quality?: string;
   extendQuality?: boolean;
   extendQualityType?: string;
@@ -107,6 +155,48 @@ export interface ConfigSyncSettings {
   playerMotion?: string;
   defaultSource?: string;
   autoSourceSwitch?: boolean;
+  // ---- 外观（v2 新增；colorMode 不同步，理由见上） ----
+  materialLevel?: number;
+  coverRadius?: number;
+  followHand?: boolean;
+  // ---- 听书（v2 新增） ----
+  hideListenTab?: boolean;
+  bookSpeed?: number;
+  bookSkipIntroSec?: number;
+  bookSkipOutroSec?: number;
+  // ---- 推荐 / 下载（v2 新增） ----
+  recommendSource?: string;
+  downloadQuality?: string;
+  downloadNameFormat?: string;
+  downloadMarkQuality?: boolean;
+  // ---- 音效 EQ（v2 新增，用户明确要求纳入同步） ----
+  eqEnabled?: boolean;
+  eqPreset?: string;
+  eqGains?: number[];
+}
+
+/**
+ * 文件里的一条听歌流水（一次「听这首歌」的经历）
+ *
+ * 只搬「歌 + 时间 + 时长」：ListenLog 的记录按「歌名 + 歌手」认歌（songKey），
+ * 不带设备侧 id。这样两台设备的同一首歌会正确合并成一条流水，回响与最近播放
+ * 都由它重建。
+ */
+export interface ConfigSyncHistoryRecord {
+  name: string;
+  singer: string;
+  /** 开播时刻（毫秒时间戳）；0 = 旧版历史（无时间） */
+  startedAt: number;
+  /** 实际听了多久（毫秒） */
+  playedMs: number;
+  /** 播放时 AVPlayer 报的真实总时长（毫秒，0 = 未知） */
+  durationMs: number;
+}
+
+/** 听歌流水：歌曲元数据去重（同 ListenLog 的 songs 字典），records 新的在前 */
+export interface ConfigSyncHistory {
+  songs: ConfigSyncSong[];
+  records: ConfigSyncHistoryRecord[];
 }
 
 /** 文件顶层结构 */
@@ -119,6 +209,15 @@ export interface ConfigSyncFile {
   sourceDevice?: string;
   playlists: ConfigSyncPlaylist[];
   settings?: ConfigSyncSettings;
+  /**
+   * 收藏（只含在线歌，与歌单同一口径：本地歌 / 云端歌跨设备不成立，跳过）。
+   * v2 新增；v1 文件没有这一项 → 恢复时保持本机收藏不动。
+   */
+  favorites?: ConfigSyncSong[];
+  /** 听歌流水（v2 新增）：播放历史 / 最近播放 / 回响都从它重建 */
+  history?: ConfigSyncHistory;
+  /** 「不感兴趣」名单（v2 新增，规则串与洛雪 dislike 同格式：name@singer） */
+  dislikes?: string[];
 }
 
 /** 本地快照（文件 + 界面上要报的计数） */
@@ -126,6 +225,8 @@ export interface ConfigSnapshot {
   file: ConfigSyncFile;
   playlists: number;
   songs: number;
+  favorites: number;
+  history: number;
   /** 本地歌 / 云端歌 / 缺元数据的歌：不会进文件，恢复端要能说明 */
   skippedSongs: number;
 }
@@ -143,16 +244,24 @@ export interface ConfigMergeOutcome {
   skippedSongs: number;
   renamed: number;
   emptyPlaylists: number;
+  /** 并入收藏的新歌数 */
+  favorites: number;
+  /** 并入的听歌流水条数 */
+  history: number;
+  /** 并入的「不感兴趣」规则数 */
+  dislikes: number;
 }
 
 // ---------------------------------------------------------------- 本地 -> 文件
 
 /**
- * 把本机歌单 + 播放设置打成一个配置快照
+ * 把本机歌单 + 收藏 + 听歌流水 + 不感兴趣 + 个性化设置打成一个配置快照
  *
- * 只导出**用户歌单**：内置的「我的收藏」在协议上是 loveList，LocalLibrary 没有对外的
- * 「往收藏里加一首」入口（addMusicToPlaylist 只认 userList），硬塞会写坏收藏的覆盖语义，
- * 所以这一版不碰它 —— 界面文案里写清楚（收藏 / 试听列表仍走洛雪同步或歌单导出）。
+ * 跨设备只搬「在线歌 + 与设备无关的数据」：
+ *   - 歌单 / 收藏里属于本地歌（本机 URI）或云端歌（自己服务器路径）的条目跳过，计数如实报；
+ *   - 听歌流水只搬歌名+歌手+时间+时长；播放历史 / 最近播放 / 回响都由它重建；
+ *   - 设置里有意的例外：WebDAV 账号密码、QQ 登录态、下载目录、深浅模式、听歌识曲来源
+ *     —— 都是凭据 / 本机路径 / 系统级能力，换了设备不该照搬。
  */
 export function buildConfigSnapshot(deviceName: string): ConfigSnapshot {
   const library: LocalLibrary = LocalLibrary.getInstance();
@@ -178,6 +287,33 @@ export function buildConfigSnapshot(deviceName: string): ConfigSnapshot {
     playlists.push({ name: name, songs: kept });
     songs += kept.length;
   }
+  // 收藏：与歌单同一口径，只搬在线歌（本地歌 / 云端歌跨设备不成立）
+  const favorites: ConfigSyncSong[] = [];
+  for (const item of library.favoriteSongs()) {
+    if (favorites.length >= CONFIG_SYNC_FAVORITES_MAX) {
+      break;
+    }
+    const song: ConfigSyncSong | null = configSongOf(item);
+    if (song !== null) {
+      favorites.push(song);
+    }
+  }
+  /**
+   * 听歌流水：播放历史 / 最近播放 / 回响三处都由 ListenLog 这一份流水重建，
+   * 所以跨设备搬它就够了（不需要另存「最近播放」列表）。
+   */
+  const history: ConfigSyncHistory = historyOf(ListenLog.getInstance().exportHistory(CONFIG_SYNC_HISTORY_MAX));
+  // 「不感兴趣」名单：规则串（name@singer，与洛雪 dislike 同格式）
+  const dislikes: string[] = [];
+  for (const rule of library.dislikeRuleList()) {
+    if (dislikes.length >= CONFIG_SYNC_DISLIKE_MAX) {
+      break;
+    }
+    const trimmed: string = rule.trim();
+    if (trimmed.length > 0) {
+      dislikes.push(trimmed);
+    }
+  }
   const file: ConfigSyncFile = {
     format: CONFIG_SYNC_FORMAT,
     version: CONFIG_SYNC_VERSION,
@@ -185,14 +321,106 @@ export function buildConfigSnapshot(deviceName: string): ConfigSnapshot {
     sourceDevice: deviceName,
     playlists: playlists,
     settings: captureSettings(),
+    favorites: favorites,
+    history: history,
+    dislikes: dislikes,
   };
-  return { file: file, playlists: playlists.length, songs: songs, skippedSongs: skipped };
+  return {
+    file: file,
+    playlists: playlists.length,
+    songs: songs,
+    favorites: favorites.length,
+    history: history.records.length,
+    skippedSongs: skipped,
+  };
+}
+
+/**
+ * ListenLog 的导出包 -> 文件里的听歌流水
+ *
+ * 歌曲元数据单独去重放（与 ListenLog 的 songs 字典同构），记录只引用「歌名 + 歌手」。
+ * 记录里的名字 / 歌手直接从 songKey 拆（songKey = name + \u0001 + singer）——
+ * 不依赖歌曲字典顺序，坏 key 直接跳过。
+ */
+function historyOf(exported: ListenHistoryExport): ConfigSyncHistory {
+  const songs: ConfigSyncSong[] = [];
+  // 留下的歌才允许留记录：本地歌 / 云端歌的记录会随歌曲一起被剔除（见 configHistorySongOf）
+  const kept: Set<string> = new Set<string>();
+  for (const song of exported.songs) {
+    const one: ConfigSyncSong | null = configHistorySongOf(song);
+    if (one !== null) {
+      songs.push(one);
+      kept.add(`${one.name}\u0001${one.singer}`);
+    }
+  }
+  const records: ConfigSyncHistoryRecord[] = [];
+  for (const record of exported.records) {
+    const at: number = record.songKey.indexOf('\u0001');
+    if (at <= 0) {
+      continue;
+    }
+    const name: string = record.songKey.substring(0, at);
+    const singer: string = record.songKey.substring(at + 1);
+    if (name.length === 0 || !kept.has(record.songKey)) {
+      continue;
+    }
+    records.push({
+      name: name,
+      singer: singer,
+      startedAt: record.startedAt,
+      playedMs: record.playedMs,
+      durationMs: record.durationMs,
+    });
+  }
+  return { songs: songs, records: records };
+}
+
+/**
+ * ListenLog 的一首歌 -> 文件条目
+ *
+ * ListenSong 本来就是「播放当时的快照」，字段够重建；没有平台 songmid 时用
+ * listenItemId 的兜底 id（source + 歌名 + 歌手），保证 sanitize 的「songId 非空」成立。
+ * 流水恢复不需要 musicInfoJson（它只影响「历史里一键续播」要不要重新搜一次）。
+ */
+function configHistorySongOf(song: ListenSong): ConfigSyncSong | null {
+  if (song.name.length === 0 || song.source.length === 0) {
+    return null;
+  }
+  // 与歌单同一口径：本地歌（本机 URI）/ 云端歌（自己服务器路径）换设备不成立。
+  // 不滤的话，另一台设备的「最近播放」里会多出一堆点不开的幽灵记录。
+  if (song.source === LOCAL_SOURCE || song.source === WEBDAV_SOURCE) {
+    return null;
+  }
+  const out: ConfigSyncSong = {
+    name: song.name,
+    singer: song.singer,
+    source: song.source,
+    songId: song.id.length > 0 ? song.id : listenItemId(song),
+  };
+  if (song.quality.length > 0) {
+    out.quality = song.quality;
+  }
+  if (song.interval.length > 0) {
+    out.interval = song.interval;
+  }
+  if (song.albumName.length > 0) {
+    out.albumName = song.albumName;
+  }
+  if (song.coverUrl.length > 0) {
+    out.picUrl = song.coverUrl;
+  }
+  return out;
 }
 
 /** 当前播放设置 -> 文件里的设置项（全部显式写出，方便对端判断「这一项要恢复」） */
 export function captureSettings(): ConfigSyncSettings {
   const settings = PlaySettings.getInstance();
-  return {
+  const appearance = AppearanceSettings.getInstance();
+  const book = BookPlaySettings.getInstance();
+  const download = DownloadSettings.getInstance();
+  const effect = AudioEffectSettings.getInstance();
+  const out: ConfigSyncSettings = {
+    // 播放
     quality: settings.getQuality(),
     extendQuality: settings.isExtendQuality(),
     extendQualityType: settings.getExtendQualityType(),
@@ -210,7 +438,36 @@ export function captureSettings(): ConfigSyncSettings {
     playerMotion: settings.getPlayerMotionLevel(),
     defaultSource: settings.getDefaultSource(),
     autoSourceSwitch: settings.isAutoSourceSwitch(),
+    // 外观（colorMode 不同步：跟随系统，且应用需要 context）
+    materialLevel: appearance.getMaterialLevel(),
+    coverRadius: appearance.getCoverRadius(),
+    followHand: appearance.isFollowHand(),
+    // 听书页签
+    hideListenTab: ListenSettings.getInstance().isHideTab(),
+    // 推荐 / 下载
+    recommendSource: RecommendSettings.getInstance().getSource(),
+    downloadQuality: download.getQuality(),
+    downloadNameFormat: download.getNameFormat(),
+    downloadMarkQuality: download.isMarkQuality(),
+    // 音效（EQ）
+    eqEnabled: effect.isEnabled(),
+    eqPreset: effect.getPreset(),
+    eqGains: effect.getGains().slice(),
   };
+  /**
+   * 听书的三个值只在 BookPlaySettings 初始化之后才导出。
+   *
+   * 它不像其它设置那样在 EntryAbility.onCreate 里 init —— 要等听书沙箱挂载时
+   * （BookSandboxHost.aboutToAppear → BookEngine.prepare）才读盘。启动瞬间的自动同步
+   * 如果早于这一刻，getter 会返回默认值（1x / 0 / 0），等于把用户的 1.5 倍速当成 1x 传上去。
+   * 没初始化就不带这三项：缺省 = 对端保持本机值，宁可少同步一次也不错传。
+   */
+  if (book.isInited()) {
+    out.bookSpeed = book.getSpeed();
+    out.bookSkipIntroSec = book.getSkipIntroSec();
+    out.bookSkipOutroSec = book.getSkipOutroSec();
+  }
+  return out;
 }
 
 /** 一条 SongItem -> 文件条目；不能跨设备迁移的返回 null（判据同 PlaylistPort.exportSongOf） */
@@ -354,7 +611,100 @@ export function parseConfigFile(text: string): ConfigParseResult {
   if (data.settings !== undefined && data.settings !== null) {
     file.settings = sanitizeSettings(data.settings);
   }
+  // ---- v2 新增：收藏 / 听歌流水 / 不感兴趣（老文件没有这些字段，保持缺省） ----
+  if (Array.isArray(data.favorites)) {
+    const list: ConfigSyncSong[] = data.favorites;
+    const favorites: ConfigSyncSong[] = [];
+    for (const song of list) {
+      if (favorites.length >= CONFIG_SYNC_FAVORITES_MAX) {
+        break;
+      }
+      const clean: ConfigSyncSong | null = sanitizeSong(song);
+      if (clean !== null) {
+        favorites.push(clean);
+      }
+    }
+    file.favorites = favorites;
+  }
+  if (data.history !== undefined && data.history !== null) {
+    const history: ConfigSyncHistory = sanitizeHistory(data.history);
+    if (history.songs.length > 0 || history.records.length > 0) {
+      file.history = history;
+    }
+  }
+  if (Array.isArray(data.dislikes)) {
+    const list: string[] = data.dislikes;
+    const rules: string[] = [];
+    for (const raw of list) {
+      if (rules.length >= CONFIG_SYNC_DISLIKE_MAX) {
+        break;
+      }
+      if (typeof raw === 'string') {
+        const rule: string = raw.trim();
+        if (rule.length > 0) {
+          rules.push(rule);
+        }
+      }
+    }
+    if (rules.length > 0) {
+      file.dislikes = rules;
+    }
+  }
   return { error: '', file: file };
+}
+
+/**
+ * 收一份听歌流水
+ *
+ * 与歌曲、设置同样的口径：类型不对、数值不合法、缺少歌名/歌手的条目直接丢，
+ * 绝不让一个坏字段把恢复弄崩。记录数按 CONFIG_SYNC_HISTORY_MAX 截断（文件来自别处，
+ * 上限在解析端也要守一次）。
+ */
+function sanitizeHistory(input: ConfigSyncHistory): ConfigSyncHistory {
+  const songs: ConfigSyncSong[] = [];
+  if (input.songs !== undefined && input.songs !== null && Array.isArray(input.songs)) {
+    for (const raw of input.songs) {
+      if (songs.length >= CONFIG_SYNC_HISTORY_MAX) {
+        break;
+      }
+      const song: ConfigSyncSong | null = sanitizeSong(raw);
+      if (song !== null) {
+        songs.push(song);
+      }
+    }
+  }
+  const records: ConfigSyncHistoryRecord[] = [];
+  if (input.records !== undefined && input.records !== null && Array.isArray(input.records)) {
+    for (const raw of input.records) {
+      if (records.length >= CONFIG_SYNC_HISTORY_MAX) {
+        break;
+      }
+      if (raw === null || raw === undefined) {
+        continue;
+      }
+      const name: string = typeof raw.name === 'string' ? raw.name.trim() : '';
+      const singer: string = typeof raw.singer === 'string' ? raw.singer.trim() : '';
+      if (name.length === 0) {
+        continue;
+      }
+      const startedAt: number = sanitizeMs(raw.startedAt);
+      const playedMs: number = sanitizeMs(raw.playedMs);
+      const durationMs: number = sanitizeMs(raw.durationMs);
+      records.push({
+        name: name,
+        singer: singer,
+        startedAt: startedAt,
+        playedMs: playedMs,
+        durationMs: durationMs,
+      });
+    }
+  }
+  return { songs: songs, records: records };
+}
+
+/** 毫秒时间/时长：非有限数或负数一律归 0（坏记录不该让整个恢复失败） */
+function sanitizeMs(value: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /** 把一条歌洗成可信结构（同 PlaylistPort.sanitizeSong） */
@@ -487,7 +837,99 @@ function sanitizeSettings(input: ConfigSyncSettings): ConfigSyncSettings {
   if (typeof input.autoSourceSwitch === 'boolean') {
     out.autoSourceSwitch = input.autoSourceSwitch;
   }
+  // ---- v2：外观 ----
+  // colorMode 不同步（跟随系统 + 应用需 context），这里没有对应字段
+  if (typeof input.materialLevel === 'number' && Number.isFinite(input.materialLevel)) {
+    const level: number = Math.round(input.materialLevel);
+    // MATERIAL_LEVEL_MAX = 3（0 跟随系统 / 1 弱 / 2 均衡 / 3 强）
+    if (level >= 0 && level <= 3) {
+      out.materialLevel = level;
+    }
+  }
+  if (typeof input.coverRadius === 'number' && Number.isFinite(input.coverRadius)) {
+    const radius: number = Math.round(input.coverRadius);
+    // COVER_RADIUS_MIN/MAX = 0..40 vp
+    if (radius >= 0 && radius <= 40) {
+      out.coverRadius = radius;
+    }
+  }
+  if (typeof input.followHand === 'boolean') {
+    out.followHand = input.followHand;
+  }
+  // ---- v2：听书 ----
+  if (typeof input.hideListenTab === 'boolean') {
+    out.hideListenTab = input.hideListenTab;
+  }
+  if (typeof input.bookSpeed === 'number' && Number.isFinite(input.bookSpeed)) {
+    // BOOK_SPEED_CHOICES：0.5 / 0.75 / 1 / 1.25 / 1.5 / 2，只认这几档
+    const choices: number[] = [0.5, 0.75, 1, 1.25, 1.5, 2];
+    if (choices.includes(input.bookSpeed)) {
+      out.bookSpeed = input.bookSpeed;
+    }
+  }
+  if (typeof input.bookSkipIntroSec === 'number' && Number.isFinite(input.bookSkipIntroSec)) {
+    const sec: number = Math.floor(input.bookSkipIntroSec);
+    if (sec >= 0 && sec <= 600) {
+      out.bookSkipIntroSec = sec;
+    }
+  }
+  if (typeof input.bookSkipOutroSec === 'number' && Number.isFinite(input.bookSkipOutroSec)) {
+    const sec: number = Math.floor(input.bookSkipOutroSec);
+    if (sec >= 0 && sec <= 600) {
+      out.bookSkipOutroSec = sec;
+    }
+  }
+  // ---- v2：推荐 / 下载 ----
+  if (typeof input.recommendSource === 'string' && input.recommendSource.length > 0) {
+    out.recommendSource = input.recommendSource;
+  }
+  if (typeof input.downloadQuality === 'string' && DOWNLOAD_QUALITY_VALUES.includes(input.downloadQuality)) {
+    out.downloadQuality = input.downloadQuality;
+  }
+  if (typeof input.downloadNameFormat === 'string' && NAME_FORMATS.includes(input.downloadNameFormat)) {
+    out.downloadNameFormat = input.downloadNameFormat;
+  }
+  if (typeof input.downloadMarkQuality === 'boolean') {
+    out.downloadMarkQuality = input.downloadMarkQuality;
+  }
+  // ---- v2：音效（EQ） ----
+  if (typeof input.eqEnabled === 'boolean') {
+    out.eqEnabled = input.eqEnabled;
+  }
+  if (typeof input.eqPreset === 'string' && isKnownEqPreset(input.eqPreset)) {
+    out.eqPreset = input.eqPreset;
+  }
+  if (Array.isArray(input.eqGains)) {
+    const list: number[] = input.eqGains;
+    if (list.length === 10) {
+      const gains: number[] = [];
+      let valid: boolean = true;
+      for (const raw of list) {
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+          valid = false;
+          break;
+        }
+        gains.push(Math.min(EQ_GAIN_MAX, Math.max(EQ_GAIN_MIN, raw)));
+      }
+      if (valid) {
+        out.eqGains = gains;
+      }
+    }
+  }
   return out;
+}
+
+/** 预设键：内置九套 + 「自定义」（与 AudioEffectSettings 的判定一致） */
+function isKnownEqPreset(key: string): boolean {
+  if (key === 'custom') {
+    return true;
+  }
+  for (const preset of EQ_PRESETS) {
+    if (preset.key === key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -567,6 +1009,66 @@ export function applySettings(settings: ConfigSyncSettings): number {
     target.setAutoSourceSwitch(settings.autoSourceSwitch);
     applied++;
   }
+  // ---- v2：外观（setter 自己会落盘 + 刷 AppStorage） ----
+  const appearance = AppearanceSettings.getInstance();
+  if (settings.materialLevel !== undefined) {
+    appearance.setMaterialLevel(settings.materialLevel);
+    applied++;
+  }
+  if (settings.coverRadius !== undefined) {
+    appearance.setCoverRadius(settings.coverRadius, true);
+    applied++;
+  }
+  if (settings.followHand !== undefined) {
+    appearance.setFollowHand(settings.followHand);
+    applied++;
+  }
+  // ---- v2：听书 ----
+  if (settings.hideListenTab !== undefined) {
+    ListenSettings.getInstance().setHideTab(settings.hideListenTab);
+    applied++;
+  }
+  const book = BookPlaySettings.getInstance();
+  if (settings.bookSpeed !== undefined) {
+    book.setSpeed(settings.bookSpeed);
+    applied++;
+  }
+  if (settings.bookSkipIntroSec !== undefined) {
+    book.setSkipIntroSec(settings.bookSkipIntroSec);
+    applied++;
+  }
+  if (settings.bookSkipOutroSec !== undefined) {
+    book.setSkipOutroSec(settings.bookSkipOutroSec);
+    applied++;
+  }
+  // ---- v2：推荐 / 下载 ----
+  if (settings.recommendSource !== undefined) {
+    RecommendSettings.getInstance().setSource(settings.recommendSource);
+    applied++;
+  }
+  const download = DownloadSettings.getInstance();
+  if (settings.downloadQuality !== undefined) {
+    download.setQuality(settings.downloadQuality);
+    applied++;
+  }
+  if (settings.downloadNameFormat !== undefined) {
+    download.setNameFormat(settings.downloadNameFormat);
+    applied++;
+  }
+  if (settings.downloadMarkQuality !== undefined) {
+    download.setMarkQuality(settings.downloadMarkQuality);
+    applied++;
+  }
+  // ---- v2：音效（EQ，用户明确要求纳入同步） ----
+  if (settings.eqEnabled !== undefined || settings.eqPreset !== undefined || settings.eqGains !== undefined) {
+    const effect = AudioEffectSettings.getInstance();
+    // 走 applySynced：落盘 + 刷 AppStorage，但**不触发重播**（同步恢复不该打断正在播的歌）
+    effect.applySynced(
+      settings.eqEnabled !== undefined ? settings.eqEnabled : effect.isEnabled(),
+      settings.eqPreset !== undefined ? settings.eqPreset : effect.getPreset(),
+      settings.eqGains !== undefined ? settings.eqGains : effect.getGains());
+    applied++;
+  }
   return applied;
 }
 
@@ -628,7 +1130,132 @@ export function mergePlaylists(playlists: ConfigSyncPlaylist[]): ConfigMergeOutc
     skippedSongs: skipped,
     renamed: renamed,
     emptyPlaylists: empty,
+    // 收藏 / 流水 / 不感兴趣由 mergeFavorites / mergeHistory / mergeDislikes 单独合，不在这里
+    favorites: 0,
+    history: 0,
+    dislikes: 0,
   };
+}
+
+/**
+ * 把文件里的收藏并入本机收藏（合并，不是替换）
+ *
+ * 认歌口径与歌单完全一致（先 source+songId，再歌名+歌手，都没有才按文件元数据重建）；
+ * addFavorites 自己按 id 去重，所以恢复两次也不会重复收藏。
+ * @returns 真正新增的首数
+ */
+export function mergeFavorites(songs: ConfigSyncSong[]): number {
+  if (songs.length === 0) {
+    return 0;
+  }
+  const library: LocalLibrary = LocalLibrary.getInstance();
+  const index: Map<string, SongItem> = buildMatchIndex(library);
+  const resolved: SongItem[] = [];
+  for (const raw of songs) {
+    const song: SongItem | null = resolveSong(raw, index);
+    if (song !== null) {
+      resolved.push(song);
+    }
+  }
+  if (resolved.length === 0) {
+    return 0;
+  }
+  return library.addFavorites(resolved);
+}
+
+/**
+ * 把文件里的听歌流水并进本机
+ *
+ * 去重（同一首歌同一开播时刻只算一次）、排序与条数上限都在 ListenLog.mergeRemote 里做；
+ * 这里只负责把文件结构还原成 ListenLog 的 songs/records。
+ * @returns 真正新增的流水条数
+ */
+export function mergeHistory(history: ConfigSyncHistory | undefined): number {
+  if (history === undefined) {
+    return 0;
+  }
+  const songs: ListenSong[] = [];
+  for (const raw of history.songs) {
+    const song: ListenSong | null = listenSongOf(raw);
+    if (song !== null) {
+      songs.push(song);
+    }
+  }
+  const records: ListenRecord[] = [];
+  for (const one of history.records) {
+    if (one.name.length === 0) {
+      continue;
+    }
+    records.push({
+      startedAt: one.startedAt,
+      playedMs: one.playedMs,
+      songKey: `${one.name}\u0001${one.singer}`,
+      durationMs: one.durationMs,
+    });
+  }
+  if (songs.length === 0 || records.length === 0) {
+    return 0;
+  }
+  return ListenLog.getInstance().mergeRemote({ songs: songs, records: records });
+}
+
+/**
+ * 文件条目 -> ListenSong（流水恢复用）
+ *
+ * id / musicInfoJson 是设备侧的播放快照：远端带来的 id 在本机没有意义，留空即可
+ * （历史行删除按 listenItemId 兜底认人；一键续播会重新搜一次）。
+ */
+function listenSongOf(raw: ConfigSyncSong): ListenSong | null {
+  if (raw.name.length === 0 || raw.source.length === 0) {
+    return null;
+  }
+  const interval: string = raw.interval !== undefined ? raw.interval : '';
+  return {
+    id: '',
+    name: raw.name,
+    singer: raw.singer !== undefined ? raw.singer : '',
+    coverUrl: raw.picUrl !== undefined ? raw.picUrl : '',
+    art: false,
+    source: raw.source,
+    quality: raw.quality !== undefined ? raw.quality : '',
+    interval: interval,
+    musicInfoJson: '',
+    albumName: raw.albumName !== undefined ? raw.albumName : '',
+    durationMs: intervalMs(interval),
+  };
+}
+
+/**
+ * 把文件里的「不感兴趣」规则并进本机（并集）
+ *
+ * 规则串格式与洛雪 dislike 完全一致（name@singer、每行一条、normalize 会小写去重）。
+ * 落盘时 emitRemote=false：这是配置同步，不再向洛雪服务端上行一次。
+ * @returns 真正新增的规则数
+ */
+export function mergeDislikes(rules: string[]): number {
+  if (rules.length === 0) {
+    return 0;
+  }
+  const library: LocalLibrary = LocalLibrary.getInstance();
+  const current: string = library.dislikeRules();
+  const merged: string = normalizeDislikeRules(`${current}\n${rules.join('\n')}`);
+  if (merged === current) {
+    return 0;
+  }
+  const before: number = splitDislikeRules(current).length;
+  const after: number = splitDislikeRules(merged).length;
+  library.setDislikeRules(merged, false);
+  return Math.max(0, after - before);
+}
+
+function splitDislikeRules(raw: string): string[] {
+  const out: string[] = [];
+  for (const line of raw.split('\n')) {
+    if (line.trim().length > 0) {
+      out.push(line.trim());
+    }
+  }
+  return out;
 }
 
 /** 本机已有歌曲的匹配索引：source+songId 与 歌名+歌手 两套键（同 PlaylistPort.buildMatchIndex） */
@@ -840,13 +1467,23 @@ function uniqueName(base: string, taken: Set<string>): string {
 
 // ---------------------------------------------------------------- 判断与展示
 
-/** 文件里一共多少首歌 */
+/** 文件里一共多少首歌（歌单里的，不含收藏与流水） */
 export function countSongs(file: ConfigSyncFile): number {
   let total: number = 0;
   for (const playlist of file.playlists) {
     total += playlist.songs.length;
   }
   return total;
+}
+
+/** 文件里带了多少首收藏（v1 老文件没有这一项 → 0） */
+export function countFavorites(file: ConfigSyncFile): number {
+  return file.favorites === undefined ? 0 : file.favorites.length;
+}
+
+/** 文件里带了多少条听歌流水（v1 老文件没有这一项 → 0） */
+export function countHistory(file: ConfigSyncFile): number {
+  return file.history === undefined ? 0 : file.history.records.length;
 }
 
 /**
@@ -863,6 +1500,22 @@ export function fingerprintOf(file: ConfigSyncFile): string {
     parts.push(`P\u0001${playlist.name}`);
     for (const song of playlist.songs) {
       parts.push(`S\u0001${song.source}\u0001${song.songId}\u0001${song.name}\u0001${song.singer}`);
+    }
+  }
+  // v2：收藏 / 流水 / 不感兴趣也要进指纹 —— 否则「只改了收藏」会被判成没变化，永远不上传
+  if (file.favorites !== undefined) {
+    for (const song of file.favorites) {
+      parts.push(`F\u0001${song.source}\u0001${song.songId}\u0001${song.name}\u0001${song.singer}`);
+    }
+  }
+  if (file.history !== undefined) {
+    for (const record of file.history.records) {
+      parts.push(`H\u0001${record.name}\u0001${record.singer}\u0001${record.startedAt}\u0001${record.playedMs}`);
+    }
+  }
+  if (file.dislikes !== undefined) {
+    for (const rule of file.dislikes) {
+      parts.push(`D\u0001${rule}`);
     }
   }
   let settings: ConfigSyncSettings = {};
@@ -893,7 +1546,26 @@ function settingText(settings: ConfigSyncSettings): string {
   cells.push(textOf(settings.playerMotion));
   cells.push(textOf(settings.defaultSource));
   cells.push(boolOf(settings.autoSourceSwitch));
+  // v2 新增项（未设置的写空，保持指纹稳定）
+  cells.push(numOf(settings.materialLevel));
+  cells.push(numOf(settings.coverRadius));
+  cells.push(boolOf(settings.followHand));
+  cells.push(boolOf(settings.hideListenTab));
+  cells.push(numOf(settings.bookSpeed));
+  cells.push(numOf(settings.bookSkipIntroSec));
+  cells.push(numOf(settings.bookSkipOutroSec));
+  cells.push(textOf(settings.recommendSource));
+  cells.push(textOf(settings.downloadQuality));
+  cells.push(textOf(settings.downloadNameFormat));
+  cells.push(boolOf(settings.downloadMarkQuality));
+  cells.push(boolOf(settings.eqEnabled));
+  cells.push(textOf(settings.eqPreset));
+  cells.push(settings.eqGains === undefined ? '' : settings.eqGains.join(','));
   return cells.join('\u0001');
+}
+
+function numOf(value: number | undefined): string {
+  return value === undefined ? '' : `${value}`;
 }
 
 function textOf(value: string | undefined): string {
@@ -951,10 +1623,46 @@ export function describeSettings(settings: ConfigSyncSettings | undefined): stri
   if (settings.desktopLyric !== undefined) {
     parts.push(`桌面歌词${settings.desktopLyric ? '开' : '关'}`);
   }
+  // v2 新增项：只在文件带了的时候提一句，避免摘要过长
+  if (settings.eqEnabled !== undefined) {
+    parts.push(`音效${settings.eqEnabled ? '开' : '关'}${eqLabel(settings.eqPreset)}`);
+  }
+  if (settings.materialLevel !== undefined || settings.coverRadius !== undefined) {
+    parts.push('外观设置');
+  }
+  if (settings.hideListenTab !== undefined) {
+    parts.push(`听书页签${settings.hideListenTab ? '隐藏' : '显示'}`);
+  }
+  if (settings.bookSpeed !== undefined) {
+    parts.push(`听书倍速 ${settings.bookSpeed}x`);
+  }
+  if (settings.downloadQuality !== undefined) {
+    parts.push(`下载音质 ${
+      settings.downloadQuality.length > 0 ? qualityLabel(settings.downloadQuality) : '跟随播放'}`);
+  }
+  if (settings.recommendSource !== undefined) {
+    parts.push('推荐来源');
+  }
   if (parts.length === 0) {
     return '文件里没有带设置';
   }
   return parts.join(' · ');
+}
+
+/** EQ 预设名（自定义 / 原声 / 预设标签；未知就只写「音效开」） */
+function eqLabel(preset: string | undefined): string {
+  if (preset === undefined) {
+    return '';
+  }
+  if (preset === 'custom') {
+    return '（自定义）';
+  }
+  for (const one of EQ_PRESETS) {
+    if (one.key === preset) {
+      return `（${one.label}）`;
+    }
+  }
+  return '';
 }
 
 function qualityLabel(value: string): string {
@@ -978,7 +1686,9 @@ export function buildFolderUrl(base: string, dir: string): string {
   const trimmedBase: string = stripTrailingSlashes(base.trim());
   const trimmedDir: string = dir.trim();
   if (trimmedDir.length === 0) {
-    return `${trimmedBase}/${CONFIG_SYNC_DEFAULT_DIR}`;
+    // 默认目录这一支也要折叠斜杠：服务器地址里手打了 //（历史配置里很常见）时，
+    // 否则 MKCOL 会打到 /dav//listen-config，坚果云回 409 —— 另两支都过了这个收口。
+    return collapseSlashes(`${trimmedBase}/${CONFIG_SYNC_DEFAULT_DIR}`);
   }
   const lower: string = trimmedDir.toLowerCase();
   if (lower.startsWith('http://') || lower.startsWith('https://')) {

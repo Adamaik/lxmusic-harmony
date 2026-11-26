@@ -298,13 +298,16 @@ export struct SyncSettingsView {
       const target: ConfigSyncFile = remoteFile;
       const when: string = describeStamp(preview.exportedAt);
       const newer: string = preview.newer ? '（比本机上次同步的更新）' : '';
-      this.davStatus = `网盘上有一份配置：${preview.playlists} 个歌单、${preview.songs} 首歌`;
+      this.davStatus = `网盘上有一份配置：${preview.playlists} 个歌单、${preview.songs} 首歌`
+        + `、${preview.favorites} 首收藏、${preview.history} 条记录`;
       this.getUIContext().showAlertDialog({
         title: '从网盘恢复配置',
         message: `导出时间：${when}${newer}\n\n`
           + `将导入 ${preview.playlists} 个歌单、共 ${preview.songs} 首歌曲\n`
+          + `收藏 ${preview.favorites} 首、听歌记录 ${preview.history} 条（合并，不删本机已有）\n`
           + `设置：${preview.settingsText}\n\n`
-          + '重名歌单会加「 (2)」后缀，本机现有歌单不会被覆盖；本地音乐与云端音乐不会随配置迁移。',
+          + '重名歌单会加「 (2)」后缀，本机现有歌单不会被覆盖；' +
+          '本地音乐与云端音乐不会随配置迁移。',
         autoCancel: true,
         buttons: [
           { value: '取消', action: () => {
@@ -750,7 +753,7 @@ export struct SyncSettingsView {
             .fontColor(C_TEXT)
             .width('100%')
             .textAlign(TextAlign.Start)
-          Text(this.davAuto ? '自动同步：启动 / 退出各试一次' : '换手机时把歌单和设置搬过去')
+          Text(this.davAuto ? '自动同步：启动 / 退出各试一次' : '换手机时把歌单、收藏、记录和设置搬过去')
             .fontSize(F_SUB)
             .fontColor(C_TEXT_WEAK)
             .width('100%')
@@ -936,14 +939,17 @@ export struct SyncSettingsView {
           .fontColor(C_TEXT_SUB)
           .width('100%')
           .textAlign(TextAlign.Start)
-        Text('同步内容是歌单（含曲目）与播放设置（音质 / 歌词 / 动效等）；本地音乐和云端音乐'
-          + '的歌不会跟着走 —— 换设备后它们的路径不成立。收藏与试听列表仍走上面的洛雪同步。')
+        Text('同步内容是歌单（含曲目）、收藏、最近播放与听歌记录（回响会跟着重建）、'
+          + '不感兴趣名单，以及播放 / 外观 / 听书 / 推荐 / 下载 / 音效等设置。'
+          + '本地音乐和云端音乐的歌不会跟着走 —— 换设备后它们的路径不成立；'
+          + '网盘账号、QQ 登录态、下载目录这类本机凭据与路径也不同步。')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
           .width('100%')
           .textAlign(TextAlign.Start)
         Text('自动同步失败不会打扰你（下次启动再试）；网盘上有更新的配置时只提示、'
-          + '不会覆盖本机，点「从网盘恢复」并确认后才写入，重名歌单加后缀。')
+          + '不会覆盖本机，点「从网盘恢复」并确认后才写入，重名歌单加后缀。'
+          + '收藏、最近播放与听歌记录按并集合并 —— 本机多出来的不会被删。')
           .fontSize(F_SUB)
           .fontColor(C_TEXT_WEAK)
           .width('100%')

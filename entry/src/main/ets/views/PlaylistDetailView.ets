@@ -93,7 +93,21 @@ export struct PlaylistDetailView {
   /** 窗口宽度（vp）：与壳层同一份量，用来算悬浮栏的左右边距与「铺满」宽度（0 = 还没量到） */
   @Prop windowWidth: number = 0;
   /** 页面主滚动容器，由壳层传进来（HDS 标题栏的滚动渐变要绑它，见 Index.titleBarOptions） */
-  scroller: Scroller = new Scroller();
+  /**
+   * 列表滚动控制器。
+   *
+   * 必须是 **ListScroller** 而不是 Scroller：整页是一个 ListItemGroup 包所有歌曲行，
+   * 「定位到正在播放那一行」要用分组内滚动 `scrollToItemInGroup`，这个方法只声明在
+   * ListScroller 上（Scroller 没有；用 Scroller 时编译报 property does not exist，
+   * 运行时也只能滚到组头 —— 就是群反馈「定位按钮没用」）。
+   */
+  scroller: ListScroller = new ListScroller();
+  /** 列表可视高度（vp）：定位时用来算「居中」目标 */
+  private listViewportH: number = 0;
+  /** 组头高度（vp）：封面 + 「播放全部」那一块，定位的基准点 */
+  private listHeaderH: number = 0;
+  /** 歌曲行间距（vp，含行间分割线）：定位按「行序号 × 间距」折算位置 */
+  private listRowPitch: number = 0;
   /** 玻璃厚度档位（外观设置）：页内那层悬浮迷你播放条的毛玻璃跟着它变 */
   @StorageLink(K_MATERIAL_LEVEL) materialLevel: number = 0;
   /** 页内迷你播放条的最大宽度：壳层按窗口宽度算好（0 = 窄屏不限，见 ui/Layout.ets） */
@@ -194,9 +208,16 @@ export struct PlaylistDetailView {
     // 这个实例复用时不能一直卡在「正在更新…」而让菜单里那一项点不动
     this.updating = false;
     this.refresh();
-    // 打开就从原歌单对齐一次（有 sourceListId 的导入歌单才做；节流 / 防重入在库里）。
-    // 不 await：页面先按本地数据画出来，网络那一路在后台跑，慢也不会白屏。
-    void this.autoSyncFromSource();
+    /**
+     * 打开歌单**不再自动回源对齐**。
+     *
+     * 产品决定（2026-11-27，群主确认）：歌单跟随源一起更新必须由用户**手动**触发 ——
+     * 自动对齐会在用户不知情时把本地歌单里的歌删掉/换掉（源歌单改版、接口少返、平台下架都会触发），
+     * 音乐丢了找不回来。所以只有「从原歌单更新」那个手动入口会跑这条链路（见 updateFromSource）。
+     *
+     * 原来的自动对齐在这里调 autoSyncFromSource()：打开一次就后台静默对齐（加歌直接落库、
+     * 删歌按 5 条/3% 闸门自动删）。已按上述决定移除；节流表 / 防重入仍保留，手动点按钮照样用。
+     */
   }
 
   private refresh(): void {
@@ -1255,6 +1276,13 @@ export struct PlaylistDetailView {
       this.playAllRow()
     }
     .width('100%')
+    // 记下组头高度：定位滚动按「组头 + 行序号 × 行间距」算目标偏移（见 scrollToCurrent）
+    .onAreaChange((_old: Area, now: Area): void => {
+      const h: number = Number(now.height);
+      if (h > 0) {
+        this.listHeaderH = h;
+      }
+    })
   }
 
   /** 组尾：空歌单 / 搜索无结果的空态 + 给悬浮迷你播放条让位的那一段 */
@@ -1336,6 +1364,16 @@ export struct PlaylistDetailView {
                 }
               }
               .width('100%')
+              // 只量第一行：行间距（含分割线）固定，定位按它折算目标位置（见 scrollToCurrent）
+              .onAreaChange((_old: Area, now: Area): void => {
+                if (index !== 0) {
+                  return;
+                }
+                const h: number = Number(now.height);
+                if (h > 0) {
+                  this.listRowPitch = h;
+                }
+              })
             }
           }, (item: SongItem, index: number) => `${index}_${item.id}`)
         }
@@ -1348,6 +1386,13 @@ export struct PlaylistDetailView {
       .contentStartOffset(this.topInset + 6)
       .layoutWeight(1)
       .width('100%')
+      // 记下可视高度：定位时要减掉半屏让目标行居中
+      .onAreaChange((_old: Area, now: Area): void => {
+        const h: number = Number(now.height);
+        if (h > 0) {
+          this.listViewportH = h;
+        }
+      })
     }
     .width('100%')
     .height('100%')
@@ -1441,11 +1486,12 @@ export struct PlaylistDetailView {
   // ------------------------------------------------------------ 跟随源歌单
 
   /**
-   * 打开歌单时：距上次同步够久、有网，就在后台静默对齐一次
+   * 打开歌单时的自动对齐 —— **已停用（2026-11-27 产品决定）**。
    *
-   * 群反馈（2026-11-20 15:19，CharlotteZero）要的是「打开一次同步一次」（多就加、少就删），
-   * 所以触发点只有 aboutToAppear 这一处：**不做定时器、不做后台轮询** —— 用户不打开歌单
-   * 就不联网，也就不会因为轮询被平台风控。
+   * 群反馈（2026-11-20 15:19，CharlotteZero）当时要的是「打开一次同步一次」（多就加、少就删），
+   * 但那会在用户不知情时改动本地歌单（源歌单改版 / 接口没返回全 / 平台下架都会触发删歌）。
+   * 群主现在明确：歌单跟随源一起更新**必须手动**，防止丢歌。所以这个方法不再被调用，
+   * 只保留说明；真要恢复自动对齐，必须配一个默认关闭的开关并告知风险。
    */
   private async autoSyncFromSource(): Promise<void> {
     if (!this.canUpdateFromSource() || this.updating) {
@@ -1480,8 +1526,9 @@ export struct PlaylistDetailView {
   /**
    * 回源对齐一次（自动与手动共用）
    *
-   * @param manual true = 用户点「从原歌单更新」：过程与结果都要提示；
-   *               false = 打开歌单时的自动对齐：只有真的改了才轻提示一句，失败全静默。
+   * @param manual true = 用户点「从原歌单更新」：过程与结果都要提示，要删的歌先弹窗确认。
+   *               false 只保留给「将来若重新提供自动对齐」的形态：**目前没有调用方** ——
+   *               2026-11-27 起打开歌单不再自动回源（产品决定：跟随源更新必须手动，防止丢歌）。
    *
    * 失败 / 无差异 / 没拉全都不打断浏览：这里的 catch 只写日志，绝不让网络问题变成弹窗。
    */
@@ -1663,25 +1710,35 @@ export struct PlaylistDetailView {
   }
 
   /**
-   * 靶心图标：外圈一道环 + 中间一个点（不依赖系统 symbol 里有没有「靶心」）
+   * 靶心图标：按群里 2026-11-16 看海给的参考图还原
    *
-   * 与参考图同观感：环和点都用主题红，点比环小一圈。
-   */  @Builder
+   * 参考图（QQ 群图 E7B0E517…）里的「旧版」观感是：白色圆钮 + 红色**十字准星**靶心 ——
+   * 一圈环、上下左右四根小刻度、中心一个实心点。之前只画了「环 + 点」，
+   * 少了四根刻度，看起来不像靶心、也被反馈「丑」；这里按参考图补全。
+   */
+  @Builder
   locateButton() {
     Stack({ alignContent: Alignment.Center }) {
+      // 四根准星刻度：贴着环外侧，上下左右各一根
+      Column().width(1.8).height(5).backgroundColor(C_RED).offset({ y: -12.5 })
+      Column().width(1.8).height(5).backgroundColor(C_RED).offset({ y: 12.5 })
+      Column().width(5).height(1.8).backgroundColor(C_RED).offset({ x: -12.5 })
+      Column().width(5).height(1.8).backgroundColor(C_RED).offset({ x: 12.5 })
+      // 外环
       Column()
-        .width(18)
-        .height(18)
-        .borderRadius(9)
+        .width(19)
+        .height(19)
+        .borderRadius(9.5)
         .border({ width: 1.6, color: C_RED })
+      // 中心红点
       Column()
         .width(6)
         .height(6)
         .borderRadius(3)
         .backgroundColor(C_RED)
     }
-    .width(24)
-    .height(24)
+    .width(30)
+    .height(30)
   }
 
   /**
@@ -1697,7 +1754,37 @@ export struct PlaylistDetailView {
     }
     for (let i = 0; i < this.songs.length; i++) {
       if (this.songs[i].id === this.currentId) {
-        this.scroller.scrollToIndex(i, true, ScrollAlign.CENTER);
+        /**
+         * 为什么不用 scrollToItemInGroup：
+         *  - smooth=true：SDK 文档写明「途经的所有条目都会被加载并计入布局」，
+         *    几百首会把几百行（含封面）一次性建出来 —— 真机实测卡约 10 秒（2026-11-27 反馈）；
+         *  - smooth=false：目标行还没被 LazyForEach 创建时算不出位置，**静默失败**
+         *    （日志里没有任何报错，就是不动）。
+         *
+         * 所以改成「测量 + scrollBy」：组头高度 / 行间距 / 可视高度在布局时量好，
+         * 目标绝对偏移 = 组头 + 行序号×行间距 + 半个行高，再减去半屏让它居中。
+         * scrollBy 只改滚动位置，不需要目标行先创建，几百首也不会卡。
+         */
+        const pitch: number = this.listRowPitch;
+        const header: number = this.listHeaderH;
+        const view: number = this.listViewportH;
+        if (pitch > 0 && view > 0) {
+          const rowCenter: number = header + i * pitch + pitch / 2;
+          const target: number = Math.max(0, rowCenter - view / 2);
+          const current: number = this.scroller.currentOffset().yOffset;
+          this.scroller.scrollBy(0, target - current);
+          this.toast(`已定位到「${this.songs[i].name}」`);
+          return;
+        }
+        // 尺寸还没量到（刚打开页面就点）：退回分组内滚动，smooth 必须 true 才能作用于未创建的行
+        try {
+          this.scroller.scrollToItemInGroup(0, i, true, ScrollAlign.CENTER);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'locate current song failed: %{public}s', JSON.stringify(e));
+          this.toast('定位失败，请稍后再试');
+          return;
+        }
+        this.toast(`已定位到「${this.songs[i].name}」`);
         return;
       }
     }
@@ -1774,12 +1861,14 @@ export struct PlaylistDetailView {
           Row() {
             this.locateButton()
           }
-          .width(42)
-          .height(42)
+          .width(44)
+          .height(44)
           .justifyContent(FlexAlign.Center)
-          .borderRadius(21)
+          .borderRadius(22)
           .backgroundColor(C_CARD)
-          .shadow({ radius: 14, color: '#33000000', offsetX: 0, offsetY: 3 })
+          // 参考图里是浅白色圆钮、几乎看不出投影；这里只留很轻的一层，
+          // 之前 14 半径、0.2 透明度的重投影就是「丑」的主要来源
+          .shadow({ radius: 6, color: '#14000000', offsetX: 0, offsetY: 1 })
           .onClick(() => {
             this.scrollToCurrent();
           })
@@ -1792,8 +1881,8 @@ export struct PlaylistDetailView {
         .alignItems(HorizontalAlign.End)
         // 让出底部那条悬浮迷你栏，别压住它
         .padding({
-          right: 18,
-          bottom: this.bottomInset + HDS_BAR_HEIGHT + PAGE_BAR_BOTTOM_GAP + 14,
+          right: 16,
+          bottom: this.bottomInset + HDS_BAR_HEIGHT + PAGE_BAR_BOTTOM_GAP + 10,
         })
         .hitTestBehavior(HitTestMode.Transparent)
       }

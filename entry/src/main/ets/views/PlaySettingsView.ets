@@ -1,5 +1,5 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, C_TEXT, R_CARD } from '../ui/Theme';
+import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
 import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
