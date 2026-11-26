@@ -165,15 +165,22 @@ struct StreamCtx {
 
     // 生产者：塞一块 float（交错）。背压：队列满时等待，cancel/failed 随时唤醒。
     void push(std::vector<float> &&chunk) {
+        if (chunk.empty()) return;
+        /**
+         * 频谱计数挪到锁外：inMeter 只由解码回调线程写入，本来就不需要队列锁保护。
+         * 原来这一行在锁内，等于每塞一块都要持着队列锁做几千次浮点运算，
+         * 消费者（RenderFrame 的拉取回调）在同一个锁上只能干等。
+         */
+        for (float x : chunk) inMeter.feed(x);
+
         std::unique_lock<std::mutex> lk(m);
         while (!stopRequested() && !producerDone.load() && queued >= cap) {
             cvPush.wait_for(lk, std::chrono::milliseconds(50));
         }
-        if (stopRequested() || chunk.empty()) return;
+        if (stopRequested()) return;
         queued += chunk.size();
         inSamples.fetch_add(static_cast<int64_t>(chunk.size()));
         inChunks.fetch_add(1);
-        for (float x : chunk) inMeter.feed(x);
         chunks.emplace_back(std::move(chunk));
         cvPop.notify_one();
     }
@@ -243,6 +250,29 @@ int32_t pullForAudioSuite(OH_AudioNode *, void *ud, void *audioData, int32_t siz
 
 // 解码输出样本 -> float（按 OH_BitsPerSample 解释，交错原样保留）
 void appendAsFloat(const uint8_t *data, size_t bytes, int32_t bits, std::vector<float> &out) {
+    /**
+     * 按位深算出**精确**样本数，一次性 reserve 到位。
+     *
+     * 这里踩过一个单位错误：调用点原先写的是 `chunk.reserve(attr.size * 2u)`，
+     * 而 `attr.size` 是**字节数**、reserve 要的是**样本个数**。于是 S16 多占 4 倍、
+     * S24 多占 6 倍、F32 多占 8 倍——队列名义上限 16MB，实际堆占用被放大到几十上百 MB，
+     * 低端机上就是内存压力（Hi-Res 全缓存那条 2300023 的坑同一个来源）。
+     *
+     * 用 reserve 而不是 resize：resize 会先把新增元素零初始化一遍，紧接着又被真实值覆盖，
+     * 等于每个样本白写一次。reserve 之后 push_back 不再触发 realloc，只需一次边界比较。
+     */
+    size_t bytesPerSample = 1u;
+    if (bits == SAMPLE_S16LE) {
+        bytesPerSample = 2u;
+    } else if (bits == SAMPLE_S24LE) {
+        bytesPerSample = 3u;
+    } else if (bits == SAMPLE_S32LE || bits == SAMPLE_F32LE) {
+        bytesPerSample = 4u;
+    }
+    if (bytes > 0) {
+        out.reserve(out.size() + bytes / bytesPerSample);
+    }
+
     switch (bits) {
         case SAMPLE_S16LE: {
             const size_t n = bytes / 2;
@@ -495,7 +525,7 @@ EqResult runPipeline(const std::string &input,
             const uint8_t *data = OH_AVBuffer_GetAddr(buffer);
             if (data != nullptr) {
                 std::vector<float> chunk;
-                chunk.reserve(attr.size * 2u);
+                // 精确 reserve 在 appendAsFloat 里按位深算（原来这里按字节数预留，多占 4~8 倍）
                 appendAsFloat(data, static_cast<size_t>(attr.size), c->bitsPerSample, chunk);
                 c->push(std::move(chunk));
             }
@@ -729,6 +759,13 @@ EqResult runPipeline(const std::string &input,
     if (ok) {
         constexpr int32_t kChunkFloats = 4096;
         std::vector<float> buf(kChunkFloats);
+        /**
+         * 转成 16bit 的落地缓冲：攒一块写一次，而不是每个样本写一次。
+         * 一首 4 分钟 44.1k 立体声有 2100 万个样本，原来的 `os.write(&s, 2)`
+         * 要过 2100 万次 streambuf 调用（每次只写 2 字节），是应用层最大的一笔开销。
+         * 在循环外分配一次，循环内只剩内存写。
+         */
+        std::vector<int16_t> pcm(kChunkFloats);
         bool finished = false;
         for (int guard = 0; guard < 2000000 && !finished; ++guard) {
             if (ctx.stopRequested()) break;
@@ -738,14 +775,23 @@ EqResult runPipeline(const std::string &input,
             if (res != AUDIOSUITE_SUCCESS || got < 0) break;
             if (got == 0) continue;
             const int32_t n = got / static_cast<int32_t>(sizeof(float));
-            for (int32_t i = 0; i < n; ++i) outMeter.feed(buf[static_cast<size_t>(i)]);
-            outSamples += n;
+            /**
+             * 一次遍历同时做：频谱计数 / 夹幅 / 转 16bit（原来是两遍循环）。
+             *
+             * 夹幅与舍入必须保持原样（std::max + std::min + std::lround），否则产物不再
+             * 逐字节一致：std::min(1.0f, NaN) 返回 1.0f，换成三元判断会把 NaN 放过去；
+             * lround 是「四舍五入远离零」，换成截断会整体差 1 LSB。
+             */
             for (int32_t i = 0; i < n; ++i) {
-                float f = std::max(-1.0f, std::min(1.0f, buf[static_cast<size_t>(i)]));
-                int16_t s = static_cast<int16_t>(std::lround(f * 32767.0f));
-                os.write(reinterpret_cast<const char *>(&s), 2);
-                dataBytes += 2;
+                const float f = buf[static_cast<size_t>(i)];
+                outMeter.feed(f);
+                pcm[static_cast<size_t>(i)] = static_cast<int16_t>(
+                    std::lround(std::max(-1.0f, std::min(1.0f, f)) * 32767.0f));
             }
+            outSamples += n;
+            os.write(reinterpret_cast<const char *>(pcm.data()),
+                     static_cast<std::streamsize>(n) * static_cast<std::streamsize>(sizeof(int16_t)));
+            dataBytes += static_cast<uint32_t>(n) * 2u;
             // 边写边落盘：播放器要能读到已产出的部分才能边播边处理
             if (dataBytes - flushed >= 64u * 1024u) {
                 os.flush();

@@ -59,8 +59,12 @@ std::string readStringArg(napi_env env, napi_value v) {
     if (v == nullptr) return "";
     size_t len = 0;
     if (napi_get_value_string_utf8(env, v, nullptr, 0, &len) != napi_ok) return "";
-    std::string s(len, '\0');
+    // 缓冲区必须按 len + 1 分配：N-API 会往末尾补 '\0'，而 std::string(len, ...)
+    // 的 data() 只有 len 个可写字节，写第 len + 1 个是越界（实践中靠 c_str()
+    // 的终止符兜住了，但那是实现细节，不该依赖）。
+    std::string s(len + 1, '\0');
     napi_get_value_string_utf8(env, v, s.data(), len + 1, &len);
+    s.resize(len);
     return s;
 }
 
