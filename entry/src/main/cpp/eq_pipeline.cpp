@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -78,6 +79,149 @@ int32_t clampGain(int32_t g) {
     if (g < kEqGainMin) return kEqGainMin;
     if (g > kEqGainMax) return kEqGainMax;
     return g;
+}
+
+// ---------------------------------------------------------------------------
+// 空间音效：3 个平台现成节点（SOUND_FIELD / ENVIRONMENT_EFFECT / SPACE_RENDER）
+// ---------------------------------------------------------------------------
+
+float clampFxFloat(float v, float lo, float hi, float fallback) {
+    if (!std::isfinite(v)) return fallback;   // NAPI 传来的 NaN / Inf 不能交给系统
+    return std::max(lo, std::min(hi, v));
+}
+
+int32_t clampFxInt(int32_t v, int32_t lo, int32_t hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+/** 第二道夹紧：ArkTS 已经夹过一次，这里防止参数从别的调用路径绕进来 */
+FxConfig sanitizeFx(const FxConfig &in) {
+    FxConfig f = in;
+    f.soundField = clampFxInt(in.soundField, 0, 4);
+    f.environment = clampFxInt(in.environment, 0, 4);
+    f.spaceMode = clampFxInt(in.spaceMode, 0, 3);
+    f.posX = clampFxFloat(in.posX, -5.0f, 5.0f, 0.0f);
+    f.posY = clampFxFloat(in.posY, -5.0f, 5.0f, 0.0f);
+    f.posZ = clampFxFloat(in.posZ, -5.0f, 5.0f, 2.0f);
+    f.surroundTime = clampFxInt(in.surroundTime, 2, 40);
+    f.surroundDir = clampFxInt(in.surroundDir, 0, 1);
+    f.extRadius = clampFxFloat(in.extRadius, 1.0f, 5.0f, 3.0f);
+    f.extAngle = clampFxInt(in.extAngle, 1, 359);
+    return f;
+}
+
+/**
+ * SpaceRender 的三组 setter 是 since 23 的 API。虽然本应用 compatibleSdkVersion
+ * 已经是 6.1.0(23)，仍走运行时查符号：万一某台设备的系统库是裁剪版，缺符号时只跳过
+ * SpaceRender 节点，EQ / 声场 / 环境音照常工作，不会在加载 libaudioeffect.so 时就整包失败。
+ *
+ * 注意不用 RTLD_DEFAULT：dlopen 进来的库是否落在「全局符号表」取决于加载器实现，
+ * 在 musl 上直接依赖未必能被 RTLD_DEFAULT 找到 —— 那会静默地把空间渲染全关掉。
+ * 显式 dlopen 我们本来就已经 DT_NEEDED 的那一个库，句柄里必定有符号。
+ * 结果缓存成单例，避免每首歌 dlopen 一次又不好意思 dlclose 导致引用计数一直涨。
+ */
+using FnSetSpacePosition = OH_AudioSuite_Result (*)(OH_AudioNode *,
+                                                    OH_AudioSuite_SpaceRenderPositionParams);
+using FnSetSpaceRotation = OH_AudioSuite_Result (*)(OH_AudioNode *,
+                                                    OH_AudioSuite_SpaceRenderRotationParams);
+using FnSetSpaceExtension = OH_AudioSuite_Result (*)(OH_AudioNode *,
+                                                     OH_AudioSuite_SpaceRenderExtensionParams);
+
+struct SpaceRenderApi {
+    FnSetSpacePosition position = nullptr;
+    FnSetSpaceRotation rotation = nullptr;
+    FnSetSpaceExtension extension = nullptr;
+};
+
+SpaceRenderApi loadSpaceRenderApi() {
+    SpaceRenderApi api;
+    void *handle = dlopen("libohaudiosuite.so", RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        return api;
+    }
+    api.position = reinterpret_cast<FnSetSpacePosition>(
+        dlsym(handle, "OH_AudioSuiteEngine_SetSpaceRenderPositionParams"));
+    api.rotation = reinterpret_cast<FnSetSpaceRotation>(
+        dlsym(handle, "OH_AudioSuiteEngine_SetSpaceRenderRotationParams"));
+    api.extension = reinterpret_cast<FnSetSpaceExtension>(
+        dlsym(handle, "OH_AudioSuiteEngine_SetSpaceRenderExtensionParams"));
+    // 有意不 dlclose：这三个函数指针本次进程还要反复用；库本来就因 DT_NEEDED 常驻，
+    // 多留一个引用计数没有副作用。
+    return api;
+}
+
+const SpaceRenderApi &spaceRenderApi() {
+    static const SpaceRenderApi api = loadSpaceRenderApi();
+    return api;
+}
+
+/** 建一个效果节点；失败返回 nullptr（节点由 pipeline 统一回收，不用单独 destroy） */
+OH_AudioNode *createEffectNode(OH_AudioSuitePipeline *pipeline, OH_AudioNode_Type type) {
+    OH_AudioNodeBuilder *b = nullptr;
+    OH_AudioNode *node = nullptr;
+    if (OH_AudioSuiteNodeBuilder_Create(&b) != AUDIOSUITE_SUCCESS || b == nullptr) {
+        return nullptr;
+    }
+    const bool ok = OH_AudioSuiteNodeBuilder_SetNodeType(b, type) == AUDIOSUITE_SUCCESS &&
+                    OH_AudioSuiteEngine_CreateNode(pipeline, b, &node) == AUDIOSUITE_SUCCESS &&
+                    node != nullptr;
+    OH_AudioSuiteNodeBuilder_Destroy(b);
+    return ok ? node : nullptr;
+}
+
+/**
+ * 按 chain 的顺序把节点连成一条线。
+ *
+ * 空间节点是「锦上添花」：某个连接不上时跳过它，让上游直接连下一个，
+ * 而不是让整首歌连同 EQ 一起失败。只有连 OUTPUT 都失败才返回 false。
+ */
+bool connectEffectChain(std::vector<OH_AudioNode *> &chain, std::string &skipped) {
+    size_t from = 0;
+    while (from + 1 < chain.size()) {
+        if (OH_AudioSuiteEngine_ConnectNodes(chain[from], chain[from + 1]) == AUDIOSUITE_SUCCESS) {
+            ++from;
+            continue;
+        }
+        // EQ 是刚需：INPUT->EQ 连不上必须整条失败，不能把 EQ 也「跳过」当成纯空间效果。
+        // 到 OUTPUT 的最后一跳同样不能跳，否则没有产物。只有中间的空间节点可省略。
+        const bool skippable = from >= 1 && from + 2 < chain.size();
+        if (!skippable) {
+            return false;
+        }
+        skipped += " node" + std::to_string(from + 1);
+        chain.erase(chain.begin() + static_cast<std::ptrdiff_t>(from + 1));
+    }
+    return true;
+}
+
+/** 给 SpaceRender 节点设参数；任一 setter 失败都视为该节点不可用 */
+bool configureSpaceRender(OH_AudioNode *node, const FxConfig &f, const SpaceRenderApi &api) {
+    if (f.spaceMode == 1) {
+        if (api.position == nullptr) return false;
+        OH_AudioSuite_SpaceRenderPositionParams p{};
+        p.x = f.posX;
+        p.y = f.posY;
+        p.z = f.posZ;
+        return api.position(node, p) == AUDIOSUITE_SUCCESS;
+    }
+    if (f.spaceMode == 2) {
+        if (api.rotation == nullptr) return false;
+        OH_AudioSuite_SpaceRenderRotationParams p{};
+        p.x = f.posX;
+        p.y = f.posY;
+        p.z = f.posZ;
+        p.surroundTime = f.surroundTime;
+        p.surroundDirection = static_cast<OH_AudioSuite_SurroundDirection>(f.surroundDir);
+        return api.rotation(node, p) == AUDIOSUITE_SUCCESS;
+    }
+    if (f.spaceMode == 3) {
+        if (api.extension == nullptr) return false;
+        OH_AudioSuite_SpaceRenderExtensionParams p{};
+        p.extRadius = f.extRadius;
+        p.extAngle = f.extAngle;
+        return api.extension(node, p) == AUDIOSUITE_SUCCESS;
+    }
+    return false;
 }
 
 /**
@@ -542,13 +686,15 @@ EqResult runPipeline(const std::string &input,
                      int32_t fd,
                      const std::string &outPath,
                      const int32_t *gains,
-                     const volatile bool *cancel) {
+                     const volatile bool *cancel,
+                     const FxConfig &fx) {
     EqResult r;
     if (gains == nullptr) {
         r.code = kErrAudioSuite;
         r.message = "EQ 增益参数为空";
         return r;
     }
+    const FxConfig fxCfg = sanitizeFx(fx);
 
     // ---------- 1. 解封装 ----------
     OH_AVSource *source = nullptr;
@@ -984,6 +1130,10 @@ EqResult runPipeline(const std::string &input,
     uint32_t flushed = 0;
     SpectrumMeter outMeter;
     int64_t outSamples = 0;
+    /** 实际串起来的节点顺序：INPUT -> EQ -> [声场] -> [环境] -> [空间] -> OUTPUT */
+    std::vector<OH_AudioNode *> chain;
+    /** 被跳过的空间节点（创建/参数/连接失败），成功时也写进 result.message 便于诊断 */
+    std::string fxSkipped;
 
     if (OH_AudioSuiteEngine_Create(&engine) != AUDIOSUITE_SUCCESS || engine == nullptr) {
         r.code = kErrAudioSuite;
@@ -1005,6 +1155,8 @@ EqResult runPipeline(const std::string &input,
         bool built = true;
         bool gainsOk = true;
         OH_AudioNodeBuilder *b = nullptr;
+
+        // --- INPUT：要设格式与拉数据回调，不能走通用 helper ---
         OH_AudioSuiteNodeBuilder_Create(&b);
         if (b == nullptr ||
             OH_AudioSuiteNodeBuilder_SetNodeType(b, OH_AudioNode_Type::INPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS ||
@@ -1014,23 +1166,62 @@ EqResult runPipeline(const std::string &input,
             built = false;
         }
         if (b != nullptr) OH_AudioSuiteNodeBuilder_Destroy(b);
+        if (inNode != nullptr) chain.push_back(inNode);
 
-        OH_AudioSuiteNodeBuilder_Create(&b);
-        if (b == nullptr ||
-            OH_AudioSuiteNodeBuilder_SetNodeType(b, OH_AudioNode_Type::EFFECT_NODE_TYPE_EQUALIZER) != AUDIOSUITE_SUCCESS ||
-            OH_AudioSuiteEngine_CreateNode(pipeline, b, &eqNode) != AUDIOSUITE_SUCCESS) {
+        // --- EQUALIZER：即使增益全 0 也建（全 0 是直通，产物与只做 EQ 时一致） ---
+        eqNode = createEffectNode(pipeline, OH_AudioNode_Type::EFFECT_NODE_TYPE_EQUALIZER);
+        if (eqNode == nullptr) {
             built = false;
-        }
-        if (b != nullptr) OH_AudioSuiteNodeBuilder_Destroy(b);
-        if (eqNode != nullptr) {
+        } else {
             OH_EqualizerFrequencyBandGains eg{};
             for (int i = 0; i < EQUALIZER_BAND_NUM; ++i) eg.gains[i] = clampGain(gains[i]);
             // 设不上就别起管线：带着半初始化的 EQ 节点 StartPipeline，系统库会崩
             if (OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains(eqNode, eg) != AUDIOSUITE_SUCCESS) {
                 gainsOk = false;
+            } else {
+                chain.push_back(eqNode);
             }
         }
 
+        // --- SOUND_FIELD（声场） ---
+        if (fxCfg.soundField != 0) {
+            OH_AudioNode *n = createEffectNode(pipeline, OH_AudioNode_Type::EFFECT_NODE_TYPE_SOUND_FIELD);
+            const bool good = n != nullptr &&
+                OH_AudioSuiteEngine_SetSoundFieldType(n, static_cast<OH_SoundFieldType>(fxCfg.soundField)) ==
+                    AUDIOSUITE_SUCCESS;
+            if (good) {
+                chain.push_back(n);
+            } else {
+                fxSkipped += " soundField";
+            }
+        }
+
+        // --- ENVIRONMENT_EFFECT（环境音） ---
+        if (fxCfg.environment != 0) {
+            OH_AudioNode *n = createEffectNode(pipeline, OH_AudioNode_Type::EFFECT_NODE_TYPE_ENVIRONMENT_EFFECT);
+            const bool good = n != nullptr &&
+                OH_AudioSuiteEngine_SetEnvironmentType(n, static_cast<OH_EnvironmentType>(fxCfg.environment)) ==
+                    AUDIOSUITE_SUCCESS;
+            if (good) {
+                chain.push_back(n);
+            } else {
+                fxSkipped += " environment";
+            }
+        }
+
+        // --- SPACE_RENDER（空间渲染，since 23） ---
+        if (fxCfg.spaceMode != 0) {
+            const SpaceRenderApi &api = spaceRenderApi();
+            OH_AudioNode *n = createEffectNode(pipeline, OH_AudioNode_Type::EFFECT_NODE_TYPE_SPACE_RENDER);
+            const bool good = n != nullptr && configureSpaceRender(n, fxCfg, api);
+            if (good) {
+                chain.push_back(n);
+            } else {
+                fxSkipped += " spaceRender";
+            }
+        }
+
+        // --- OUTPUT ---
         OH_AudioSuiteNodeBuilder_Create(&b);
         if (b == nullptr ||
             OH_AudioSuiteNodeBuilder_SetNodeType(b, OH_AudioNode_Type::OUTPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS ||
@@ -1039,6 +1230,7 @@ EqResult runPipeline(const std::string &input,
             built = false;
         }
         if (b != nullptr) OH_AudioSuiteNodeBuilder_Destroy(b);
+        if (outNode != nullptr) chain.push_back(outNode);
 
         if (!built || inNode == nullptr || eqNode == nullptr || outNode == nullptr) {
             r.code = kErrAudioSuite;
@@ -1046,8 +1238,7 @@ EqResult runPipeline(const std::string &input,
         } else if (!gainsOk) {
             r.code = kErrAudioSuite;
             r.message = "音效参数被系统拒绝（增益需在 -10~+10 dB）";
-        } else if (OH_AudioSuiteEngine_ConnectNodes(inNode, eqNode) != AUDIOSUITE_SUCCESS ||
-                   OH_AudioSuiteEngine_ConnectNodes(eqNode, outNode) != AUDIOSUITE_SUCCESS) {
+        } else if (!connectEffectChain(chain, fxSkipped)) {
             r.code = kErrAudioSuite;
             r.message = "连接音效节点失败";
         } else if (OH_AudioSuiteEngine_StartPipeline(pipeline) != AUDIOSUITE_SUCCESS) {
@@ -1301,7 +1492,10 @@ EqResult runPipeline(const std::string &input,
     r.message = std::string("durFrom=") + durSource + " bitrate=" + std::to_string(srcBitrate) +
                 " inputBytes=" + std::to_string(inputBytes) +
                 " suiteRate=" + std::to_string(static_cast<int32_t>(suiteRate)) +
-                (rateMapped ? "" : "(unmapped!)");
+                (rateMapped ? "" : "(unmapped!)") +
+                " fx=" + std::to_string(fxCfg.soundField) + "/" +
+                std::to_string(fxCfg.environment) + "/" + std::to_string(fxCfg.spaceMode) +
+                (fxSkipped.empty() ? "" : " fxSkipped=" + fxSkipped);
     return r;
 }
 
@@ -1310,22 +1504,25 @@ EqResult runPipeline(const std::string &input,
 EqResult processAudio(const std::string &inPath,
                       const std::string &outPath,
                       const int32_t *gains,
-                      const volatile bool *cancel) {
-    return runPipeline(inPath, InputKind::kPath, -1, outPath, gains, cancel);
+                      const volatile bool *cancel,
+                      const FxConfig &fx) {
+    return runPipeline(inPath, InputKind::kPath, -1, outPath, gains, cancel, fx);
 }
 
 EqResult processAudioUrl(const std::string &url,
                          const std::string &outPath,
                          const int32_t *gains,
-                         const volatile bool *cancel) {
-    return runPipeline(url, InputKind::kUrl, -1, outPath, gains, cancel);
+                         const volatile bool *cancel,
+                         const FxConfig &fx) {
+    return runPipeline(url, InputKind::kUrl, -1, outPath, gains, cancel, fx);
 }
 
 EqResult processAudioFd(int32_t fd,
                         const std::string &outPath,
                         const int32_t *gains,
-                        const volatile bool *cancel) {
-    return runPipeline("", InputKind::kFd, fd, outPath, gains, cancel);
+                        const volatile bool *cancel,
+                        const FxConfig &fx) {
+    return runPipeline("", InputKind::kFd, fd, outPath, gains, cancel, fx);
 }
 
 }  // namespace lxeq

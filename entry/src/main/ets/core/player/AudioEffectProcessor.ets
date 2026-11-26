@@ -217,6 +217,8 @@ export class AudioEffectProcessor {
     this.activeTaskId = taskId;
 
     const gains: number[] = settings.getGains();
+    // 空间音效参数：与 gains 同一次快照，避免处理中途用户改了设置导致两者不同步
+    const fx: number[] = settings.toNativeArray();
     // 产物按 taskId 命名：每次播放都是一份新的临时文件，不跨曲复用（见类注释）
     const wavPath: string = `${this.dir}/${AudioEffectProcessor.TMP_PREFIX}${taskId}.wav`;
     const rawPath: string = `${this.dir}/${AudioEffectProcessor.TMP_PREFIX}${taskId}.raw`;
@@ -232,7 +234,7 @@ export class AudioEffectProcessor {
 
     this.current = run;
     // 后台跑，不阻塞这里等整首；同时把 Promise 挂起来，下一首开始前要等它退干净
-    const runPromise: Promise<void> = this.execute(run, filePath, url, headers, gains);
+    const runPromise: Promise<void> = this.execute(run, filePath, url, headers, gains, fx);
     this.activeRun = runPromise;
     void runPromise.then(() => {
       if (this.activeRun === runPromise) {
@@ -376,18 +378,18 @@ export class AudioEffectProcessor {
 
   /** 真正干活：本地文件直读 / URL 直连 Native / 需要请求头时走本机代理（失败才整份下载） */
   private async execute(run: EqRunState, filePath: string, url: string,
-    headers: Record<string, string>, gains: number[]): Promise<void> {
+    headers: Record<string, string>, gains: number[], fx: number[]): Promise<void> {
     const needProxy: boolean = Object.keys(headers).length > 0;
     try {
       let result: ProcessAudioResult;
       if (filePath.length > 0) {
         // 本地音频（含 Picker 给的 file:// URI）：本侧开 fd 交给 Native，原文件只读
-        result = await this.processLocal(filePath, run, gains);
+        result = await this.processLocal(filePath, run, gains, fx);
       } else if (needProxy) {
-        result = await this.processByProxy(url, headers, run, gains);
+        result = await this.processByProxy(url, headers, run, gains, fx);
       } else {
         // URL 直连：系统解封装器自己拉流，省掉整份下载
-        result = await processAudioUrl(url, run.wavPath, gains, run.taskId);
+        result = await processAudioUrl(url, run.wavPath, gains, run.taskId, fx);
       }
       if (this.current !== run) {
         // 切歌了：产物作废
@@ -406,7 +408,9 @@ export class AudioEffectProcessor {
         'eq processed: task %{public}d -> %{public}d bytes, delta=%{public}s, container=%{public}dms (%{public}s), decoded=%{public}d frames @%{public}dHz/%{public}dch',
         run.taskId, result.outBytes, result.delta.toFixed(3), Math.round(result.durationUs / 1000),
         result.message, result.outFrames, result.sampleRate, result.channels);
-      if (result.delta > 0.98 && result.delta < 1.02) {
+      // 只在「确实要求 EQ 改变频谱」时做这条自检：空间音效不一定改动低/高频能量比，
+      // 拿它去判 EQ 有没有干活会误报。
+      if (gains.some((g: number) => g !== 0) && result.delta > 0.98 && result.delta < 1.02) {
         hilog.warn(DOMAIN, TAG,
           'eq selfcheck: delta≈1.0, EQ likely did NOT alter spectrum (gains all zero or effect chain inert)');
       }
@@ -433,10 +437,11 @@ export class AudioEffectProcessor {
    * 能不能读取决于 ArkTS 侧的持久化授权（见 LocalAccess），原生 `fopen` 按这个串打不开。
    * fd 在整趟处理期间必须保持有效（系统解封装器一直在读数据），所以在这里开着、结算后关。
    */
-  private async processLocal(path: string, run: EqRunState, gains: number[]): Promise<ProcessAudioResult> {
+  private async processLocal(path: string, run: EqRunState, gains: number[],
+    fx: number[]): Promise<ProcessAudioResult> {
     const file: fs.File = fs.openSync(path, fs.OpenMode.READ_ONLY);
     try {
-      return await processAudioFd(file.fd, run.wavPath, gains, run.taskId);
+      return await processAudioFd(file.fd, run.wavPath, gains, run.taskId, fx);
     } finally {
       try {
         fs.closeSync(file);
@@ -460,7 +465,7 @@ export class AudioEffectProcessor {
    *   这时不重试、不删文件，直接让这次失败上抛（调用方回退原声并提示）。
    */
   private async processByProxy(url: string, headers: Record<string, string>, run: EqRunState,
-    gains: number[]): Promise<ProcessAudioResult> {
+    gains: number[], fx: number[]): Promise<ProcessAudioResult> {
     let proxy: LocalStreamProxy | null = null;
     try {
       proxy = new LocalStreamProxy();
@@ -471,7 +476,7 @@ export class AudioEffectProcessor {
       }
       hilog.info(DOMAIN, TAG, 'eq via local proxy: %{public}s', localUrl);
       const result: ProcessAudioResult =
-        await processAudioUrl(localUrl, run.wavPath, gains, run.taskId);
+        await processAudioUrl(localUrl, run.wavPath, gains, run.taskId, fx);
       if (result.ok || this.current !== run) {
         return result;
       }
@@ -501,7 +506,7 @@ export class AudioEffectProcessor {
     if (this.current !== run) {
       throw new Error('eq cancelled');
     }
-    return await processAudio(run.rawPath, run.wavPath, gains, run.taskId);
+    return await processAudio(run.rawPath, run.wavPath, gains, run.taskId, fx);
   }
 
   /** 产物里是否已经有真数据（不能只看文件存在：可能只写了 44 字节的 WAV 头） */

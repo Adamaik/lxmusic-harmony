@@ -11,6 +11,7 @@
 #include <napi/native_api.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -53,6 +54,8 @@ struct WorkData {
     std::string inPath;
     std::string outPath;
     int32_t gains[10] = {0};
+    /** 空间音效参数（第 5 个参数，可选）；全 0 时 Native 只跑 EQ，行为与旧版一致 */
+    lxeq::FxConfig fx;
     int32_t taskId = 0;
     /** 输入形态：true = 网络地址（processAudioUrl）；false = 本地路径 / fd（由 fd 是否 >=0 再分） */
     bool isUrl = false;
@@ -75,12 +78,58 @@ std::string readStringArg(napi_env env, napi_value v) {
     return s;
 }
 
+/**
+ * 读第 5 个参数：空间音效的 10 个 number。
+ * 索引用 ArkTS 的 toNativeArray() 约定，缺省/不是数组时保持 FxConfig 的全 0 默认值。
+ */
+void readFxArg(napi_env env, napi_value v, lxeq::FxConfig *fx) {
+    if (env == nullptr || v == nullptr || fx == nullptr) return;
+    bool isArray = false;
+    napi_is_array(env, v, &isArray);
+    if (!isArray) return;
+    uint32_t len = 0;
+    napi_get_array_length(env, v, &len);
+    // 先用 FxConfig 的默认值铺底：传进来的数组若 incomplete（老调用 / 手改），
+    // 缺的那几项不该被 0 覆盖 —— 否则 posZ=0、extAngle=0 会被夹到边界上，
+    // 听感跟界面显示的默认值对不上。
+    const lxeq::FxConfig def;
+    double a[10] = {
+        static_cast<double>(def.soundField), static_cast<double>(def.environment),
+        static_cast<double>(def.spaceMode),
+        static_cast<double>(def.posX), static_cast<double>(def.posY), static_cast<double>(def.posZ),
+        static_cast<double>(def.surroundTime), static_cast<double>(def.surroundDir),
+        static_cast<double>(def.extRadius), static_cast<double>(def.extAngle),
+    };
+    for (uint32_t i = 0; i < 10 && i < len; ++i) {
+        napi_value elem = nullptr;
+        if (napi_get_element(env, v, i, &elem) != napi_ok || elem == nullptr) continue;
+        double d = 0;
+        if (napi_get_value_double(env, elem, &d) == napi_ok) a[i] = d;
+    }
+    // NaN / Inf 不能直接 static_cast 成 int（UB），统一退回安全值；
+    // float 字段保留原值，由 C++ 侧 sanitizeFx 用 isfinite 兜住。
+    auto toInt = [](double d, int32_t fallback) -> int32_t {
+        if (!std::isfinite(d)) return fallback;
+        return static_cast<int32_t>(d);
+    };
+    fx->soundField = toInt(a[0], 0);
+    fx->environment = toInt(a[1], 0);
+    fx->spaceMode = toInt(a[2], 0);
+    fx->posX = static_cast<float>(a[3]);
+    fx->posY = static_cast<float>(a[4]);
+    fx->posZ = static_cast<float>(a[5]);
+    fx->surroundTime = toInt(a[6], 10);
+    fx->surroundDir = toInt(a[7], 1);
+    fx->extRadius = static_cast<float>(a[8]);
+    fx->extAngle = toInt(a[9], 90);
+}
+
 /** 入口形态：0 = 本地路径，1 = 网络地址，2 = 已打开的 fd */
 enum InputKind { kInPath = 0, kInUrl = 1, kInFd = 2 };
 
 napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
-    size_t argc = 4;
-    napi_value args[4] = {nullptr};
+    size_t argc = 5;
+    napi_value args[5] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     if (argc < 4) {
         napi_throw_error(env, nullptr, "process input, output, gains, taskId are required");
@@ -122,6 +171,10 @@ napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
         }
     }
     napi_get_value_int32(env, args[3], &data->taskId);
+    // 第 5 个参数可选：老调用（4 参）拿不到就保持全 0，管线退化为纯 EQ
+    if (argc >= 5) {
+        readFxArg(env, args[4], &data->fx);
+    }
     data->cancelFlag = acquireTask(data->taskId, true);
 
     napi_value workName = nullptr;
@@ -142,11 +195,11 @@ napi_value startProcess(napi_env env, napi_callback_info info, int kind) {
                 flag = reinterpret_cast<const volatile bool *>(d->cancelFlag.get());
             }
             if (d->fd >= 0) {
-                d->result = lxeq::processAudioFd(d->fd, d->outPath, d->gains, flag);
+                d->result = lxeq::processAudioFd(d->fd, d->outPath, d->gains, flag, d->fx);
             } else if (d->isUrl) {
-                d->result = lxeq::processAudioUrl(d->inPath, d->outPath, d->gains, flag);
+                d->result = lxeq::processAudioUrl(d->inPath, d->outPath, d->gains, flag, d->fx);
             } else {
-                d->result = lxeq::processAudio(d->inPath, d->outPath, d->gains, flag);
+                d->result = lxeq::processAudio(d->inPath, d->outPath, d->gains, flag, d->fx);
             }
         },
         [](napi_env e, napi_status status, void *ud) {

@@ -15,12 +15,23 @@ export interface ProcessAudioResult {
   outFrames: number;
 }
 
-/** 把本地音频过 10 段 EQ 后另存为 WAV。taskId 用于取消。 */
+/**
+ * 空间音效参数（可选，长度 10）。顺序见 AudioEffectSettings.toNativeArray()：
+ *   [0] 声场 0..4  [1] 环境音 0..4  [2] 空间渲染模式 0..3
+ *   [3..5] 位置 x/y/z（米，[-5,5]）
+ *   [6] 环绕周期（秒，[2,40]）  [7] 环绕方向 0/1
+ *   [8] 扩散半径（米，[1,5]）   [9] 扩散角度（度，[1,359]）
+ * 不传或全 0 时管线与「只做 EQ」完全一致。
+ */
+export type FxParams = number[];
+
+/** 把本地音频过 10 段 EQ（可叠加空间音效）后另存为 WAV。taskId 用于取消。 */
 export function processAudio(
   inputPath: string,
   outputPath: string,
   gains: number[],
-  taskId: number
+  taskId: number,
+  fx?: FxParams
 ): Promise<ProcessAudioResult>;
 
 /** 直接处理网络音频地址（http/https，渐进式格式），省掉整份下载。taskId 用于取消。 */
@@ -28,7 +39,8 @@ export function processAudioUrl(
   url: string,
   outputPath: string,
   gains: number[],
-  taskId: number
+  taskId: number,
+  fx?: FxParams
 ): Promise<ProcessAudioResult>;
 
 /**
@@ -41,7 +53,8 @@ export function processAudioFd(
   fd: number,
   outputPath: string,
   gains: number[],
-  taskId: number
+  taskId: number,
+  fx?: FxParams
 ): Promise<ProcessAudioResult>;
 
 /** 取消指定任务（切歌时调用）。 */
