@@ -1,9 +1,13 @@
 import { LengthMetrics } from '@kit.ArkUI';
-import { C_BG, C_CARD, R_CARD } from '../ui/Theme';
-import { HintText, OptionSetting, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { C_BG, C_CARD, C_CHEVRON, C_RED, C_TEXT, C_TEXT_WEAK, R_CARD } from '../ui/Theme';
+import { HintText, OptionSetting, ROW_H, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { I_CHEVRON_RIGHT, IconGlyph } from '../ui/Icons';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
 import { PlaySession } from '../core/player/PlaySession';
 import { PlaybackService } from '../core/player/PlaybackService';
+import { K_SLEEP_CLOCK, K_SLEEP_MINUTES, K_SLEEP_MODE, K_SLEEP_REMAIN, SLEEP_DEFAULT_MINUTES,
+  SLEEP_MODE_CLOCK, SLEEP_MODE_DURATION, SLEEP_MODE_LABELS, SLEEP_MODE_OFF, SLEEP_PRESET_LABELS,
+  SLEEP_PRESET_MINUTES, SleepTimer } from '../core/player/SleepTimer';
 import { DEFAULT_SOURCE_LABELS, DEFAULT_SOURCE_VALUES,
   EXTEND_QUALITYS, EXTEND_QUALITY_LABELS, K_AUTO_MATCH_LYRIC, K_AUTO_PAUSE_HEADSET_OFF,
   K_AUTO_RESUME_AFTER_INTERRUPT,
@@ -166,6 +170,16 @@ export struct PlaySettingsView {
    * 由壳层写进 AppStorage（见 pages/Index.ets 的 publishLayout），这里只订阅。
    */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
+  /**
+   * 定时关闭的当前状态（见 core/player/SleepTimer）
+   *
+   * 四个 key 都订阅：倒计时每秒刷新一次，界面上的「还剩 12:34」跟着走；
+   * 模式 / 时长 / 时刻只在用户改的时候变。
+   */
+  @StorageLink(K_SLEEP_MODE) sleepMode: string = SLEEP_MODE_OFF;
+  @StorageLink(K_SLEEP_REMAIN) sleepRemain: number = 0;
+  @StorageLink(K_SLEEP_MINUTES) sleepMinutes: number = SLEEP_DEFAULT_MINUTES;
+  @StorageLink(K_SLEEP_CLOCK) sleepClock: string = '';
 
   /** 宽屏（够两列才并排，见 ui/Layout.ets 的 cardColumnsFor） */
   private cardsSideBySide(): boolean {
@@ -330,6 +344,92 @@ export struct PlaySettingsView {
   private autoPauseHeadsetOffHint(): string {
     return '拔掉有线耳机、断开蓝牙耳机或拔掉 USB 耳机时自动暂停（否则声音会突然改从外放出来）。'
       + '只是暂停，点播放就能接着听；本来就没插耳机时不生效。';
+  }
+
+  // ------------------------------------------------------------ 定时关闭
+  // 状态全在 SleepTimer 单例里，界面只负责「点了算哪一档」与回显。
+
+  /** 关闭方式：0 关闭 / 1 播放时长 / 2 指定时刻 */
+  private sleepModeIndex(): number {
+    if (this.sleepMode === SLEEP_MODE_DURATION) {
+      return 1;
+    }
+    if (this.sleepMode === SLEEP_MODE_CLOCK) {
+      return 2;
+    }
+    return 0;
+  }
+
+  private sleepMinutesIndex(): number {
+    const index: number = SLEEP_PRESET_MINUTES.indexOf(this.sleepMinutes);
+    return index < 0 ? SLEEP_PRESET_MINUTES.indexOf(SLEEP_DEFAULT_MINUTES) : index;
+  }
+
+  private onPickSleepMode(index: number): void {
+    const timer = SleepTimer.getInstance();
+    if (index === 1) {
+      // 同一档连点不重置倒计时（SleepTimer 里挡了）；换一档才按新时长重新计时
+      timer.startDuration(this.sleepMinutes);
+      return;
+    }
+    if (index === 2) {
+      this.openClockPicker();
+      return;
+    }
+    timer.cancel();
+  }
+
+  /**
+   * 时间选择对话框：默认「半小时后」，已经设过钟点就回显那个时刻。
+   *
+   * 这里刻意**不预先改状态**：用户在对话框里按取消，定时器就维持原样（本来关着还是关着），
+   * 免得「点了指定时刻又反悔」却留下一个明天同一时刻的定时。
+   */
+  private openClockPicker(): void {
+    const selected: Date = new Date();
+    if (this.sleepMode === SLEEP_MODE_CLOCK) {
+      const clock: number[] = SleepTimer.getInstance().getClock();
+      selected.setHours(clock[0], clock[1], 0, 0);
+    } else {
+      selected.setTime(selected.getTime() + SLEEP_DEFAULT_MINUTES * 60 * 1000);
+      selected.setSeconds(0, 0);
+    }
+    this.getUIContext().showTimePickerDialog({
+      selected: selected,
+      useMilitaryTime: true,
+      onAccept: (value: TimePickerResult) => {
+        SleepTimer.getInstance().startClock(value.hour, value.minute);
+      },
+      onCancel: () => {
+      },
+    });
+  }
+
+  /**
+   * 倒计时文本
+   *
+   * 特意从 `this.sleepRemain`（AppStorage 里的秒数）算，而不是问单例：
+   * 这样每秒的刷新都作用在这个状态变量上，界面才会真的跟着跳。
+   */
+  private sleepRemainText(): string {
+    const total: number = Math.max(0, this.sleepRemain);
+    const hours: number = Math.floor(total / 3600);
+    const minutes: number = Math.floor((total % 3600) / 60);
+    const seconds: number = total % 60;
+    const pad = (value: number): string => (value < 10 ? `0${value}` : `${value}`);
+    return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+  }
+
+  /** 卡片底部那句说明：设定中就报倒计时，没设定就说清楚两种策略的区别 */
+  private sleepHint(): string {
+    if (this.sleepMode === SLEEP_MODE_DURATION) {
+      return '只累计真正在播放的时间：暂停、切歌加载都不走表。到点停止播放并退出应用。';
+    }
+    if (this.sleepMode === SLEEP_MODE_CLOCK) {
+      return '按钟点走，暂停也照常到点。今天这个点如果已经过了，会自动顺延到明天同一时刻。';
+    }
+    return '到点先停止播放，再退出应用。「播放时长」只算真正在放的时间；'
+      + '「指定时刻」按钟点走，暂停也照常到点。定时只在这一次有效，重启应用不保留。';
   }
 
   build() {
@@ -606,6 +706,84 @@ export struct PlaySettingsView {
                 + '同时成立才有动画。暂停、收起播放页、退到后台、切歌加载时立刻停；'
                 + '切歌是先停旧再起新，不会两份叠着跑。',
             })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 定时关闭（卡 + 说明是一个单元）
+          Column({ space: 14 }) {
+            Column({ space: 8 }) {
+              OptionSetting({
+                label: '定时关闭',
+                options: SLEEP_MODE_LABELS,
+                activeIndex: this.sleepModeIndex(),
+                onPick: (index: number) => {
+                  this.onPickSleepMode(index);
+                },
+              })
+
+              if (this.sleepMode === SLEEP_MODE_DURATION) {
+                OptionSetting({
+                  label: '关闭时长',
+                  options: SLEEP_PRESET_LABELS,
+                  activeIndex: this.sleepMinutesIndex(),
+                  onPick: (index: number) => {
+                    // 明确换档 = 重新计时（restart），而不是「点一下没反应」
+                    SleepTimer.getInstance().startDuration(SLEEP_PRESET_MINUTES[index], true);
+                  },
+                })
+              }
+
+              if (this.sleepMode === SLEEP_MODE_CLOCK) {
+                // 点这一行改时刻（系统时间选择器）：标题 + 当前时刻 + 右箭头
+                Row() {
+                  Text('关闭时刻')
+                    .fontSize(15)
+                    .fontColor(C_TEXT)
+                    .layoutWeight(1)
+                    .textAlign(TextAlign.Start)
+                  Text(this.sleepClock)
+                    .fontSize(15)
+                    .fontColor(C_TEXT_WEAK)
+                  IconGlyph({ symbol: I_CHEVRON_RIGHT, iconSize: 13, color: C_CHEVRON })
+                    .margin({ left: 4 })
+                }
+                .width('100%')
+                .height(ROW_H)
+                .onClick(() => {
+                  this.openClockPicker();
+                })
+              }
+
+              if (this.sleepMode !== SLEEP_MODE_OFF) {
+                /**
+                 * 倒计时。
+                 *
+                 * 每秒跳一次靠的是 `this.sleepRemain`（SleepTimer 每秒往 AppStorage 写一次），
+                 * 所以这里必须从那个状态变量算文本，不能问单例要（那样界面不会刷新）。
+                 */
+                Row({ space: 6 }) {
+                  Text('还剩')
+                    .fontSize(13)
+                    .fontColor(C_TEXT_WEAK)
+                  Text(this.sleepRemainText())
+                    .fontSize(20)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(C_RED)
+                  Blank()
+                  Text('到点自动退出')
+                    .fontSize(13)
+                    .fontColor(C_TEXT_WEAK)
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Center)
+              }
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({ text: this.sleepHint() })
           }
           .width(cardWidthOf(this.windowWidth))
         }
