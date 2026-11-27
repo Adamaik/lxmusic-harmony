@@ -27,17 +27,46 @@ struct EqResult {
 };
 
 /**
- * 把一段本地音频文件过 10 段 EQ 后另存为 WAV。
+ * 空间音效配置：平台现成的 3 个 AudioSuite 节点。
+ *
+ * 与 EQ 串在同一条管线里（INPUT -> EQUALIZER -> SOUND_FIELD -> ENVIRONMENT
+ * -> SPACE_RENDER -> OUTPUT），四个节点的输出格式都是 48kHz / S16LE / 2ch。
+ * 值为 0 表示不创建对应节点。
+ *
+ * 所有范围都来自 native_audio_suite_base.h：
+ * - position xyz / rotation xyz: [-5.0, 5.0] 米
+ * - surroundTime: [2, 40] 秒；surroundDirection: 0 逆时针 / 1 顺时针
+ * - extRadius: [1.0, 5.0] 米；extAngle: (0, 360) 度
+ * 越界时 setter 返回 INVALID_PARAM 且节点停在半初始化状态，StartPipeline 后会在
+ * 系统库里空指针崩溃 —— 所以 ArkTS 侧夹一次，这里再夹一次。
+ */
+struct FxConfig {
+    int32_t soundField = 0;    // 0..4：OH_SoundFieldType
+    int32_t environment = 0;   // 0..4：OH_EnvironmentType
+    int32_t spaceMode = 0;     // 0..3：0 关 / 1 定位 / 2 环绕 / 3 扩散
+    float posX = 0.0f;
+    float posY = 0.0f;
+    float posZ = 2.0f;
+    int32_t surroundTime = 10;
+    int32_t surroundDir = 1;
+    float extRadius = 3.0f;
+    int32_t extAngle = 90;
+};
+
+/**
+ * 把一段本地音频过 10 段 EQ（可叠加空间音效）后另存为 WAV。
  *
  * @param inPath   本地输入文件路径（沙箱绝对路径，mp3/flac/m4a/wav 等 AVPlayer 支持的格式）
  * @param outPath  输出 WAV 路径（沙箱绝对路径）
- * @param gains    长度必须为 10 的增益数组（dB，建议 -15..+15）
+ * @param gains    长度必须为 10 的增益数组（dB，-10..+10）
  * @param cancel   取消标志指针：Native 线程循环中会读它，置 true 即尽快中止并回收
+ * @param fx       空间音效配置；全 0 时管线与只做 EQ 完全一致
  */
 EqResult processAudio(const std::string &inPath,
                       const std::string &outPath,
                       const int32_t *gains,
-                      const volatile bool *cancel);
+                      const volatile bool *cancel,
+                      const FxConfig &fx);
 
 /**
  * 与 processAudio 相同，但输入是网络地址（http/https）。
@@ -48,7 +77,8 @@ EqResult processAudio(const std::string &inPath,
 EqResult processAudioUrl(const std::string &url,
                          const std::string &outPath,
                          const int32_t *gains,
-                         const volatile bool *cancel);
+                         const volatile bool *cancel,
+                         const FxConfig &fx);
 
 /**
  * 与 processAudio 相同，但输入用**已打开的 fd**。
@@ -63,7 +93,8 @@ EqResult processAudioUrl(const std::string &url,
 EqResult processAudioFd(int32_t fd,
                         const std::string &outPath,
                         const int32_t *gains,
-                        const volatile bool *cancel);
+                        const volatile bool *cancel,
+                        const FxConfig &fx);
 
 }  // namespace lxeq
 

@@ -37,6 +37,69 @@ export const EQ_BAND_LABELS: string[] = ['31', '62', '125', '250', '500', '1k', 
 export const EQ_GAIN_MIN: number = -10;
 export const EQ_GAIN_MAX: number = 10;
 
+// ---------------------------------------------------------------------------
+// 空间音效（平台现成的 3 个 AudioSuite 节点）
+//
+// 这三项和 EQ 一样是「烘焙」进 WAV 的，所以共用同一条离线处理管线：
+//   INPUT -> EQUALIZER -> SOUND_FIELD -> ENVIRONMENT -> SPACE_RENDER -> OUTPUT
+// 四个节点在 SDK 里的输出格式都是 48kHz / S16LE / 2ch，可以直接串。
+//
+// 值全部对应 native_audio_suite_base.h 的枚举，0 一律表示「不建这个节点」。
+// ---------------------------------------------------------------------------
+
+/** 声场类型：OH_SoundFieldType（1 前置 / 2 宏大 / 3 近场 / 4 宽广） */
+export const SOUND_FIELD_LABELS: string[] = ['关闭', '前置', '宏大', '近场', '宽广'];
+/** 环境音类型：OH_EnvironmentType（1 广播 / 2 听筒 / 3 水下 / 4 留声机） */
+export const ENVIRONMENT_LABELS: string[] = ['关闭', '广播', '听筒', '水下', '留声机'];
+/** 空间渲染模式：0 关 / 1 静态定位 / 2 环绕旋转 / 3 扩散 */
+export const SPACE_MODE_LABELS: string[] = ['关闭', '定位', '环绕', '扩散'];
+
+/** 位置坐标合法范围，单位米。越界时 setter 返回 INVALID_PARAM 且节点半初始化 */
+export const SPACE_XYZ_MIN: number = -5;
+export const SPACE_XYZ_MAX: number = 5;
+/** 环绕一周的秒数 [2, 40] */
+export const SURROUND_TIME_MIN: number = 2;
+export const SURROUND_TIME_MAX: number = 40;
+/** 扩散半径 [1.0, 5.0] 米 */
+export const EXT_RADIUS_MIN: number = 1;
+export const EXT_RADIUS_MAX: number = 5;
+/** 扩散角度 (0, 360) 度，开区间 */
+export const EXT_ANGLE_MIN: number = 1;
+export const EXT_ANGLE_MAX: number = 359;
+
+/** 空间音效的全部可调值。UI 通过 @StorageLink(K_FX_STATE) 订阅这一整个对象 */
+export interface SpaceFxState {
+  soundField: number;
+  environment: number;
+  spaceMode: number;
+  posX: number;
+  posY: number;
+  posZ: number;
+  surroundTime: number;
+  surroundDir: number;
+  extRadius: number;
+  extAngle: number;
+}
+
+/** 传给 Native 的扁平参数，索引含义见 toNativeArray / napi_init.cpp 的 FxConfig */
+export const FX_PARAM_COUNT: number = 10;
+
+/** 空间音效的默认状态（界面 @StorageLink 的初始值也用它） */
+export function defaultFx(): SpaceFxState {
+  return {
+    soundField: 0,
+    environment: 0,
+    spaceMode: 0,
+    posX: 0,
+    posY: 0,
+    posZ: 2,
+    surroundTime: 10,
+    surroundDir: 1,
+    extRadius: 3,
+    extAngle: 90,
+  };
+}
+
 /**
  * 内置预设，数值来自 HarmonyOS AudioSuite 官方常量（native_audio_suite_base.h），
  * 顺序与 EQ_BANDS 一致（31/62/125/250/500/1k/2k/4k/8k/16k Hz）。
@@ -80,6 +143,8 @@ export const K_EQ_GAINS: string = 'cfg_eq_gains';
  * 页面上的应用按钮据此显示「应用 / 已应用」，用户才不会以为拖完就已经生效了。
  */
 export const K_EQ_DIRTY: string = 'cfg_eq_dirty';
+/** 空间音效（声场 / 环境音 / 空间渲染）的整体状态，界面订阅它 */
+export const K_FX_STATE: string = 'cfg_fx_state';
 
 /**
  * 音效配置变更回调。
@@ -97,9 +162,12 @@ interface AudioEffectData {
   enabled: boolean;
   preset: string;
   gains: number[];
+  /** v2 新增；老配置文件里没有这个字段，读进来按全关处理 */
+  fx?: SpaceFxState;
 }
 
-const SETTINGS_VERSION: number = 1;
+/** v1 只有 EQ；v2 追加空间音效。读到更高版本直接忽略，避免未来格式被旧代码写坏 */
+const SETTINGS_VERSION: number = 2;
 
 function defaultGains(): number[] {
   return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -116,6 +184,8 @@ export class AudioEffectSettings {
   private enabled: boolean = false;
   private preset: string = 'off';
   private gains: number[] = defaultGains();
+  /** 空间音效状态（声场 / 环境音 / 空间渲染） */
+  private fx: SpaceFxState = defaultFx();
   /**
    * 上一次「应用」时的增益快照
    *
@@ -179,8 +249,38 @@ export class AudioEffectSettings {
     if (Array.isArray(data.gains) && data.gains.length === 10) {
       this.gains = data.gains.map((v: number) => this.clampGain(v));
     }
+    if (data.fx !== undefined && data.fx !== null) {
+      this.fx = this.sanitizeFx(data.fx);
+    }
     // 读进来的配置就是「已经生效的那一份」：下次起播就用它，不该显示成待应用
     this.appliedGains = this.gains.slice();
+  }
+
+  /**
+   * 把任意来源（旧配置、手工改坏的 JSON、UI 传来的滑块值）的空间参数夹到 SDK 的合法区间。
+   *
+   * 这不是防御性编程的仪式：SpaceRender 的 setter 对越界值返回失败后节点会停在半初始化
+   * 状态，StartPipeline 随后在系统库里空指针崩溃 —— 和 EQ 增益 -15 那次是同一类问题。
+   * Native 侧还会再夹一次，这里是第一道。
+   */
+  private clampFxNum(v: number, fallback: number, min: number, max: number): number {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return fallback;
+    return Math.max(min, Math.min(max, v));
+  }
+
+  private sanitizeFx(raw: SpaceFxState): SpaceFxState {
+    const d: SpaceFxState = defaultFx();
+    d.soundField = Math.round(this.clampFxNum(raw.soundField, 0, 0, 4));
+    d.environment = Math.round(this.clampFxNum(raw.environment, 0, 0, 4));
+    d.spaceMode = Math.round(this.clampFxNum(raw.spaceMode, 0, 0, 3));
+    d.posX = this.clampFxNum(raw.posX, 0, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+    d.posY = this.clampFxNum(raw.posY, 0, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+    d.posZ = this.clampFxNum(raw.posZ, 2, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+    d.surroundTime = Math.round(this.clampFxNum(raw.surroundTime, 10, SURROUND_TIME_MIN, SURROUND_TIME_MAX));
+    d.surroundDir = Math.round(this.clampFxNum(raw.surroundDir, 1, 0, 1));
+    d.extRadius = this.clampFxNum(raw.extRadius, 3, EXT_RADIUS_MIN, EXT_RADIUS_MAX);
+    d.extAngle = Math.round(this.clampFxNum(raw.extAngle, 90, EXT_ANGLE_MIN, EXT_ANGLE_MAX));
+    return d;
   }
 
   private clampGain(v: number): number {
@@ -195,6 +295,7 @@ export class AudioEffectSettings {
       enabled: this.enabled,
       preset: this.preset,
       gains: this.gains.slice(),
+      fx: this.getFx(),
     };
     try {
       const file: fs.File = fs.openSync(this.file, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -213,6 +314,7 @@ export class AudioEffectSettings {
     AppStorage.setOrCreate(K_EQ_PRESET, this.preset);
     AppStorage.setOrCreate(K_EQ_GAINS, this.gains.slice());
     AppStorage.setOrCreate(K_EQ_DIRTY, this.isDirty());
+    AppStorage.setOrCreate(K_FX_STATE, this.getFx());
     // 「这一趟到底有没有过上音效」是播放器写的（见 LxPlayer.markEqApplied）；
     // 这里只保证键存在，免得播放页 @StorageLink 拿到 undefined。
     if (AppStorage.get<boolean>(K_EQ_ACTIVE) === undefined) {
@@ -250,10 +352,60 @@ export class AudioEffectSettings {
     return this.gains.slice();
   }
 
-  /** 当前是否真的会走 EQ 管线（开关打开且不是全 0） */
+  /** 返回副本，避免调用方改到内部状态 */
+  getFx(): SpaceFxState {
+    return {
+      soundField: this.fx.soundField,
+      environment: this.fx.environment,
+      spaceMode: this.fx.spaceMode,
+      posX: this.fx.posX,
+      posY: this.fx.posY,
+      posZ: this.fx.posZ,
+      surroundTime: this.fx.surroundTime,
+      surroundDir: this.fx.surroundDir,
+      extRadius: this.fx.extRadius,
+      extAngle: this.fx.extAngle,
+    };
+  }
+
+  /** 有没有开任意一个空间模块（EQ 全 0 时也要靠它决定要不要进管线） */
+  hasSpaceFx(): boolean {
+    return this.fx.soundField !== 0 || this.fx.environment !== 0 || this.fx.spaceMode !== 0;
+  }
+
+  /**
+   * 交给 Native 的扁平参数数组。
+   * 用定长 number[] 而不是对象，是为了让 NAPI 侧和 gains 一样走同一套数组解析。
+   * 顺序必须与 napi_init.cpp 的 readFxArg / eq_pipeline.h 的 FxConfig 一致。
+   */
+  toNativeArray(): number[] {
+    const f: SpaceFxState = this.fx;
+    return [
+      f.soundField, f.environment, f.spaceMode,
+      f.posX, f.posY, f.posZ,
+      f.surroundTime, f.surroundDir,
+      f.extRadius, f.extAngle,
+    ];
+  }
+
+  /** 播放侧用它做「配置有没有真的变」的指纹（见 PlaySession.requestEqReplay） */
+  effectSignature(): string {
+    return `${this.enabled ? 1 : 0}|${this.gains.join(',')}|${this.toNativeArray().join(',')}`;
+  }
+
+  /**
+   * 当前是否真的要走离线处理管线。
+   *
+   * 以前只判「EQ 增益非全 0」—— 只开空间模块、EQ 停在原声时会直接返回 false，
+   * 整条管线都不进，空间效果自然一点声音都没有。这里必须把三项一起算上。
+   */
   shouldProcess(): boolean {
     if (!this.enabled) return false;
-    return this.gains.some((g: number) => g !== 0);
+    return this.gains.some((g: number) => g !== 0) || this.hasSpaceFx();
+  }
+
+  private publishFx(): void {
+    AppStorage.setOrCreate(K_FX_STATE, this.getFx());
   }
 
   // ---------------- 写 ----------------
@@ -353,6 +505,79 @@ export class AudioEffectSettings {
       return;
     }
     this.notifyChanged('apply');
+  }
+
+  // ---------------- 空间音效写接口 ----------------
+
+  /** 声场档位（0 关 / 1 前置 / 2 宏大 / 3 近场 / 4 宽广）：点一下一档，立即生效 */
+  setSoundField(v: number): void {
+    const next: number = Math.round(this.clampFxNum(v, 0, 0, 4));
+    if (next === this.fx.soundField) return;
+    this.fx.soundField = next;
+    this.write();
+    this.publishFx();
+    this.notifyChanged('soundField');
+  }
+
+  /** 环境音档位（0 关 / 1 广播 / 2 听筒 / 3 水下 / 4 留声机） */
+  setEnvironment(v: number): void {
+    const next: number = Math.round(this.clampFxNum(v, 0, 0, 4));
+    if (next === this.fx.environment) return;
+    this.fx.environment = next;
+    this.write();
+    this.publishFx();
+    this.notifyChanged('environment');
+  }
+
+  /** 空间渲染模式（0 关 / 1 静态定位 / 2 环绕旋转 / 3 扩散） */
+  setSpaceMode(v: number): void {
+    const next: number = Math.round(this.clampFxNum(v, 0, 0, 3));
+    if (next === this.fx.spaceMode) return;
+    this.fx.spaceMode = next;
+    this.write();
+    this.publishFx();
+    this.notifyChanged('spaceMode');
+  }
+
+  /**
+   * 改空间渲染的数值参数。
+   *
+   * 与 EQ 推子同样的两段式：拖动中 commit=false 只更新界面，松手 commit=true 才落盘并
+   * 通知播放侧重播 —— 否则拖一下 XYZ 会连着把歌打回开头十几次。
+   * 每个字段按 SDK 的合法区间夹紧（越界会让 SpaceRender 节点半初始化 → 启动管线崩溃）。
+   */
+  setSpaceParam(field: string, value: number, commit: boolean = true): void {
+    switch (field) {
+      case 'posX':
+        this.fx.posX = this.clampFxNum(value, 0, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+        break;
+      case 'posY':
+        this.fx.posY = this.clampFxNum(value, 0, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+        break;
+      case 'posZ':
+        this.fx.posZ = this.clampFxNum(value, 2, SPACE_XYZ_MIN, SPACE_XYZ_MAX);
+        break;
+      case 'surroundTime':
+        this.fx.surroundTime = Math.round(this.clampFxNum(value, 10, SURROUND_TIME_MIN, SURROUND_TIME_MAX));
+        break;
+      case 'surroundDir':
+        this.fx.surroundDir = Math.round(this.clampFxNum(value, 1, 0, 1));
+        break;
+      case 'extRadius':
+        this.fx.extRadius = this.clampFxNum(value, 3, EXT_RADIUS_MIN, EXT_RADIUS_MAX);
+        break;
+      case 'extAngle':
+        this.fx.extAngle = Math.round(this.clampFxNum(value, 90, EXT_ANGLE_MIN, EXT_ANGLE_MAX));
+        break;
+      default:
+        return;
+    }
+    this.publishFx();
+    if (commit) {
+      this.write();
+      // 值没变时 PlaySession 的 effectSignature 会去重，不会真的重播
+      this.notifyChanged('space');
+    }
   }
 
   /**

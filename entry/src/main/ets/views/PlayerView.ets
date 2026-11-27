@@ -20,8 +20,8 @@ import { isLocalSong, LocalMusic } from '../core/local/LocalMusic';
 import { isWebDavSong, WebDavLibrary } from '../core/webdav/WebDavLibrary';
 import { LxMusicInfo } from '../core/music/MusicSearch';
 import { C_BG, C_ICON_GREEN, C_RED } from '../ui/Theme';
-import { AudioEffectSettings, EQ_PRESETS, EqPreset, K_EQ_ACTIVE, K_EQ_DIRTY, K_EQ_ENABLED,
-  K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
+import { AudioEffectSettings, defaultFx, EQ_PRESETS, EqPreset, K_EQ_ACTIVE, K_EQ_DIRTY,
+  K_EQ_ENABLED, K_EQ_PRESET, K_FX_STATE, SpaceFxState } from '../core/settings/AudioEffectSettings';
 import { HdsEdgeFlowLight } from '../ui/Hds';
 import { BREATH_CYCLE_MS, BREATH_SCALE_MAX, BREATH_SCALE_REST, BREATH_SETTLE_MS, CoverTint,
   HALO_GLOW_MAX, HALO_GLOW_REST, MOTION_FPS_30, PlayerAtmosphere, PlayerHalo, PlayerLightBand,
@@ -195,6 +195,8 @@ export struct PlayerView {
    * 窗口内下完，都会回退原声。标识必须能分辨，否则用户听不出差别时只会以为音效坏了。
    */
   @StorageLink(K_EQ_ACTIVE) eqActive: boolean = false;
+  /** 空间音效状态：EQ 停在「原声」但开了空间模块时，标识要改说「空间」 */
+  @StorageLink(K_FX_STATE) fx: SpaceFxState = defaultFx();
   @StorageLink(K_PLAYER_STATUS) @Watch('onStatusChanged') status: string = 'idle';
   /** 播放页封面圆角（外观设置里可调，默认 12） */
   @StorageLink(K_COVER_RADIUS) coverRadius: number = COVER_RADIUS_DEFAULT;
@@ -1595,9 +1597,21 @@ export struct PlayerView {
    * 「原声」预设（增益全 0）本来就不做任何处理，它不算「未生效」—— 那是用户选的结果，
    * 标识写「原声」才对。自定义但十段全 0 是同一回事：平直曲线就是用户主动要的，
    * 见 AudioEffectSettings.shouldProcess（开关开着且增益不全为 0 才真的会走 EQ）。
-   * 其余预设只要没真正过一遍，就按未生效显示。
+   * 但空间模块开着时，EQ 平直也不等于「没开音效」—— 管线仍要跑一遍空间节点，
+   * 这一趟没真正过完就得算未生效。
    */
+  private hasSpaceFx(): boolean {
+    return this.fx.soundField !== 0 || this.fx.environment !== 0 || this.fx.spaceMode !== 0;
+  }
+
   private eqInEffect(): boolean {
+    if (this.eqActive) {
+      return true;
+    }
+    // 空间模块开着：EQ 平直也得真的过一遍管线，否则听到的只是原声
+    if (this.hasSpaceFx()) {
+      return false;
+    }
     if (this.eqPreset === 'off') {
       return true;
     }
@@ -1607,7 +1621,7 @@ export struct PlayerView {
     }
     // 手动改过推子（dirty）但还没应用时，当前这首带的仍是上一次应用过的音效：
     // 绿点由 eqActive 给出，标识只是把「未应用」写在名字后面（见 eqBadgeLabel）
-    return this.eqActive;
+    return false;
   }
 
   /** 现在没有歌在响（还没起播 / 已经播完）：这时「没过音效」不是回退，是还没轮到它 */
@@ -1620,10 +1634,14 @@ export struct PlayerView {
     // 自定义的十段全 0：本来就不该处理，按「用户主动平直」写「自定义」，别误报未生效
     const flatCustom: boolean = this.eqPreset === 'custom'
       && !AudioEffectSettings.getInstance().shouldProcess();
-    if (this.eqPreset !== 'off' && !flatCustom && !this.eqActive) {
+    if (!this.eqInEffect() && !flatCustom) {
       // 还没起播（idle / 播完 stopped）时还没轮到音效，写「待起播」；
       // 真正在放 / 暂停（playing / paused / loading）却没有音效，才是回退，写「未生效」
       return this.eqStatusIdle() ? '待起播' : '未生效';
+    }
+    // EQ 停在原声、但空间效果开着：写「原声」会让人以为什么都没开
+    if (this.eqPreset === 'off' && this.hasSpaceFx()) {
+      return '空间';
     }
     if (this.eqPreset === 'custom' && this.eqDirty) {
       // 当前这首响的是上一次应用过的旧音效，新拖的值要按「应用」才生效

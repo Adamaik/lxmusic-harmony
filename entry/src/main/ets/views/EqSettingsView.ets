@@ -5,9 +5,12 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { util } from '@kit.ArkTS';
 import { C_BG, C_CARD, C_DIVIDER, C_FILL_SOFT, C_ON_ACCENT, C_RED, C_RED_TINT, C_SEG_BG,
   C_SEG_UNSELECTED, C_SLIDER_TRACK, C_TEXT, C_TEXT_WEAK, R_CARD } from '../ui/Theme';
-import { HintText, ToggleSetting } from '../ui/SettingWidgets';
-import { AudioEffectSettings, EQ_BAND_LABELS, EQ_GAIN_MAX, EQ_GAIN_MIN, EQ_PRESETS, EqPreset,
-  K_EQ_DIRTY, K_EQ_ENABLED, K_EQ_GAINS, K_EQ_PRESET } from '../core/settings/AudioEffectSettings';
+import { HintText, SegPills, SliderSetting, ToggleSetting } from '../ui/SettingWidgets';
+import { AudioEffectSettings, defaultFx, ENVIRONMENT_LABELS, EQ_BAND_LABELS, EQ_GAIN_MAX,
+  EQ_GAIN_MIN, EQ_PRESETS, EqPreset, EXT_ANGLE_MAX, EXT_ANGLE_MIN, EXT_RADIUS_MAX, EXT_RADIUS_MIN,
+  K_EQ_DIRTY, K_EQ_ENABLED, K_EQ_GAINS, K_EQ_PRESET, K_FX_STATE, SOUND_FIELD_LABELS,
+  SPACE_MODE_LABELS, SPACE_XYZ_MAX, SPACE_XYZ_MIN, SpaceFxState, SURROUND_TIME_MAX,
+  SURROUND_TIME_MIN } from '../core/settings/AudioEffectSettings';
 import { EqCustomPreset, EqImportResult, EqPresetStore, EQ_PRESET_NAME_MAX,
   K_EQ_CUSTOM_PRESETS } from '../core/settings/EqPresetStore';
 import { cardColumnsFor, cardWidthOf, K_WINDOW_WIDTH } from '../ui/Layout';
@@ -42,6 +45,8 @@ export struct EqSettingsView {
   @StorageLink(K_EQ_GAINS) eqGains: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   /** 推子改过但还没点「应用」 */
   @StorageLink(K_EQ_DIRTY) eqDirty: boolean = false;
+  /** 空间音效（声场 / 环境音 / 空间渲染）整体状态 */
+  @StorageLink(K_FX_STATE) fx: SpaceFxState = defaultFx();
   /** 窗口宽度（vp）：宽屏下开关卡与预设卡并排、推子卡独占整行（0 = 还没量到，按手机一列） */
   @StorageLink(K_WINDOW_WIDTH) windowWidth: number = 0;
 
@@ -656,7 +661,7 @@ export struct EqSettingsView {
           Column({ space: 12 }) {
             Column({ space: 8 }) {
               ToggleSetting({
-                label: '音效（EQ）',
+                label: '音效总开关',
                 value: this.eqEnabled,
                 onPick: (next: boolean) => {
                   AudioEffectSettings.getInstance().setEnabled(next);
@@ -664,7 +669,8 @@ export struct EqSettingsView {
               })
               HintText({
                 text: this.eqEnabled
-                  ? '开着的时候，每首歌在起播前先过一次 EQ：起播多等约 0.3~0.5 秒，之后就是普通播放。'
+                  ? '开着的时候，每首歌在起播前先过一次音效处理（EQ 与下面三项空间效果都在这条链上）：'
+                    + '起播多等约 0.3~0.5 秒，之后就是普通播放。'
                   : '音效现在关着：下面的调节会存下来，打开这个开关才开始生效。',
               })
             }
@@ -811,6 +817,194 @@ export struct EqSettingsView {
           }
           // 十段推子卡在宽屏下独占整行：十行推子要的是整行宽度，跟两张窄卡并排会挤得没法拖
           .width('100%')
+
+          // ------------------------------------------------ 声场（SOUND_FIELD）
+          Column({ space: 12 }) {
+            Column({ space: 10 }) {
+              Row({ space: 6 }) {
+                Text('声场')
+                  .fontSize(15)
+                  .fontColor(C_TEXT)
+                Text('Space · 空间感')
+                  .fontSize(10.5)
+                  .fontColor(C_TEXT_WEAK)
+                Blank()
+              }
+              .width('100%')
+
+              SegPills({
+                labels: SOUND_FIELD_LABELS,
+                activeIndex: this.fx.soundField,
+                onPick: (i: number) => {
+                  AudioEffectSettings.getInstance().setSoundField(i);
+                },
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 14 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({
+              text: '改变声音的宽窄与远近：前置像贴在面前，宏大拉开空间，近场贴耳，宽广向两侧展开。'
+                + '和 EQ 串在同一条处理链上，选一档就会用新设置重新处理当前这首。',
+            })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 空间渲染（SPACE_RENDER）
+          Column({ space: 12 }) {
+            Column({ space: 6 }) {
+              Row({ space: 6 }) {
+                Text('空间渲染')
+                  .fontSize(15)
+                  .fontColor(C_TEXT)
+                Text('Space · 3D')
+                  .fontSize(10.5)
+                  .fontColor(C_TEXT_WEAK)
+                Blank()
+              }
+              .width('100%')
+
+              SegPills({
+                labels: SPACE_MODE_LABELS,
+                activeIndex: this.fx.spaceMode,
+                onPick: (i: number) => {
+                  AudioEffectSettings.getInstance().setSpaceMode(i);
+                },
+              })
+
+              if (this.fx.spaceMode === 1 || this.fx.spaceMode === 2) {
+                Text('声源位置（米）')
+                  .fontSize(11.5)
+                  .fontColor(C_TEXT_WEAK)
+                  .width('100%')
+                  .margin({ top: 4 })
+                SliderSetting({
+                  label: 'X 左右',
+                  value: this.fx.posX,
+                  min: SPACE_XYZ_MIN,
+                  max: SPACE_XYZ_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('posX', v, done);
+                  },
+                })
+                SliderSetting({
+                  label: 'Y 上下',
+                  value: this.fx.posY,
+                  min: SPACE_XYZ_MIN,
+                  max: SPACE_XYZ_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('posY', v, done);
+                  },
+                })
+                SliderSetting({
+                  label: 'Z 前后',
+                  value: this.fx.posZ,
+                  min: SPACE_XYZ_MIN,
+                  max: SPACE_XYZ_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('posZ', v, done);
+                  },
+                })
+              }
+
+              if (this.fx.spaceMode === 2) {
+                Text('环绕运动')
+                  .fontSize(11.5)
+                  .fontColor(C_TEXT_WEAK)
+                  .width('100%')
+                  .margin({ top: 4 })
+                SliderSetting({
+                  label: '一圈秒数',
+                  value: this.fx.surroundTime,
+                  min: SURROUND_TIME_MIN,
+                  max: SURROUND_TIME_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('surroundTime', v, done);
+                  },
+                })
+                SegPills({
+                  labels: ['逆时针', '顺时针'],
+                  activeIndex: this.fx.surroundDir,
+                  onPick: (i: number) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('surroundDir', i, true);
+                  },
+                })
+              }
+
+              if (this.fx.spaceMode === 3) {
+                Text('扩散范围')
+                  .fontSize(11.5)
+                  .fontColor(C_TEXT_WEAK)
+                  .width('100%')
+                  .margin({ top: 4 })
+                SliderSetting({
+                  label: '半径（米）',
+                  value: this.fx.extRadius,
+                  min: EXT_RADIUS_MIN,
+                  max: EXT_RADIUS_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('extRadius', v, done);
+                  },
+                })
+                SliderSetting({
+                  label: '角度（度）',
+                  value: this.fx.extAngle,
+                  min: EXT_ANGLE_MIN,
+                  max: EXT_ANGLE_MAX,
+                  onPick: (v: number, done: boolean) => {
+                    AudioEffectSettings.getInstance().setSpaceParam('extAngle', v, done);
+                  },
+                })
+              }
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 14 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({
+              text: '定位把声源放到三维空间的某个点；环绕让它绕着你转；扩散把声场铺开成一片。'
+                + '坐标范围 -5~5 米是系统限制，越界会让音效节点初始化失败，界面已经替你夹住了。'
+                + '这一项需要较新的系统版本，老设备上会自动跳过，不影响 EQ 和另外两项。',
+            })
+          }
+          .width(cardWidthOf(this.windowWidth))
+
+          // ------------------------------------------------ 环境音（ENVIRONMENT_EFFECT）
+          Column({ space: 12 }) {
+            Column({ space: 10 }) {
+              Row({ space: 6 }) {
+                Text('环境音')
+                  .fontSize(15)
+                  .fontColor(C_TEXT)
+                Text('Ambience · 场景')
+                  .fontSize(10.5)
+                  .fontColor(C_TEXT_WEAK)
+                Blank()
+              }
+              .width('100%')
+
+              SegPills({
+                labels: ENVIRONMENT_LABELS,
+                activeIndex: this.fx.environment,
+                onPick: (i: number) => {
+                  AudioEffectSettings.getInstance().setEnvironment(i);
+                },
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 14 })
+            .borderRadius(R_CARD)
+            .backgroundColor(C_CARD)
+
+            HintText({
+              text: '给声音套一层场景音色：广播像老收音机，听筒模拟贴耳通话，水下闷而发飘，'
+                + '留声机带复古的窄频与噪声。四个档位是系统预设，不能叠加。',
+            })
+          }
+          .width(cardWidthOf(this.windowWidth))
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: this.bottomInset + 16 })

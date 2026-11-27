@@ -820,7 +820,9 @@ export class PlaySession {
    */
   private requestEqReplay(reason: string): void {
     const settings: AudioEffectSettings = AudioEffectSettings.getInstance();
-    const signature: string = `${settings.isEnabled() ? 1 : 0}|${settings.getGains().join(',')}`;
+    // 用统一指纹：EQ 增益 + 三个空间模块的参数都算进去，否则只改空间效果时
+    // 会被当成「配置没变」而不重播，用户听到的还是旧的那份 WAV。
+    const signature: string = settings.effectSignature();
     if (signature === this.eqReplaySignature) {
       return;   // 同一套配置（比如点了和当前一样的那一档），不必重播
     }
