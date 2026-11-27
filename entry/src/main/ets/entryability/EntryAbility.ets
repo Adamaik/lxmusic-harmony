@@ -22,6 +22,7 @@ import { AudioEffectSettings } from '../core/settings/AudioEffectSettings';
 import { EqPresetStore } from '../core/settings/EqPresetStore';
 import { PlatformPush } from '../core/sync/PlatformPush';
 import { AudioEffectProcessor } from '../core/player/AudioEffectProcessor';
+import { SleepTimer } from '../core/player/SleepTimer';
 import { AppearanceSettings } from '../core/settings/AppearanceSettings';
 import { RecommendSettings } from '../core/settings/RecommendSettings';
 import { ListenSettings } from '../core/settings/ListenSettings';
@@ -79,6 +80,8 @@ export default class EntryAbility extends UIAbility {
     PlatformPush.getInstance().init(this.context);
     // 音效预处理的 WAV 缓存目录（开启音效时才会用到）
     AudioEffectProcessor.getInstance().init(this.context);
+    // 定时关闭：到点要关应用，得先拿到这里的 UIAbility Context（terminateSelf 只有它有）
+    SleepTimer.getInstance().init(this.context);
     // 外观设置（材质档位 / 封面圆角 / 深浅模式）：同样要早于界面创建，
     // 界面用 @StorageLink 订阅它发布的值。
     AppearanceSettings.getInstance().init(this.context);
